@@ -24,7 +24,7 @@ import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { detectBuildTool } from "./gates/build";
 import { createRunner } from "./runners/runner";
-import { orchestrate } from "./core/orchestrator";
+import { orchestrate } from "./orchestrator";
 
 async function main() {
   banner("write-java-ut pipeline 啟動");

@@ -8,7 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { findModuleInfo, listJavaClasses, expectedTestPath } from "../libs/utils";
 import { parseJacocoReport } from "../gates/coverage";
-import { parseVerdict } from "../review/verdict";
+import { parseVerdict } from "../gates/review";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { traceEvent } from "../runners/opencode";

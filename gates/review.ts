@@ -1,10 +1,15 @@
-// Verdict parsing: fail-closed + deterministic scoring.
+// Review gate: run the read-only reviewer, then fail-closed parsing + deterministic scoring.
 // Six 0-10 integer dims (per the skill rubric bands).
 // weighted_score and grade are computed here from skill weights (25/20/15/15/15/10)
 // and bands (A>=85 / B>=70 / C>=55 / D) — the LLM never scores.
 // Pass = blockers empty AND all six dims meet threshold; advisories/grade don't affect it.
 // Any parse failure, missing field, or out-of-range score -> passed=false with a reason, never throws.
-import { REVIEW_DIMENSIONS, ReviewScores, ReviewVerdict } from "../libs/types";
+import {
+  AgentRunner,
+  REVIEW_DIMENSIONS,
+  ReviewScores,
+  ReviewVerdict,
+} from "../libs/types";
 import { SCORE_THRESHOLDS, ScoreThresholds, RUBRIC_WEIGHTS, GRADE_BANDS } from "../config";
 import { tail } from "../libs/log";
 
@@ -68,4 +73,12 @@ export function parseVerdict(
   const { weighted, grade } = computeWeighted(scores);
   const passed = blockers.length === 0 && belowThreshold.length === 0;
   return { passed, scores, blockers, advisories, belowThreshold, weightedScore: weighted, grade, raw };
+}
+
+export async function runReviewGate(
+  runner: AgentRunner,
+  prompt: string,
+): Promise<ReviewVerdict> {
+  const raw = await runner.runReview(prompt);
+  return parseVerdict(raw);
 }
