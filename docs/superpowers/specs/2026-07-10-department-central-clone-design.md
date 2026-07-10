@@ -10,6 +10,7 @@
 | 使用型態 | **中央 clone，對各 Java repo 執行**（非 per-repo vendoring） | 覆寫 DESIGN.md「已否決：global 安裝」——該節須標記 superseded 並記錄理由與緩解 |
 | agent 安裝機制 | **Global 安裝**到 `~/.config/opencode/`（每人一次），目標 repo 的 `.opencode/agent/` 優先（專案化覆寫） | guard 的 agent 解析邏輯需擴充；此為 AGENTS.md 高風險項，授權即本 spec |
 | 語言 | 文件維持繁體中文；code comments 維持極簡英文 | 沿用既有慣例 |
+| 目錄整併 | **整併版**（使用者於 spec review 時決定）：7 個程式碼資料夾 → 4，消滅單檔資料夾 | 見 §2.8；搬移屬 AGENTS.md 高風險「遷移」項，本決定即人類授權 |
 
 ## 1. 目標與成功標準
 
@@ -28,7 +29,7 @@ npx tsx <clone 路徑>/loop.ts <target>   # 或 bin/testgen wrapper
 
 ## 2. 程式碼調整
 
-原則：orchestrator / gates / review / prompts / runners 的**邏輯零更動**；權限矩陣不變；新增邏輯以純函式為主，讓 selftest 覆蓋。
+原則：orchestrator / gates / review / prompts / runners 的**邏輯零更動**（§2.8 只搬移與合檔，不改任何行為）；權限矩陣不變；新增邏輯以純函式為主，讓 selftest 覆蓋。
 
 ### 2.1 `config.ts`
 - `SKILL_DIR_CANDIDATES` 尾端追加 `TESTGEN_ROOT/.opencode/skills/test-quality-evaluator`（目標 repo 的候選仍在前，保留專案化覆寫）。
@@ -71,7 +72,32 @@ npx tsx <clone 路徑>/loop.ts <target>   # 或 bin/testgen wrapper
 - `resolveAgentPath` 解析順序（repo 優先 / global fallback / 皆無）。
 - runs 目錄 namespace 推導。
 - skill 候選順序（repo 候選在前、TESTGEN_ROOT fallback 在後）。
-- 既有 34 條全數保留。
+- 既有 34 條全數保留（import 路徑隨 §2.8 更新）。
+
+### 2.8 目錄整併（7 個程式碼資料夾 → 4）
+搬移與合檔，**邏輯與 export 名稱一字不改**：
+
+| 動作 | 來源 | 目的 |
+| --- | --- | --- |
+| 搬移 | `core/orchestrator.ts` | `orchestrator.ts`（根目錄，與 `loop.ts` 並排——硬規則 #1 在檔案樹直接可見）；刪除 `core/` |
+| 合檔 | `review/verdict.ts` + `review/gate.ts` | `gates/review.ts`（verdict 內容 + 12 行 gate glue；exports：`parseVerdict`、`computeWeighted`、`runReviewGate`）；刪除 `review/` |
+| 合檔 | `prompts/{generate,fix,review}.ts` | `prompts.ts`（根目錄；exports：`DIMENSION_ONELINERS`、`testRootRel`、三個 build*Prompt 與其 input interfaces）；刪除 `prompts/` |
+
+連動更新：
+- 全部 import 路徑；selftest 的 `parseVerdict` 改自 `gates/review` 匯入。
+- 文件字面：AGENTS.md 硬規則 #1 改為「`orchestrator.ts` + `loop.ts`」；SDK 隔離 grep 範圍改為「`runners/` 以外的所有 `.ts`」（實際指令由 plan 定）。
+- 新檔（`libs/version.ts`、`scripts/{setup,doctor}.ts`）直接建在整併後位置。
+- 驗證：`tsc --noEmit` + 既有 34 條 selftest 全綠即證明搬移無行為變更。
+
+整併後結構：
+```
+loop.ts  orchestrator.ts  config.ts  prompts.ts
+gates/{build,coverage,review}.ts
+runners/{runner,opencode,qwen}.ts     ← SDK 隔離邊界，不動
+libs/{types,log,shell,utils,guard,rubric,version}.ts
+scripts/{selftest,setup,doctor}.ts
+bin/testgen  standards/  docs/
+```
 
 ## 3. 文件
 
@@ -85,8 +111,9 @@ npx tsx <clone 路徑>/loop.ts <target>   # 或 bin/testgen wrapper
 
 ### 3.3 `AGENTS.md` / `CLAUDE.md`
 - 「定位」段落改寫（不再是 `tools/testgen/` 內嵌；改述中央 clone + global agents + repo 覆寫）。
-- 硬規則八條不變；高風險清單不變。
-- CLAUDE.md 的指令區與架構描述同步（含 setup/doctor/check）。
+- 硬規則八條**語義不變**；#1 與 #6 的路徑字面隨 §2.8 更新（`core/orchestrator.ts` → `orchestrator.ts`、grep 範圍改述）。高風險清單不變。
+- 「目錄結構」區塊改為 §2.8 整併後結構。
+- CLAUDE.md 的指令區與架構描述同步（含 setup/doctor/check 與新結構）。
 
 ### 3.4 其他
 - `.env.example`：無新增 env（版本戳記不走 env），僅校對描述。
@@ -106,11 +133,12 @@ npx tsx <clone 路徑>/loop.ts <target>   # 或 bin/testgen wrapper
 
 ### 順序（風險前置）
 1. **Spike：global agent 探索實測**——把 agents 拷到 `~/.config/opencode/`，在一個**無 `.opencode` 的暫存目錄**跑 `opencode run --agent ut-reviewer "回覆 OK"`。成功 → 續行；失敗 → 停下回報，setup 降級為「拷進目標 repo」機制（本 spec 其餘部分不受影響，僅 §2.2/§2.3 的 global 分支改為 repo 分支）。
-2. 純函式（resolveAgentPath、candidates、runs namespace）+ selftest → guard/config 接線。
-3. setup.ts、doctor.ts、version.ts、bin/testgen、package.json。
-4. 文件（README/DESIGN/AGENTS/CLAUDE/CHANGELOG）。
-5. CI workflow。
-6. 清理項。
+2. **目錄整併（§2.8）**——先搬再蓋新料，tsc + 既有 selftest 全綠後才進下一步。
+3. 純函式（resolveAgentPath、candidates、runs namespace）+ selftest → guard/config 接線。
+4. setup.ts、doctor.ts、version.ts、bin/testgen、package.json。
+5. 文件（README/DESIGN/AGENTS/CLAUDE/CHANGELOG）。
+6. CI workflow。
+7. 清理項。
 
 ### 驗收（evidence, not assertion）
 - `npm run check` 綠（tsc + selftest 含新 cases）。
@@ -133,4 +161,4 @@ npx tsx <clone 路徑>/loop.ts <target>   # 或 bin/testgen wrapper
 - Windows global-path 支援（README 註記限制即可）。
 - mutation gate（Phase 3，另案）。
 - 英文版文件、npm registry 發佈、多 build tool 擴充。
-- 任何 orchestrator/gates/review/prompts/runners 的邏輯重構。
+- 任何 orchestrator/gates/review/prompts/runners 的**邏輯**重構（§2.8 目錄整併是唯一的結構性變更，且不含邏輯改動）。
