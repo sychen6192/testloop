@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Thin wrapper: `testgen <target>` runs the loop; `testgen doctor|setup [...]` runs the scripts.
+set -euo pipefail
+TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TSX="$TOOL_DIR/node_modules/.bin/tsx"
+[ -x "$TSX" ] || { echo "先在 $TOOL_DIR 執行 npm install"; exit 1; }
+case "${1:-}" in
+  doctor) shift; exec "$TSX" "$TOOL_DIR/scripts/doctor.ts" "$@" ;;
+  setup)  shift; exec "$TSX" "$TOOL_DIR/scripts/setup.ts" "$@" ;;
+  *)      exec "$TSX" "$TOOL_DIR/loop.ts" "$@" ;;
+esac
