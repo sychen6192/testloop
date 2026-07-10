@@ -1,5 +1,5 @@
 // Central config (SSOT: every threshold and param is defined only here).
-// Loads tools/testgen/.env without overriding existing env vars.
+// Loads the tool's own .env without overriding existing env vars.
 // REPO_ROOT = cwd at run time (must run from the Java repo root).
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -45,7 +45,7 @@ export const QUIET = process.env.UT_QUIET === "1";
 // 1 = skip the agent frontmatter permission guard (not recommended).
 export const SKIP_GUARD = process.env.UT_SKIP_GUARD === "1";
 
-// Runner: opencode (default) | qwen (needs @qwen-code/sdk installed).
+// Runner: opencode (default) | qwen (needs the qwen-code SDK installed).
 export const RUNNER_KIND = (process.env.UT_RUNNER ?? "opencode") as "opencode" | "qwen";
 
 // Models: empty = don't pass --model; the agent .md's model field decides (agent file is SSOT).

@@ -53,7 +53,7 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
 | 內容 | 位置 | 消費者 |
 | --- | --- | --- |
 | 測試撰寫標準 | <工具 clone>/standards/java-ut-standards.md | writer prompt（loop 注入） |
-| 評分 rubric | skill 的 references/rubric.md（目標 repo .opencode/.claude → 工具內建） | reviewer prompt（loop 注入；SKILL.md 不注入） |
+| 評分 rubric | skill 的 references/rubric.md（UT_SKILL_DIR → 目標 repo .opencode/.claude → 工具內建） | reviewer prompt（loop 注入；SKILL.md 不注入） |
 | 門檻與參數 | config.ts（env 可覆蓋） | gates / verdict |
 | 角色契約與權限 | 目標 repo .opencode/agent/ 優先，否則 ~/.config/opencode/agent/（npm run setup 安裝） | opencode runtime + startup guard |
 

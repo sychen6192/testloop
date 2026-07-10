@@ -1,4 +1,4 @@
-// Entry point: npx tsx tools/testgen/loop.ts <target dir or .java file>
+// Entry point: npx tsx <clone>/loop.ts <target dir or .java file> (or bin/testgen)
 // Must run from the Java repo root (REPO_ROOT = cwd).
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -35,7 +35,7 @@ async function main() {
   if (!TARGET_ARG) {
     die(
       "請提供要寫 UT 的類別資料夾或 .java 檔，例如：\n" +
-        "  npx tsx tools/testgen/loop.ts minio-sync-core/src/main/java/com/acme/service",
+        "  npx tsx <clone 路徑>/loop.ts core-module/src/main/java/com/acme/service",
     );
   }
   const absTarget = path.resolve(REPO_ROOT, TARGET_ARG);
