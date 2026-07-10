@@ -33,11 +33,11 @@ npx tsx tools/testgen/scripts/selftest.ts
 
 # Layer 1：writer 能不能真的寫檔（不經過 loop）
 opencode run --agent ut-writer --format json \
-  "在 minio-sync-core/src/test/java 對應 package 建一個最小的 SmokeTest.java，只要一個空的 @Test 方法"
+  "在 core-module/src/test/java 對應 package 建一個最小的 SmokeTest.java，只要一個空的 @Test 方法"
 # 看兩件事：(a) 有跳 tool 事件 (b) 檔案真的落地
 
 # Layer 2：端到端（挑一個最簡單、依賴最少的 class）
-npx tsx tools/testgen/loop.ts minio-sync-core/src/main/java/<某個簡單的package>
+npx tsx tools/testgen/loop.ts core-module/src/main/java/<某個簡單的package>
 ```
 
 一定要在 **Java repo 根目錄**執行 loop（多模組的 reactor root）。

@@ -1,4 +1,4 @@
-/** Review gate：唯讀 reviewer 執行 + fail-closed 解析（prompt 由 orchestrator 組裝並落盤） */
+// Review gate: run the read-only reviewer + fail-closed parse (prompt assembled by the orchestrator).
 import { AgentRunner, ReviewVerdict } from "../libs/types";
 import { parseVerdict } from "./verdict";
 

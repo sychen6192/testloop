@@ -1,11 +1,7 @@
-/**
- * Hard gate：編譯 + 測試。
- * 多模組感知：
- * - Maven：REPO_ROOT 有 reactor pom → 在 REPO_ROOT 跑 `mvn -pl <module> -am test`；
- *          否則直接在模組目錄跑 `mvn test`。
- * - Gradle：多模組用 `-p <module>`（best-effort；本專案主力是 Maven）。
- * 測試報告一律到「模組」的 target/build 底下找（多模組的 report 不在 repo 根）。
- */
+// Hard gate: compile + test, module-aware.
+// Maven: reactor pom at REPO_ROOT -> `mvn -pl <module> -am test` from root; else `mvn test` in the module.
+// Gradle: `-p <module>` for multi-module (best-effort; Maven is the primary path).
+// Test reports are read from the *module's* target/build, not the repo root.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { REPO_ROOT, MAVEN_EXTRA_ARGS } from "../config";

@@ -1,10 +1,8 @@
-/**
- * Selftest：不需 opencode / mvn / LLM 的純邏輯自測。
- * 覆蓋：多模組偵測、測試路徑推導、JaCoCo 解析（含原版「取第一個 counter」
- * bug 的 regression case）、verdict fail-closed（0-10 制 + weighted/grade
- * 確定性計算）、rubric loader（references/rubric.md 優先、絕不注入 SKILL.md）。
- * 執行：npx tsx scripts/selftest.ts
- */
+// Selftest: pure-logic checks, no opencode / mvn / LLM.
+// Covers: module detection, test-path derivation, JaCoCo parsing (incl. the "first counter"
+// regression), verdict fail-closed (0-10 + deterministic weighted/grade), and the rubric
+// loader (references/rubric.md first, never injects SKILL.md).
+// Run: npx tsx scripts/selftest.ts
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,7 +26,7 @@ function check(name: string, cond: boolean, detail = "") {
 }
 
 // ---------------------------------------------------------------------------
-// 1. 多模組偵測 / 檔案遍歷 / 測試路徑推導
+// 1. module detection / file walk / test-path derivation
 // ---------------------------------------------------------------------------
 console.log("\n[1] findModuleInfo / listJavaClasses / expectedTestPath");
 {
@@ -71,7 +69,7 @@ console.log("\n[1] findModuleInfo / listJavaClasses / expectedTestPath");
 }
 
 // ---------------------------------------------------------------------------
-// 2. JaCoCo 解析
+// 2. JaCoCo parsing
 // ---------------------------------------------------------------------------
 console.log("\n[2] parseJacocoReport");
 {
@@ -120,7 +118,7 @@ console.log("\n[2] parseJacocoReport");
 }
 
 // ---------------------------------------------------------------------------
-// 3. Verdict（0-10 制 + weighted/grade 確定性計算 + fail-closed）
+// 3. Verdict (0-10 + deterministic weighted/grade + fail-closed)
 // ---------------------------------------------------------------------------
 console.log("\n[3] parseVerdict（0-10 + weighted/grade + fail-closed）");
 {
@@ -137,7 +135,7 @@ console.log("\n[3] parseVerdict（0-10 + weighted/grade + fail-closed）");
     '"fast_reliable":9,"mock_appropriateness":8},"blockers":[],"advisories":["可再精簡 helper"]}';
 
   const v1 = parseVerdict(good, TH);
-  // 9*.25+8*.2+9*.15+8*.15+9*.15+8*.10 = 8.55 → ×10 = 85.5 → A
+  // 9*.25+8*.2+9*.15+8*.15+9*.15+8*.10 = 8.55 -> x10 = 85.5 -> A
   check("合法 JSON 且全達門檻 → passed", v1.passed === true && v1.advisories.length === 1);
   check(
     "weighted_score 確定性計算 = 85.5",
@@ -188,7 +186,7 @@ console.log("\n[3] parseVerdict（0-10 + weighted/grade + fail-closed）");
 }
 
 // ---------------------------------------------------------------------------
-// 4. Rubric loader（references/rubric.md 優先；絕不注入 SKILL.md）
+// 4. Rubric loader (references/rubric.md first; never injects SKILL.md)
 // ---------------------------------------------------------------------------
 console.log("\n[4] loadRubric");
 {
@@ -224,8 +222,8 @@ console.log("\n[4] loadRubric");
 }
 
 // ---------------------------------------------------------------------------
-// 5. opencode JSONL 事件解析（v4 修正的 regression：part.type 連字號為準）
-//    （本段的 [t] 事件轉印屬預期雜訊）
+// 5. opencode JSONL event parsing (regression: trust the hyphenated part.type)
+//    (the [t] event echoes in this block are expected noise)
 // ---------------------------------------------------------------------------
 console.log("\n[5] traceEvent（opencode --format json 事件解析）");
 {
@@ -233,7 +231,7 @@ console.log("\n[5] traceEvent（opencode --format json 事件解析）");
     '{"scores":{"effectiveness":8,"coverage":7,"independence":9,"readability":8,' +
     '"fast_reliable":9,"mock_appropriateness":7},"blockers":[],"advisories":[]}';
 
-  // (a) 實測結構：外層 ev.type 不可靠，真型別在 part.type（連字號）
+  // (a) observed structure: ev.type is unreliable, the real type is in part.type (hyphenated)
   const acc1 = { text: "", lastText: "" };
   const realEvents = [
     JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
@@ -250,17 +248,17 @@ console.log("\n[5] traceEvent（opencode --format json 事件解析）");
   check("lastText 保險：最後一個 text part 為完整 JSON", acc1.lastText === verdictJson);
   check("tool 事件不污染 text 累積", !acc1.text.includes("No files found"));
 
-  // (b) part.type 缺漏時退回 ev.type
+  // (b) fall back to ev.type when part.type is missing
   const acc2 = { text: "", lastText: "" };
   traceEvent(JSON.stringify({ type: "text", part: { text: "FALLBACK" } }), "[t]", acc2);
   check("part.type 缺漏 → 退回 ev.type", acc2.text === "FALLBACK");
 
-  // (c) 底線型別相容
+  // (c) underscore type compatibility
   const acc3 = { text: "", lastText: "" };
   traceEvent(JSON.stringify({ type: "x", part: { type: "step_start" } }), "[t]", acc3);
   check("底線 step_start 相容不 crash 且不累積", acc3.text === "");
 
-  // (d) 非 JSON 行安靜略過
+  // (d) non-JSON lines are silently skipped
   const acc4 = { text: "", lastText: "" };
   traceEvent("not-json-noise", "[t]", acc4);
   check("非 JSON 行略過", acc4.text === "");

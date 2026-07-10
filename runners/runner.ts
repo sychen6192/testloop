@@ -1,4 +1,4 @@
-/** Runner factory：預設 opencode；qwen 走動態 import（未裝 SDK 不影響預設路徑） */
+// Runner factory: opencode by default; qwen via dynamic import (a missing SDK never affects the default path).
 import { AgentRunner } from "../libs/types";
 import { RUNNER_KIND } from "../config";
 import { OpencodeRunner } from "./opencode";

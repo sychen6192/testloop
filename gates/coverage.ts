@@ -1,12 +1,8 @@
-/**
- * Hard gate：JaCoCo 覆蓋率。
- * 修正兩件事（相對原版）：
- * 1. 多模組：報告位置在「模組」的 target/ 底下，不在 repo 根。
- * 2. 解析 bug：原版取 class block 內「第一個」counter，那是第一個 method 的
- *    counter，不是 class 彙總 → 覆蓋率被嚴重低估。
- *    正確做法：優先取 <sourcefile> 的檔案級彙總；退而求其次取 class block 的
- *    「最後一個」counter（JaCoCo 的 class 級 counter 排在所有 method 之後）。
- */
+// Hard gate: JaCoCo coverage.
+// Reports live under the *module's* target/, not the repo root.
+// Parsing gotcha: prefer the file-level <sourcefile> aggregate; else the class block's
+// LAST counter (JaCoCo's class-level counter comes after all methods — the first counter
+// is method-level and badly undercounts).
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { MIN_LINE_COV, MIN_BRANCH_COV, STRICT_COV } from "../config";
@@ -26,7 +22,7 @@ function lastCounterPct(block: string, type: string): number | null {
   return (covered / Math.max(1, missed + covered)) * 100;
 }
 
-/** 純函式：解析 JaCoCo XML，逐類別檢查門檻（selftest 可測） */
+// Pure: parse JaCoCo XML, check each class against thresholds.
 export function parseJacocoReport(
   xml: string,
   targetClasses: string[],
@@ -38,7 +34,7 @@ export function parseJacocoReport(
   for (const cls of targetClasses) {
     const simple = path.basename(cls);
 
-    // 由來源路徑推 package，先縮小到對的 <package> 區塊（避免同名檔誤中）
+    // Narrow to the right <package> block by source path (avoid same-name collisions).
     const pkgMatch = cls.replace(/\\/g, "/").match(/src\/main\/java\/(.+)\/[^/]+\.java$/);
     let scope = xml;
     if (pkgMatch) {
@@ -47,10 +43,10 @@ export function parseJacocoReport(
       if (pm) scope = pm[0];
     }
 
-    // 1) sourcefile 檔案級彙總（含 inner class，最準）
+    // 1) file-level <sourcefile> aggregate (includes inner classes, most accurate)
     const sfRe = new RegExp(`<sourcefile name="${escRe(simple)}">[\\s\\S]*?</sourcefile>`);
     let block = scope.match(sfRe)?.[0];
-    // 2) 退回 class block（取最後一個 counter = class 級彙總）
+    // 2) fallback: class block — take the LAST counter (class-level aggregate)
     if (!block) {
       const clsRe = new RegExp(
         `<class[^>]*sourcefilename="${escRe(simple)}"[\\s\\S]*?</class>`,

@@ -1,11 +1,9 @@
-/**
- * Verdict 解析：fail-closed + 確定性計分。
- * - 六維 0-10 整數（對齊 skill rubric 的分數帶）。
- * - weighted_score 與 grade 由本函式依 skill 權重（25/20/15/15/15/10）與
- *   bands（A≥85 / B≥70 / C≥55 / D）計算——LLM 不算分（skill 原則 P1/P3）。
- * - 通過 = blockers 空 且 六維全數達門檻；advisories 與 grade 不影響判定。
- * - 任何解析失敗、缺欄位、分數超出範圍 → passed=false 附原因，絕不拋錯。
- */
+// Verdict parsing: fail-closed + deterministic scoring.
+// Six 0-10 integer dims (per the skill rubric bands).
+// weighted_score and grade are computed here from skill weights (25/20/15/15/15/10)
+// and bands (A>=85 / B>=70 / C>=55 / D) — the LLM never scores.
+// Pass = blockers empty AND all six dims meet threshold; advisories/grade don't affect it.
+// Any parse failure, missing field, or out-of-range score -> passed=false with a reason, never throws.
 import { REVIEW_DIMENSIONS, ReviewScores, ReviewVerdict } from "../libs/types";
 import { SCORE_THRESHOLDS, ScoreThresholds, RUBRIC_WEIGHTS, GRADE_BANDS } from "../config";
 import { tail } from "../libs/log";
@@ -13,7 +11,7 @@ import { tail } from "../libs/log";
 export function computeWeighted(scores: ReviewScores): { weighted: number; grade: string } {
   let sum = 0;
   for (const d of REVIEW_DIMENSIONS) sum += scores[d] * RUBRIC_WEIGHTS[d];
-  const weighted = Math.round(sum * 10 * 10) / 10; // Σ(score×weight)×10，保留一位小數
+  const weighted = Math.round(sum * 10 * 10) / 10; // Σ(score×weight)×10, one decimal
   const grade = GRADE_BANDS.find((b) => weighted >= b.min)?.grade ?? "D";
   return { weighted, grade };
 }

@@ -1,4 +1,4 @@
-/** Logging：所有輸出帶 [mm:ss] 經過時間，方便判斷是否還在跑 */
+// Logging: every line carries [mm:ss] elapsed time so you can tell it's still alive.
 import { QUIET } from "../config";
 
 const START_TS = Date.now();
@@ -31,7 +31,7 @@ export function tail(s: string, n = 6000): string {
   return s.length > n ? `…(截斷)\n${s.slice(-n)}` : s;
 }
 
-/** 長時間操作期間每 15 秒印一次心跳，避免看起來像卡死 */
+// Heartbeat every 15s during long ops so it doesn't look hung.
 export function startHeartbeat(label: string): () => void {
   let ticks = 0;
   const timer = setInterval(() => {

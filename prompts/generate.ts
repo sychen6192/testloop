@@ -1,8 +1,8 @@
-/** Writer prompt（首次產生）：standards 由 loop 注入（injection over discovery） */
+// Writer prompt (first pass): standards injected by the loop (injection over discovery).
 import * as path from "node:path";
 import { ModuleInfo } from "../libs/types";
 
-/** 給 writer 的六維「名稱＋一句話」——只給優化方向，不給評分細則（防 teaching-to-the-test） */
+// Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
 export const DIMENSION_ONELINERS = `你產出的測試之後會依以下六個維度被審查（評分細則由審查方持有）：
 - Effectiveness：斷言驗證具體行為與值，能抓出真實錯誤
 - Coverage：涵蓋正常路徑、邊界（null/空/0/負數/極值）與例外路徑

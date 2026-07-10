@@ -1,7 +1,5 @@
-/**
- * Startup guard：pipeline 啟動時 assert agent 定義的權限契約。
- * 文件會 drift，guard 不會——writer 拿到 bash 或 reviewer 可寫檔時，第一秒就炸。
- */
+// Startup guard: assert the agent permission contract at launch.
+// Docs drift, this doesn't — it fails instantly if writer gets bash or reviewer can write.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { REPO_ROOT, SKIP_GUARD } from "../config";
@@ -30,13 +28,13 @@ export function assertAgents() {
   const w = frontmatterOf(writerPath);
   mustContain(w, "ut-writer.md", "write", "true");
   mustContain(w, "ut-writer.md", "edit", "true");
-  mustContain(w, "ut-writer.md", "bash", "false"); // 驗證權不外包
+  mustContain(w, "ut-writer.md", "bash", "false"); // verification stays in the loop
 
   const reviewerPath = path.join(REPO_ROOT, ".opencode", "agent", "ut-reviewer.md");
   const r = frontmatterOf(reviewerPath);
   mustContain(r, "ut-reviewer.md", "write", "false");
   mustContain(r, "ut-reviewer.md", "edit", "false");
-  mustContain(r, "ut-reviewer.md", "bash", "false"); // reviewer 全唯讀
+  mustContain(r, "ut-reviewer.md", "bash", "false"); // reviewer is fully read-only
 
   log("[OK] agent 權限 guard 通過（writer 無 bash / reviewer 唯讀）");
 }

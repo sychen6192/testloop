@@ -1,4 +1,4 @@
-/** 子行程執行：stdout/stderr 逐行即時轉印（帶前綴），並回傳完整輸出 */
+// Run a child process; stream stdout/stderr line-by-line (prefixed), return the full output.
 import { spawn } from "node:child_process";
 import { logVerbose } from "./log";
 

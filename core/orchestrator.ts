@@ -1,10 +1,8 @@
-/**
- * Iteration orchestrator：唯一的迭代控制流（deterministic）。
- * - 零 SDK import：所有 agent 互動經由 AgentRunner interface。
- * - 每輪 artifacts 落盤到 runs/<ts>/iter-N/（state in artifacts, not context）。
- * - Review 判定：blockers 空 且 六維達門檻；feedback 只餵 blockers + 低分維度，
- *   advisories 不進迴圈（防 thrash）。
- */
+// Iteration orchestrator: the single deterministic control loop.
+// Zero SDK imports — all agent interaction goes through the AgentRunner interface.
+// Each iteration's artifacts land in runs/<ts>/iter-N/ (state in artifacts, not context).
+// Review passes when blockers are empty and all six dims meet threshold; feedback carries
+// only blockers + below-threshold dims (advisories stay out of the loop to avoid thrash).
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { MAX_ITER } from "../config";
@@ -55,7 +53,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     banner(`第 ${iter}/${MAX_ITER} 輪迭代`);
 
-    // Step 1：產生或修正
+    // Step 1: generate or fix
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
     const prompt = feedback
       ? buildFixPrompt({ gateReport: feedback, standards: cfg.standards, mod: cfg.mod })
@@ -69,7 +67,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     save("writer-summary.md", agentSummary || "（writer 未回傳文字）");
     log(`[writer 總結] ${tail(agentSummary, 1500)}`);
 
-    // Step 2：hard gate — 編譯與測試
+    // Step 2: hard gate — compile & test
     log("Step 2/4：執行編譯與測試 gate");
     const build = await runBuildAndTests(cfg.buildTool, cfg.mod);
     save("build.log", build.raw ?? build.report);
@@ -81,7 +79,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       continue;
     }
 
-    // Step 3：hard gate — 覆蓋率
+    // Step 3: hard gate — coverage
     log("Step 3/4：檢查覆蓋率 gate");
     const cov = checkCoverage(cfg.targetClasses, cfg.mod);
     lastCov = cov.report;
@@ -94,7 +92,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       continue;
     }
 
-    // Step 4：review gate
+    // Step 4: review gate
     if (cfg.skipReview) {
       log("Step 4/4：依設定跳過 review gate");
       log("[OK] 全部 hard gate 通過");

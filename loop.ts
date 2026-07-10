@@ -1,7 +1,5 @@
-/**
- * Entry point：npx tsx tools/testgen/loop.ts <目標資料夾或 .java 檔>
- * 必須在 Java repo 根目錄執行（REPO_ROOT = cwd）。
- */
+// Entry point: npx tsx tools/testgen/loop.ts <target dir or .java file>
+// Must run from the Java repo root (REPO_ROOT = cwd).
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {

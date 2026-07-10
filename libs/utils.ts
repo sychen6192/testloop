@@ -1,9 +1,9 @@
-/** 純函式工具：檔案遍歷、多模組偵測、測試路徑推導（皆吃參數，selftest 可測） */
+// Pure helpers: Java-file walk, module detection, test-path derivation.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ModuleInfo } from "./types";
 
-/** 列出目標（資料夾或單一 .java 檔）內的 Java 類別，回傳相對 repoRoot 的路徑 */
+// List Java classes under target (dir or single .java); paths relative to repoRoot.
 export function listJavaClasses(target: string, repoRoot: string): string[] {
   const out: string[] = [];
   const add = (p: string) => {
@@ -36,10 +36,8 @@ function hasBuildFile(dir: string): boolean {
   );
 }
 
-/**
- * 多模組偵測：從目標路徑向上找「最近的」pom.xml / build.gradle，
- * 該目錄即模組根。找不到則退回 repoRoot（讓 detectBuildTool 決定生死）。
- */
+// Module detection: walk up from target to the nearest pom.xml / build.gradle;
+// that dir is the module root. Falls back to repoRoot if none is found.
 export function findModuleInfo(absTarget: string, repoRoot: string): ModuleInfo {
   let dir = fs.statSync(absTarget).isDirectory() ? absTarget : path.dirname(absTarget);
   while (!hasBuildFile(dir)) {
@@ -56,7 +54,7 @@ export function findModuleInfo(absTarget: string, repoRoot: string): ModuleInfo 
   return { moduleRoot, moduleRel, multiModule: moduleRel !== "" };
 }
 
-/** 由來源檔路徑推導預期測試檔路徑：src/main/java → src/test/java、Foo → FooTest */
+// Derive the expected test path: src/main/java -> src/test/java, Foo -> FooTest.
 export function expectedTestPath(clsRelPath: string): string {
   const norm = clsRelPath.replace(/\\/g, "/");
   const renamed = norm.replace(/([^/]+)\.java$/, (_m, n: string) => `${n}Test.java`);

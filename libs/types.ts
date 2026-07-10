@@ -1,15 +1,15 @@
-/** 共用型別（SSOT：其他模組一律從此 import） */
+// Shared types (SSOT: all other modules import from here).
 
 export type BuildTool = "maven" | "gradle";
 
 export interface GateResult {
   passed: boolean;
   report: string;
-  /** 完整原始輸出（build.log 落盤用） */
+  // Full raw output (persisted to build.log).
   raw?: string;
 }
 
-/** Runtime adapter：核心零 SDK import 的關鍵 interface */
+// Runtime adapter: the interface that keeps the core free of SDK imports.
 export interface AgentRunner {
   runWriter(prompt: string): Promise<string>;
   runReview(prompt: string): Promise<string>;
@@ -29,28 +29,28 @@ export type ReviewScores = Record<ReviewDimension, number>;
 
 export interface ReviewVerdict {
   passed: boolean;
-  /** 六維 0-10 整數（對齊 skill rubric）；解析失敗時為空物件 */
+  // Six 0-10 integer scores (per skill rubric); empty object on parse failure.
   scores: Partial<ReviewScores>;
-  /** 違反標準硬規則（≈ skill severity=high）：必須全部修正才能過關 */
+  // Hard-rule violations (~ skill severity=high): all must be fixed to pass.
   blockers: string[];
-  /** 建議級改善（≈ severity=medium/low）：不擋關、不進下一輪 feedback（防 thrash） */
+  // Advisory improvements (~ severity=medium/low): non-blocking, kept out of feedback to avoid thrash.
   advisories: string[];
-  /** 低於門檻的維度描述，例如 "coverage（6 < 門檻 7）" */
+  // Dimensions below threshold, e.g. "coverage (6 < threshold 7)".
   belowThreshold: string[];
-  /** Σ(score×weight)×10（0-100），由 pipeline 依 skill 權重確定性計算 */
+  // Σ(score×weight)×10 (0-100), computed deterministically by the pipeline.
   weightedScore?: number;
-  /** A/B/C/D（skill bands：85/70/55），僅供報告，不作 gate 條件 */
+  // A/B/C/D (skill bands 85/70/55); report-only, not a gate condition.
   grade?: string;
   parseError?: string;
   raw?: string;
 }
 
-/** 多模組資訊：由目標路徑向上找最近的 pom.xml / build.gradle 推得 */
+// Module info: derived by walking up to the nearest pom.xml / build.gradle.
 export interface ModuleInfo {
-  /** 模組根目錄（絕對路徑）。單一模組時 = REPO_ROOT */
+  // Module root (absolute). Equals REPO_ROOT for a single module.
   moduleRoot: string;
-  /** 相對 REPO_ROOT 的模組路徑。單一模組時 = ""（空字串） */
+  // Module path relative to REPO_ROOT. "" for a single module.
   moduleRel: string;
-  /** moduleRel !== ""，即目標位於子模組內 */
+  // moduleRel !== "" — the target lives inside a submodule.
   multiModule: boolean;
 }

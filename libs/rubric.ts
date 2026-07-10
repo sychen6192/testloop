@@ -1,9 +1,6 @@
-/**
- * Rubric loader（injection over discovery）。
- * 只注入「評分細則」：references/rubric.md → rubric.md → rubric/*.md。
- * 刻意不注入 SKILL.md 全文——那是批次稽核的 workflow 文件（六輸入確認、
- * concurrency、environment probe），對單輪 review gate 的 reviewer 是錯誤指令。
- */
+// Rubric loader (injection over discovery): references/rubric.md -> rubric.md -> rubric/*.md.
+// Never injects the full SKILL.md — that's the batch-audit workflow doc, the wrong
+// instructions for a single-shot review-gate reviewer.
 import * as fs from "node:fs";
 import * as path from "node:path";
 

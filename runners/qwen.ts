@@ -1,7 +1,5 @@
-/**
- * QwenRunner（備援路線）：UT_RUNNER=qwen 時才動態載入 @qwen-code/sdk。
- * SDK 未安裝時只有選用此 runner 才會報錯，預設 opencode 路徑完全不受影響。
- */
+// QwenRunner (fallback path): dynamically loads @qwen-code/sdk only when UT_RUNNER=qwen.
+// A missing SDK errors only if this runner is selected; the default opencode path is unaffected.
 import { AgentRunner } from "../libs/types";
 import { REPO_ROOT, WRITER_MODEL, REVIEWER_MODEL } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
@@ -36,7 +34,7 @@ export class QwenRunner implements AgentRunner {
   private async load(): Promise<any> {
     if (this.sdk) return this.sdk;
     try {
-      // 動態 import：只有 UT_RUNNER=qwen 時才需要這個套件
+      // dynamic import: this package is only needed when UT_RUNNER=qwen
       this.sdk = await import("@qwen-code/sdk" as string);
     } catch {
       throw new Error(

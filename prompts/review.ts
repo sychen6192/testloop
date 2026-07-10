@@ -1,8 +1,6 @@
-/**
- * Reviewer prompt：rubric 由 loop 讀檔注入（不靠 skill 機制觸發）。
- * 分數量表對齊 skill rubric（0-10 整數、分數帶 9-10/7-8/5-6/3-4/0-2）。
- * weighted_score 與 grade 由 pipeline 確定性計算，reviewer 不得輸出。
- */
+// Reviewer prompt: rubric injected by the loop (not triggered via the skill mechanism).
+// Score scale matches the skill rubric (0-10 integers, bands 9-10/7-8/5-6/3-4/0-2).
+// weighted_score and grade are computed deterministically by the pipeline; the reviewer must not output them.
 import { ModuleInfo, REVIEW_DIMENSIONS } from "../libs/types";
 import { SCORE_THRESHOLDS } from "../config";
 import { expectedTestPath } from "../libs/utils";

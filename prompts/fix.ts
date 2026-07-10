@@ -1,4 +1,4 @@
-/** Writer prompt（修正輪）：帶上一輪 gate 失敗報告 */
+// Writer prompt (fix pass): carries the previous round's gate failure report.
 import { ModuleInfo } from "../libs/types";
 import { DIMENSION_ONELINERS, testRootRel } from "./generate";
 
