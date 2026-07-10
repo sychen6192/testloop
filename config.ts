@@ -2,8 +2,10 @@
 // Loads tools/testgen/.env without overriding existing env vars.
 // REPO_ROOT = cwd at run time (must run from the Java repo root).
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { skillDirCandidates, runsDirFor } from "./libs/utils";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -65,15 +67,15 @@ export const STANDARDS_PATH =
   process.env.UT_STANDARDS_PATH ??
   path.join(TESTGEN_ROOT, "standards", "java-ut-standards.md");
 
-// Rubric search order: env override -> .opencode/skills -> .claude/skills.
-export const SKILL_DIR_CANDIDATES = [
+// Rubric search order: env override -> target repo -> the tool's own copy.
+export const SKILL_DIR_CANDIDATES = skillDirCandidates(
+  REPO_ROOT,
+  TESTGEN_ROOT,
   process.env.UT_SKILL_DIR,
-  path.join(REPO_ROOT, ".opencode", "skills", "test-quality-evaluator"),
-  path.join(REPO_ROOT, ".claude", "skills", "test-quality-evaluator"),
-].filter(Boolean) as string[];
+);
 
-// Where each run's artifacts are written.
-export const RUNS_DIR = path.join(TESTGEN_ROOT, "runs");
+// Artifacts, namespaced per target repo.
+export const RUNS_DIR = runsDirFor(TESTGEN_ROOT, REPO_ROOT);
 
 // Six score thresholds (0-10, per skill rubric). Partial override via UT_SCORE_THRESHOLDS='{"coverage":6}'.
 export interface ScoreThresholds {
@@ -124,3 +126,9 @@ export const GRADE_BANDS: ReadonlyArray<{ min: number; grade: string }> = [
 export const MAVEN_EXTRA_ARGS = (process.env.UT_MAVEN_ARGS ?? "")
   .split(" ")
   .filter(Boolean);
+
+// Global opencode config dir (agents/skill installed here by scripts/setup.ts).
+export const GLOBAL_OPENCODE_DIR = path.join(
+  process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"),
+  "opencode",
+);

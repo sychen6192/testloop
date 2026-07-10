@@ -6,7 +6,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { findModuleInfo, listJavaClasses, expectedTestPath } from "../libs/utils";
+import { findModuleInfo, listJavaClasses, expectedTestPath, skillDirCandidates, runsDirFor } from "../libs/utils";
+import { resolveAgentPath, contractViolations, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport } from "../gates/coverage";
 import { parseVerdict } from "../gates/review";
 import { loadRubric } from "../libs/rubric";
@@ -262,6 +263,57 @@ console.log("\n[5] traceEvent（opencode --format json 事件解析）");
   const acc4 = { text: "", lastText: "" };
   traceEvent("not-json-noise", "[t]", acc4);
   check("非 JSON 行略過", acc4.text === "");
+}
+
+// ---------------------------------------------------------------------------
+// 6. central-clone resolution (agent repo->global, skill candidates, runs namespace)
+// ---------------------------------------------------------------------------
+console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / runsDirFor");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-central-"));
+  const repo = path.join(tmp, "repo");
+  const globalDir = path.join(tmp, "global-opencode");
+  fs.mkdirSync(path.join(repo, ".opencode", "agent"), { recursive: true });
+  fs.mkdirSync(path.join(globalDir, "agent"), { recursive: true });
+  const writerFm = "---\ntools:\n  write: true\n  edit: true\n  bash: false\n---\nbody";
+  fs.writeFileSync(path.join(repo, ".opencode", "agent", "ut-writer.md"), writerFm);
+  fs.writeFileSync(path.join(globalDir, "agent", "ut-writer.md"), writerFm);
+  fs.writeFileSync(
+    path.join(globalDir, "agent", "ut-reviewer.md"),
+    "---\ntools:\n  write: false\n  edit: false\n  bash: false\n---\nbody",
+  );
+
+  const both = resolveAgentPath("ut-writer", repo, globalDir);
+  check("repo-local agent 優先於 global", both?.source === "repo" && !!both?.path.startsWith(repo));
+  const globalOnly = resolveAgentPath("ut-reviewer", repo, globalDir);
+  check("repo 無此 agent → global fallback", globalOnly?.source === "global");
+  check("兩處皆無 → null", resolveAgentPath("nope", repo, globalDir) === null);
+
+  check(
+    "writer 契約合規 → 無違規",
+    contractViolations(path.join(globalDir, "agent", "ut-writer.md"), WRITER_RULES).length === 0,
+  );
+  const badWriter = path.join(tmp, "bad-writer.md");
+  fs.writeFileSync(badWriter, "---\ntools:\n  write: true\n  edit: true\n  bash: true\n---\n");
+  const errs = contractViolations(badWriter, WRITER_RULES);
+  check("writer 拿到 bash → 違規", errs.length === 1 && errs[0].includes("bash"));
+
+  const cands = skillDirCandidates("/repo", "/tool", undefined);
+  check(
+    "skill 候選順序：repo .opencode → repo .claude → 工具內建",
+    cands.length === 3 &&
+      cands[0] === path.join("/repo", ".opencode", "skills", "test-quality-evaluator") &&
+      cands[1] === path.join("/repo", ".claude", "skills", "test-quality-evaluator") &&
+      cands[2] === path.join("/tool", ".opencode", "skills", "test-quality-evaluator"),
+    JSON.stringify(cands),
+  );
+  const withEnv = skillDirCandidates("/repo", "/tool", "/env/dir");
+  check("UT_SKILL_DIR 排最前", withEnv.length === 4 && withEnv[0] === "/env/dir");
+
+  check(
+    "runsDirFor：runs/<repo basename>",
+    runsDirFor("/tool", "/w/myrepo") === path.join("/tool", "runs", "myrepo"),
+  );
 }
 
 // ---------------------------------------------------------------------------
