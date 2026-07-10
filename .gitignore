@@ -1,3 +1,23 @@
+# Dependencies
 node_modules/
+
+# Run artifacts (per-target-repo, written by the pipeline)
 runs/
+
+# Secrets — commit .env.example instead
 .env
+
+# opencode local workspace (skill deps generated on the fly, never committed)
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# OS / editor noise
+.DS_Store
+*.log
+
+# Local agent tooling (scratch from omo / superpowers workflows)
+.omo/
+.codegraph
+.superpowers/

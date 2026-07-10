@@ -119,4 +119,4 @@ cd <clone> && git pull && npm install && npm run setup
   修改評分細則：`.opencode/skills/test-quality-evaluator/references/rubric.md`
   ——改完通知同事 `git pull && npm run setup`。
 - 設計文件：`DESIGN.md`（架構決策與否決紀錄）、`AGENTS.md`（agent 操作規範）；
-  規格與計畫：`docs/superpowers/`。
+  歷次改動的完整 rationale 見 `git log`。
