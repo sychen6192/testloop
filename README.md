@@ -1,57 +1,72 @@
-# testgen — Java UT Loop Engineering Pipeline（OpenCode 版）
+# testgen — Java 單元測試自動產生 pipeline
 
-對指定資料夾的 Java 類別執行「產生 → 編譯/測試 gate → 覆蓋率 gate → 品質審查 gate → 修正」
-的迭代迴圈，直到單元測試符合團隊品質標準。控制流 100% 在 TypeScript loop，
-LLM 只負責「寫」（ut-writer）與「審」（ut-reviewer），驗證權不外包。
+對指定的 Java 類別執行「產生 → 編譯/測試 gate → 覆蓋率 gate → 品質審查 gate → 修正」
+迭代迴圈，直到單元測試符合團隊品質標準。控制流 100% 在 TypeScript，
+LLM 只負責寫（ut-writer）與審（ut-reviewer），驗證權不外包。
 
-## 放置（zip 解到 Java repo 根目錄）
+**使用模式：中央 clone。** 你 clone 一份本工具，對部門任何 Java repo 執行；
+不需要把工具放進你的 Java repo。
 
 ```
-<你的 Java repo>/
-├-- .opencode/agent/ut-writer.md      ← agent 定義（權限契約）
-├-- .opencode/agent/ut-reviewer.md
-├-- .opencode/skills/test-quality-evaluator/   ← 你的 skill（rubric 來源，已存在就不用動）
-└-- tools/testgen/                    ← 本 pipeline
+你的 Java repo（在此執行指令）◄── 實際跑 mvn test / 解析 JaCoCo / 寫測試檔
+        ▲
+        │ 每輪：writer 寫 → build gate → coverage gate → review gate
+本工具 clone ──────────── artifacts 寫入 <clone>/runs/<repo 名>/<時間戳>/
+        │
+~/.config/opencode/ ◄──── npm run setup 安裝 ut-writer / ut-reviewer / 評分 skill
 ```
 
-## 安裝
+## 前置需求
+
+- Node.js >= 20
+- [opencode](https://opencode.ai) CLI 已安裝且在 PATH（版本需支援 `--format json`）
+- LLM provider 存取權（見下方「Provider / 模型設定」）
+- 目標 Java repo：Maven（主力支援；Gradle best-effort）、JUnit 5；
+  覆蓋率 gate 需要模組綁 JaCoCo（沒有也能跑，該 gate 會略過並提示）
+
+## 安裝（每人一次）
 
 ```bash
-cd tools/testgen
-npm install                 # typescript / tsx / @types/node
-cp .env.example .env        # 視需要調整（全部可留空）
+git clone git@github.com:sychen6192/testloop.git
+cd testloop
+npm install
+npm run setup      # 安裝 agents + 評分 skill 到 ~/.config/opencode/
+npm run doctor     # 環境自診（此時「Java repo」項顯示 WARN 屬正常）
 ```
 
-前置：`opencode` CLI 已安裝且在 PATH；provider（本地 vLLM、Anthropic 等）已在
-opencode.json / auth 設定好；建議在兩個 agent .md 取消 `model:` 註解填入 provider/model。
-
-## 煙霧測試（由內而外，一次驗一層）
+選用：把 wrapper 加入 PATH，之後在任何地方都能用 `testgen`：
 
 ```bash
-# Layer 0：純邏輯自測（不需 opencode / mvn / LLM）
-npx tsx tools/testgen/scripts/selftest.ts
-
-# Layer 1：writer 能不能真的寫檔（不經過 loop）
-opencode run --agent ut-writer --format json \
-  "在 core-module/src/test/java 對應 package 建一個最小的 SmokeTest.java，只要一個空的 @Test 方法"
-# 看兩件事：(a) 有跳 tool 事件 (b) 檔案真的落地
-
-# Layer 2：端到端（挑一個最簡單、依賴最少的 class）
-npx tsx tools/testgen/loop.ts core-module/src/main/java/<某個簡單的package>
+echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-一定要在 **Java repo 根目錄**執行 loop（多模組的 reactor root）。
+## Provider / 模型設定
 
-## 多模組 Maven（已內建處理）
+> **部門設定（維運者填寫後 commit 本 README）**
+> - writer 模型：`＿＿＿＿＿＿＿＿`（例：`vllm/qwen3-coder`，endpoint：＿＿＿＿）
+> - reviewer 模型：`＿＿＿＿＿＿＿＿`（例：`anthropic/claude-sonnet-4-6`）
 
-- 由目標路徑自動向上找最近的 `pom.xml` 判定模組，`mvn -pl <module> -am -DskipITs test`
-  在 reactor root 執行。
-- Surefire 與 JaCoCo 報告都到「該模組」的 `target/` 底下找
-  （`<module>/target/site/jacoco/jacoco.xml`）。
-- JaCoCo 的 report 若未綁 `test` phase，設 `UT_MAVEN_ARGS="jacoco:report"`。
-- 完全沒有 JaCoCo 時預設「略過並提示」；設 `UT_STRICT_COV=1` 改為直接 FAIL。
+1. 設定 provider 憑證：`opencode auth login`（或部門 vLLM 的 OpenAI 相容 endpoint）。
+2. 指定模型（二選一）：
+   - 編輯 `~/.config/opencode/agent/ut-writer.md` / `ut-reviewer.md` 的 `model:` 欄位；或
+   - 用環境變數覆蓋：`UT_WRITER_MODEL` / `UT_REVIEWER_MODEL`（格式 `provider/model`）。
 
-## 環境變數（全部選填，詳見 .env.example）
+建議：writer 用本地/便宜模型狂迭代、reviewer 用較強模型——cross-model 可降低
+self-agreement bias。
+
+## 第一次執行
+
+```bash
+cd <你的 Java repo 根目錄>          # 多模組 Maven = reactor root
+testgen doctor <某個 package 路徑> --smoke   # preflight + 實測 provider 一發
+testgen core-module/src/main/java/com/acme/service   # 端對端
+```
+
+挑一個依賴最少的簡單 class 起手。退出碼：`0` 全數通過、`2` 迭代用盡未通過、`1` 致命錯誤。
+每輪產物在 `<clone>/runs/<repo 名>/<時間戳>/`（prompt、writer 總結、build log、
+覆蓋率、審查判決、失敗報告，以及 `params.json` 內的工具版本戳記）。
+
+## 參數（環境變數，全部選填，詳見 .env.example）
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
@@ -63,36 +78,45 @@ npx tsx tools/testgen/loop.ts core-module/src/main/java/<某個簡單的package>
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋（JSON，0-10 制） |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時 |
-| `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋 |
+| `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋（未設：目標 repo → 工具內建） |
 | `UT_JACOCO_XML` | 自動搜尋 | 報告路徑覆蓋 |
+| `UT_MAVEN_ARGS` | - | 額外 maven 參數，例如 `jacoco:report` |
 
-Rubric 搜尋順序：`UT_SKILL_DIR` → `.opencode/skills/test-quality-evaluator` →
-`.claude/skills/test-quality-evaluator`；注入 `references/rubric.md`
-（fallback：`rubric.md` → `rubric/*.md`），由 loop 讀檔注入 reviewer prompt。
-**刻意不注入 SKILL.md 全文**——那是批次稽核的 workflow 文件（六輸入確認、
-concurrency、environment probe），對單輪 gate reviewer 是錯誤指令。
-找不到 rubric 時退回 standards 全文並警告。
-
-評分量表對齊 skill rubric：六維 **0-10 整數**（分數帶 9-10/7-8/5-6/3-4/0-2），
-門檻預設 7/7/7/6/7/6；`weighted_score`（權重 25/20/15/15/15/10）與
-`grade`（A≥85/B≥70/C≥55/D）由 pipeline 確定性計算（skill 原則 P1/P3：LLM 不算分），
-僅供報告——gate 條件是「blockers 空 且 六維達門檻」。
-blockers ≈ skill 的 severity=high，advisories ≈ medium/low（不擋關、不進 feedback）。
-
-## Artifacts
-
-每次執行寫入 `tools/testgen/runs/<timestamp>/`：`params.json`、每輪
-`iter-N/{prompt.md, writer-summary.md, build.log, coverage.txt, verdict.json,
-review-raw.txt, feedback.md}`、最終 `summary.json`。已在 .gitignore。
+評分規則：六維 0-10 整數、門檻預設 7/7/7/6/7/6；`weighted_score`（權重
+25/20/15/15/15/10）與 `grade`（A≥85/B≥70/C≥55/D）由 pipeline 確定性計算，僅供報告——
+gate 條件是「blockers 空 且 六維達門檻」。advisories 不擋關、不進下一輪 feedback。
 
 ## Troubleshooting
 
-- **writer 有跑但沒寫檔**：非互動模式 permission 被擋。先確認 ut-writer.md 的
-  `permission: edit: allow` 存在；最後手段 `UT_OC_SKIP_PERMS=1`
-  （附加 --dangerously-skip-permissions，writer 的 bash/web 已在 tools 層關閉）。
-- **看不到即時進度**：需要 opencode 支援 `--format json`（JSONL 事件）。
-  版本太舊可先 `UT_OPENCODE_JSON=0` 退回整段輸出（會失去即時 tracing）。
-- **啟動就 FATAL agent 權限**：startup guard 攔到 agent .md 權限被改壞——
-  這是刻意設計，照訊息修回 frontmatter。
-- **覆蓋率永遠略過**：模組沒綁 JaCoCo。加 jacoco-maven-plugin
-  （prepare-agent + report 綁 test phase），或 `UT_MAVEN_ARGS="jacoco:report"`。
+先跑 `testgen doctor <目標> --smoke`——多數問題會直接指出修法。常見情形：
+
+- **doctor 說 agent 找不到**：回工具 clone 跑 `npm run setup`。
+- **smoke FAIL / writer 沒動靜**：provider 未設定或 model 欄位空——見「Provider / 模型設定」。
+- **writer 有跑但沒寫檔**：非互動模式 permission 被擋。確認 global 的 ut-writer.md 含
+  `permission: edit: allow`；最後手段 `UT_OC_SKIP_PERMS=1`（writer 的 bash/web 本來就關閉）。
+- **覆蓋率永遠略過**：模組沒綁 JaCoCo。加 jacoco-maven-plugin（prepare-agent + report 綁
+  test phase），或 `UT_MAVEN_ARGS="jacoco:report"`；要強制擋關設 `UT_STRICT_COV=1`。
+- **啟動就 FATAL agent 權限**：startup guard 攔到 agent 權限被改壞——刻意設計，照訊息修回
+  frontmatter（writer 禁 bash、reviewer 全唯讀）。
+- **看不到即時進度**：opencode 版本太舊不支援 `--format json`——`UT_OPENCODE_JSON=0` 退回
+  整段輸出（失去即時 tracing）。
+- **我的 repo 想客製 reviewer**：把 agent .md 放進該 repo 的 `.opencode/agent/`——repo 內
+  定義優先於 global。
+
+## 更新工具
+
+```bash
+cd <clone> && git pull && npm install && npm run setup
+```
+
+變更內容見 `CHANGELOG.md`。每次執行的 banner 與 `params.json` 都有工具版本戳記，
+回報問題時請附上。
+
+## 維運者
+
+- 品質防線：`npm run check`（typecheck + selftest）；GitHub Actions 於 push/PR 自動執行。
+- 修改測試標準：`standards/java-ut-standards.md`（writer 契約）；
+  修改評分細則：`.opencode/skills/test-quality-evaluator/references/rubric.md`
+  ——改完通知同事 `git pull && npm run setup`。
+- 設計文件：`DESIGN.md`（架構決策與否決紀錄）、`AGENTS.md`（agent 操作規範）；
+  規格與計畫：`docs/superpowers/`。

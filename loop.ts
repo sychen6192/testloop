@@ -1,4 +1,4 @@
-// Entry point: npx tsx tools/testgen/loop.ts <target dir or .java file>
+// Entry point: npx tsx <clone>/loop.ts <target dir or .java file> (or bin/testgen)
 // Must run from the Java repo root (REPO_ROOT = cwd).
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -22,17 +22,20 @@ import { banner, log, die } from "./libs/log";
 import { listJavaClasses, findModuleInfo } from "./libs/utils";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
+import { getToolVersion } from "./libs/version";
 import { detectBuildTool } from "./gates/build";
 import { createRunner } from "./runners/runner";
-import { orchestrate } from "./core/orchestrator";
+import { orchestrate } from "./orchestrator";
 
 async function main() {
   banner("write-java-ut pipeline 啟動");
+  const toolVersion = getToolVersion();
+  log(`工具版本：${toolVersion}`);
 
   if (!TARGET_ARG) {
     die(
       "請提供要寫 UT 的類別資料夾或 .java 檔，例如：\n" +
-        "  npx tsx tools/testgen/loop.ts minio-sync-core/src/main/java/com/acme/service",
+        "  npx tsx <clone 路徑>/loop.ts core-module/src/main/java/com/acme/service",
     );
   }
   const absTarget = path.resolve(REPO_ROOT, TARGET_ARG);
@@ -87,6 +90,7 @@ async function main() {
         targetClasses,
         thresholds: { MIN_LINE_COV, MIN_BRANCH_COV, scores: SCORE_THRESHOLDS },
         runner: RUNNER_KIND,
+        toolVersion,
       },
       null,
       2,

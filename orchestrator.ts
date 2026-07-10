@@ -5,20 +5,18 @@
 // only blockers + below-threshold dims (advisories stay out of the loop to avoid thrash).
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MAX_ITER } from "../config";
-import { log, banner, tail } from "../libs/log";
+import { MAX_ITER } from "./config";
+import { log, banner, tail } from "./libs/log";
 import {
   AgentRunner,
   BuildTool,
   ModuleInfo,
   ReviewVerdict,
-} from "../libs/types";
-import { buildGeneratePrompt } from "../prompts/generate";
-import { buildFixPrompt } from "../prompts/fix";
-import { runBuildAndTests } from "../gates/build";
-import { checkCoverage } from "../gates/coverage";
-import { runReviewGate } from "../review/gate";
-import { buildReviewPrompt } from "../prompts/review";
+} from "./libs/types";
+import { buildGeneratePrompt, buildFixPrompt, buildReviewPrompt } from "./prompts";
+import { runBuildAndTests } from "./gates/build";
+import { checkCoverage } from "./gates/coverage";
+import { runReviewGate } from "./gates/review";
 
 export interface OrchestratorConfig {
   targetClasses: string[];

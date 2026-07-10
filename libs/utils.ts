@@ -63,3 +63,22 @@ export function expectedTestPath(clsRelPath: string): string {
   }
   return renamed;
 }
+
+// Skill-dir search order: env override -> target repo (.opencode, .claude) -> the tool's own copy.
+export function skillDirCandidates(
+  repoRoot: string,
+  testgenRoot: string,
+  envDir?: string,
+): string[] {
+  return [
+    envDir,
+    path.join(repoRoot, ".opencode", "skills", "test-quality-evaluator"),
+    path.join(repoRoot, ".claude", "skills", "test-quality-evaluator"),
+    path.join(testgenRoot, ".opencode", "skills", "test-quality-evaluator"),
+  ].filter(Boolean) as string[];
+}
+
+// Per-target-repo artifacts namespace: runs/<repo basename>.
+export function runsDirFor(testgenRoot: string, repoRoot: string): string {
+  return path.join(testgenRoot, "runs", path.basename(repoRoot));
+}
