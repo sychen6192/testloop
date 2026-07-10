@@ -156,6 +156,11 @@ bin/testgen  standards/  docs/
 | 中央工具版本與 repo 脫鉤 | params.json 版本戳記 + CHANGELOG + doctor |
 | 各人 provider 設定差異 | doctor --smoke 實測 + README provider 段落含部門值 |
 
+> 追記（2026-07-10，實作期間）：發現既有 OpencodeRunner spawn 未關閉 child stdin，
+> opencode >= 1.17 會等待 stdin EOF，導致所有 writer/reviewer 執行掛起至逾時。
+> 經使用者核准修復（spawn stdio: ["ignore","pipe","pipe"]）；驗證 = `doctor --smoke`
+> 由 60 秒逾時「無回應」變為秒級回覆 OK。
+
 ## 8. 明確不做（YAGNI）
 
 - Windows global-path 支援（README 註記限制即可）。

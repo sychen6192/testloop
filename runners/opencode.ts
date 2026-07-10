@@ -97,9 +97,13 @@ export class OpencodeRunner implements AgentRunner {
         args.push("--dangerously-skip-permissions");
         logVerbose(`[${label}] [WARN] UT_OC_SKIP_PERMS=1：已附加 --dangerously-skip-permissions`);
       }
-      args.push(prompt); // prompt goes last (positional; opencode run takes no stdin)
+      args.push(prompt); // prompt goes last (positional)
 
-      const child = spawn(OPENCODE_BIN, args, { cwd: REPO_ROOT, env: process.env });
+      const child = spawn(OPENCODE_BIN, args, {
+        cwd: REPO_ROOT,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"], // opencode >=1.17 waits for stdin EOF on a piped stdin
+      });
 
       const acc = { text: "", lastText: "" };
       let rawStdout = "";
