@@ -22,12 +22,15 @@ import { banner, log, die } from "./libs/log";
 import { listJavaClasses, findModuleInfo } from "./libs/utils";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
+import { getToolVersion } from "./libs/version";
 import { detectBuildTool } from "./gates/build";
 import { createRunner } from "./runners/runner";
 import { orchestrate } from "./orchestrator";
 
 async function main() {
   banner("write-java-ut pipeline 啟動");
+  const toolVersion = getToolVersion();
+  log(`工具版本：${toolVersion}`);
 
   if (!TARGET_ARG) {
     die(
@@ -87,6 +90,7 @@ async function main() {
         targetClasses,
         thresholds: { MIN_LINE_COV, MIN_BRANCH_COV, scores: SCORE_THRESHOLDS },
         runner: RUNNER_KIND,
+        toolVersion,
       },
       null,
       2,
