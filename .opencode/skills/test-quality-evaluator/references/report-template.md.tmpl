@@ -1,0 +1,196 @@
+# Test Quality Report — {{repo_name}}
+
+**Generated:** {{generated_at}}
+**Skill version:** {{skill_version}}
+**Rubric version:** {{rubric_version}} (Draft — weights still being calibrated)
+**Scope:** {{scope_description}} — {{actual_test_count}} test methods in {{file_count}} files
+**Metric mode:** {{metric_mode}}{{metric_mode_confirmation_suffix}}
+**Output mode:** {{output_mode}}
+**Sanity check:** {{sanity_check_status}}
+**Determinism check:** {{determinism_check_status}}
+
+> ⚠️ Scores have ±3 point drift across runs. Use grade buckets (A/B/C/D)
+> for decisions, not precise scores.
+
+---
+
+## Environment transparency
+
+| Check | Result |
+|-------|--------|
+| Shell execution | {{shell_status}} |
+| Java | {{java_version_or_na}} |
+| Maven wrapper | {{maven_wrapper_status}} |
+| Gradle wrapper | {{gradle_wrapper_status}} |
+| JaCoCo plugin declared | {{jacoco_plugin_status}} |
+| PIT plugin declared | {{pit_plugin_status}} |
+| Basic test compile | {{basic_compile_status}} |
+| Deterministic mode | {{deterministic_mode_status}} |
+
+**Tools actually executed:** {{tools_executed_list}}
+**Tools skipped:** {{tools_skipped_list}}
+
+{{#if determinism_self_check_failed}}
+> ⚠️ **Determinism self-check failed.** Score drift exceeds expected
+> thresholds (max dimension drift: {{max_dimension_drift}}, max total
+> drift: {{max_total_drift}}). Scores in this report may not be
+> reproducible across runs.
+{{/if}}
+
+---
+
+## Summary
+
+| Grade | Count | Percentage |
+|-------|-------|------------|
+| 🟢 A (85+) | {{grade_a_count}} | {{grade_a_pct}}% |
+| 🔵 B (70-84) | {{grade_b_count}} | {{grade_b_pct}}% |
+| 🟡 C (55-69) | {{grade_c_count}} | {{grade_c_pct}}% |
+| 🔴 D (<55) | {{grade_d_count}} | {{grade_d_pct}}% |
+
+**Average weighted score:** {{avg_weighted_score}} / 100
+
+### Dimension averages
+
+| Dimension | Average (0-10) |
+|-----------|----------------|
+| Effectiveness | {{dim_effectiveness_avg}} |
+| Coverage | {{dim_coverage_avg}} |
+| Independence | {{dim_independence_avg}} |
+| Readability | {{dim_readability_avg}} |
+| Fast & Reliable | {{dim_fast_reliable_avg}} |
+| Mock Appropriateness | {{dim_mock_avg}} |
+
+---
+
+## Top 10 tests to prioritize
+
+Sorted by lowest weighted score. Largest quality improvement per unit effort.
+
+| # | Score | Grade | File / Test | Main issue |
+|---|-------|-------|-------------|------------|
+{{#each top_10_lowest}}
+| {{rank}} | {{weighted_score}} | {{grade}} | `{{file}}` — `{{test_method}}` | {{main_issue}} |
+{{/each}}
+
+---
+
+## Most common test smells
+
+| Smell | Count | Typical fix |
+|-------|-------|-------------|
+{{#each top_smells}}
+| {{type}} | {{count}} | {{typical_fix}} |
+{{/each}}
+
+---
+
+## Caveats
+
+{{#each caveats}}
+- {{this}}
+{{/each}}
+
+{{#if has_errors}}
+---
+
+## Errors
+
+The validation pipeline detected {{error_count}} issue(s):
+
+{{#each errors}}
+### {{type}}
+
+{{error_details}}
+
+{{/each}}
+
+**Do not trust the metrics in this report until these are resolved.**
+See `test-quality-report.json` → `meta.errors` for full details.
+{{/if}}
+
+---
+
+## How to read this report
+
+- **Grade (A/B/C/D)** is the primary signal — stable across runs
+- **Weighted score** has ±3 drift, do not over-interpret precise values
+- **Top 10** is sorted by score, low scores first (priority for improvement)
+- **Issues** in JSON have line numbers pointing to specific problems
+- **Missing cases** are scenarios the test class doesn't cover, in plain English
+
+## What to do next
+
+1. Pick the Top-5 lowest-scoring tests above
+2. Open `test-quality-report.json`, find each entry, read `top_issues` and `missing_cases`
+3. Rewrite one test as a proof-of-concept
+4. Re-run this skill on the changed test, confirm score improved
+5. Use that as the team's reference example for the pattern
+
+---
+
+**Full data:** `test-quality-report.json`
+**Methodology:** Test Quality Standard v0.2 (KMS link)
+**Skill source:** `.claude/skills/test-quality-evaluator/SKILL.md`
+
+---
+
+## TEMPLATE NOTES (delete this section when rendering)
+
+This file is a TEMPLATE, not a final report. Variables in `{{...}}` and
+control blocks `{{#if}}` / `{{#each}}` must be processed by the orchestrator
+during Phase 6.
+
+**Implementation guidance:**
+
+- Use a simple template engine (Jinja2 in Python, Handlebars in JS/TS, or
+  even basic string replacement for `{{var}}` and manual loop expansion).
+- For booleans like `determinism_self_check_failed`: render the block only
+  when true.
+- For arrays like `top_10_lowest`, `top_smells`, `caveats`, `errors`:
+  iterate and substitute.
+
+**Variable mapping** (from JSON to template):
+
+| Variable | JSON path |
+|----------|-----------|
+| `{{repo_name}}` | `meta.repo` |
+| `{{generated_at}}` | `meta.generated_at` (format human-readable) |
+| `{{skill_version}}` | `meta.skill_version` |
+| `{{rubric_version}}` | `meta.rubric_version` |
+| `{{scope_description}}` | `meta.scope` |
+| `{{actual_test_count}}` | `meta.actual_test_count` |
+| `{{file_count}}` | derived: `len(set(t.file for t in tests))` |
+| `{{metric_mode}}` | `meta.metric_mode` |
+| `{{metric_mode_confirmation_suffix}}` | ` (user-confirmed)` if `metric_mode_user_confirmed` else ` (NOT CONFIRMED — see warnings)` |
+| `{{output_mode}}` | `meta.output_mode` |
+| `{{sanity_check_status}}` | `✅ passed` if true else `❌ failed — see errors` |
+| `{{determinism_check_status}}` | `✅ passed (drift ≤ N)` or `❌ failed (drift = N)` |
+| `{{shell_status}}` | `available` / `unavailable` |
+| `{{java_version_or_na}}` | `java_version` or `N/A` |
+| `{{maven_wrapper_status}}` | `found (version X)` / `not found` |
+| `{{gradle_wrapper_status}}` | `found` / `not found` |
+| `{{jacoco_plugin_status}}` | `yes` / `no` |
+| `{{pit_plugin_status}}` | `yes` / `no` |
+| `{{basic_compile_status}}` | `passed` / `failed` / `not attempted` |
+| `{{deterministic_mode_status}}` | `supported` / `not supported (warning)` |
+| `{{tools_executed_list}}` | comma-separated `tools_actually_executed` or `none` |
+| `{{tools_skipped_list}}` | comma-separated `tools_skipped` or `none` |
+| `{{determinism_self_check_failed}}` | boolean: `not determinism_self_check.passed` |
+| `{{max_dimension_drift}}` | `determinism_self_check.max_dimension_drift` |
+| `{{max_total_drift}}` | `determinism_self_check.max_total_drift` |
+| `{{grade_a_count}}` ... `{{grade_d_count}}` | `summary.grade_distribution.*` |
+| `{{grade_a_pct}}` ... | computed: `count / actual_test_count * 100` (1 decimal) |
+| `{{avg_weighted_score}}` | `summary.avg_weighted_score` (1 decimal) |
+| `{{dim_*_avg}}` | `summary.dimension_averages.*` (1 decimal) |
+| `{{top_10_lowest}}` | iterate `summary.top_10_lowest_scoring` |
+| `{{top_smells}}` | iterate `summary.top_smells` (look up `typical_fix` from a static map) |
+| `{{caveats}}` | iterate `meta.caveats` |
+| `{{has_errors}}` | `len(meta.errors) > 0` |
+| `{{error_count}}` | `len(meta.errors)` |
+| `{{errors}}` | iterate `meta.errors` (format per type) |
+
+**Format stability requirement:** Two runs producing the same JSON MUST
+produce byte-identical Markdown (modulo timestamps and LLM-generated
+text fields). If the rendered output differs, the renderer is broken,
+not the LLM.
