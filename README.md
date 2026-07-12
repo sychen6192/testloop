@@ -133,6 +133,8 @@ cd <clone> && git pull && npm install && npm run setup
 
 ## 維運者
 
+作者・維運：**Jack SY Chen**（[@sychen6192](https://github.com/sychen6192)）。歡迎同事提 PR。
+
 - 品質防線：`npm run check`（typecheck + selftest）；GitHub Actions 於 push/PR 自動執行。
 - 修改測試標準：`standards/java-ut-standards.md`（writer 契約）；
   修改評分細則：`.opencode/skills/test-quality-evaluator/references/rubric.md`
