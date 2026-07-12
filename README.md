@@ -6,7 +6,7 @@ testgen 為指定的 Java 類別自動產生 JUnit 5 單元測試。它跑一個
 控制流完全在 TypeScript。LLM 只做兩件事：ut-writer 寫測試、ut-reviewer 審查。驗證權不
 外包給模型；編譯、測試、覆蓋率一律由 script 實際執行並解析原始報告。
 
-**本工具走中央 clone 模式。** clone 一份即可對部門任何 Java repo 執行，不需把工具放進
+**本工具走中央 clone 模式。** clone 一份即可對任何 Java repo 執行，不需把工具放進
 目標 repo。
 
 ```
@@ -28,7 +28,6 @@ testgen 為指定的 Java 類別自動產生 JUnit 5 單元測試。它跑一個
 
 ## 安裝
 
-每人一次：
 
 ```bash
 git clone git@github.com:sychen6192/testloop.git
@@ -46,7 +45,6 @@ echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 
 ## Provider 與模型設定
 
-> **部門設定**
 >
 > | 角色 | 模型 | 說明 |
 > | --- | --- | --- |
@@ -65,7 +63,7 @@ echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 
 設定步驟：
 
-1. 設定 provider 憑證，執行 `opencode auth login`。部門若使用 vLLM，改指向其 OpenAI 相容
+1. 設定 provider 憑證，執行 `opencode auth login`。若使用 vLLM，改指向其 OpenAI 相容
    endpoint。
 2. 指定模型，以下二擇一：
    - 編輯 `~/.config/opencode/agent/ut-writer.md` 與 `ut-reviewer.md` 的 `model:` 欄位；或
@@ -150,16 +148,3 @@ cd <clone> && git pull && npm install && npm run setup
 
 變更內容見 `CHANGELOG.md`。每次執行的 banner 與 `params.json` 都帶工具版本戳記，回報問題時
 請一併附上。
-
-## 維運者
-
-作者與維運：**Jack SY Chen**，GitHub [@sychen6192](https://github.com/sychen6192)。歡迎
-同事提 PR。
-
-- 品質防線為 `npm run check`，內容是 typecheck 加 selftest。GitHub Actions 於 push 與 PR
-  自動執行。
-- 修改測試標準改 `standards/java-ut-standards.md`，這是 writer 契約。修改評分細則改
-  `.opencode/skills/test-quality-evaluator/references/rubric.md`。改完通知同事
-  `git pull && npm run setup`。
-- 設計文件見 `DESIGN.md` 與 `AGENTS.md`：前者記架構決策與否決紀錄，後者是 agent 操作規範。
-  歷次改動的完整 rationale 見 `git log`。
