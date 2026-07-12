@@ -42,17 +42,24 @@ echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 
 ## Provider / 模型設定
 
-> **部門設定（維運者填寫後 commit 本 README）**
-> - writer 模型：`＿＿＿＿＿＿＿＿`（例：`vllm/qwen3-coder`，endpoint：＿＿＿＿）
-> - reviewer 模型：`＿＿＿＿＿＿＿＿`（例：`anthropic/claude-sonnet-4-6`）
+> **部門設定**
+> - writer 模型：`ollama/qwen3.6:27b`（dense；endpoint：`http://llm:11434/v1`，Ollama OpenAI 相容）
+> - reviewer 模型：`ollama/qwen3.6:27b`（單卡 32GB 共用同一顆，避免 writer/reviewer 換模 reload thrash）
+>
+> 實測要點（qwen3.6:27b dense on RTX 5090 32GB）：
+> - 一次只鎖**單一 class** 當目標——讓 writer 每輪只產一個測試檔；同時重寫多個大檔會慢到撞逾時。
+> - `UT_AGENT_TIMEOUT_MS=1500000`（~25 分）——dense 約 15-25 tok/s，給完整生成餘裕免被 SIGTERM 截斷。
+> - opencode 該模型 `num_ctx` 設 65536——扣掉 plugin/MCP 的 session 固定開銷才有足夠工作空間。
+> - `qwen3.6:35b-a3b`（MoE，僅 3B active）服從性不足、寫不出較大的新測試檔，**不建議**當 writer。
 
 1. 設定 provider 憑證：`opencode auth login`（或部門 vLLM 的 OpenAI 相容 endpoint）。
 2. 指定模型（二選一）：
    - 編輯 `~/.config/opencode/agent/ut-writer.md` / `ut-reviewer.md` 的 `model:` 欄位；或
    - 用環境變數覆蓋：`UT_WRITER_MODEL` / `UT_REVIEWER_MODEL`（格式 `provider/model`）。
 
-建議：writer 用本地/便宜模型狂迭代、reviewer 用較強模型——cross-model 可降低
-self-agreement bias。
+建議：理想上 writer 用便宜模型狂迭代、reviewer 用較強模型——cross-model 可降低
+self-agreement bias。但若只有單張 GPU（放不下兩顆模型並存），writer/reviewer 用同一顆
+可免每輪換模的 reload 成本；此時靠 review gate 的 must-read 防護擋掉 reviewer 不讀檔的假判決。
 
 ## 第一次執行
 
