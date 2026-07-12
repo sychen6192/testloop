@@ -14,6 +14,7 @@
     "doctor": "tsx scripts/doctor.ts"
   },
   "devDependencies": {
+    "@qwen-code/sdk": "^0.1.7",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
