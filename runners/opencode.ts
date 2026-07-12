@@ -4,7 +4,7 @@
 // Wall-clock timeout backstop (SIGTERM, then SIGKILL after 10s).
 // Fail-closed: on spawn failure/timeout it still returns accumulated text; the gate decides pass/fail.
 import { spawn } from "node:child_process";
-import { AgentRunner } from "../libs/types";
+import { AgentRunner, ReviewRunOutput } from "../libs/types";
 import {
   REPO_ROOT,
   WRITER_MODEL,
@@ -21,7 +21,11 @@ import { log, logVerbose, startHeartbeat } from "../libs/log";
 // (step-start / step-finish / text / tool); text in part.text, tool in part.tool, status in
 // part.state.status. The outer ev.type is an unreliable envelope label — trust part.type.
 // Compat: accept both hyphen and underscore; fall back to ev.type when part.type is missing.
-export function traceEvent(line: string, prefix: string, acc: { text: string; lastText: string }) {
+export function traceEvent(
+  line: string,
+  prefix: string,
+  acc: { text: string; lastText: string; toolCalls?: Set<string> },
+) {
   let ev: Record<string, unknown>;
   try {
     ev = JSON.parse(line);
@@ -53,6 +57,10 @@ export function traceEvent(line: string, prefix: string, acc: { text: string; la
       const outNote =
         typeof outRaw === "string" && outRaw.length <= 60 ? ` -> ${outRaw}` : "";
       logVerbose(`${prefix}  [tool] ${tool} [${status}] ${shortInput}${outNote}`);
+      // completed tool calls, deduped by callID (reviewer must-read evidence)
+      if (status === "completed" && acc.toolCalls) {
+        acc.toolCalls.add(String(part.callID ?? `${tool}#${acc.toolCalls.size}`));
+      }
       break;
     }
     case "text": {
@@ -82,7 +90,7 @@ export class OpencodeRunner implements AgentRunner {
     model: string,
     prompt: string,
     allowSkipPerms: boolean,
-  ): Promise<string> {
+  ): Promise<ReviewRunOutput> {
     return new Promise((resolve) => {
       log(
         `[${label}] session 啟動（agent=${agent}, model=${model || "（agent 預設）"}）`,
@@ -105,7 +113,7 @@ export class OpencodeRunner implements AgentRunner {
         stdio: ["ignore", "pipe", "pipe"], // opencode >=1.17 waits for stdin EOF on a piped stdin
       });
 
-      const acc = { text: "", lastText: "" };
+      const acc = { text: "", lastText: "", toolCalls: new Set<string>() };
       let rawStdout = "";
       let stdoutBuf = "";
 
@@ -149,11 +157,15 @@ export class OpencodeRunner implements AgentRunner {
         const secs = ((Date.now() - started) / 1000).toFixed(0);
         log(`[OK] [${label}] 完成（耗時 ${secs} 秒）`);
         // JSONL mode: use accumulated text (or the last text part if empty);
-        // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout.
+        // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout — no events to count,
+        // so tool usage is unobservable (undefined), not zero.
         if (OPENCODE_JSON_EVENTS) {
-          resolve(acc.text.trim() ? acc.text : acc.lastText);
+          resolve({
+            text: acc.text.trim() ? acc.text : acc.lastText,
+            toolCallCount: acc.toolCalls.size,
+          });
         } else {
-          resolve(rawStdout);
+          resolve({ text: rawStdout });
         }
       };
 
@@ -169,10 +181,11 @@ export class OpencodeRunner implements AgentRunner {
 
   async runWriter(prompt: string): Promise<string> {
     // permission contract in .opencode/agent/ut-writer.md (write/edit on, bash/web off)
-    return this.runAgent("writer", "ut-writer", WRITER_MODEL, prompt, true);
+    const r = await this.runAgent("writer", "ut-writer", WRITER_MODEL, prompt, true);
+    return r.text;
   }
 
-  async runReview(prompt: string): Promise<string> {
+  async runReview(prompt: string): Promise<ReviewRunOutput> {
     // read-only reviewer; skip-perms never applies to the reviewer
     return this.runAgent("reviewer", "ut-reviewer", REVIEWER_MODEL, prompt, false);
   }

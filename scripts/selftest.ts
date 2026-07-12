@@ -9,9 +9,11 @@ import * as path from "node:path";
 import { findModuleInfo, listJavaClasses, expectedTestPath, skillDirCandidates, runsDirFor } from "../libs/utils";
 import { resolveAgentPath, contractViolations, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport } from "../gates/coverage";
-import { parseVerdict } from "../gates/review";
+import { parseVerdict, runReviewGate } from "../gates/review";
+import { countTestsRun } from "../gates/build";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
+import { AgentRunner } from "../libs/types";
 import { traceEvent } from "../runners/opencode";
 
 let passCount = 0;
@@ -263,6 +265,19 @@ console.log("\n[5] traceEvent（opencode --format json 事件解析）");
   const acc4 = { text: "", lastText: "" };
   traceEvent("not-json-noise", "[t]", acc4);
   check("非 JSON 行略過", acc4.text === "");
+
+  // (e) completed tool calls counted + deduped by callID when acc.toolCalls provided
+  const acc5 = { text: "", lastText: "", toolCalls: new Set<string>() };
+  const toolEv = (callID: string, status: string) =>
+    JSON.stringify({
+      type: "tool_use",
+      part: { type: "tool", tool: "read", callID, state: { status, input: {} } },
+    });
+  traceEvent(toolEv("c1", "running"), "[t]", acc5);
+  traceEvent(toolEv("c1", "completed"), "[t]", acc5);
+  traceEvent(toolEv("c1", "completed"), "[t]", acc5);
+  traceEvent(toolEv("c2", "completed"), "[t]", acc5);
+  check("tool 計數：只算 completed、callID 去重 = 2", acc5.toolCalls.size === 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +329,49 @@ console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / 
     "runsDirFor：runs/<repo basename>",
     runsDirFor("/tool", "/w/myrepo") === path.join("/tool", "runs", "myrepo"),
   );
+}
+
+// ---------------------------------------------------------------------------
+// 7. build gate zero-test detection (maven stdout parsing)
+// ---------------------------------------------------------------------------
+console.log("\n[7] countTestsRun（0 測試 fail-closed）");
+{
+  const success =
+    "[INFO] Running com.example.FooTest\n" +
+    "[INFO] Tests run: 16, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.042 s -- in FooTest\n" +
+    "[INFO] Results:\n" +
+    "[INFO] Tests run: 46, Failures: 0, Errors: 0, Skipped: 0\n" +
+    "[INFO] BUILD SUCCESS";
+  check("取最後一個 Tests run（Results 彙總）= 46", countTestsRun(success) === 46);
+  check(
+    "無任何 Tests run 行（No tests to run）→ null",
+    countTestsRun("[INFO] No tests to run.\n[INFO] BUILD SUCCESS") === null,
+  );
+  check("Tests run: 0 → 0", countTestsRun("[INFO] Tests run: 0, Failures: 0") === 0);
+}
+
+// ---------------------------------------------------------------------------
+// 8. review gate: reviewer must-read guard (0 tool calls -> fail-closed)
+// ---------------------------------------------------------------------------
+console.log("\n[8] runReviewGate（reviewer 0 tool call → fail-closed）");
+{
+  const goodVerdict =
+    '{"scores":{"effectiveness":9,"coverage":8,"independence":9,"readability":8,' +
+    '"fast_reliable":9,"mock_appropriateness":8},"blockers":[],"advisories":[]}';
+  const fake = (toolCallCount?: number): AgentRunner => ({
+    runWriter: async () => "",
+    runReview: async () => ({ text: goodVerdict, toolCallCount }),
+  });
+
+  const z = await runReviewGate(fake(0), "p");
+  check(
+    "0 tool calls → REJECT（即使 verdict JSON 合法高分）",
+    z.passed === false && z.blockers[0].includes("未呼叫任何工具"),
+  );
+  const ok = await runReviewGate(fake(5), "p");
+  check("有 tool calls → 正常解析並通過", ok.passed === true);
+  const unknown = await runReviewGate(fake(undefined), "p");
+  check("無法觀測（undefined）→ 不觸發 guard", unknown.passed === true);
 }
 
 // ---------------------------------------------------------------------------

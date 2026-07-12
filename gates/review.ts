@@ -10,7 +10,13 @@ import {
   ReviewScores,
   ReviewVerdict,
 } from "../libs/types";
-import { SCORE_THRESHOLDS, ScoreThresholds, RUBRIC_WEIGHTS, GRADE_BANDS } from "../config";
+import {
+  SCORE_THRESHOLDS,
+  ScoreThresholds,
+  RUBRIC_WEIGHTS,
+  GRADE_BANDS,
+  REVIEWER_MUST_READ,
+} from "../config";
 import { tail } from "../libs/log";
 
 export function computeWeighted(scores: ReviewScores): { weighted: number; grade: string } {
@@ -75,10 +81,29 @@ export function parseVerdict(
   return { passed, scores, blockers, advisories, belowThreshold, weightedScore: weighted, grade, raw };
 }
 
+// Fail-closed: a verdict produced without a single tool call means the reviewer read nothing
+// (observed failure mode: schema-valid verdicts with fabricated findings).
+export function zeroToolCallVerdict(raw: string): ReviewVerdict {
+  return {
+    passed: false,
+    scores: {},
+    blockers: [
+      "Reviewer 未呼叫任何工具即輸出判決（tool calls = 0），視同未實際讀取測試檔，" +
+        "依 fail-closed 原則判 REJECT。此屬 reviewer 模型行為異常：請考慮更換 " +
+        "UT_REVIEWER_MODEL 或改善 provider 設定（確定要放行可設 UT_REVIEWER_MUST_READ=0）。",
+    ],
+    advisories: [],
+    belowThreshold: [],
+    parseError: "reviewer 0 tool calls",
+    raw,
+  };
+}
+
 export async function runReviewGate(
   runner: AgentRunner,
   prompt: string,
 ): Promise<ReviewVerdict> {
-  const raw = await runner.runReview(prompt);
-  return parseVerdict(raw);
+  const out = await runner.runReview(prompt);
+  if (REVIEWER_MUST_READ && out.toolCallCount === 0) return zeroToolCallVerdict(out.text);
+  return parseVerdict(out.text);
 }

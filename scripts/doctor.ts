@@ -111,7 +111,8 @@ if (smoke) {
   try {
     const runner = await createRunner();
     const out = await runner.runReview("這是連線測試，請只回覆：OK");
-    if (out.trim()) add("OK", "smoke（reviewer）", out.trim().slice(0, 60));
+    const txt = out.text.trim();
+    if (txt) add("OK", "smoke（reviewer）", txt.slice(0, 60));
     else add("FAIL", "smoke（reviewer）", "無回應——檢查 provider 設定（opencode auth）與 agent 的 model 欄位");
   } catch (e) {
     add("FAIL", "smoke（reviewer）", e instanceof Error ? e.message : String(e));

@@ -40,6 +40,10 @@ export const MIN_LINE_COV = Number(process.env.UT_MIN_LINE_COV ?? 80);
 export const MIN_BRANCH_COV = Number(process.env.UT_MIN_BRANCH_COV ?? 70);
 // 1 = fail the coverage gate when no JaCoCo report is found (default: skip leniently).
 export const STRICT_COV = process.env.UT_STRICT_COV === "1";
+// 1 = let a passing build through even when zero tests actually ran (default: fail-closed).
+export const ALLOW_ZERO_TESTS = process.env.UT_ALLOW_ZERO_TESTS === "1";
+// 0 = accept reviewer verdicts produced without a single tool call (default: fail-closed).
+export const REVIEWER_MUST_READ = process.env.UT_REVIEWER_MUST_READ !== "0";
 export const SKIP_REVIEW = process.env.UT_SKIP_REVIEW === "1";
 export const QUIET = process.env.UT_QUIET === "1";
 // 1 = skip the agent frontmatter permission guard (not recommended).

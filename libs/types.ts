@@ -9,10 +9,17 @@ export interface GateResult {
   raw?: string;
 }
 
+// Review-run output: final text plus tool-call observability.
+// toolCallCount undefined = the runner cannot observe tool usage (must-read check disabled).
+export interface ReviewRunOutput {
+  text: string;
+  toolCallCount?: number;
+}
+
 // Runtime adapter: the interface that keeps the core free of SDK imports.
 export interface AgentRunner {
   runWriter(prompt: string): Promise<string>;
-  runReview(prompt: string): Promise<string>;
+  runReview(prompt: string): Promise<ReviewRunOutput>;
 }
 
 export const REVIEW_DIMENSIONS = [
