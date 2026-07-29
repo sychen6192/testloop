@@ -1,7 +1,8 @@
 // Selftest: pure-logic checks, no opencode / mvn / LLM.
 // Covers: module detection, test-path derivation, JaCoCo parsing (incl. the "first counter"
-// regression), verdict fail-closed (0-10 + deterministic weighted/grade), and the rubric
-// loader (references/rubric.md first, never injects SKILL.md).
+// regression), verdict fail-closed (0-10 + deterministic weighted/grade), the rubric
+// loader (references/rubric.md first, never injects SKILL.md), and Windows spawn planning
+// (asserted with an explicit platform, so it runs identically on Linux/macOS/Windows).
 // Run: npx tsx scripts/selftest.ts
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,7 +15,8 @@ import { countTestsRun } from "../gates/build";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
-import { traceEvent } from "../runners/opencode";
+import { traceEvent, buildInvocation } from "../runners/opencode";
+import { planSpawn, resolveWindowsCommand, explainSpawnError } from "../libs/shell";
 
 let passCount = 0;
 let failCount = 0;
@@ -372,6 +374,115 @@ console.log("\n[8] runReviewGate（reviewer 0 tool call → fail-closed）");
   check("有 tool calls → 正常解析並通過", ok.passed === true);
   const unknown = await runReviewGate(fake(undefined), "p");
   check("無法觀測（undefined）→ 不觸發 guard", unknown.passed === true);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Windows spawn planning (the three failures behind "spawn opencode failed")
+// ---------------------------------------------------------------------------
+console.log("\n[9] planSpawn / resolveWindowsCommand / buildInvocation（Windows spawn）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-win-"));
+  const shim = path.join(tmp, "opencode.cmd");
+  fs.writeFileSync(shim, "@echo off");
+  fs.writeFileSync(path.join(tmp, "opencode"), "#!/bin/sh"); // the extensionless bash shim npm also drops
+  const env = { PATH: tmp, PATHEXT: ".COM;.EXE;.BAT;.CMD" } as NodeJS.ProcessEnv;
+
+  // ENOENT: a bare name only resolves if PATHEXT is applied — Node's spawn does not.
+  check(
+    "resolveWindowsCommand：裸名 opencode → opencode.cmd（不是無副檔名的 bash shim）",
+    resolveWindowsCommand("opencode", env) === shim,
+    String(resolveWindowsCommand("opencode", env)),
+  );
+  check(
+    "resolveWindowsCommand：不存在的指令 → undefined",
+    resolveWindowsCommand("definitely-not-installed", env) === undefined,
+  );
+
+  // Non-Windows must stay byte-identical to the old behaviour.
+  const posix = planSpawn("opencode", ["run", "--agent", "ut-writer", "hi"], "linux");
+  check(
+    "planSpawn（linux）：原樣傳遞，不繞 shell",
+    posix.file === "opencode" &&
+      posix.args.length === 4 &&
+      posix.windowsVerbatimArguments === undefined &&
+      posix.error === undefined,
+  );
+
+  // EINVAL: a .cmd must be routed through cmd.exe, never spawned directly.
+  const win = planSpawn(shim, ["run", "hi"], "win32");
+  check(
+    "planSpawn（win32 + .cmd）：改由 cmd.exe /d /s /c 執行",
+    /cmd\.exe$/i.test(win.file) &&
+      win.args[0] === "/d" &&
+      win.args[1] === "/s" &&
+      win.args[2] === "/c" &&
+      win.windowsVerbatimArguments === true,
+    `${win.file} ${JSON.stringify(win.args.slice(0, 3))}`,
+  );
+  check("planSpawn（win32 + .cmd）：命令列未超限時無 error", win.error === undefined);
+
+  // E2BIG: 8191 through cmd.exe, and a fix-iteration prompt easily exceeds it.
+  const huge = planSpawn(shim, ["run", "x".repeat(9000)], "win32");
+  check(
+    "planSpawn（win32 + .cmd + 超長 prompt）：回報 8191 上限而非丟 errno",
+    huge.error !== undefined && huge.error.includes("8191"),
+    huge.error,
+  );
+
+  // buildInvocation: inline stays inline; only an unfittable prompt goes via --file.
+  const inline = buildInvocation("ut-writer", "", "短 prompt", {
+    jsonEvents: true,
+    skipPerms: false,
+    bin: shim,
+    platform: "win32",
+    writeFile: () => "/never/used",
+  });
+  check(
+    "buildInvocation：塞得下時走 positional，不產生 --file",
+    inline.args[inline.args.length - 1] === "短 prompt" &&
+      !inline.args.includes("--file") &&
+      inline.promptFile === undefined &&
+      inline.args.includes("--format"),
+    JSON.stringify(inline.args),
+  );
+
+  const written: string[] = [];
+  const viaFile = buildInvocation("ut-writer", "qwen3.6:27b", "y".repeat(9000), {
+    jsonEvents: true,
+    skipPerms: true,
+    bin: shim,
+    platform: "win32",
+    writeFile: (text) => {
+      written.push(text);
+      return path.join(tmp, "prompt.md");
+    },
+  });
+  check(
+    "buildInvocation：超長 prompt 改走 --file，且仍帶 message 說明如何處理附件",
+    viaFile.args.includes("--file") &&
+      viaFile.promptFile === path.join(tmp, "prompt.md") &&
+      !viaFile.args.some((a) => a.length > 5000) &&
+      written.length === 1 &&
+      written[0].length === 9000,
+    JSON.stringify(viaFile.args.map((a) => a.slice(0, 24))),
+  );
+  check(
+    "buildInvocation：--file 路徑仍保留 --agent/--model/--dangerously-skip-permissions",
+    viaFile.args.includes("--agent") &&
+      viaFile.args.includes("qwen3.6:27b") &&
+      viaFile.args.includes("--dangerously-skip-permissions"),
+  );
+
+  // The old handler blamed a missing install for every errno; these two need different fixes.
+  const enoent = explainSpawnError({ code: "ENOENT", message: "x" } as NodeJS.ErrnoException, "opencode");
+  const einval = explainSpawnError({ code: "EINVAL", message: "x" } as NodeJS.ErrnoException, "opencode");
+  check(
+    "explainSpawnError：ENOENT 與 EINVAL 給出不同診斷",
+    enoent !== einval && enoent.includes("找不到") && einval.includes("cmd.exe"),
+    `${enoent} / ${einval}`,
+  );
+
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

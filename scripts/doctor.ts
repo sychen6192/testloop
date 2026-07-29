@@ -13,6 +13,7 @@ const { resolveAgentPath, contractViolations, WRITER_RULES, REVIEWER_RULES } = a
 );
 const { loadRubric } = await import("../libs/rubric");
 const { findModuleInfo } = await import("../libs/utils");
+const { planSpawn, explainSpawnError } = await import("../libs/shell");
 
 type Status = "OK" | "WARN" | "FAIL";
 const rows: Array<{ status: Status; name: string; note: string }> = [];
@@ -26,10 +27,24 @@ const target = args.find((a) => !a.startsWith("--"));
 const major = Number(process.versions.node.split(".")[0]);
 add(major >= 20 ? "OK" : "FAIL", "node >= 20", `目前 ${process.versions.node}`);
 
-// 2. opencode CLI
-const ver = spawnSync(config.OPENCODE_BIN, ["--version"], { encoding: "utf8" });
-if (ver.status === 0) add("OK", "opencode CLI", ver.stdout.trim());
-else add("FAIL", "opencode CLI", `找不到 ${config.OPENCODE_BIN}——安裝 opencode 或設 UT_OPENCODE_BIN`);
+// 2. opencode CLI — resolved exactly the way the runner will spawn it. A plain `where`
+// (or a bare spawn) reports the extensionless bash shim as a hit on Windows, so doctor
+// would pass while the real spawn fails — the worst split, since preflight then vouches
+// for a broken setup.
+const verPlan = planSpawn(config.OPENCODE_BIN, ["--version"]);
+const ver = spawnSync(verPlan.file, verPlan.args, {
+  encoding: "utf8",
+  windowsVerbatimArguments: verPlan.windowsVerbatimArguments,
+});
+if (ver.status === 0) {
+  const via = verPlan.file === config.OPENCODE_BIN ? "" : `，實際執行 ${verPlan.file}`;
+  add("OK", "opencode CLI", `${ver.stdout.trim()}${via}`);
+} else {
+  const why = ver.error
+    ? explainSpawnError(ver.error as NodeJS.ErrnoException, config.OPENCODE_BIN)
+    : `找不到 ${config.OPENCODE_BIN}`;
+  add("FAIL", "opencode CLI", `${why}——安裝 opencode 或設 UT_OPENCODE_BIN`);
+}
 
 // 3. agents (repo-local wins, global fallback)
 for (const { name, rules } of [
