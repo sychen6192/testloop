@@ -4,7 +4,7 @@
 // Test reports are read from the *module's* target/build, not the repo root.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { REPO_ROOT, MAVEN_EXTRA_ARGS, ALLOW_ZERO_TESTS } from "../config";
+import { REPO_ROOT, MAVEN_EXTRA_ARGS, ALLOW_ZERO_TESTS, BUILD_TIMEOUT_MS } from "../config";
 import { tail, die } from "../libs/log";
 import { shLive } from "../libs/shell";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
@@ -95,7 +95,7 @@ export async function runBuildAndTests(
   mod: ModuleInfo,
 ): Promise<GateResult> {
   const isWin = process.platform === "win32";
-  let r: { code: number; out: string };
+  let r: { code: number; out: string; timedOut?: boolean };
 
   if (tool === "maven") {
     const wrapper = isWin ? "mvnw.cmd" : "mvnw";
@@ -110,7 +110,7 @@ export async function runBuildAndTests(
       "test",
       ...MAVEN_EXTRA_ARGS,
     ];
-    r = await shLive(cmd, args, "[mvn]", cwd);
+    r = await shLive(cmd, args, "[mvn]", cwd, BUILD_TIMEOUT_MS);
   } else {
     const wrapper = isWin ? "gradlew.bat" : "gradlew";
     const wrapperAt = fs.existsSync(path.join(REPO_ROOT, wrapper));
@@ -120,7 +120,17 @@ export async function runBuildAndTests(
       "test",
       "--console=plain",
     ];
-    r = await shLive(cmd, args, "[gradle]", REPO_ROOT);
+    r = await shLive(cmd, args, "[gradle]", REPO_ROOT, BUILD_TIMEOUT_MS);
+  }
+
+  if (r.timedOut) {
+    return {
+      passed: false,
+      report:
+        `建置/測試逾時（${BUILD_TIMEOUT_MS}ms），已終止程序樹。` +
+        `常見原因：依賴解析卡住、測試含真實網路 I/O。可調整 UT_BUILD_TIMEOUT_MS。`,
+      raw: r.out,
+    };
   }
 
   if (r.code === 0) {

@@ -9,17 +9,23 @@ export interface GateResult {
   raw?: string;
 }
 
-// Review-run output: final text plus tool-call observability.
+// One agent run's outcome. `status` separates infrastructure failures from bad answers:
+// "spawn-error" means the agent never ran — retrying or blaming the model is wrong there.
 // toolCallCount undefined = the runner cannot observe tool usage (must-read check disabled).
-export interface ReviewRunOutput {
+// outputTokens undefined = the runner cannot observe token usage.
+export type AgentRunStatus = "ok" | "timeout" | "spawn-error";
+
+export interface AgentRunOutput {
   text: string;
+  status: AgentRunStatus;
   toolCallCount?: number;
+  outputTokens?: number;
 }
 
 // Runtime adapter: the interface that keeps the core free of SDK imports.
 export interface AgentRunner {
-  runWriter(prompt: string): Promise<string>;
-  runReview(prompt: string): Promise<ReviewRunOutput>;
+  runWriter(prompt: string): Promise<AgentRunOutput>;
+  runReview(prompt: string): Promise<AgentRunOutput>;
 }
 
 export const REVIEW_DIMENSIONS = [

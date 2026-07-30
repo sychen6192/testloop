@@ -99,11 +99,28 @@ export function zeroToolCallVerdict(raw: string): ReviewVerdict {
   };
 }
 
+// The reviewer never ran. Diagnosing this as model misbehaviour sends the operator to swap
+// models when the actual fix is the opencode install / UT_OPENCODE_BIN.
+export function spawnErrorVerdict(): ReviewVerdict {
+  return {
+    passed: false,
+    scores: {},
+    blockers: [
+      "Reviewer 程序未能啟動（spawn 失敗），本輪判 REJECT。這是環境問題而非模型問題：" +
+        "請確認 opencode CLI 可用，或以 UT_OPENCODE_BIN 指定路徑。",
+    ],
+    advisories: [],
+    belowThreshold: [],
+    parseError: "reviewer spawn error",
+  };
+}
+
 export async function runReviewGate(
   runner: AgentRunner,
   prompt: string,
 ): Promise<ReviewVerdict> {
   const out = await runner.runReview(prompt);
+  if (out.status === "spawn-error") return spawnErrorVerdict();
   if (REVIEWER_MUST_READ && out.toolCallCount === 0) return zeroToolCallVerdict(out.text);
   return parseVerdict(out.text);
 }

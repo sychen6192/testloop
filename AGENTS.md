@@ -114,7 +114,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（8 組 49 項），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（11 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門

@@ -11,6 +11,31 @@ import { GateResult, ModuleInfo } from "../libs/types";
 
 const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Compress sorted line numbers into "12-15, 22, 30-31" ranges.
+export function toRanges(nums: number[]): string {
+  const parts: string[] = [];
+  for (let i = 0; i < nums.length; ) {
+    let j = i;
+    while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++;
+    parts.push(i === j ? String(nums[i]) : `${nums[i]}-${nums[j]}`);
+    i = j + 1;
+  }
+  return parts.join(", ");
+}
+
+// Missed line numbers from a <sourcefile> block's <line nr= mi=> entries.
+// mi > 0 means the line has missed instructions. Feeding the writer the exact lines beats
+// telling it "62% < 80" and making it re-derive what is uncovered.
+export function missedLines(block: string): number[] {
+  const re = /<line nr="(\d+)" mi="(\d+)"/g;
+  const out: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block))) {
+    if (Number(m[2]) > 0) out.push(Number(m[1]));
+  }
+  return out;
+}
+
 function lastCounterPct(block: string, type: string): number | null {
   const re = new RegExp(`<counter type="${type}" missed="(\\d+)" covered="(\\d+)"/>`, "g");
   let m: RegExpExecArray | null;
@@ -69,6 +94,10 @@ export function parseJacocoReport(
         `branch=${branch?.toFixed(1) ?? "N/A"}%（門檻 ${min.branch}） ` +
         `${lineOk && branchOk ? "PASS" : "FAIL"}`,
     );
+    if (!lineOk || !branchOk) {
+      const missed = missedLines(block);
+      if (missed.length) lines.push(`  未覆蓋行：${toRanges(missed)}`);
+    }
   }
   return { passed: allPass, lines };
 }

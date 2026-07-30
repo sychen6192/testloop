@@ -1,10 +1,8 @@
 // QwenRunner (fallback path): dynamically loads @qwen-code/sdk only when UT_RUNNER=qwen.
 // A missing SDK errors only if this runner is selected; the default opencode path is unaffected.
-import { AgentRunner, ReviewRunOutput } from "../libs/types";
+import { AgentRunner, AgentRunOutput } from "../libs/types";
 import { REPO_ROOT, WRITER_MODEL, REVIEWER_MODEL } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
 
 // Returns the number of tool_use blocks in this assistant message (must-read evidence).
 function traceAssistantMessage(m: any, prefix: string): number {
@@ -54,7 +52,7 @@ export class QwenRunner implements AgentRunner {
     prompt: string,
     model: string,
     options: Record<string, unknown>,
-  ): Promise<ReviewRunOutput> {
+  ): Promise<AgentRunOutput> {
     const { query, isSDKAssistantMessage, isSDKResultMessage, isSDKSystemMessage } =
       await this.load();
     log(`[${label}] session 啟動（model=${model || "（預設）"}）`);
@@ -71,7 +69,13 @@ export class QwenRunner implements AgentRunner {
           authType: "openai",
           ...(model ? { model } : {}),
           env: {
-            OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? "none",
+            // No silent "none" placeholder: a missing key must fail as a missing key,
+            // not as a mysterious auth error from the provider.
+            OPENAI_API_KEY:
+              process.env.OPENAI_API_KEY ??
+              (() => {
+                throw new Error("UT_RUNNER=qwen 需要 OPENAI_API_KEY（.env 或環境變數）");
+              })(),
             OPENAI_BASE_URL: process.env.OPENAI_BASE_URL ?? "",
             ...(model ? { OPENAI_MODEL: model } : {}),
           },
@@ -93,19 +97,18 @@ export class QwenRunner implements AgentRunner {
     }
     const secs = ((Date.now() - started) / 1000).toFixed(0);
     log(`[OK] [${label}] 完成（${turns} 個 assistant 回合，耗時 ${secs} 秒）`);
-    return { text: finalText, toolCallCount: toolCalls };
+    return { text: finalText, status: "ok", toolCallCount: toolCalls };
   }
 
-  async runWriter(prompt: string): Promise<string> {
-    const r = await this.runAgent("writer", prompt, WRITER_MODEL, {
+  runWriter(prompt: string): Promise<AgentRunOutput> {
+    return this.runAgent("writer", prompt, WRITER_MODEL, {
       permissionMode: "auto-edit",
       excludeTools: ["ShellTool", "web_fetch", "web_search"],
       maxSessionTurns: 40,
     });
-    return r.text;
   }
 
-  async runReview(prompt: string): Promise<ReviewRunOutput> {
+  async runReview(prompt: string): Promise<AgentRunOutput> {
     return this.runAgent("reviewer", prompt, REVIEWER_MODEL, {
       permissionMode: "plan",
       excludeTools: ["ShellTool", "web_fetch", "web_search"],

@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const config = await import("../config");
-const { resolveAgentPath, contractViolations, WRITER_RULES, REVIEWER_RULES } = await import(
+const { resolveAgentPath, contractViolations, AGENT_SPECS } = await import(
   "../libs/guard"
 );
 const { loadRubric } = await import("../libs/rubric");
@@ -47,10 +47,7 @@ if (ver.status === 0) {
 }
 
 // 3. agents (repo-local wins, global fallback)
-for (const { name, rules } of [
-  { name: "ut-writer", rules: WRITER_RULES },
-  { name: "ut-reviewer", rules: REVIEWER_RULES },
-]) {
+for (const { name, rules } of AGENT_SPECS) {
   const res = resolveAgentPath(name, config.REPO_ROOT, config.GLOBAL_OPENCODE_DIR);
   if (!res) add("FAIL", `agent ${name}`, "repo 與 global 皆無——在工具 clone 執行 npm run setup");
   else {
