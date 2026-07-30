@@ -2,6 +2,23 @@
 
 使用者可見的變更記錄。更新方式：`git pull && npm install && npm run setup`。
 
+## [1.1.1] - 2026-07-30
+
+### Fixed
+- **Windows 逾時會永久卡死。** 逾時只 signal 我們 spawn 的那個程序，但 npm 裝的
+  `opencode.cmd` 必須經 cmd.exe，所以被殺的是外殼、opencode 仍在跑，還握著繼承來的
+  stdout/stderr 管線——而 Node 的 `'close'` 要等管線關閉才觸發，於是整個 run 永遠不會結束
+  （10 秒後的 SIGKILL 是送給一具屍體，什麼也沒做）。現在改殺整棵程序樹：Windows 用
+  `taskkill /T /F`，POSIX 用 `detached` + process group signal；並補上 `'exit'` 保險，
+  程序結束後最多再等 2 秒讓管線排空就收工。中斷（Ctrl-C）時也會一併帶走整棵樹。
+- 逾時訊息不再自稱 `[OK] 完成`，改為 `[WARN] 逾時中止`，並提示調高 `UT_AGENT_TIMEOUT_MS`。
+  被砍掉的 run 仍會把已收到的輸出交給 gate 判斷（fail-closed 不變）。
+
+### Added
+- README 前置需求與 Troubleshooting 補上 ripgrep：opencode 的 glob 與 grep 都由它實作，
+  離線環境不會自動下載，缺了會讓兩個工具一律回 `[error]`。附各平台放置路徑與驗證指令。
+- selftest 新增 `planKill` / `killTree` 案例，含「外層死掉但孫程序還在」的實際迴歸驗證。
+
 ## [1.1.0] - 2026-07-11
 
 ### Added
