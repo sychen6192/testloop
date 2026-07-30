@@ -48,9 +48,9 @@ export function shLive(
 //
 // shLive above passes `shell: true`, which makes the shell resolve the command — that is why
 // the build gate finds mvnw.cmd. Callers that must NOT go through a shell (the opencode
-// runner streams a JSONL event stream and passes a prompt containing shell metacharacters)
-// need this instead. Three distinct failures hide behind "spawn opencode failed", each
-// needing a different fix, and all three are invisible on Linux/macOS.
+// runner, which streams a JSONL event stream) need this instead. Three distinct failures hide
+// behind "spawn opencode failed", each needing a different fix, and all three are invisible on
+// Linux/macOS.
 //
 // 1. ENOENT — an npm-installed CLI is `opencode.cmd` (plus `.ps1`, often an extensionless
 //    bash shim). Node's spawn does NOT apply PATHEXT, so a bare `opencode` is not found —
@@ -60,7 +60,9 @@ export function shLive(
 //    must go through a shell.
 // 3. E2BIG / silent truncation — the command line is capped at 32767 chars for
 //    CreateProcess and 8191 through cmd.exe. Linux allows ~2MB, so passing a prompt as an
-//    argument works everywhere except the platform the user is on.
+//    argument works everywhere except the platform the user is on. The opencode runner no
+//    longer does that (the prompt goes over stdin), so the check below is a backstop for any
+//    remaining caller rather than a routine branch.
 
 const WINDOWS_ARGV_LIMIT = 32_767;
 const CMD_EXE_ARGV_LIMIT = 8_191;

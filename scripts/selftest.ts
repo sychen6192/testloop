@@ -421,56 +421,44 @@ console.log("\n[9] planSpawn / resolveWindowsCommand / buildInvocation（Windows
   );
   check("planSpawn（win32 + .cmd）：命令列未超限時無 error", win.error === undefined);
 
-  // E2BIG: 8191 through cmd.exe, and a fix-iteration prompt easily exceeds it.
+  // E2BIG: 8191 through cmd.exe. The runner no longer puts a prompt on the command line, so
+  // this is a backstop for other callers — it must still report the limit, not throw an errno.
   const huge = planSpawn(shim, ["run", "x".repeat(9000)], "win32");
   check(
-    "planSpawn（win32 + .cmd + 超長 prompt）：回報 8191 上限而非丟 errno",
+    "planSpawn（win32 + .cmd + 超長引數）：回報 8191 上限而非丟 errno",
     huge.error !== undefined && huge.error.includes("8191"),
     huge.error,
   );
 
-  // buildInvocation: inline stays inline; only an unfittable prompt goes via --file.
-  const inline = buildInvocation("ut-writer", "", "短 prompt", {
-    jsonEvents: true,
-    skipPerms: false,
-    bin: shim,
-    platform: "win32",
-    writeFile: () => "/never/used",
-  });
+  // buildInvocation: flags only. The prompt goes to stdin, so nothing about it may appear in
+  // argv — that is what stops cmd.exe re-parsing the quotes/newlines out of a writer prompt,
+  // and what puts the 8191-char limit out of reach.
+  const bare = buildInvocation("ut-writer", "", { jsonEvents: true, skipPerms: false });
   check(
-    "buildInvocation：塞得下時走 positional，不產生 --file",
-    inline.args[inline.args.length - 1] === "短 prompt" &&
-      !inline.args.includes("--file") &&
-      inline.promptFile === undefined &&
-      inline.args.includes("--format"),
-    JSON.stringify(inline.args),
+    "buildInvocation：只產生旗標，prompt 不進 argv（無 positional、無 --file）",
+    JSON.stringify(bare) === JSON.stringify(["run", "--agent", "ut-writer", "--format", "json"]),
+    JSON.stringify(bare),
   );
 
-  const written: string[] = [];
-  const viaFile = buildInvocation("ut-writer", "qwen3.6:27b", "y".repeat(9000), {
-    jsonEvents: true,
-    skipPerms: true,
-    bin: shim,
-    platform: "win32",
-    writeFile: (text) => {
-      written.push(text);
-      return path.join(tmp, "prompt.md");
-    },
-  });
+  const full = buildInvocation("ut-writer", "qwen3.6:27b", { jsonEvents: true, skipPerms: true });
   check(
-    "buildInvocation：超長 prompt 改走 --file，且仍帶 message 說明如何處理附件",
-    viaFile.args.includes("--file") &&
-      viaFile.promptFile === path.join(tmp, "prompt.md") &&
-      !viaFile.args.some((a) => a.length > 5000) &&
-      written.length === 1 &&
-      written[0].length === 9000,
-    JSON.stringify(viaFile.args.map((a) => a.slice(0, 24))),
+    "buildInvocation：帶 model 與 skip-perms 時仍只有旗標",
+    full.includes("--model") &&
+      full.includes("qwen3.6:27b") &&
+      full.includes("--dangerously-skip-permissions") &&
+      !full.includes("--file"),
+    JSON.stringify(full),
   );
   check(
-    "buildInvocation：--file 路徑仍保留 --agent/--model/--dangerously-skip-permissions",
-    viaFile.args.includes("--agent") &&
-      viaFile.args.includes("qwen3.6:27b") &&
-      viaFile.args.includes("--dangerously-skip-permissions"),
+    "buildInvocation：UT_OPENCODE_JSON=0 時不帶 --format",
+    !buildInvocation("ut-writer", "", { jsonEvents: false, skipPerms: false }).includes("--format"),
+  );
+
+  // A flags-only argv is short enough that a .cmd shim can never hit the cmd.exe limit,
+  // however large the prompt is.
+  check(
+    "buildInvocation + planSpawn（win32 + .cmd）：命令列不再有長度風險",
+    planSpawn(shim, full, "win32").error === undefined,
   );
 
   // The old handler blamed a missing install for every errno; these two need different fixes.

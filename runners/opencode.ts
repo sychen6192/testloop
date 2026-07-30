@@ -1,14 +1,12 @@
-// OpencodeRunner: spawn `opencode run --agent <name> --format json <prompt>`.
+// OpencodeRunner: spawn `opencode run --agent <name> --format json` and write the prompt to
+// the child's stdin. The prompt is never a command-line argument — see buildInvocation.
 // --format json makes stdout a JSONL event stream, parsed line-by-line for live tracing.
 // No --model unless a model is set; otherwise the agent .md's model field decides.
 // Wall-clock timeout backstop (SIGTERM, then SIGKILL after 10s).
 // Fail-closed: on spawn failure/timeout it still returns accumulated text; the gate decides pass/fail.
-// Spawning goes through planSpawn — no `shell: true` here, because the prompt is an argument
-// and would be re-parsed by the shell; see libs/shell.ts for what that costs on Windows.
+// Spawning goes through planSpawn — no `shell: true` here; see libs/shell.ts for why that
+// matters on Windows even now that the prompt itself is off the command line.
 import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { AgentRunner, ReviewRunOutput } from "../libs/types";
 import {
   REPO_ROOT,
@@ -89,49 +87,37 @@ export function traceEvent(
   }
 }
 
-// The positional message still has to say what to do with the attachment: opencode attaches
-// the file's content, but the instruction itself lives in the message.
-const ATTACHED_FILE_MESSAGE = "請完全依照附加檔案中的指示執行，不要再詢問或要求補充。";
-
 /**
- * Decides how the prompt reaches opencode.
+ * Builds the argv for one `opencode run`. The prompt is deliberately NOT in it — the runner
+ * writes it to the child's stdin.
  *
- * Passing it as a positional argument is simplest and is what every POSIX run does. On
- * Windows it is not always possible: CreateProcess caps the command line at 32767 chars and
- * a .cmd shim routed through cmd.exe at 8191, while a fix-iteration prompt carrying a Maven
- * failure report runs well past that. `opencode run --file <path>` attaches file content to
- * the message, which is the documented way to hand it more text than an argument can hold.
+ * `opencode run` reads stdin to EOF whenever stdin is not a TTY and uses it as the message
+ * (appended after the positional message, if any). Passing no positional message therefore
+ * makes the piped text the entire prompt.
  *
- * The file route is used only when the inline one would not fit, so the common path stays
- * unchanged and this cannot regress a working setup.
+ * That is the only route that is safe on Windows. Two earlier attempts were not:
+ *
+ * - Positional argument: an npm-installed `opencode.cmd` must be spawned through cmd.exe
+ *   (Node refuses to spawn .cmd directly since the CVE-2024-27980 fix), and cmd.exe re-parses
+ *   the command line. A writer prompt full of quotes, newlines and JSON comes out shredded,
+ *   and the command line is capped at 8191 chars besides.
+ * - `--file <tmp>/prompt.md <instruction>`: opencode declares --file as a yargs array option,
+ *   so it greedily swallows every following positional. The instruction was parsed as a
+ *   second file path, giving `File not found: <the instruction text>`.
+ *
+ * stdin has no length limit and never passes through a shell, so this needs no
+ * platform-specific branch at all.
  */
 export function buildInvocation(
   agent: string,
   model: string,
-  prompt: string,
-  opts: {
-    jsonEvents: boolean;
-    skipPerms: boolean;
-    bin?: string;
-    platform?: string;
-    writeFile?: (text: string) => string;
-  },
-): { args: string[]; promptFile?: string; note?: string } {
-  const base = ["run", "--agent", agent];
-  if (model) base.push("--model", model);
-  if (opts.jsonEvents) base.push("--format", "json");
-  if (opts.skipPerms) base.push("--dangerously-skip-permissions");
-
-  const inline = [...base, prompt];
-  const plan = planSpawn(opts.bin ?? OPENCODE_BIN, inline, opts.platform);
-  if (!plan.error || !opts.writeFile) return { args: inline };
-
-  const promptFile = opts.writeFile(prompt);
-  return {
-    args: [...base, "--file", promptFile, ATTACHED_FILE_MESSAGE],
-    promptFile,
-    note: `prompt（${prompt.length} 字元）改以 --file 傳遞：${plan.error}`,
-  };
+  opts: { jsonEvents: boolean; skipPerms: boolean },
+): string[] {
+  const args = ["run", "--agent", agent];
+  if (model) args.push("--model", model);
+  if (opts.jsonEvents) args.push("--format", "json");
+  if (opts.skipPerms) args.push("--dangerously-skip-permissions");
+  return args;
 }
 
 export class OpencodeRunner implements AgentRunner {
@@ -154,26 +140,18 @@ export class OpencodeRunner implements AgentRunner {
         logVerbose(`[${label}] [WARN] UT_OC_SKIP_PERMS=1：已附加 --dangerously-skip-permissions`);
       }
 
-      let tmpDir: string | undefined;
-      const invocation = buildInvocation(agent, model, prompt, {
+      const args = buildInvocation(agent, model, {
         jsonEvents: OPENCODE_JSON_EVENTS,
         skipPerms,
-        writeFile: (text) => {
-          tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-oc-"));
-          const file = path.join(tmpDir, "prompt.md");
-          fs.writeFileSync(file, text, "utf8");
-          return file;
-        },
       });
-      if (invocation.note) logVerbose(`[${label}] ${invocation.note}`);
+      logVerbose(`[${label}] prompt（${prompt.length} 字元）以 stdin 傳入`);
 
       // Windows needs the command resolved through PATHEXT, and .cmd shims routed via
       // cmd.exe — Node refuses to spawn them directly since the CVE-2024-27980 fix.
-      const plan = planSpawn(OPENCODE_BIN, invocation.args);
+      const plan = planSpawn(OPENCODE_BIN, args);
       if (plan.error) {
         log(`[FAIL] [${label}] ${plan.error}`);
         stopHeartbeat();
-        if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
         resolve({ text: "" });
         return;
       }
@@ -182,8 +160,15 @@ export class OpencodeRunner implements AgentRunner {
         cwd: REPO_ROOT,
         env: process.env,
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
-        stdio: ["ignore", "pipe", "pipe"], // opencode >=1.17 waits for stdin EOF on a piped stdin
+        stdio: ["pipe", "pipe", "pipe"],
       });
+
+      // opencode blocks on reading stdin to EOF before it prompts the model, so this has to
+      // be written and closed unconditionally — a piped-but-never-closed stdin hangs the run.
+      // EPIPE is expected if the child dies first (bad flag, missing auth); the close handler
+      // reports that, so swallow it here rather than let it surface as an unhandled error.
+      child.stdin.on("error", () => {});
+      child.stdin.end(prompt, "utf8");
 
       const acc = { text: "", lastText: "", toolCalls: new Set<string>() };
       let rawStdout = "";
@@ -226,7 +211,6 @@ export class OpencodeRunner implements AgentRunner {
         clearTimeout(timer);
         if (killEscalation) clearTimeout(killEscalation);
         stopHeartbeat();
-        if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
         if (spawnError) {
           log(`[FAIL] [${label}] ${spawnError}`);
           resolve({ text: "" });
