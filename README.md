@@ -22,6 +22,8 @@ testgen 為指定的 Java 類別自動產生 JUnit 5 單元測試。它跑一個
 
 - Node.js 20 以上。
 - opencode CLI 已安裝並在 PATH 中，版本需支援 `--format json`。
+- ripgrep（`rg`）已安裝。opencode 的 glob 與 grep 工具都靠它，writer 與 reviewer 都要用；
+  缺了會讓兩個工具一起回 `[error]`。見「離線環境需先備妥 ripgrep」。
 - LLM provider 存取權。設定方式見「Provider 與模型設定」。
 - 目標 Java repo 使用 JUnit 5。建置工具以 Maven 為主力，Gradle 為 best-effort 支援。
 - 覆蓋率 gate 需要模組綁定 JaCoCo。未綁定時該 gate 會自動略過並提示。
@@ -133,12 +135,43 @@ testgen <package 路徑>                  # 端對端執行
 - **review gate 一直 REJECT，訊息含「tool calls = 0」。** reviewer 沒讀任何檔案就輸出判決，
   fail-closed 防的是捏造的假 verdict。改用更強的 `UT_REVIEWER_MODEL`。確定要放行設
   `UT_REVIEWER_MUST_READ=0`，或暫時 `UT_SKIP_REVIEW=1` 只跑 hard gate。
+- **trace 裡 glob 與 grep 一律 `[error]`。** 缺 ripgrep。見下一節。
+- **writer 逾時被中止。** 預設 15 分鐘對 dense 模型太短，見「Provider 與模型設定」的
+  `UT_AGENT_TIMEOUT_MS=1500000` 建議。逾時會終止整棵 opencode 程序樹（Windows 走
+  `taskkill /T /F`），已產出的部分仍會交給 gate 判斷，不會靜默當成通過。
 - **啟動就 FATAL agent 權限。** startup guard 攔到 agent 權限被改壞。這是刻意設計，照訊息把
   frontmatter 修回：writer 禁 bash、reviewer 全唯讀。
 - **看不到即時進度。** opencode 版本太舊，不支援 `--format json`。設 `UT_OPENCODE_JSON=0`
   退回整段輸出，但會失去即時 tracing。
 - **想為某個 repo 客製 reviewer。** 把 agent .md 放進該 repo 的 `.opencode/agent/`。repo 內
   定義優先於 global。
+
+## 離線環境需先備妥 ripgrep
+
+opencode 的 glob 與 grep 兩個內建工具都由 ripgrep 實作。writer 靠它找目標類別與既有測試，
+reviewer 靠它蒐證，缺了會讓兩個工具在 trace 裡一律回 `[error]`，本工具無從代勞。
+
+opencode 找 ripgrep 的順序是：PATH 上的 `rg`（Windows 為 `rg.exe`）→ 自己的 cache bin →
+都沒有就從 GitHub Releases 下載。第三步在封閉網路必然失敗，所以要在跑 `testgen` 前先讓
+前兩步之一命中。cache bin 位置在各平台都是家目錄下的 `.cache`（opencode 用 XDG 慣例，
+Windows 也不例外）：
+
+| 平台 | 放置路徑 |
+| --- | --- |
+| Windows | `%USERPROFILE%\.cache\opencode\bin\rg.exe` |
+| macOS / Linux | `~/.cache/opencode/bin/rg`（需 `chmod +x`） |
+
+取得 `rg` 的方式，擇一即可：
+
+- 裝過 VS Code 的話它自帶一份，直接複製即可，免下載。Windows 路徑為
+  `<VS Code>\resources\app\node_modules\@vscode\ripgrep\bin\rg.exe`。
+- 用套件管理器安裝並確認在 PATH 上：`winget install BurntSushi.ripgrep.MSVC`、
+  `brew install ripgrep`、`apt install ripgrep`。
+- 從別台有網路的機器抓 [ripgrep releases](https://github.com/BurntSushi/ripgrep/releases)
+  的對應壓縮檔，把裡面的 `rg` 執行檔拷進上表路徑。
+
+驗證：`opencode debug rg files --glob "**/*.java" --limit 5`。列得出檔案就代表 ripgrep
+已就緒。
 
 ## 更新工具
 
