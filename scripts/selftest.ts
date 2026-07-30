@@ -16,7 +16,8 @@ import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
 import { traceEvent, buildInvocation } from "../runners/opencode";
-import { planSpawn, resolveWindowsCommand, explainSpawnError } from "../libs/shell";
+import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree } from "../libs/shell";
+import { spawn } from "node:child_process";
 
 let passCount = 0;
 let failCount = 0;
@@ -471,6 +472,78 @@ console.log("\n[9] planSpawn / resolveWindowsCommand / buildInvocation（Windows
   );
 
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 10. Killing the process tree on timeout (the Windows hang)
+// ---------------------------------------------------------------------------
+console.log("\n[10] planKill / killTree（逾時終止整棵程序樹）");
+{
+  // Windows: signals do not exist, so the only reachable mechanism is taskkill /T /F.
+  const win = planKill(4242, "SIGTERM", "win32");
+  check(
+    "planKill（win32）：taskkill /T /F，帶樹且強制",
+    win.via === "taskkill" &&
+      win.file === "taskkill" &&
+      win.args.join(" ") === "/pid 4242 /T /F",
+    JSON.stringify(win),
+  );
+  check(
+    "planKill（win32）：SIGKILL 與 SIGTERM 產生相同計畫（Windows 無優雅終止可言）",
+    JSON.stringify(planKill(4242, "SIGKILL", "win32")) === JSON.stringify(win),
+  );
+
+  // POSIX: signal the group (negative pid), and keep the requested signal meaningful.
+  const posixTerm = planKill(4242, "SIGTERM", "linux");
+  check(
+    "planKill（linux）：送給 process group（負 pid），而非單一程序",
+    posixTerm.via === "signal" && posixTerm.target === -4242 && posixTerm.signal === "SIGTERM",
+    JSON.stringify(posixTerm),
+  );
+  const posixKill = planKill(4242, "SIGKILL", "linux");
+  check(
+    "planKill（linux）：SIGKILL 升級會保留下來",
+    posixKill.via === "signal" && posixKill.signal === "SIGKILL",
+  );
+
+  // The regression itself, end to end: a wrapper process with a longer-lived child, exactly
+  // the shape cmd.exe + opencode makes on Windows. killTree must take the grandchild with it.
+  if (process.platform !== "win32") {
+    const wrapper = spawn("sh", ["-c", "sleep 30 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true, // what the runner now does; planKill's group signal depends on it
+    });
+    const grandchildPid = await new Promise<number>((res) => {
+      wrapper.stdout.setEncoding("utf8");
+      wrapper.stdout.once("data", (d: string) => res(Number(d.trim())));
+    });
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    check("killTree 前置：孫程序確實活著", alive(grandchildPid), `pid ${grandchildPid}`);
+
+    killTree(wrapper, "SIGKILL");
+    await new Promise((r) => setTimeout(r, 300));
+    check(
+      "killTree：連孫程序一起收掉（舊 child.kill 只殺得到外層）",
+      !alive(grandchildPid),
+      `pid ${grandchildPid} 仍在`,
+    );
+    check("killTree：外層本身也結束", wrapper.exitCode !== null || wrapper.signalCode !== null);
+    check("killTree：對已結束的程序再呼叫不丟例外", (() => {
+      try {
+        killTree(wrapper, "SIGKILL");
+        return true;
+      } catch {
+        return false;
+      }
+    })());
+  }
 }
 
 // ---------------------------------------------------------------------------

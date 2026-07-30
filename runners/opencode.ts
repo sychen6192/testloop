@@ -18,7 +18,16 @@ import {
   OPENCODE_SKIP_PERMS,
 } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
-import { explainSpawnError, planSpawn } from "../libs/shell";
+import {
+  DETACH_CHILDREN,
+  explainSpawnError,
+  killTree,
+  planSpawn,
+  trackForShutdown,
+} from "../libs/shell";
+
+// After the child exits, how long to wait for its stdio pipes to close before finishing anyway.
+const EXIT_DRAIN_MS = 2_000;
 
 // One JSONL event -> readable progress; text events accumulate into finalText.
 // Observed opencode structure (--format json): the real type is in part.type, hyphenated
@@ -161,7 +170,11 @@ export class OpencodeRunner implements AgentRunner {
         env: process.env,
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
         stdio: ["pipe", "pipe", "pipe"],
+        // POSIX only: makes the child a process-group leader so a timeout can kill the whole
+        // tree, not just the process we happen to hold. See libs/shell.ts.
+        detached: DETACH_CHILDREN,
       });
+      trackForShutdown(child);
 
       // opencode blocks on reading stdin to EOF before it prompts the model, so this has to
       // be written and closed unconditionally — a piped-but-never-closed stdin hangs the run.
@@ -192,24 +205,36 @@ export class OpencodeRunner implements AgentRunner {
         }
       });
 
-      // timeout: SIGTERM, then SIGKILL if still alive after 10s
+      // Timeout: kill the whole process tree. The old code signalled only the process we
+      // spawned, which on Windows is the cmd.exe wrapper rather than opencode itself.
+      let timedOut = false;
       let killEscalation: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
-        logVerbose(`[${label}] 逾時 ${AGENT_TIMEOUT_MS}ms，送出 SIGTERM`);
-        child.kill("SIGTERM");
-        killEscalation = setTimeout(() => {
-          logVerbose(`[${label}] SIGTERM 未生效，SIGKILL`);
-          child.kill("SIGKILL");
-        }, 10_000);
+        timedOut = true;
+        log(
+          `[WARN] [${label}] 逾時 ${AGENT_TIMEOUT_MS}ms，終止 opencode 程序樹` +
+            `（模型較慢時請調高 UT_AGENT_TIMEOUT_MS）`,
+        );
+        killTree(child, "SIGTERM");
+        // Only POSIX has anything to escalate to: on Windows taskkill /F was already a hard
+        // kill, and repeating it would just log a second failure against a dead pid.
+        if (DETACH_CHILDREN) {
+          killEscalation = setTimeout(() => {
+            logVerbose(`[${label}] 程序樹仍在，改送 SIGKILL`);
+            killTree(child, "SIGKILL");
+          }, 10_000);
+        }
       }, AGENT_TIMEOUT_MS);
 
       let finished = false;
       let spawnError: string | undefined;
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
         if (killEscalation) clearTimeout(killEscalation);
+        if (drainTimer) clearTimeout(drainTimer);
         stopHeartbeat();
         if (spawnError) {
           log(`[FAIL] [${label}] ${spawnError}`);
@@ -218,7 +243,13 @@ export class OpencodeRunner implements AgentRunner {
         }
         if (stdoutBuf.trim()) traceEvent(stdoutBuf, `[${label}]`, acc); // flush the partial line
         const secs = ((Date.now() - started) / 1000).toFixed(0);
-        log(`[OK] [${label}] 完成（耗時 ${secs} 秒）`);
+        // A killed run is not a completed one; say so, but still hand back what arrived —
+        // fail-closed means the gate judges the partial output, not this function.
+        log(
+          timedOut
+            ? `[WARN] [${label}] 逾時中止（耗時 ${secs} 秒），以已收到的輸出繼續`
+            : `[OK] [${label}] 完成（耗時 ${secs} 秒）`,
+        );
         // JSONL mode: use accumulated text (or the last text part if empty);
         // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout — no events to count,
         // so tool usage is unobservable (undefined), not zero.
@@ -232,6 +263,17 @@ export class OpencodeRunner implements AgentRunner {
         }
       };
 
+      // 'close' waits for the stdio pipes to close as well as for the process to exit, so any
+      // survivor holding an inherited pipe keeps it from ever firing — that is what turned a
+      // Windows timeout into a permanent hang. 'exit' always fires; let the pipes drain
+      // briefly, then finish regardless. finish() is idempotent, so the usual ordering
+      // ('close' first, promptly) is unaffected.
+      child.on("exit", () => {
+        drainTimer = setTimeout(() => {
+          logVerbose(`[${label}] 程序已結束但輸出管線未關閉，不再等待`);
+          finish();
+        }, EXIT_DRAIN_MS);
+      });
       child.on("close", finish);
       child.on("error", (err) => {
         // The old message blamed a missing install for every errno, which is wrong for the
