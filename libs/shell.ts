@@ -11,13 +11,25 @@ export function shLive(
   args: string[],
   linePrefix: string,
   cwd: string,
-): Promise<{ code: number; out: string }> {
+  timeoutMs = 0,
+): Promise<{ code: number; out: string; timedOut?: boolean }> {
   return new Promise((resolve) => {
     logVerbose(`> 執行：${cmd} ${args.join(" ")}（cwd=${cwd}）`);
     const child = spawn(cmd, args, {
       cwd,
       shell: process.platform === "win32",
+      detached: DETACH_CHILDREN,
     });
+    trackForShutdown(child);
+
+    let timedOut = false;
+    const timer = timeoutMs
+      ? setTimeout(() => {
+          timedOut = true;
+          logVerbose(`${linePrefix} 逾時 ${timeoutMs}ms，終止程序樹`);
+          killTree(child, "SIGKILL");
+        }, timeoutMs)
+      : undefined;
 
     let buf = "";
     const pipe = (stream: NodeJS.ReadableStream) => {
@@ -36,8 +48,12 @@ export function shLive(
     pipe(child.stdout);
     pipe(child.stderr);
 
-    child.on("close", (code) => resolve({ code: code ?? 1, out: buf }));
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: code ?? 1, out: buf, timedOut });
+    });
     child.on("error", (err) => {
+      if (timer) clearTimeout(timer);
       logVerbose(`指令啟動失敗：${err.message}`);
       resolve({ code: 1, out: String(err) });
     });
@@ -46,8 +62,8 @@ export function shLive(
 
 // ─── Windows process spawning ────────────────────────────────────────────────
 //
-// shLive above passes `shell: true`, which makes the shell resolve the command — that is why
-// the build gate finds mvnw.cmd. Callers that must NOT go through a shell (the opencode
+// shLive above passes `shell: true` on Windows only, which lets the shell resolve wrapper
+// scripts like mvnw.cmd there. Callers that must NOT go through a shell (the opencode
 // runner, which streams a JSONL event stream) need this instead. Three distinct failures hide
 // behind "spawn opencode failed", each needing a different fix, and all three are invisible on
 // Linux/macOS.

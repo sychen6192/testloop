@@ -32,7 +32,7 @@ testgen 為指定的 Java 類別自動產生 JUnit 5 單元測試。它跑一個
 
 
 ```bash
-git clone git@github.com:sychen6192/testloop.git
+git clone https://github.com/sychen6192/testloop.git
 cd testloop
 npm install
 npm run setup      # 安裝 agents 與評分 skill 到 ~/.config/opencode/
@@ -47,21 +47,15 @@ echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 
 ## Provider 與模型設定
 
->
-> | 角色 | 模型 | 說明 |
-> | --- | --- | --- |
-> | writer | `ollama/qwen3.6:27b` | dense 模型，endpoint 為 `http://llm:11434/v1` |
-> | reviewer | `ollama/qwen3.6:27b` | 單卡 32GB 共用同一顆，免去換模的 reload thrash |
->
-> 在 RTX 5090 32GB 上以 qwen3.6:27b dense 實測，建議依下列設定執行。
->
-> - 一次只鎖定單一 class 當目標，讓 writer 每輪只產一個測試檔。同時重寫多個大檔會慢到撞逾時。
-> - 設 `UT_AGENT_TIMEOUT_MS=1500000`，約 25 分鐘。dense 模型約 15–25 tok/s，這給完整生成
->   留餘裕，避免被 SIGTERM 截斷。
-> - 將 opencode 中該模型的 `num_ctx` 設為 65536。扣掉 plugin 與 MCP 的 session 固定開銷後，
->   才有足夠工作空間。
-> - 不要用 `qwen3.6:35b-a3b` 當 writer。它是 MoE、僅 3B active，服從性不足，寫不出較大的
->   新測試檔。
+自架單卡（約 32GB VRAM）跑 27B 級 dense 模型的實測建議：
+
+- writer 與 reviewer 共用同一顆模型即可，省去每輪換模的 reload 成本。
+- 一次只鎖定單一 class 當目標，讓 writer 每輪只產一個測試檔。同時重寫多個大檔會慢到撞逾時。
+- 設 `UT_AGENT_TIMEOUT_MS=1500000`，約 25 分鐘。dense 模型約 15–25 tok/s，這給完整生成
+  留餘裕，避免被 SIGTERM 截斷。
+- 將 opencode 中該模型的 context（如 Ollama 的 `num_ctx`）設為 65536。扣掉 plugin 與 MCP
+  的 session 固定開銷後，才有足夠工作空間。
+- 避免用 activation 很小的 MoE 模型當 writer——服從性不足，寫不出較大的新測試檔。
 
 設定步驟：
 
@@ -95,7 +89,7 @@ testgen <package 路徑>                  # 端對端執行
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `UT_RUNNER` | opencode | opencode 或 qwen。qwen 需另裝 @qwen-code/sdk |
+| `UT_RUNNER` | opencode | opencode 或 qwen。qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
@@ -105,9 +99,23 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
+| `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |
 | `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋。未設時依序找目標 repo、工具內建 |
 | `UT_JACOCO_XML` | 自動搜尋 | 報告路徑覆蓋 |
 | `UT_MAVEN_ARGS` | - | 額外 maven 參數，例如 `jacoco:report` |
+| `UT_RUNS_DIR` | 工具 clone 內 | artifacts 落點覆蓋（共用或唯讀安裝時使用） |
+| `UT_OPENCODE_BIN` | opencode | opencode 執行檔路徑覆蓋 |
+| `UT_OPENCODE_JSON` | 1 | 0 = 不用 `--format json`（失去即時 tracing 與 must-read 觀測） |
+| `UT_OC_SKIP_PERMS` | - | 1 = writer 附加 `--dangerously-skip-permissions`（最後手段） |
+| `UT_SKIP_GUARD` | - | 1 = 跳過 agent 權限 guard（不建議） |
+| `UT_QUIET` | - | 1 = 關閉 verbose 行 |
+
+數值型變數在啟動時驗證：`UT_MAX_ITER=five` 這類拼錯會直接 FATAL，不會靜默用 NaN
+把整個迴圈變成 0 輪。
+
+提前中止：writer 程序起不來（環境問題）、gate 失敗後 writer 未改任何測試檔（no-op）、
+連續兩輪拿到完全相同的失敗報告（stuck）——三者都立即結束並在 summary 標明 `stopReason`，
+不會空燒剩餘輪數。
 
 評分規則：六維各給 0-10 整數，門檻預設 7/7/7/6/7/6。`weighted_score` 依權重
 25/20/15/15/15/10 計算，`grade` 依 85/70/55 分界為 A/B/C/D。兩者都由 pipeline 確定性計算、

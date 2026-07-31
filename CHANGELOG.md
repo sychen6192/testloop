@@ -2,6 +2,42 @@
 
 使用者可見的變更記錄。更新方式：`git pull && npm install && npm run setup`。
 
+## [1.2.0] - 2026-07-30
+
+依 loop engineering 全面審查（對照 Qodo Cover、Meta TestGen-LLM、SWE-agent、OpenHands 等
+業界做法）後的強化與重構。
+
+### Added
+- **Writer 變更偵測**：每輪 writer 前後對 `src/test/java` 拍快照，`changed-files.txt`
+  進 artifacts。堵住最危險的 fail-open 鏈——writer 靜默 no-op → gate 判的是 repo 既有
+  測試 → 什麼都沒產生卻 exit 0。gate 失敗後的 no-op 現在立即中止（stopReason=writer-no-op）。
+- **Stuck 偵測**：連續兩輪拿到完全相同的失敗報告即中止（stopReason=stuck），不空燒輪數。
+- **基礎設施失敗與模型失敗分流**：`AgentRunner` 回傳 `status`（ok/timeout/spawn-error）。
+  opencode 起不來時立即中止並指向環境修法，不再被誤診為「模型行為異常」。
+- **迭代漏斗（funnel）**：summary.json 記錄每輪到達的 gate 與結果、變更檔數、
+  writer output tokens——一眼看出輪次死在哪個 gate（TestGen-LLM 式 per-stage yield）。
+- **Token 記帳**：累計 writer output tokens 進 summary。
+- **覆蓋率回饋帶未覆蓋行**：JaCoCo `<line>` 解析成 `12-15, 22` 區間直接給 writer，
+  不再只給百分比要模型自己猜哪裡沒蓋到。
+- **Fix prompt 帶目標類別**：第 2 輪起 writer 不再只能從截斷的 build log 猜範圍。
+- **build/test gate 逾時**（`UT_BUILD_TIMEOUT_MS`，預設 30 分鐘）：卡死的 mvn 會被整樹
+  終止，是先前 pipeline 唯一無上限的等待。
+- `UT_RUNS_DIR` 覆蓋 artifacts 落點；params.json 補齊全部生效參數 + 目標 repo git SHA，
+  成為完整可重現紀錄；crash 也會寫出 summary.json。
+- CI 加入 windows-latest（libs/shell.ts 的 Windows 路徑首次進 CI）。
+- LICENSE（MIT）。
+
+### Changed
+- 數值型環境變數啟動時驗證，拼錯直接 FATAL 並點名變數（先前 `UT_MAX_ITER=five` 會靜默
+  變成 0 輪、`UT_AGENT_TIMEOUT_MS` 拼錯會立刻殺掉每個 agent）。
+- guard 改解析 frontmatter 的 `tools:` 區塊實值（先前正則掃全文，`description:` 提到
+  `bash: false` 就能騙過），契約範圍擴及 `webfetch`。
+- 目標路徑包含檢查改用 `path.relative`（先前 `startsWith` 會把 `/work/repo-evil` 當成
+  `/work/repo` 內部）。
+- `@qwen-code/sdk` 移出 devDependencies（僅 `UT_RUNNER=qwen` 需要，用時再裝）。
+- qwen runner 缺 `OPENAI_API_KEY` 時直接報缺鍵，不再塞 `"none"` 假憑證。
+- selftest 擴充至 78 項（快照 diff、未覆蓋行、guard 解析、spawn-error 分流等）。
+
 ## [1.1.1] - 2026-07-30
 
 ### Fixed

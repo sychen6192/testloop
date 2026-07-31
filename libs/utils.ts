@@ -82,3 +82,43 @@ export function skillDirCandidates(
 export function runsDirFor(testgenRoot: string, repoRoot: string): string {
   return path.join(testgenRoot, "runs", path.basename(repoRoot));
 }
+
+// JSON.stringify replacer that drops the bulky `raw` fields from persisted artifacts.
+export const stripRaw = (k: string, v: unknown) => (k === "raw" ? undefined : v);
+
+// ─── Test-tree snapshots ─────────────────────────────────────────────────────
+// The loop verifies after every writer session that the test tree actually changed.
+// Without this, a writer that silently no-ops (context exhausted, permission-blocked)
+// lets the gates judge the repo's PRE-EXISTING tests — and a run can "succeed" having
+// generated nothing. mtime+size per file is enough to detect that.
+
+export type TreeSnapshot = Record<string, string>;
+
+export function snapshotTree(root: string): TreeSnapshot {
+  const snap: TreeSnapshot = {};
+  if (!fs.existsSync(root)) return snap;
+  const walk = (d: string) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else {
+        const st = fs.statSync(p);
+        snap[path.relative(root, p).replace(/\\/g, "/")] = `${st.mtimeMs}:${st.size}`;
+      }
+    }
+  };
+  walk(root);
+  return snap;
+}
+
+// Paths that were added, removed, or modified between two snapshots.
+export function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot): string[] {
+  const changed: string[] = [];
+  for (const p of Object.keys(after)) {
+    if (before[p] !== after[p]) changed.push(p);
+  }
+  for (const p of Object.keys(before)) {
+    if (!(p in after)) changed.push(p);
+  }
+  return changed.sort();
+}

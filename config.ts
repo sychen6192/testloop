@@ -35,9 +35,23 @@ export const REPO_ROOT = process.cwd();
 // First CLI arg: target dir or single .java file.
 export const TARGET_ARG = process.argv[2];
 
-export const MAX_ITER = Number(process.env.UT_MAX_ITER ?? 5);
-export const MIN_LINE_COV = Number(process.env.UT_MIN_LINE_COV ?? 80);
-export const MIN_BRANCH_COV = Number(process.env.UT_MIN_BRANCH_COV ?? 70);
+// Numeric env vars fail fast on garbage. `Number("five")` is NaN, and NaN silently
+// disables whatever it configures: a NaN MAX_ITER runs zero rounds, a NaN timeout
+// fires immediately and kills every agent. Exiting with the variable's name beats both.
+export function numEnv(name: string, def: number, min = 0): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min) {
+    console.error(`FATAL: ${name}=${raw} 不是有效數值（需 >= ${min}）`);
+    process.exit(1);
+  }
+  return n;
+}
+
+export const MAX_ITER = numEnv("UT_MAX_ITER", 5, 1);
+export const MIN_LINE_COV = numEnv("UT_MIN_LINE_COV", 80);
+export const MIN_BRANCH_COV = numEnv("UT_MIN_BRANCH_COV", 70);
 // 1 = fail the coverage gate when no JaCoCo report is found (default: skip leniently).
 export const STRICT_COV = process.env.UT_STRICT_COV === "1";
 // 1 = let a passing build through even when zero tests actually ran (default: fail-closed).
@@ -58,7 +72,10 @@ export const WRITER_MODEL = process.env.UT_WRITER_MODEL ?? process.env.UT_MODEL 
 export const REVIEWER_MODEL = process.env.UT_REVIEWER_MODEL ?? "";
 
 // Per-run agent wall-clock timeout (replaces the SDK's maxSessionTurns).
-export const AGENT_TIMEOUT_MS = Number(process.env.UT_AGENT_TIMEOUT_MS ?? 15 * 60 * 1000);
+export const AGENT_TIMEOUT_MS = numEnv("UT_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1000);
+// Build/test gate wall-clock timeout. A hung mvn (unreachable repo, a test with a real
+// socket) was the one unbounded wait left in the pipeline.
+export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000);
 export const OPENCODE_BIN = process.env.UT_OPENCODE_BIN ?? "opencode";
 // 0 = drop --format json (fallback for versions without JSONL events; loses live progress).
 export const OPENCODE_JSON_EVENTS = process.env.UT_OPENCODE_JSON !== "0";
@@ -78,8 +95,11 @@ export const SKILL_DIR_CANDIDATES = skillDirCandidates(
   process.env.UT_SKILL_DIR,
 );
 
-// Artifacts, namespaced per target repo.
-export const RUNS_DIR = runsDirFor(TESTGEN_ROOT, REPO_ROOT);
+// Artifacts, namespaced per target repo. UT_RUNS_DIR overrides the base for shared or
+// read-only installs (default: the tool's own clone).
+export const RUNS_DIR = process.env.UT_RUNS_DIR
+  ? path.join(process.env.UT_RUNS_DIR, path.basename(REPO_ROOT))
+  : runsDirFor(TESTGEN_ROOT, REPO_ROOT);
 
 // Six score thresholds (0-10, per skill rubric). Partial override via UT_SCORE_THRESHOLDS='{"coverage":6}'.
 export interface ScoreThresholds {
@@ -104,6 +124,8 @@ export const SCORE_THRESHOLDS: ScoreThresholds = (() => {
   try {
     return { ...def, ...JSON.parse(raw) };
   } catch {
+    // A silently ignored override would make the operator believe their thresholds apply.
+    console.error(`[WARN] UT_SCORE_THRESHOLDS 不是合法 JSON，已改用預設門檻：${raw}`);
     return def;
   }
 })();

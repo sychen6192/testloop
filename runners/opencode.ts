@@ -7,7 +7,7 @@
 // Spawning goes through planSpawn — no `shell: true` here; see libs/shell.ts for why that
 // matters on Windows even now that the prompt itself is off the command line.
 import { spawn } from "node:child_process";
-import { AgentRunner, ReviewRunOutput } from "../libs/types";
+import { AgentRunner, AgentRunOutput } from "../libs/types";
 import {
   REPO_ROOT,
   WRITER_MODEL,
@@ -37,7 +37,7 @@ const EXIT_DRAIN_MS = 2_000;
 export function traceEvent(
   line: string,
   prefix: string,
-  acc: { text: string; lastText: string; toolCalls?: Set<string> },
+  acc: { text: string; lastText: string; toolCalls?: Set<string>; outputTokens?: number },
 ) {
   let ev: Record<string, unknown>;
   try {
@@ -55,8 +55,10 @@ export function traceEvent(
       break;
     case "step-finish": {
       const tokens = (part.tokens ?? {}) as Record<string, unknown>;
-      if (tokens.output !== undefined) {
-        logVerbose(`${prefix}  -- step 結束（output tokens=${String(tokens.output)}）`);
+      const out = Number(tokens.output);
+      if (Number.isFinite(out)) {
+        acc.outputTokens = (acc.outputTokens ?? 0) + out;
+        logVerbose(`${prefix}  -- step 結束（output tokens=${out}）`);
       }
       break;
     }
@@ -136,7 +138,7 @@ export class OpencodeRunner implements AgentRunner {
     model: string,
     prompt: string,
     allowSkipPerms: boolean,
-  ): Promise<ReviewRunOutput> {
+  ): Promise<AgentRunOutput> {
     return new Promise((resolve) => {
       log(
         `[${label}] session 啟動（agent=${agent}, model=${model || "（agent 預設）"}）`,
@@ -161,7 +163,7 @@ export class OpencodeRunner implements AgentRunner {
       if (plan.error) {
         log(`[FAIL] [${label}] ${plan.error}`);
         stopHeartbeat();
-        resolve({ text: "" });
+        resolve({ text: "", status: "spawn-error" });
         return;
       }
 
@@ -183,7 +185,12 @@ export class OpencodeRunner implements AgentRunner {
       child.stdin.on("error", () => {});
       child.stdin.end(prompt, "utf8");
 
-      const acc = { text: "", lastText: "", toolCalls: new Set<string>() };
+      const acc = {
+        text: "",
+        lastText: "",
+        toolCalls: new Set<string>(),
+        outputTokens: undefined as number | undefined,
+      };
       let rawStdout = "";
       let stdoutBuf = "";
 
@@ -205,8 +212,8 @@ export class OpencodeRunner implements AgentRunner {
         }
       });
 
-      // Timeout: kill the whole process tree. The old code signalled only the process we
-      // spawned, which on Windows is the cmd.exe wrapper rather than opencode itself.
+      // Timeout: kill the whole process tree — on Windows the direct child is a cmd.exe
+      // wrapper, and killing only it would leave opencode running (see libs/shell.ts).
       let timedOut = false;
       let killEscalation: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
@@ -238,7 +245,7 @@ export class OpencodeRunner implements AgentRunner {
         stopHeartbeat();
         if (spawnError) {
           log(`[FAIL] [${label}] ${spawnError}`);
-          resolve({ text: "" });
+          resolve({ text: "", status: "spawn-error" });
           return;
         }
         if (stdoutBuf.trim()) traceEvent(stdoutBuf, `[${label}]`, acc); // flush the partial line
@@ -250,16 +257,19 @@ export class OpencodeRunner implements AgentRunner {
             ? `[WARN] [${label}] 逾時中止（耗時 ${secs} 秒），以已收到的輸出繼續`
             : `[OK] [${label}] 完成（耗時 ${secs} 秒）`,
         );
+        const status = timedOut ? "timeout" : "ok";
         // JSONL mode: use accumulated text (or the last text part if empty);
         // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout — no events to count,
-        // so tool usage is unobservable (undefined), not zero.
+        // so tool/token usage is unobservable (undefined), not zero.
         if (OPENCODE_JSON_EVENTS) {
           resolve({
             text: acc.text.trim() ? acc.text : acc.lastText,
+            status,
             toolCallCount: acc.toolCalls.size,
+            outputTokens: acc.outputTokens,
           });
         } else {
-          resolve({ text: rawStdout });
+          resolve({ text: rawStdout, status });
         }
       };
 
@@ -276,22 +286,18 @@ export class OpencodeRunner implements AgentRunner {
       });
       child.on("close", finish);
       child.on("error", (err) => {
-        // The old message blamed a missing install for every errno, which is wrong for the
-        // two failures that actually bite on Windows (EINVAL on a .cmd, and an oversized
-        // command line) and sends people to reinstall a CLI that is already there.
         spawnError = `${explainSpawnError(err, OPENCODE_BIN)}——請確認已安裝 opencode CLI，或以 UT_OPENCODE_BIN 指定路徑`;
         finish();
       });
     });
   }
 
-  async runWriter(prompt: string): Promise<string> {
+  runWriter(prompt: string): Promise<AgentRunOutput> {
     // permission contract in .opencode/agent/ut-writer.md (write/edit on, bash/web off)
-    const r = await this.runAgent("writer", "ut-writer", WRITER_MODEL, prompt, true);
-    return r.text;
+    return this.runAgent("writer", "ut-writer", WRITER_MODEL, prompt, true);
   }
 
-  async runReview(prompt: string): Promise<ReviewRunOutput> {
+  runReview(prompt: string): Promise<AgentRunOutput> {
     // read-only reviewer; skip-perms never applies to the reviewer
     return this.runAgent("reviewer", "ut-reviewer", REVIEWER_MODEL, prompt, false);
   }

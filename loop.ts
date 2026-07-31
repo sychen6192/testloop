@@ -17,9 +17,15 @@ import {
   REVIEWER_MODEL,
   SCORE_THRESHOLDS,
   STRICT_COV,
+  ALLOW_ZERO_TESTS,
+  REVIEWER_MUST_READ,
+  AGENT_TIMEOUT_MS,
+  BUILD_TIMEOUT_MS,
+  MAVEN_EXTRA_ARGS,
 } from "./config";
+import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
-import { listJavaClasses, findModuleInfo } from "./libs/utils";
+import { listJavaClasses, findModuleInfo, stripRaw } from "./libs/utils";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
@@ -40,7 +46,10 @@ async function main() {
   }
   const absTarget = path.resolve(REPO_ROOT, TARGET_ARG);
   if (!fs.existsSync(absTarget)) die(`找不到目標：${absTarget}`);
-  if (!absTarget.startsWith(REPO_ROOT)) {
+  // path.relative-based containment: a plain startsWith would accept /work/repo-evil
+  // as being inside /work/repo.
+  const rel = path.relative(REPO_ROOT, absTarget);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
     die("目標必須位於目前工作目錄底下（請在 Java repo 根目錄執行本指令）");
   }
 
@@ -80,6 +89,22 @@ async function main() {
   const runId = new Date().toISOString().replace(/[:.]/g, "-");
   const runDir = path.join(RUNS_DIR, runId);
   fs.mkdirSync(runDir, { recursive: true });
+
+  // The target repo's HEAD, so a run record says what code the tests were written against.
+  let targetGitSha = "no-git";
+  try {
+    targetGitSha = execSync("git rev-parse HEAD", {
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    /* not a git repo */
+  }
+
+  // Every effective knob goes in — a params.json that omits half the config cannot
+  // reproduce the run it describes.
   fs.writeFileSync(
     path.join(runDir, "params.json"),
     JSON.stringify(
@@ -88,8 +113,20 @@ async function main() {
         module: mod.moduleRel || "(root)",
         buildTool,
         targetClasses,
+        targetGitSha,
         thresholds: { MIN_LINE_COV, MIN_BRANCH_COV, scores: SCORE_THRESHOLDS },
         runner: RUNNER_KIND,
+        writerModel: WRITER_MODEL || "(agent default)",
+        reviewerModel: REVIEWER_MODEL || "(agent default)",
+        maxIter: MAX_ITER,
+        strictCov: STRICT_COV,
+        allowZeroTests: ALLOW_ZERO_TESTS,
+        reviewerMustRead: REVIEWER_MUST_READ,
+        skipReview: SKIP_REVIEW,
+        agentTimeoutMs: AGENT_TIMEOUT_MS,
+        buildTimeoutMs: BUILD_TIMEOUT_MS,
+        mavenExtraArgs: MAVEN_EXTRA_ARGS,
+        rubricSource: rubric ? source : "(standards fallback)",
         toolVersion,
       },
       null,
@@ -99,20 +136,37 @@ async function main() {
   log(`artifacts：${runDir}`);
 
   const runner = await createRunner();
-  const result = await orchestrate({
-    targetClasses,
-    buildTool,
-    runner,
-    standards,
-    rubric: effectiveRubric,
-    skipReview: SKIP_REVIEW,
-    mod,
-    runDir,
-  });
+  let result;
+  try {
+    result = await orchestrate({
+      targetClasses,
+      buildTool,
+      runner,
+      standards,
+      rubric: effectiveRubric,
+      skipReview: SKIP_REVIEW,
+      mod,
+      runDir,
+    });
+  } catch (e) {
+    // A crashed run must still leave a summary — otherwise the artifacts directory
+    // is indistinguishable from a run that is still going.
+    fs.writeFileSync(
+      path.join(runDir, "summary.json"),
+      JSON.stringify({ success: false, stopReason: "crash", error: String(e) }, null, 2),
+    );
+    throw e;
+  }
 
   banner("SUMMARY");
-  log(`結果：${result.success ? "[OK] 全部關卡通過" : "[FAIL] 未通過"}（迭代 ${result.iterations} 輪）`);
+  log(
+    `結果：${result.success ? "[OK] 全部關卡通過" : "[FAIL] 未通過"}` +
+      `（迭代 ${result.iterations} 輪，stop=${result.stopReason}）`,
+  );
   console.log(result.coverageReport);
+  if (result.totalOutputTokens !== undefined) {
+    log(`writer output tokens 合計：${result.totalOutputTokens}`);
+  }
   if (result.finalVerdict) {
     const v = result.finalVerdict;
     console.log(`review scores：${JSON.stringify(v.scores)}`);
@@ -123,10 +177,7 @@ async function main() {
   if (!result.success && result.finalFeedback) {
     console.log(`最後失敗報告：\n${result.finalFeedback}`);
   }
-  fs.writeFileSync(
-    path.join(runDir, "summary.json"),
-    JSON.stringify(result, (k, v) => (k === "raw" ? undefined : v), 2),
-  );
+  fs.writeFileSync(path.join(runDir, "summary.json"), JSON.stringify(result, stripRaw, 2));
   log(`artifacts 已寫入：${runDir}`);
   process.exit(result.success ? 0 : 2);
 }

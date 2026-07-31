@@ -7,10 +7,19 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { findModuleInfo, listJavaClasses, expectedTestPath, skillDirCandidates, runsDirFor } from "../libs/utils";
-import { resolveAgentPath, contractViolations, WRITER_RULES } from "../libs/guard";
-import { parseJacocoReport } from "../gates/coverage";
+import {
+  findModuleInfo,
+  listJavaClasses,
+  expectedTestPath,
+  skillDirCandidates,
+  runsDirFor,
+  snapshotTree,
+  diffSnapshots,
+} from "../libs/utils";
+import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
+import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
+import { buildFixPrompt } from "../prompts";
 import { countTestsRun } from "../gates/build";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
@@ -293,7 +302,8 @@ console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / 
   const globalDir = path.join(tmp, "global-opencode");
   fs.mkdirSync(path.join(repo, ".opencode", "agent"), { recursive: true });
   fs.mkdirSync(path.join(globalDir, "agent"), { recursive: true });
-  const writerFm = "---\ntools:\n  write: true\n  edit: true\n  bash: false\n---\nbody";
+  const writerFm =
+    "---\ntools:\n  write: true\n  edit: true\n  bash: false\n  webfetch: false\n---\nbody";
   fs.writeFileSync(path.join(repo, ".opencode", "agent", "ut-writer.md"), writerFm);
   fs.writeFileSync(path.join(globalDir, "agent", "ut-writer.md"), writerFm);
   fs.writeFileSync(
@@ -312,7 +322,10 @@ console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / 
     contractViolations(path.join(globalDir, "agent", "ut-writer.md"), WRITER_RULES).length === 0,
   );
   const badWriter = path.join(tmp, "bad-writer.md");
-  fs.writeFileSync(badWriter, "---\ntools:\n  write: true\n  edit: true\n  bash: true\n---\n");
+  fs.writeFileSync(
+    badWriter,
+    "---\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n---\n",
+  );
   const errs = contractViolations(badWriter, WRITER_RULES);
   check("writer 拿到 bash → 違規", errs.length === 1 && errs[0].includes("bash"));
 
@@ -362,8 +375,8 @@ console.log("\n[8] runReviewGate（reviewer 0 tool call → fail-closed）");
     '{"scores":{"effectiveness":9,"coverage":8,"independence":9,"readability":8,' +
     '"fast_reliable":9,"mock_appropriateness":8},"blockers":[],"advisories":[]}';
   const fake = (toolCallCount?: number): AgentRunner => ({
-    runWriter: async () => "",
-    runReview: async () => ({ text: goodVerdict, toolCallCount }),
+    runWriter: async () => ({ text: "", status: "ok" as const }),
+    runReview: async () => ({ text: goodVerdict, status: "ok" as const, toolCallCount }),
   });
 
   const z = await runReviewGate(fake(0), "p");
@@ -375,6 +388,18 @@ console.log("\n[8] runReviewGate（reviewer 0 tool call → fail-closed）");
   check("有 tool calls → 正常解析並通過", ok.passed === true);
   const unknown = await runReviewGate(fake(undefined), "p");
   check("無法觀測（undefined）→ 不觸發 guard", unknown.passed === true);
+
+  // spawn-error must be diagnosed as an environment problem, not model misbehaviour
+  const broken: AgentRunner = {
+    runWriter: async () => ({ text: "", status: "spawn-error" as const }),
+    runReview: async () => ({ text: "", status: "spawn-error" as const }),
+  };
+  const se = await runReviewGate(broken, "p");
+  check(
+    "spawn-error → REJECT 且訊息指向環境而非模型",
+    se.passed === false && se.blockers[0].includes("環境問題"),
+    se.blockers[0] ?? "",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +569,69 @@ console.log("\n[10] planKill / killTree（逾時終止整棵程序樹）");
       }
     })());
   }
+}
+
+// ---------------------------------------------------------------------------
+// 11. loop hardening: snapshots, coverage ranges, fix-prompt scope, guard parsing
+// ---------------------------------------------------------------------------
+console.log("\n[11] 迴圈強化（writer 變更偵測 / 未覆蓋行 / fix prompt 範圍 / guard 解析）");
+{
+  // snapshot diff: add / modify / delete all show up
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-snap-"));
+  fs.mkdirSync(path.join(tmp, "com"), { recursive: true });
+  fs.writeFileSync(path.join(tmp, "com", "AT.java"), "a");
+  fs.writeFileSync(path.join(tmp, "BT.java"), "b");
+  const s1 = snapshotTree(tmp);
+  fs.writeFileSync(path.join(tmp, "com", "AT.java"), "aa"); // modify
+  fs.writeFileSync(path.join(tmp, "CT.java"), "c"); // add
+  fs.rmSync(path.join(tmp, "BT.java")); // delete
+  const changed = diffSnapshots(s1, snapshotTree(tmp));
+  check(
+    "diffSnapshots：新增/修改/刪除皆被偵測",
+    JSON.stringify(changed) === JSON.stringify(["BT.java", "CT.java", "com/AT.java"]),
+    JSON.stringify(changed),
+  );
+  check("diffSnapshots：無變更 → 空陣列", diffSnapshots(s1, s1).length === 0);
+  check("snapshotTree：不存在的目錄 → 空快照", Object.keys(snapshotTree(path.join(tmp, "nope"))).length === 0);
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  // coverage: missed lines and range compression
+  check("toRanges：連續與單點壓縮", toRanges([1, 2, 3, 7, 9, 10]) === "1-3, 7, 9-10");
+  check("toRanges：空陣列", toRanges([]) === "");
+  const block =
+    '<sourcefile name="Foo.java"><line nr="5" mi="2" ci="0"/><line nr="6" mi="0" ci="3"/>' +
+    '<line nr="7" mi="1" ci="1"/></sourcefile>';
+  check(
+    "missedLines：只取 mi>0 的行",
+    JSON.stringify(missedLines(block)) === JSON.stringify([5, 7]),
+  );
+
+  // fix prompt now carries the target classes (round 2+ scope was previously lost)
+  const fix = buildFixPrompt({
+    gateReport: "r",
+    standards: "s",
+    mod: { moduleRoot: "/x", moduleRel: "", multiModule: false },
+    targetClasses: ["src/main/java/com/x/Foo.java"],
+  });
+  check("buildFixPrompt：包含目標類別清單", fix.includes("com/x/Foo.java"));
+
+  // guard: the tools block is parsed, not regex-matched anywhere in the frontmatter
+  const fm = 'description: 提到 bash: false 不算數\nmode: all\ntools:\n  write: true\n  bash: true\n';
+  const tools = parseToolsBlock(fm);
+  check("parseToolsBlock：讀 tools 區塊的值", tools.bash === "true" && tools.write === "true");
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-guard-"));
+  const deceptive = path.join(tmp2, "agent.md");
+  fs.writeFileSync(
+    deceptive,
+    "---\ndescription: bash: false 只是描述\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n---\nbody",
+  );
+  const errs = contractViolations(deceptive, WRITER_RULES);
+  check(
+    "contractViolations：description 提及不能滿足 guard（實際 bash: true 被抓）",
+    errs.length === 1 && errs[0].includes("tools.bash"),
+    JSON.stringify(errs),
+  );
+  fs.rmSync(tmp2, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

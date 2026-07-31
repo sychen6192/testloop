@@ -59,6 +59,9 @@ export interface FixPromptInput {
   gateReport: string;
   standards: string;
   mod: ModuleInfo;
+  // Without these, from round 2 onward the writer's only clue about scope is whatever
+  // class names survive in a truncated build log.
+  targetClasses: string[];
 }
 
 export function buildFixPrompt(input: FixPromptInput): string {
@@ -68,6 +71,9 @@ export function buildFixPrompt(input: FixPromptInput): string {
 <gate_report>
 ${input.gateReport}
 </gate_report>
+
+本次任務的目標類別（測試範圍以此為準）：
+${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
 請修正 ${root} 中相關的測試檔案，讓上述所有問題被解決。仍然嚴格遵守：
 <standards>
