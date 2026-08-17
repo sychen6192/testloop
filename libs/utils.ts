@@ -64,6 +64,41 @@ export function expectedTestPath(clsRelPath: string): string {
   return renamed;
 }
 
+// Pure: bound a writer-facing report, keeping the head. Reports are written most-actionable
+// first (compile errors, then failing tests, then log noise), so the head is what the writer
+// needs — tail() would keep maven's "-> [Help 1]" footer and drop the error itself.
+// The notice states how much went missing: a silently shortened report reads as a complete one.
+export function clampText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}\n…（報告過長，已截斷 ${s.length - max} 字元；完整輸出見 build.log）`;
+}
+
+// Pure: does `fileName` look like an existing test for `className`?
+// Deliberately narrow — only the canonical name and the qualifiers a previous run or a
+// colleague actually uses (FooTest / FooTests / FooUnitTest / TestFoo). A looser pattern
+// would match FooBarTest, and pointing the writer at another class's test is worse than
+// missing a duplicate.
+export function matchesTestNaming(className: string, fileName: string): boolean {
+  const cls = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^(?:${cls}(?:Unit)?Tests?|Tests?${cls})\\.java$`).test(fileName);
+}
+
+// Existing test files for a target class, repo-relative, canonical <ClassName>Test.java first.
+// The writer is told about these explicitly: left to infer it, it writes a second file
+// (FooUnitTest.java) beside the one that already exists.
+export function findExistingTests(clsRelPath: string, repoRoot: string): string[] {
+  const expected = expectedTestPath(clsRelPath);
+  const dir = path.dirname(expected).replace(/\\/g, "/");
+  const className = path.basename(clsRelPath).replace(/\.java$/, "");
+  const absDir = path.join(repoRoot, dir);
+  if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) return [];
+  return fs
+    .readdirSync(absDir)
+    .filter((f) => matchesTestNaming(className, f))
+    .map((f) => `${dir}/${f}`)
+    .sort((a, b) => (a === expected ? -1 : b === expected ? 1 : a.localeCompare(b)));
+}
+
 // Skill-dir search order: env override -> target repo (.opencode, .claude) -> the tool's own copy.
 export function skillDirCandidates(
   repoRoot: string,

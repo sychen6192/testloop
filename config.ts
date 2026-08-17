@@ -50,12 +50,25 @@ export function numEnv(name: string, def: number, min = 0): number {
 }
 
 export const MAX_ITER = numEnv("UT_MAX_ITER", 5, 1);
+// Upper bound on the failure report fed back to the writer each round. A build log grows with
+// the module, not with the writer's mistake — an unbounded report crowds the model's context
+// out with maven boilerplate and leaves no room to actually fix anything.
+export const MAX_FEEDBACK_CHARS = numEnv("UT_MAX_FEEDBACK_CHARS", 12000, 500);
+// Per-round caps on surefire failure detail: how many failing test classes get quoted, and
+// how much of each. Without these, one broken module produces a report longer than the tests.
+export const MAX_FAILURE_BLOCKS = numEnv("UT_MAX_FAILURE_BLOCKS", 5, 1);
 export const MIN_LINE_COV = numEnv("UT_MIN_LINE_COV", 80);
 export const MIN_BRANCH_COV = numEnv("UT_MIN_BRANCH_COV", 70);
 // 1 = fail the coverage gate when no JaCoCo report is found (default: skip leniently).
 export const STRICT_COV = process.env.UT_STRICT_COV === "1";
 // 1 = let a passing build through even when zero tests actually ran (default: fail-closed).
 export const ALLOW_ZERO_TESTS = process.env.UT_ALLOW_ZERO_TESTS === "1";
+// 1 = skip the baseline pre-check build (saves one full build; the loop then cannot tell
+// a pre-existing red module from one the writer broke).
+export const SKIP_BASELINE = process.env.UT_SKIP_BASELINE === "1";
+// 1 = run the pre-check but proceed on a red baseline instead of aborting. The known-broken
+// files are then carried into every fix prompt as "not yours, do not fix".
+export const ALLOW_DIRTY_BASELINE = process.env.UT_ALLOW_DIRTY_BASELINE === "1";
 // 0 = accept reviewer verdicts produced without a single tool call (default: fail-closed).
 export const REVIEWER_MUST_READ = process.env.UT_REVIEWER_MUST_READ !== "0";
 export const SKIP_REVIEW = process.env.UT_SKIP_REVIEW === "1";

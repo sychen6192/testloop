@@ -7,6 +7,10 @@
 
 ## 結構與命名
 - 測試類別放在 `src/test/java` 相同 package 下，命名 `<ClassName>Test`
+- 測試類別可見性沿用專案既有慣例。JUnit 5 本身不要求 `public`，但若專案有以
+  `@SelectClasses` / `@SuiteClasses` 列舉測試類別的測試套件，跨 package 引用就需要
+  `public class`，否則整個模組編譯失敗。pipeline 會掃描既有測試並在 prompt 中告知結論，
+  依該結論撰寫，不要自行假設
 - 測試方法命名採「方法名_情境_預期結果」，例如
   `calculateFee_whenAmountIsNegative_throwsIllegalArgumentException`
 - 每個測試遵循 AAA（Arrange / Act / Assert）結構，區塊間以空行分隔
@@ -23,6 +27,10 @@
 - 禁止測試之間有順序相依或共享可變靜態狀態
 - 禁止為了讓測試通過而修改 production code
 - 禁止使用 `@Disabled` 略過失敗測試
+- 禁止在測試碼中加入 logging（`@Slf4j`、`log.info(...)`、`System.out.println`）。斷言就是
+  測試的輸出，失敗訊息由 assertion library 提供；logging 只會製造噪音，並讓測試多依賴一套
+  在 test scope 未必配置正確的機制（例如 Lombok 的 annotation processor 未生效時，
+  `@Slf4j` 不會產生 `log` 欄位，整個檔案編譯失敗）
 
 ## 覆蓋率
 - 目標類別 line coverage >= 80%、branch coverage >= 70%（可由環境變數調整）

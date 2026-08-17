@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { ModuleInfo, REVIEW_DIMENSIONS } from "./libs/types";
 import { SCORE_THRESHOLDS } from "./config";
 import { expectedTestPath } from "./libs/utils";
+import { TestConventions } from "./libs/conventions";
 
 // Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
 export const DIMENSION_ONELINERS = `你產出的測試之後會依以下六個維度被審查（評分細則由審查方持有）：
@@ -15,10 +16,81 @@ export const DIMENSION_ONELINERS = `你產出的測試之後會依以下六個�
 - Fast & Reliable：無 sleep、無真實 I/O、結果具決定性
 - Mock Appropriateness：只 mock 外部相依，不過度驗證內部實作`;
 
+// Test files that already exist for a target class. The loop resolves these on disk and
+// names them in the prompt — "若已存在測試檔請補強" alone leaves the writer to discover them,
+// and a writer that misses one creates <Class>UnitTest.java next to <Class>Test.java.
+export interface ExistingTests {
+  cls: string;
+  tests: string[];
+}
+
+// Failures the module already had before the writer touched anything, from the baseline
+// pre-check. Named so the writer can tell them apart from its own damage in the gate report.
+export interface PreExistingFailures {
+  compileErrorFiles: string[];
+  failingTestClasses: string[];
+}
+
+// Measured project conventions -> prompt text. A class-symbol suite is a hard constraint
+// (package-private breaks the build), so it is stated as a requirement; everything else is
+// reported as what the module already does, for the writer to match.
+export function renderConventions(c: TestConventions | undefined): string {
+  if (!c) return "";
+  const parts: string[] = [];
+  if (c.classRefSuites.length) {
+    parts.push(
+      `本模組有以 @SelectClasses / @SuiteClasses 逐一列舉測試類別的測試套件：\n` +
+        c.classRefSuites.map((f) => `- ${f}`).join("\n") +
+        `\n跨 package 引用測試類別需要 public 可見性，因此你產生的測試類別**必須**宣告為 ` +
+        `\`public class\`——package-private 會讓該套件編譯失敗（cannot find symbol）。`,
+    );
+  } else if (c.publicCount + c.packagePrivateCount > 0) {
+    const dominant = c.publicCount >= c.packagePrivateCount ? "public" : "package-private";
+    parts.push(
+      `本模組既有測試類別的可見性慣例為 **${dominant}**` +
+        `（public ${c.publicCount} 個、package-private ${c.packagePrivateCount} 個），請沿用。`,
+    );
+  }
+  if (parts.length === 0) return "";
+  return `專案既有慣例（由 pipeline 掃描既有測試得出，非推測）：
+${parts.join("\n")}
+`;
+}
+
+export function renderExistingTests(existing: ExistingTests[]): string {
+  const withTests = existing.filter((e) => e.tests.length > 0);
+  if (withTests.length === 0) return "";
+  const rows = withTests
+    .map((e) => `- ${e.cls}\n  已存在：${e.tests.join("、")}`)
+    .join("\n");
+  return `以下目標類別「已經有」測試檔，必須直接開啟並修改/補強這些既有檔案：
+${rows}
+嚴禁另建新檔（例如 <ClassName>UnitTest.java）來繞過既有測試——那會產生重複測試。
+`;
+}
+
+export function renderPreExisting(pre: PreExistingFailures | undefined): string {
+  if (!pre) return "";
+  const { compileErrorFiles, failingTestClasses } = pre;
+  if (compileErrorFiles.length === 0 && failingTestClasses.length === 0) return "";
+  const rows: string[] = [];
+  if (compileErrorFiles.length) rows.push(`編譯失敗的檔案：\n${compileErrorFiles.map((f) => `- ${f}`).join("\n")}`);
+  if (failingTestClasses.length) rows.push(`測試失敗的類別：\n${failingTestClasses.map((c) => `- ${c}`).join("\n")}`);
+  return `注意：以下失敗在本工具介入之前就已經存在，**不是你造成的**：
+<pre_existing_failures>
+${rows.join("\n")}
+</pre_existing_failures>
+上面失敗報告中屬於這些檔案的錯誤請一律忽略，**不要嘗試修復它們**——那不在本次任務範圍內，
+修它們只會浪費本輪機會。你只需要處理目標類別的測試本身的問題。
+`;
+}
+
 export interface GeneratePromptInput {
   targetClasses: string[];
   standards: string;
   mod: ModuleInfo;
+  existingTests: ExistingTests[];
+  conventions?: TestConventions;
 }
 
 export function testRootRel(mod: ModuleInfo): string {
@@ -39,6 +111,7 @@ export function buildGeneratePrompt(input: GeneratePromptInput): string {
 目標類別：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
+${renderExistingTests(input.existingTests)}${renderConventions(input.conventions)}
 必須嚴格遵守以下品質標準：
 <standards>
 ${input.standards}
@@ -62,6 +135,8 @@ export interface FixPromptInput {
   // Without these, from round 2 onward the writer's only clue about scope is whatever
   // class names survive in a truncated build log.
   targetClasses: string[];
+  preExisting?: PreExistingFailures;
+  conventions?: TestConventions;
 }
 
 export function buildFixPrompt(input: FixPromptInput): string {
@@ -72,6 +147,7 @@ export function buildFixPrompt(input: FixPromptInput): string {
 ${input.gateReport}
 </gate_report>
 
+${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}
 本次任務的目標類別（測試範圍以此為準）：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 

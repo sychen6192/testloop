@@ -15,12 +15,27 @@ import {
   runsDirFor,
   snapshotTree,
   diffSnapshots,
+  matchesTestNaming,
+  findExistingTests,
+  clampText,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
-import { buildFixPrompt } from "../prompts";
-import { countTestsRun } from "../gates/build";
+import {
+  buildFixPrompt,
+  buildGeneratePrompt,
+  renderExistingTests,
+  renderPreExisting,
+  renderConventions,
+} from "../prompts";
+import {
+  countTestsRun,
+  extractCompileErrorFiles,
+  summarizeBuildErrors,
+  surefireHasFailure,
+} from "../gates/build";
+import { classVisibility, isClassRefSuite, scanTestConventions } from "../libs/conventions";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
@@ -632,6 +647,356 @@ console.log("\n[11] 迴圈強化（writer 變更偵測 / 未覆蓋行 / fix prom
     JSON.stringify(errs),
   );
   fs.rmSync(tmp2, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 12. Scope containment: baseline pre-check + existing-test detection
+//     (build gate covers the whole module, so the writer must be told what is not its work)
+// ---------------------------------------------------------------------------
+console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍限縮");
+{
+  // (a) maven and javac error shapes, deduped, first-seen order
+  const mavenOut =
+    "[INFO] Compiling 42 source files\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/CacheServiceImplTest.java:[7,26] cannot find symbol\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/CacheServiceImplTest.java:[9,3] cannot find symbol\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/SamlServiceImplTest.java:[3,1] package does not exist\n" +
+    "[ERROR] Failed to execute goal ... on project modA\n";
+  const mavenFiles = extractCompileErrorFiles(mavenOut);
+  check(
+    "extractCompileErrorFiles：maven 格式，同檔多錯只列一次",
+    mavenFiles.length === 2 &&
+      mavenFiles[0].endsWith("CacheServiceImplTest.java") &&
+      mavenFiles[1].endsWith("SamlServiceImplTest.java"),
+    JSON.stringify(mavenFiles),
+  );
+  const javacFiles = extractCompileErrorFiles(
+    "/w/repo/src/test/java/com/x/ConfigUtilTest.java:12: error: cannot find symbol\n",
+  );
+  check(
+    "extractCompileErrorFiles：javac/gradle 格式也認得",
+    javacFiles.length === 1 && javacFiles[0].endsWith("ConfigUtilTest.java"),
+    JSON.stringify(javacFiles),
+  );
+  check(
+    "extractCompileErrorFiles：乾淨輸出 → 空陣列",
+    extractCompileErrorFiles("[INFO] BUILD SUCCESS").length === 0,
+  );
+
+  // (b) existing-test detection: the duplicate-file bug is <Class>UnitTest.java beside <Class>Test.java
+  check("matchesTestNaming：正規名稱", matchesTestNaming("CommonServiceImpl", "CommonServiceImplTest.java"));
+  check("matchesTestNaming：UnitTest 變體", matchesTestNaming("CommonServiceImpl", "CommonServiceImplUnitTest.java"));
+  check("matchesTestNaming：複數 Tests", matchesTestNaming("Foo", "FooTests.java"));
+  check("matchesTestNaming：Test 前綴", matchesTestNaming("Foo", "TestFoo.java"));
+  check(
+    "matchesTestNaming：不誤判另一個類別的測試（FooBarTest 不屬於 Foo）",
+    !matchesTestNaming("Foo", "FooBarTest.java"),
+  );
+  check("matchesTestNaming：production 檔不算", !matchesTestNaming("Foo", "Foo.java"));
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-existing-"));
+  const testPkg = path.join(tmp, "modA", "src", "test", "java", "com", "x");
+  fs.mkdirSync(testPkg, { recursive: true });
+  fs.writeFileSync(path.join(testPkg, "CommonServiceImplUnitTest.java"), "");
+  fs.writeFileSync(path.join(testPkg, "CommonServiceImplTest.java"), "");
+  fs.writeFileSync(path.join(testPkg, "OtherTest.java"), "");
+  const found = findExistingTests("modA/src/main/java/com/x/CommonServiceImpl.java", tmp);
+  check(
+    "findExistingTests：抓到重複檔，且正規檔名排最前",
+    found.length === 2 &&
+      found[0] === "modA/src/test/java/com/x/CommonServiceImplTest.java" &&
+      found[1] === "modA/src/test/java/com/x/CommonServiceImplUnitTest.java",
+    JSON.stringify(found),
+  );
+  check(
+    "findExistingTests：測試目錄不存在 → 空陣列",
+    findExistingTests("modA/src/main/java/com/nope/Absent.java", tmp).length === 0,
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  // (c) both facts must actually reach the prompts
+  const mod = { moduleRoot: "/x", moduleRel: "modA", multiModule: true };
+  const gen = buildGeneratePrompt({
+    targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    standards: "s",
+    mod,
+    existingTests: [
+      { cls: "modA/src/main/java/com/x/Foo.java", tests: ["modA/src/test/java/com/x/FooTest.java"] },
+    ],
+  });
+  check(
+    "buildGeneratePrompt：既有測試檔被點名且禁止另建新檔",
+    gen.includes("modA/src/test/java/com/x/FooTest.java") && gen.includes("嚴禁另建新檔"),
+  );
+  check(
+    "buildGeneratePrompt：沒有既有測試時不塞空區塊",
+    !buildGeneratePrompt({
+      targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+      standards: "s",
+      mod,
+      existingTests: [{ cls: "modA/src/main/java/com/x/Foo.java", tests: [] }],
+    }).includes("嚴禁另建新檔"),
+  );
+  check("renderExistingTests：全空 → 空字串", renderExistingTests([]) === "");
+
+  const fixWithPre = buildFixPrompt({
+    gateReport: "r",
+    standards: "s",
+    mod,
+    targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    preExisting: {
+      compileErrorFiles: ["modA/src/test/java/com/x/CacheServiceImplTest.java"],
+      failingTestClasses: ["com.x.SamlServiceImplTest"],
+    },
+  });
+  check(
+    "buildFixPrompt：既有紅燈標記為 pre-existing 並要求不要修",
+    fixWithPre.includes("CacheServiceImplTest.java") &&
+      fixWithPre.includes("com.x.SamlServiceImplTest") &&
+      fixWithPre.includes("不要嘗試修復"),
+  );
+  check(
+    "buildFixPrompt：無 preExisting 時不出現該區塊",
+    !buildFixPrompt({
+      gateReport: "r",
+      standards: "s",
+      mod,
+      targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    }).includes("pre_existing_failures"),
+  );
+  check(
+    "renderPreExisting：兩份清單都空 → 空字串",
+    renderPreExisting({ compileErrorFiles: [], failingTestClasses: [] }) === "",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Feedback budget: extract the errors, drop maven's footer, bound the whole report
+// ---------------------------------------------------------------------------
+console.log("\n[13] summarizeBuildErrors / clampText（回饋預算）");
+{
+  const mavenFail =
+    "[INFO] Compiling 42 source files\n" +
+    "[INFO] -------------------------------------------------------------\n" +
+    "[ERROR] COMPILATION ERROR : \n" +
+    "[ERROR] /w/modA/src/test/java/com/x/CacheServiceImplTest.java:[4,27] cannot find symbol\n" +
+    "  symbol:   variable log\n" +
+    "  location: class com.x.CacheServiceImplTest\n" +
+    "[INFO] BUILD FAILURE\n" +
+    "[INFO] Total time:  6.940 s\n" +
+    "[ERROR] Failed to execute goal org.apache.maven.plugins:compiler on project modA -> [Help 1]\n" +
+    "[ERROR] \n" +
+    "[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.\n" +
+    "[ERROR] Re-run Maven using the -X switch to enable full debug logging.\n" +
+    "[ERROR] \n" +
+    "[ERROR] For more information about the errors and possible solutions, please read:\n" +
+    "[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException\n" +
+    "[ERROR] After correcting the problems, you can resume the build with the command\n" +
+    "[ERROR]   mvn <args> -rf :modA\n";
+  const summary = summarizeBuildErrors(mavenFail);
+  check(
+    "summarizeBuildErrors：保留編譯錯誤本身",
+    summary.includes("CacheServiceImplTest.java:[4,27] cannot find symbol"),
+    summary,
+  );
+  check(
+    "summarizeBuildErrors：保留 javac 的無前綴接續行（symbol/location）",
+    summary.includes("symbol:   variable log") && summary.includes("location: class com.x"),
+  );
+  check(
+    "summarizeBuildErrors：丟掉 maven 樣板（Help/stack trace/Re-run/resume）",
+    !/Help 1|full stack trace|Re-run Maven|For more information|After correcting|-rf :modA/.test(
+      summary,
+    ),
+    summary,
+  );
+  check(
+    "summarizeBuildErrors：丟掉 INFO 噪音，且不留空的 [ERROR] 行",
+    !summary.includes("[INFO]") && !/^\[ERROR\]\s*$/m.test(summary),
+  );
+  // the regression this replaces: tail() keeps the footer and drops the error
+  check(
+    "regression：舊的 tail 取法會留下樣板、丟掉錯誤本身",
+    mavenFail.slice(-260).includes("mvn <args>") &&
+      !mavenFail.slice(-260).includes("cannot find symbol"),
+  );
+  check(
+    "summarizeBuildErrors：完全沒有 [ERROR] 行時退回 tail（不能回空字串）",
+    summarizeBuildErrors("[INFO] weird failure with no error lines").length > 0,
+  );
+  check(
+    "summarizeBuildErrors：超過上限時截斷並標明",
+    summarizeBuildErrors(
+      Array.from({ length: 400 }, (_, i) => `[ERROR] line ${i} of noise`).join("\n"),
+      500,
+    ).includes("已截斷"),
+  );
+
+  // surefire 報告：通過的報告本身就含「Failures」「Errors」字樣，子字串比對會把每一份都當失敗
+  const passing =
+    "Test set: com.x.FooTest\n" +
+    "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in com.x.FooTest";
+  check(
+    "regression：通過的 surefire 報告不算失敗（舊的 /FAILURE|ERROR/ 比對會誤判）",
+    !surefireHasFailure(passing) && /ERROR/i.test(passing),
+  );
+  check(
+    "surefireHasFailure：Failures 非零",
+    surefireHasFailure("Tests run: 3, Failures: 1, Errors: 0, Skipped: 0"),
+  );
+  check(
+    "surefireHasFailure：Errors 非零",
+    surefireHasFailure("Tests run: 3, Failures: 0, Errors: 2, Skipped: 0"),
+  );
+  check(
+    "surefireHasFailure：無彙總行時退回逐項標記",
+    surefireHasFailure("com.x.FooTest.bar  Time elapsed: 0.01 s  <<< FAILURE!") &&
+      !surefireHasFailure("完全無關的文字"),
+  );
+
+  check("clampText：未超限原樣返回", clampText("abc", 10) === "abc");
+  const clamped = clampText("x".repeat(100), 20);
+  check(
+    "clampText：超限保留開頭並標明截斷字元數",
+    clamped.startsWith("x".repeat(20)) && clamped.includes("截斷 80 字元"),
+    clamped,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Test-class visibility: measured from the repo, never assumed
+// ---------------------------------------------------------------------------
+console.log("\n[14] classVisibility / isClassRefSuite / scanTestConventions（專案慣例）");
+{
+  check(
+    "classVisibility：public 頂層類別",
+    classVisibility("package com.x;\npublic class FooTest {}") === "public",
+  );
+  check(
+    "classVisibility：package-private 頂層類別",
+    classVisibility("package com.x;\nclass FooTest {}") === "package-private",
+  );
+  check(
+    "classVisibility：final/abstract 修飾詞不影響判定",
+    classVisibility("public final class FooTest {}") === "public" &&
+      classVisibility("abstract class FooTest {}") === "package-private",
+  );
+  check(
+    "classVisibility：內部類別（有縮排）不會蓋掉外層判定",
+    classVisibility("class Outer {\n    public class Inner {}\n}") === "package-private",
+  );
+  check(
+    "classVisibility：註解裡的宣告不算數",
+    classVisibility("// public class Wrong {}\n/* public class AlsoWrong {} */\nclass Right {}") ===
+      "package-private",
+  );
+  check("classVisibility：沒有 class 宣告 → null", classVisibility("package com.x;") === null);
+
+  check(
+    "isClassRefSuite：@SelectClasses 逐一列舉 → 需要 public",
+    isClassRefSuite("@Suite\n@SelectClasses({FooTest.class})\nclass AllTests {}"),
+  );
+  check(
+    "isClassRefSuite：JUnit 4 @SuiteClasses 同樣算",
+    isClassRefSuite("@RunWith(Suite.class)\n@SuiteClasses({FooTest.class})\npublic class S {}"),
+  );
+  check(
+    "isClassRefSuite：@SelectPackages 依 package 名解析，不強制 public",
+    !isClassRefSuite('@Suite\n@SelectPackages("com.x")\nclass AllTests {}'),
+  );
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-conv-"));
+  const pkg = path.join(tmp, "modA", "src", "test", "java", "com", "x");
+  fs.mkdirSync(pkg, { recursive: true });
+  fs.writeFileSync(path.join(pkg, "AlphaTest.java"), "package com.x;\npublic class AlphaTest {}");
+  fs.writeFileSync(path.join(pkg, "BetaTest.java"), "package com.x;\npublic class BetaTest {}");
+  fs.writeFileSync(path.join(pkg, "GammaTest.java"), "package com.x;\nclass GammaTest {}");
+  const testRoot = path.join(tmp, "modA", "src", "test", "java");
+  const noSuite = scanTestConventions(testRoot, tmp);
+  check(
+    "scanTestConventions：統計既有可見性",
+    noSuite.publicCount === 2 && noSuite.packagePrivateCount === 1 && noSuite.scanned === 3,
+    JSON.stringify(noSuite),
+  );
+  check("scanTestConventions：無套件 → classRefSuites 空", noSuite.classRefSuites.length === 0);
+
+  fs.writeFileSync(
+    path.join(pkg, "SonarTestSuite.java"),
+    "package com.x.suite;\nimport com.x.*;\n@Suite\n@SelectClasses({AlphaTest.class})\npublic class SonarTestSuite {}",
+  );
+  const withSuite = scanTestConventions(testRoot, tmp);
+  check(
+    "scanTestConventions：抓到 SonarTestSuite（repo 相對路徑）",
+    withSuite.classRefSuites.length === 1 &&
+      withSuite.classRefSuites[0] === "modA/src/test/java/com/x/SonarTestSuite.java",
+    JSON.stringify(withSuite.classRefSuites),
+  );
+  check(
+    "scanTestConventions：套件本身不列入可見性統計",
+    withSuite.publicCount === 2 && withSuite.packagePrivateCount === 1,
+    JSON.stringify(withSuite),
+  );
+  check(
+    "scanTestConventions：測試目錄不存在 → 零值而非拋錯",
+    scanTestConventions(path.join(tmp, "nope"), tmp).scanned === 0,
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  // the conclusion must actually reach the writer, and say "必須" only when a suite forces it
+  const suiteText = renderConventions({
+    scanned: 3,
+    publicCount: 0,
+    packagePrivateCount: 3,
+    classRefSuites: ["modA/src/test/java/com/x/SonarTestSuite.java"],
+  });
+  check(
+    "renderConventions：有 class-symbol 套件 → 硬性要求 public",
+    suiteText.includes("SonarTestSuite.java") &&
+      suiteText.includes("必須") &&
+      suiteText.includes("public class"),
+    suiteText,
+  );
+  const majorityText = renderConventions({
+    scanned: 12,
+    publicCount: 10,
+    packagePrivateCount: 2,
+    classRefSuites: [],
+  });
+  check(
+    "renderConventions：無套件 → 只回報既有多數慣例，不宣稱必須",
+    majorityText.includes("public") && !majorityText.includes("必須"),
+    majorityText,
+  );
+  check(
+    "renderConventions：package-private 佔多數時如實回報",
+    renderConventions({ scanned: 5, publicCount: 1, packagePrivateCount: 4, classRefSuites: [] })
+      .includes("package-private"),
+  );
+  check(
+    "renderConventions：沒有既有測試 → 空字串（不編造慣例）",
+    renderConventions({ scanned: 0, publicCount: 0, packagePrivateCount: 0, classRefSuites: [] }) ===
+      "" && renderConventions(undefined) === "",
+  );
+
+  const mod = { moduleRoot: "/x", moduleRel: "modA", multiModule: true };
+  const conv = { scanned: 1, publicCount: 0, packagePrivateCount: 1, classRefSuites: ["S.java"] };
+  check(
+    "buildGeneratePrompt / buildFixPrompt：兩段 prompt 都帶到慣例結論",
+    buildGeneratePrompt({
+      targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+      standards: "s",
+      mod,
+      existingTests: [],
+      conventions: conv,
+    }).includes("必須") &&
+      buildFixPrompt({
+        gateReport: "cannot find symbol: class FooTest",
+        standards: "s",
+        mod,
+        targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+        conventions: conv,
+      }).includes("必須"),
+  );
 }
 
 // ---------------------------------------------------------------------------

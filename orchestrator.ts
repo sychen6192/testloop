@@ -10,11 +10,19 @@
 // - identical feedback twice in a row: the loop is stuck, more rounds add cost, not progress.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MAX_ITER } from "./config";
+import { MAX_ITER, MAX_FEEDBACK_CHARS } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
-import { diffSnapshots, snapshotTree, stripRaw } from "./libs/utils";
-import { buildGeneratePrompt, buildFixPrompt, buildReviewPrompt, testRootRel } from "./prompts";
+import { clampText, diffSnapshots, snapshotTree, stripRaw } from "./libs/utils";
+import {
+  buildGeneratePrompt,
+  buildFixPrompt,
+  buildReviewPrompt,
+  testRootRel,
+  ExistingTests,
+  PreExistingFailures,
+} from "./prompts";
+import { TestConventions } from "./libs/conventions";
 import { runBuildAndTests } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate } from "./gates/review";
@@ -28,6 +36,11 @@ export interface OrchestratorConfig {
   skipReview: boolean;
   mod: ModuleInfo;
   runDir: string;
+  // Resolved by loop.ts before round 1: existing tests per target class, and the failures
+  // the module already had. Both exist to keep the writer inside its own scope.
+  existingTests: ExistingTests[];
+  preExisting?: PreExistingFailures;
+  conventions?: TestConventions;
 }
 
 // One row per iteration: which gate the round reached and how it ended.
@@ -92,11 +105,15 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           standards: cfg.standards,
           mod: cfg.mod,
           targetClasses: cfg.targetClasses,
+          preExisting: cfg.preExisting,
+          conventions: cfg.conventions,
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
           standards: cfg.standards,
           mod: cfg.mod,
+          existingTests: cfg.existingTests,
+          conventions: cfg.conventions,
         });
     save("prompt.md", prompt);
 
@@ -151,7 +168,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         writerOutputTokens: writer.outputTokens,
       });
       prevFeedback = feedback;
-      feedback = build.report;
+      // Bounded here as well as at the source: the invariant is "the writer never receives
+      // more than MAX_FEEDBACK_CHARS", and it must hold whichever gate wrote the report.
+      feedback = clampText(build.report, MAX_FEEDBACK_CHARS);
       save("feedback.md", feedback);
       if (prevFeedback !== null && prevFeedback === feedback) {
         return fail(
@@ -178,7 +197,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         writerOutputTokens: writer.outputTokens,
       });
       prevFeedback = feedback;
-      feedback = `測試全數通過，但覆蓋率未達門檻，請補強缺漏情境的測試。\n${cov.report}`;
+      feedback = clampText(
+        `測試全數通過，但覆蓋率未達門檻，請補強缺漏情境的測試。\n${cov.report}`,
+        MAX_FEEDBACK_CHARS,
+      );
       save("feedback.md", feedback);
       if (prevFeedback !== null && prevFeedback === feedback) {
         return fail(
@@ -269,7 +291,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     }
     fb.push("（advisories 為建議級，本輪不需處理。）");
     prevFeedback = feedback;
-    feedback = fb.join("\n");
+    feedback = clampText(fb.join("\n"), MAX_FEEDBACK_CHARS);
     save("feedback.md", feedback);
     if (prevFeedback !== null && prevFeedback === feedback) {
       return fail(
