@@ -9,6 +9,8 @@ import {
   MIN_LINE_COV,
   MIN_BRANCH_COV,
   SKIP_REVIEW,
+  SKIP_BASELINE,
+  ALLOW_DIRTY_BASELINE,
   STANDARDS_PATH,
   SKILL_DIR_CANDIDATES,
   RUNS_DIR,
@@ -25,11 +27,11 @@ import {
 } from "./config";
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
-import { listJavaClasses, findModuleInfo, stripRaw } from "./libs/utils";
+import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw } from "./libs/utils";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
-import { detectBuildTool } from "./gates/build";
+import { detectBuildTool, runBaseline } from "./gates/build";
 import { createRunner } from "./runners/runner";
 import { orchestrate } from "./orchestrator";
 
@@ -69,6 +71,17 @@ async function main() {
   log(`建置工具：${buildTool}`);
   log(`目標類別 ${targetClasses.length} 個：`);
   targetClasses.forEach((c) => log(`  - ${c}`));
+
+  // Existing tests, resolved deterministically rather than left to the writer to discover.
+  const existingTests = targetClasses.map((cls) => ({
+    cls,
+    tests: findExistingTests(cls, REPO_ROOT),
+  }));
+  const withExisting = existingTests.filter((e) => e.tests.length > 0);
+  if (withExisting.length) {
+    log(`既有測試檔（writer 將被要求修改這些檔案，而非另建新檔）：`);
+    withExisting.forEach((e) => log(`  - ${e.cls} → ${e.tests.join("、")}`));
+  }
   log(`品質標準：${STANDARDS_PATH}`);
   log(
     rubric
@@ -121,6 +134,11 @@ async function main() {
         maxIter: MAX_ITER,
         strictCov: STRICT_COV,
         allowZeroTests: ALLOW_ZERO_TESTS,
+        skipBaseline: SKIP_BASELINE,
+        allowDirtyBaseline: ALLOW_DIRTY_BASELINE,
+        existingTests: Object.fromEntries(
+          existingTests.filter((e) => e.tests.length).map((e) => [e.cls, e.tests]),
+        ),
         reviewerMustRead: REVIEWER_MUST_READ,
         skipReview: SKIP_REVIEW,
         agentTimeoutMs: AGENT_TIMEOUT_MS,
@@ -135,6 +153,45 @@ async function main() {
   );
   log(`artifacts：${runDir}`);
 
+  // Baseline pre-check. The build gate runs `mvn -pl <module> -am test`, so every test source
+  // in the module *and its upstream modules* must compile — a test file the tool never touched
+  // can fail the gate on round 1 and keep failing it forever. Establishing the baseline first
+  // makes that legible instead of sending the writer to fix other people's code.
+  let preExisting: { compileErrorFiles: string[]; failingTestClasses: string[] } | undefined;
+  if (SKIP_BASELINE) {
+    log("[WARN] UT_SKIP_BASELINE=1：跳過預檢，既有紅燈將無法與 writer 造成的失敗區分");
+  } else {
+    banner("預檢基準（baseline）");
+    const baseline = await runBaseline(buildTool, mod);
+    fs.writeFileSync(path.join(runDir, "baseline.md"), baseline.summary);
+    fs.writeFileSync(path.join(runDir, "baseline.log"), baseline.raw);
+    console.log(baseline.summary);
+    if (!baseline.clean) {
+      preExisting = {
+        compileErrorFiles: baseline.compileErrorFiles,
+        failingTestClasses: baseline.failingTestClasses,
+      };
+      if (!ALLOW_DIRTY_BASELINE) {
+        fs.writeFileSync(
+          path.join(runDir, "summary.json"),
+          JSON.stringify(
+            { success: false, stopReason: "dirty-baseline", ...preExisting },
+            null,
+            2,
+          ),
+        );
+        die(
+          "模組在本工具介入前就無法通過建置，因此 build gate 無法區分「既有問題」與「writer 產生的問題」，\n" +
+            "writer 會把迭代次數花在修別人的檔案上。請先修好上列檔案，或：\n" +
+            "  UT_ALLOW_DIRTY_BASELINE=1  照樣執行（已知紅燈會標記為 pre-existing 並要求 writer 不要碰）\n" +
+            "  UT_SKIP_BASELINE=1         完全跳過預檢\n" +
+            `詳見 ${path.join(runDir, "baseline.log")}`,
+        );
+      }
+      log("[WARN] UT_ALLOW_DIRTY_BASELINE=1：帶著既有紅燈繼續，已知失敗會標記為 pre-existing");
+    }
+  }
+
   const runner = await createRunner();
   let result;
   try {
@@ -147,6 +204,8 @@ async function main() {
       skipReview: SKIP_REVIEW,
       mod,
       runDir,
+      existingTests,
+      preExisting,
     });
   } catch (e) {
     // A crashed run must still leave a summary — otherwise the artifacts directory

@@ -95,6 +95,8 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
+| `UT_SKIP_BASELINE` | - | 1 = 跳過預檢基準建置（省一次 build，但既有紅燈將無法與 writer 造成的失敗區分） |
+| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 預檢發現既有紅燈時照樣執行。預設中止 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
@@ -127,6 +129,11 @@ testgen <package 路徑>                  # 端對端執行
 先跑 `testgen doctor <目標> --smoke`，多數問題會直接指出修法。常見情形如下。
 
 - **doctor 說 agent 找不到。** 回工具 clone 目錄執行 `npm run setup`。
+- **啟動就中止，說「模組在本工具介入前就無法通過建置」。** 預檢基準抓到既有紅燈。build gate
+  跑的是 `mvn -pl <module> -am test`，整個模組**連同上游模組**的測試原始碼都要編得過，所以一個
+  本工具沒碰過的壞檔就能擋掉每一輪。先修好訊息列出的檔案是最省事的做法。真的要照跑就設
+  `UT_ALLOW_DIRTY_BASELINE=1`——已知紅燈會被標記為 pre-existing 寫進 writer 的修正 prompt，
+  並明確要求它不要去修。完整輸出在 `runs/<repo>/<ts>/baseline.log`。
 - **smoke FAIL，或 writer 沒動靜。** provider 未設定，或 model 欄位為空。見「Provider 與
   模型設定」。
 - **writer 有跑但沒寫檔。** 非互動模式下 permission 被擋。常見根因是 global

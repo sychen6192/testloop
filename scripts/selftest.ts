@@ -15,12 +15,14 @@ import {
   runsDirFor,
   snapshotTree,
   diffSnapshots,
+  matchesTestNaming,
+  findExistingTests,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
-import { buildFixPrompt } from "../prompts";
-import { countTestsRun } from "../gates/build";
+import { buildFixPrompt, buildGeneratePrompt, renderExistingTests, renderPreExisting } from "../prompts";
+import { countTestsRun, extractCompileErrorFiles } from "../gates/build";
 import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
@@ -632,6 +634,127 @@ console.log("\n[11] 迴圈強化（writer 變更偵測 / 未覆蓋行 / fix prom
     JSON.stringify(errs),
   );
   fs.rmSync(tmp2, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 12. Scope containment: baseline pre-check + existing-test detection
+//     (build gate covers the whole module, so the writer must be told what is not its work)
+// ---------------------------------------------------------------------------
+console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍限縮");
+{
+  // (a) maven and javac error shapes, deduped, first-seen order
+  const mavenOut =
+    "[INFO] Compiling 42 source files\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/CacheServiceImplTest.java:[7,26] cannot find symbol\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/CacheServiceImplTest.java:[9,3] cannot find symbol\n" +
+    "[ERROR] /w/repo/modA/src/test/java/com/x/SamlServiceImplTest.java:[3,1] package does not exist\n" +
+    "[ERROR] Failed to execute goal ... on project modA\n";
+  const mavenFiles = extractCompileErrorFiles(mavenOut);
+  check(
+    "extractCompileErrorFiles：maven 格式，同檔多錯只列一次",
+    mavenFiles.length === 2 &&
+      mavenFiles[0].endsWith("CacheServiceImplTest.java") &&
+      mavenFiles[1].endsWith("SamlServiceImplTest.java"),
+    JSON.stringify(mavenFiles),
+  );
+  const javacFiles = extractCompileErrorFiles(
+    "/w/repo/src/test/java/com/x/ConfigUtilTest.java:12: error: cannot find symbol\n",
+  );
+  check(
+    "extractCompileErrorFiles：javac/gradle 格式也認得",
+    javacFiles.length === 1 && javacFiles[0].endsWith("ConfigUtilTest.java"),
+    JSON.stringify(javacFiles),
+  );
+  check(
+    "extractCompileErrorFiles：乾淨輸出 → 空陣列",
+    extractCompileErrorFiles("[INFO] BUILD SUCCESS").length === 0,
+  );
+
+  // (b) existing-test detection: the duplicate-file bug is <Class>UnitTest.java beside <Class>Test.java
+  check("matchesTestNaming：正規名稱", matchesTestNaming("CommonServiceImpl", "CommonServiceImplTest.java"));
+  check("matchesTestNaming：UnitTest 變體", matchesTestNaming("CommonServiceImpl", "CommonServiceImplUnitTest.java"));
+  check("matchesTestNaming：複數 Tests", matchesTestNaming("Foo", "FooTests.java"));
+  check("matchesTestNaming：Test 前綴", matchesTestNaming("Foo", "TestFoo.java"));
+  check(
+    "matchesTestNaming：不誤判另一個類別的測試（FooBarTest 不屬於 Foo）",
+    !matchesTestNaming("Foo", "FooBarTest.java"),
+  );
+  check("matchesTestNaming：production 檔不算", !matchesTestNaming("Foo", "Foo.java"));
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-existing-"));
+  const testPkg = path.join(tmp, "modA", "src", "test", "java", "com", "x");
+  fs.mkdirSync(testPkg, { recursive: true });
+  fs.writeFileSync(path.join(testPkg, "CommonServiceImplUnitTest.java"), "");
+  fs.writeFileSync(path.join(testPkg, "CommonServiceImplTest.java"), "");
+  fs.writeFileSync(path.join(testPkg, "OtherTest.java"), "");
+  const found = findExistingTests("modA/src/main/java/com/x/CommonServiceImpl.java", tmp);
+  check(
+    "findExistingTests：抓到重複檔，且正規檔名排最前",
+    found.length === 2 &&
+      found[0] === "modA/src/test/java/com/x/CommonServiceImplTest.java" &&
+      found[1] === "modA/src/test/java/com/x/CommonServiceImplUnitTest.java",
+    JSON.stringify(found),
+  );
+  check(
+    "findExistingTests：測試目錄不存在 → 空陣列",
+    findExistingTests("modA/src/main/java/com/nope/Absent.java", tmp).length === 0,
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  // (c) both facts must actually reach the prompts
+  const mod = { moduleRoot: "/x", moduleRel: "modA", multiModule: true };
+  const gen = buildGeneratePrompt({
+    targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    standards: "s",
+    mod,
+    existingTests: [
+      { cls: "modA/src/main/java/com/x/Foo.java", tests: ["modA/src/test/java/com/x/FooTest.java"] },
+    ],
+  });
+  check(
+    "buildGeneratePrompt：既有測試檔被點名且禁止另建新檔",
+    gen.includes("modA/src/test/java/com/x/FooTest.java") && gen.includes("嚴禁另建新檔"),
+  );
+  check(
+    "buildGeneratePrompt：沒有既有測試時不塞空區塊",
+    !buildGeneratePrompt({
+      targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+      standards: "s",
+      mod,
+      existingTests: [{ cls: "modA/src/main/java/com/x/Foo.java", tests: [] }],
+    }).includes("嚴禁另建新檔"),
+  );
+  check("renderExistingTests：全空 → 空字串", renderExistingTests([]) === "");
+
+  const fixWithPre = buildFixPrompt({
+    gateReport: "r",
+    standards: "s",
+    mod,
+    targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    preExisting: {
+      compileErrorFiles: ["modA/src/test/java/com/x/CacheServiceImplTest.java"],
+      failingTestClasses: ["com.x.SamlServiceImplTest"],
+    },
+  });
+  check(
+    "buildFixPrompt：既有紅燈標記為 pre-existing 並要求不要修",
+    fixWithPre.includes("CacheServiceImplTest.java") &&
+      fixWithPre.includes("com.x.SamlServiceImplTest") &&
+      fixWithPre.includes("不要嘗試修復"),
+  );
+  check(
+    "buildFixPrompt：無 preExisting 時不出現該區塊",
+    !buildFixPrompt({
+      gateReport: "r",
+      standards: "s",
+      mod,
+      targetClasses: ["modA/src/main/java/com/x/Foo.java"],
+    }).includes("pre_existing_failures"),
+  );
+  check(
+    "renderPreExisting：兩份清單都空 → 空字串",
+    renderPreExisting({ compileErrorFiles: [], failingTestClasses: [] }) === "",
+  );
 }
 
 // ---------------------------------------------------------------------------

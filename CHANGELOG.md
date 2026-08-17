@@ -2,6 +2,30 @@
 
 使用者可見的變更記錄。更新方式：`git pull && npm install && npm run setup`。
 
+## [Unreleased]
+
+依實地使用回報修正兩個範圍問題：build gate 涵蓋整個模組，但 writer 的職責只有目標類別，
+兩者之間的落差先前完全由 prompt 措辭承擔。
+
+### Added
+- **預檢基準（baseline pre-check）**：第一輪之前先跑一次與 build gate 完全相同的指令，
+  取得「writer 介入前」的紅燈基準。build gate 跑的是 `mvn -pl <module> -am test`，整個模組
+  連同上游模組的測試原始碼都要編得過，所以一個本工具沒碰過的壞檔就足以擋掉每一輪；先前
+  writer 會把迭代次數花在修別人的檔案上。預設在紅燈時中止並列出具體檔案，
+  `UT_ALLOW_DIRTY_BASELINE=1` 可帶著已知紅燈續跑——那些檔案會被標記為 pre-existing 寫進
+  修正 prompt，並明確要求 writer 不要碰。`UT_SKIP_BASELINE=1` 可完全跳過（省一次 build）。
+  基準寫入 `runs/<repo>/<ts>/baseline.md` 與 `baseline.log`。
+- **既有測試偵測**：loop 啟動時以確定性方式解析每個目標類別的既有測試檔（正規
+  `<Class>Test.java` 與 `<Class>UnitTest.java` / `Tests` / `Test<Class>` 等變體），把檔名
+  直接寫進 generate prompt 並禁止另建新檔。先前只有一句「若已存在測試檔請補強」，writer
+  沒發現既有檔案就會產生 `<Class>UnitTest.java` 與既有測試重複。清單同時進 params.json。
+
+### Changed
+- `runBuildAndTests` 新增 `allowZeroTests` 選項（預檢專用：模組還沒有測試是本工具的正常
+  起點，不該被零測試 guard 判 FAIL）。
+- selftest 擴充 17 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判防護、
+  兩段 prompt 區塊的實際注入與留空行為）。
+
 ## [1.2.0] - 2026-07-30
 
 依 loop engineering 全面審查（對照 Qodo Cover、Meta TestGen-LLM、SWE-agent、OpenHands 等

@@ -14,7 +14,14 @@ import { MAX_ITER } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
 import { diffSnapshots, snapshotTree, stripRaw } from "./libs/utils";
-import { buildGeneratePrompt, buildFixPrompt, buildReviewPrompt, testRootRel } from "./prompts";
+import {
+  buildGeneratePrompt,
+  buildFixPrompt,
+  buildReviewPrompt,
+  testRootRel,
+  ExistingTests,
+  PreExistingFailures,
+} from "./prompts";
 import { runBuildAndTests } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate } from "./gates/review";
@@ -28,6 +35,10 @@ export interface OrchestratorConfig {
   skipReview: boolean;
   mod: ModuleInfo;
   runDir: string;
+  // Resolved by loop.ts before round 1: existing tests per target class, and the failures
+  // the module already had. Both exist to keep the writer inside its own scope.
+  existingTests: ExistingTests[];
+  preExisting?: PreExistingFailures;
 }
 
 // One row per iteration: which gate the round reached and how it ended.
@@ -92,11 +103,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           standards: cfg.standards,
           mod: cfg.mod,
           targetClasses: cfg.targetClasses,
+          preExisting: cfg.preExisting,
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
           standards: cfg.standards,
           mod: cfg.mod,
+          existingTests: cfg.existingTests,
         });
     save("prompt.md", prompt);
 

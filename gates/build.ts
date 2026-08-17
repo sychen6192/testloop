@@ -5,9 +5,20 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { REPO_ROOT, MAVEN_EXTRA_ARGS, ALLOW_ZERO_TESTS, BUILD_TIMEOUT_MS } from "../config";
-import { tail, die } from "../libs/log";
+import { tail, die, log } from "../libs/log";
 import { shLive } from "../libs/shell";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
+
+// What the module already looked like before the writer touched anything.
+// Without this the build gate cannot tell "the writer broke it" from "it arrived broken",
+// and the fix prompt sends the writer chasing other people's compile errors.
+export interface BaselineResult {
+  clean: boolean;
+  compileErrorFiles: string[];
+  failingTestClasses: string[];
+  summary: string;
+  raw: string;
+}
 
 export function detectBuildTool(moduleRoot: string): BuildTool {
   if (fs.existsSync(path.join(moduleRoot, "pom.xml"))) return "maven";
@@ -49,6 +60,84 @@ function collectGradleFailures(moduleRoot: string): string {
     }
   }
   return failures;
+}
+
+// Pure: the distinct .java files the compiler reported errors in. Two shapes cover both
+// build tools — Maven prefixes and bracket-wraps the position, javac (gradle) does not:
+//   [ERROR] /abs/path/FooTest.java:[12,34] cannot find symbol
+//   /abs/path/FooTest.java:12: error: cannot find symbol
+// Order is first-seen, so the report reads in the order the compiler produced it.
+export function extractCompileErrorFiles(raw: string): string[] {
+  const seen = new Set<string>();
+  const patterns = [/^\[ERROR\]\s+(.+?\.java):\[\d+,\d+\]/gm, /^(.+?\.java):\d+:\s*error:/gm];
+  for (const re of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(raw))) seen.add(m[1].trim().replace(/\\/g, "/"));
+  }
+  return [...seen];
+}
+
+// Test classes whose surefire report records a failure. Reports written before `since` are
+// left over from an earlier run — counting them would blame classes this build never ran.
+function collectFailingTestClasses(moduleRoot: string, since: number): string[] {
+  const dir = path.join(moduleRoot, "target", "surefire-reports");
+  if (!fs.existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".txt"))) {
+    const p = path.join(dir, f);
+    if (fs.statSync(p).mtimeMs < since) continue;
+    if (/FAILURE|ERROR/i.test(fs.readFileSync(p, "utf8"))) out.push(f.replace(/\.txt$/, ""));
+  }
+  return out.sort();
+}
+
+/**
+ * Baseline pre-check: run the *same* command the build gate will run, before the writer
+ * has written anything. A baseline computed with a cheaper command (test-compile, -Dtest=X)
+ * is not a baseline — it would miss exactly the failures that later block the gate.
+ *
+ * Zero tests is not a baseline failure: a module with no tests yet is the normal case for
+ * this tool, so the zero-test guard is suppressed here and left to the real gate.
+ */
+export async function runBaseline(tool: BuildTool, mod: ModuleInfo): Promise<BaselineResult> {
+  const startedAt = Date.now();
+  log("預檢：在 writer 介入前先建置一次，取得既有紅燈基準");
+  const r = await runBuildAndTests(tool, mod, { allowZeroTests: true });
+
+  if (r.passed) {
+    return {
+      clean: true,
+      compileErrorFiles: [],
+      failingTestClasses: [],
+      summary: "預檢基準：乾淨（模組在 writer 介入前即可編譯且測試全過）。",
+      raw: r.raw ?? "",
+    };
+  }
+
+  const raw = r.raw ?? "";
+  const compileErrorFiles = extractCompileErrorFiles(raw);
+  const failingTestClasses =
+    tool === "maven" ? collectFailingTestClasses(mod.moduleRoot, startedAt) : [];
+  const lines = ["預檢基準：模組在 writer 介入前就已經是紅的。"];
+  if (compileErrorFiles.length) {
+    lines.push(`編譯失敗的檔案（${compileErrorFiles.length}）：`);
+    compileErrorFiles.forEach((f) => lines.push(`  - ${f}`));
+  }
+  if (failingTestClasses.length) {
+    lines.push(`測試失敗的類別（${failingTestClasses.length}）：`);
+    failingTestClasses.forEach((c) => lines.push(`  - ${c}`));
+  }
+  if (!compileErrorFiles.length && !failingTestClasses.length) {
+    lines.push("（無法從輸出定位到具體檔案，建置輸出節錄如下）");
+    lines.push(tail(raw, 2000));
+  }
+  return {
+    clean: false,
+    compileErrorFiles,
+    failingTestClasses,
+    summary: lines.join("\n"),
+    raw,
+  };
 }
 
 // Pure: last "Tests run: N" in the maven stream = the Results-block aggregate.
@@ -93,6 +182,7 @@ function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string 
 export async function runBuildAndTests(
   tool: BuildTool,
   mod: ModuleInfo,
+  opts: { allowZeroTests?: boolean } = {},
 ): Promise<GateResult> {
   const isWin = process.platform === "win32";
   let r: { code: number; out: string; timedOut?: boolean };
@@ -134,7 +224,8 @@ export async function runBuildAndTests(
   }
 
   if (r.code === 0) {
-    const zeroReport = ALLOW_ZERO_TESTS ? null : detectZeroTests(tool, mod, r.out);
+    const zeroReport =
+      ALLOW_ZERO_TESTS || opts.allowZeroTests ? null : detectZeroTests(tool, mod, r.out);
     if (zeroReport) return { passed: false, report: zeroReport, raw: r.out };
     return { passed: true, report: "編譯與測試全數通過。", raw: r.out };
   }
