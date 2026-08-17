@@ -30,7 +30,7 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
 
-### 五個必須理解的機制
+### 六個必須理解的機制
 1. **驗證權在 loop，不在 LLM。** writer 永遠拿不到 bash；所有 hard gate 由 `gates/` 執行並解析
    原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
@@ -52,6 +52,14 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    `UT_ALLOW_DIRTY_BASELINE=1` 才帶著已知紅燈續跑並標記為 pre-existing 要求 writer 別碰）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
+   同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
+   class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論。
+   測試類別可見性**沒有**放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
+   但跨 package 的 class-symbol 套件沒有 `public` 就編不過。禁止在 standards 或 prompt 裡
+   寫死任一邊。
+6. **回饋有預算。** 每輪餵回 writer 的失敗報告受 `MAX_FEEDBACK_CHARS` 上限約束（orchestrator
+   統一 clamp，與產生報告的是哪個 gate 無關），且 build 報告是**抽取** `[ERROR]` 行而非
+   `tail` 整份 log——maven 的 Help/stack trace 樣板正好落在尾端，tail 會留下樣板、丟掉錯誤。
 
 ### Review gate 判定（fail-closed）
 通過 = **blockers 空** 且 **六維（0-10 整數）皆達門檻**。維度：effectiveness / coverage /
@@ -96,7 +104,8 @@ runners/…             factory＋兩個 AgentRunner 實作（SDK 隔離邊界�
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印）
-libs/utils.ts         純函式（含 skillDirCandidates / runsDirFor）
+libs/utils.ts         純函式（含 skillDirCandidates / runsDirFor / findExistingTests / clampText）
+libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記

@@ -6,6 +6,7 @@ import {
   REPO_ROOT,
   TARGET_ARG,
   MAX_ITER,
+  MAX_FEEDBACK_CHARS,
   MIN_LINE_COV,
   MIN_BRANCH_COV,
   SKIP_REVIEW,
@@ -28,6 +29,7 @@ import {
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
 import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw } from "./libs/utils";
+import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
@@ -81,6 +83,21 @@ async function main() {
   if (withExisting.length) {
     log(`既有測試檔（writer 將被要求修改這些檔案，而非另建新檔）：`);
     withExisting.forEach((e) => log(`  - ${e.cls} → ${e.tests.join("、")}`));
+  }
+
+  // Measured, not guessed: no blanket rule on test-class visibility is correct (JUnit 5 wants
+  // package-private, a @SelectClasses suite needs public), so the repo decides.
+  const conventions = scanTestConventions(
+    path.join(mod.moduleRoot, "src", "test", "java"),
+    REPO_ROOT,
+  );
+  if (conventions.classRefSuites.length) {
+    log(`測試套件（強制 public 測試類別）：${conventions.classRefSuites.join("、")}`);
+  } else if (conventions.publicCount + conventions.packagePrivateCount > 0) {
+    log(
+      `既有測試可見性慣例：public ${conventions.publicCount} 個、` +
+        `package-private ${conventions.packagePrivateCount} 個（掃描 ${conventions.scanned} 檔）`,
+    );
   }
   log(`品質標準：${STANDARDS_PATH}`);
   log(
@@ -139,6 +156,8 @@ async function main() {
         existingTests: Object.fromEntries(
           existingTests.filter((e) => e.tests.length).map((e) => [e.cls, e.tests]),
         ),
+        conventions,
+        maxFeedbackChars: MAX_FEEDBACK_CHARS,
         reviewerMustRead: REVIEWER_MUST_READ,
         skipReview: SKIP_REVIEW,
         agentTimeoutMs: AGENT_TIMEOUT_MS,
@@ -206,6 +225,7 @@ async function main() {
       runDir,
       existingTests,
       preExisting,
+      conventions,
     });
   } catch (e) {
     // A crashed run must still leave a summary — otherwise the artifacts directory

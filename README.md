@@ -97,6 +97,8 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
 | `UT_SKIP_BASELINE` | - | 1 = 跳過預檢基準建置（省一次 build，但既有紅燈將無法與 writer 造成的失敗區分） |
 | `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 預檢發現既有紅燈時照樣執行。預設中止 |
+| `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
+| `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
@@ -145,6 +147,11 @@ testgen <package 路徑>                  # 端對端執行
   schema 可吃掉 20k 以上 tokens，模型 context 不夠用。在目標 repo 的 project `opencode.json`
   調高該模型 context。Ollama 範例：
   `{"provider":{"ollama":{"models":{"<model>":{"options":{"num_ctx":65536}}}}}}`。
+  另一半在失敗報告：每輪餵回的報告有 `UT_MAX_FEEDBACK_CHARS` 上限（預設 12000 字元），
+  且只保留 `[ERROR]` 行與 javac 的接續行，maven 的 Help/stack trace 樣板不會進 prompt。
+  context 仍然吃緊時可再調小。注意跨輪 context 本來就不累積——每輪都是全新 session，
+  只帶上一輪的報告，所以 summary 的「writer output tokens 合計」是各輪輸出的加總，
+  不是單輪 context 佔用。
 - **覆蓋率永遠略過。** 模組沒綁 JaCoCo。加上 jacoco-maven-plugin，將 prepare-agent 與 report
   綁到 test phase；或設 `UT_MAVEN_ARGS="jacoco:report"`。要強制擋關則設 `UT_STRICT_COV=1`。
 - **review gate 一直 REJECT，訊息含「tool calls = 0」。** reviewer 沒讀任何檔案就輸出判決，

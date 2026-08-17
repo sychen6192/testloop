@@ -20,11 +20,35 @@
   直接寫進 generate prompt 並禁止另建新檔。先前只有一句「若已存在測試檔請補強」，writer
   沒發現既有檔案就會產生 `<Class>UnitTest.java` 與既有測試重複。清單同時進 params.json。
 
+- **專案慣例掃描**：loop 啟動時掃描模組既有測試，得出測試類別可見性慣例，以及是否存在以
+  `@SelectClasses` / `@SuiteClasses` 逐一列舉測試類別的測試套件，結論寫進 writer 的兩段
+  prompt。可見性沒有放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
+  但跨 package 的 class-symbol 套件（常見於 `SonarTestSuite`）沒有 `public` 就會
+  `cannot find symbol` 讓整個模組編不過。所以由 pipeline 量測該 repo 後給結論，而非在
+  standards 裡押一邊。
+- **回饋預算**：每輪餵回 writer 的失敗報告受 `UT_MAX_FEEDBACK_CHARS`（預設 12000）約束，
+  由 orchestrator 統一 clamp，與產生報告的是哪個 gate 無關；surefire 明細另受
+  `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
+
+### Fixed
+- **build 失敗報告改為抽取錯誤，不再 tail 整份 log**。maven 的 `-> [Help 1]`、
+  `To see the full stack trace`、`Re-run Maven` 樣板正好落在輸出尾端，`tail` 會完整保留樣板
+  卻把編譯錯誤本身推出視窗外。現在只保留 `[ERROR]` 行與 javac 的無前綴接續行
+  （`symbol:` / `location:`）。實測一個編譯失敗的模組：4826 → 713 字元，且錯誤在第一行。
+- **通過的測試被當成失敗引用**。surefire 報告的彙總行本身就含「Failures」「Errors」字樣，
+  舊的 `/FAILURE|ERROR/i` 子字串比對會把每一份通過的報告都當失敗塞進回饋。改為讀計數值。
+- **陳舊的 surefire 報告不再進報告**。編譯階段就失敗時本輪根本沒跑測試，先前會引用上一輪
+  遺留的報告，等於告訴 writer 一些這輪沒執行過的測試「失敗了」。改以 mtime 過濾。
+
 ### Changed
+- standards 新增兩條：測試碼禁止 logging（`@Slf4j` / `log.*` / `System.out`——斷言就是測試的
+  輸出，且 Lombok 的 annotation processor 在 test scope 未必生效，`@Slf4j` 產不出 `log`
+  欄位會讓整個檔案編譯失敗）；測試類別可見性依 pipeline 掃描結論撰寫，不自行假設。
 - `runBuildAndTests` 新增 `allowZeroTests` 選項（預檢專用：模組還沒有測試是本工具的正常
   起點，不該被零測試 guard 判 FAIL）。
-- selftest 擴充 17 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判防護、
-  兩段 prompt 區塊的實際注入與留空行為）。
+- selftest 擴充至 127 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
+  防護、錯誤抽取與樣板剔除、surefire 計數判定、可見性與套件偵測、各 prompt 區塊的實際
+  注入與留空行為）。
 
 ## [1.2.0] - 2026-07-30
 

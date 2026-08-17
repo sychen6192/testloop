@@ -64,6 +64,15 @@ export function expectedTestPath(clsRelPath: string): string {
   return renamed;
 }
 
+// Pure: bound a writer-facing report, keeping the head. Reports are written most-actionable
+// first (compile errors, then failing tests, then log noise), so the head is what the writer
+// needs — tail() would keep maven's "-> [Help 1]" footer and drop the error itself.
+// The notice states how much went missing: a silently shortened report reads as a complete one.
+export function clampText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}\n…（報告過長，已截斷 ${s.length - max} 字元；完整輸出見 build.log）`;
+}
+
 // Pure: does `fileName` look like an existing test for `className`?
 // Deliberately narrow — only the canonical name and the qualifiers a previous run or a
 // colleague actually uses (FooTest / FooTests / FooUnitTest / TestFoo). A looser pattern

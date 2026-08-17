@@ -13,6 +13,7 @@ npx tsx <工具 clone>/loop.ts <目標>        （於目標 Java repo 根執行�
         ▼
 loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ 建立
         │  既有測試偵測（findExistingTests）→ 寫進 generate prompt
+        │  專案慣例掃描（scanTestConventions）→ 可見性結論寫進 prompt
         │  預檢基準（runBaseline，與 build gate 同一道指令）→ 紅燈預設中止
         │
 orchestrator.ts  ←-- 唯一 loop controller（確定性）
@@ -49,11 +50,13 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    換 runtime = 換一個 runner 檔（runners/opencode.ts ↔ runners/qwen.ts）。
 7. **可觀測性**：每輪 artifacts 落盤；startup guard 把「文件契約」變成
    「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。
-8. **範圍由 loop 界定**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），
+8. **範圍與慣例用量的，不用猜的**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），
    writer 的職責卻只有目標類別。這個落差必須由確定性步驟填平，不能靠 prompt 措辭：
    預檢基準先量出「介入前就存在的紅燈」，既有測試偵測先量出「已經有哪些測試檔」，
-   兩者都在第一輪之前完成並寫進 prompt。（否則 writer 會拿迭代次數去修別人的
-   編譯錯誤，或在既有測試旁邊再開一個 `<Class>UnitTest.java`。）
+   慣例掃描先量出「既有測試怎麼寫的」，三者都在第一輪之前完成並寫進 prompt。
+   （否則 writer 會拿迭代次數去修別人的編譯錯誤、在既有測試旁邊再開一個
+   `<Class>UnitTest.java`、或用錯可見性讓整個模組編不過。）
+   回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表
 
@@ -93,6 +96,11 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
 - **把 SKILL.md 全文注入 reviewer**：那是批次稽核 workflow（六輸入、concurrency、
   environment probe），對單輪 gate 是錯誤指令；只注入評分細則。
 - **checker 可寫檔**：見權限矩陣。
+- **standards 一律規定測試類別為 `public`**：JUnit 5 不要求，Sonar S5786 反而會標記
+  「JUnit5 test classes should not be public」——寫死任一邊都會在某類專案上出錯。
+  改由 `libs/conventions.ts` 掃描該 repo 後給結論。
+- **`@Slf4j` 失效時退回明確的 `Logger` 宣告**：那是把噪音搬進測試碼。單元測試不需要
+  logging，斷言就是輸出；standards 直接禁止測試碼 logging，問題根除而非繞道。
 - **用 `-Dtest=<GeneratedTest>` 把 build gate 限縮到本次產生的測試**：`-Dtest` 只限制
   surefire「執行」哪些測試，不限制 `test-compile` 編哪些檔——既有壞檔照樣擋死整輪，
   解不了它想解的問題；而且會讓 gate 對「新測試破壞既有測試」完全失明。改採預檢基準：

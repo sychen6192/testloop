@@ -4,8 +4,15 @@
 // Test reports are read from the *module's* target/build, not the repo root.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { REPO_ROOT, MAVEN_EXTRA_ARGS, ALLOW_ZERO_TESTS, BUILD_TIMEOUT_MS } from "../config";
+import {
+  REPO_ROOT,
+  MAVEN_EXTRA_ARGS,
+  ALLOW_ZERO_TESTS,
+  BUILD_TIMEOUT_MS,
+  MAX_FAILURE_BLOCKS,
+} from "../config";
 import { tail, die, log } from "../libs/log";
+import { clampText } from "../libs/utils";
 import { shLive } from "../libs/shell";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
 
@@ -31,14 +38,83 @@ export function detectBuildTool(moduleRoot: string): BuildTool {
   die(`在 ${moduleRoot} 偵測不到 pom.xml 或 build.gradle`);
 }
 
-function collectSurefireFailures(moduleRoot: string): string {
-  let failures = "";
-  const surefireDir = path.join(moduleRoot, "target", "surefire-reports");
-  if (fs.existsSync(surefireDir)) {
-    for (const f of fs.readdirSync(surefireDir).filter((f) => f.endsWith(".txt"))) {
-      const txt = fs.readFileSync(path.join(surefireDir, f), "utf8");
-      if (/FAILURE|ERROR/i.test(txt)) failures += `\n----- ${f} -----\n${tail(txt, 2000)}`;
+// Maven's own footer — it repeats on every failed build and tells the writer nothing about
+// the code. It is also the part tail() would keep, which is why the report is extracted
+// rather than tailed.
+const MAVEN_BOILERPLATE =
+  /-> \[Help \d\]|\[Help \d\] http|To see the full stack trace|Re-run Maven|For more information about the errors|After correcting the problems|^\s*mvn <args>/;
+
+/**
+ * Pure: the actionable part of a failed maven/gradle build.
+ *
+ * Keeps `[ERROR]` lines and the unprefixed continuation lines javac emits under them
+ * ("symbol: variable log", "location: class Foo"), drops the boilerplate footer, and falls
+ * back to a tail when nothing matched — an empty report would tell the writer nothing at all.
+ */
+export function summarizeBuildErrors(raw: string, max = 4000): string {
+  const kept: string[] = [];
+  const lines = raw.split("\n");
+  let inErrorBlock = false;
+  for (const line of lines) {
+    const isError = /^\[ERROR\]/.test(line);
+    // javac continuation: indented, no level prefix, directly under an [ERROR] line.
+    const isContinuation = inErrorBlock && /^\s+\S/.test(line) && !/^\s*\[\w+\]/.test(line);
+    if (!isError && !isContinuation) {
+      inErrorBlock = false;
+      continue;
     }
+    inErrorBlock = true;
+    const text = line.replace(/\s*-> \[Help \d\]\s*$/, "").trimEnd();
+    // Boilerplate is matched against the payload, not the raw line: the patterns are anchored
+    // and every maven line carries an "[ERROR] " prefix in front of them.
+    const payload = text.replace(/^\[ERROR\]\s*/, "");
+    if (!payload.trim()) continue; // bare "[ERROR]" spacer
+    if (MAVEN_BOILERPLATE.test(payload)) continue;
+    kept.push(text);
+  }
+  if (kept.length === 0) return tail(raw, max);
+  return clampText(kept.join("\n"), max);
+}
+
+/**
+ * Pure: does a surefire .txt report record an actual failure?
+ *
+ * Every report — passing ones included — contains the summary line
+ * "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0", so a substring match on /FAILURE|ERROR/
+ * flags all of them. The counts have to be read. Falls back to surefire's per-test marker
+ * when the summary line is missing (a report truncated by a crashed JVM).
+ */
+export function surefireHasFailure(txt: string): boolean {
+  const m = /Failures:\s*(\d+),\s*Errors:\s*(\d+)/i.exec(txt);
+  if (m) return Number(m[1]) > 0 || Number(m[2]) > 0;
+  return /<<<\s*(?:FAILURE|ERROR)!/.test(txt);
+}
+
+// Reports older than `since` are left over from an earlier build. Quoting them tells the
+// writer about tests that this round never ran — the compile step may have failed first.
+function failingReports(surefireDir: string, since: number): string[] {
+  if (!fs.existsSync(surefireDir)) return [];
+  return fs
+    .readdirSync(surefireDir)
+    .filter((f) => f.endsWith(".txt"))
+    .filter((f) => {
+      const p = path.join(surefireDir, f);
+      return fs.statSync(p).mtimeMs >= since && surefireHasFailure(fs.readFileSync(p, "utf8"));
+    })
+    .sort();
+}
+
+function collectSurefireFailures(moduleRoot: string, since: number): string {
+  const surefireDir = path.join(moduleRoot, "target", "surefire-reports");
+  const failing = failingReports(surefireDir, since);
+
+  let failures = "";
+  for (const f of failing.slice(0, MAX_FAILURE_BLOCKS)) {
+    const txt = fs.readFileSync(path.join(surefireDir, f), "utf8");
+    failures += `\n----- ${f} -----\n${tail(txt, 1500)}`;
+  }
+  if (failing.length > MAX_FAILURE_BLOCKS) {
+    failures += `\n（另有 ${failing.length - MAX_FAILURE_BLOCKS} 個失敗的測試類別未列出，見 build.log）`;
   }
   return failures;
 }
@@ -77,18 +153,10 @@ export function extractCompileErrorFiles(raw: string): string[] {
   return [...seen];
 }
 
-// Test classes whose surefire report records a failure. Reports written before `since` are
-// left over from an earlier run — counting them would blame classes this build never ran.
+// Test classes this build ran and failed.
 function collectFailingTestClasses(moduleRoot: string, since: number): string[] {
   const dir = path.join(moduleRoot, "target", "surefire-reports");
-  if (!fs.existsSync(dir)) return [];
-  const out: string[] = [];
-  for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".txt"))) {
-    const p = path.join(dir, f);
-    if (fs.statSync(p).mtimeMs < since) continue;
-    if (/FAILURE|ERROR/i.test(fs.readFileSync(p, "utf8"))) out.push(f.replace(/\.txt$/, ""));
-  }
-  return out.sort();
+  return failingReports(dir, since).map((f) => f.replace(/\.txt$/, ""));
 }
 
 /**
@@ -128,8 +196,8 @@ export async function runBaseline(tool: BuildTool, mod: ModuleInfo): Promise<Bas
     failingTestClasses.forEach((c) => lines.push(`  - ${c}`));
   }
   if (!compileErrorFiles.length && !failingTestClasses.length) {
-    lines.push("（無法從輸出定位到具體檔案，建置輸出節錄如下）");
-    lines.push(tail(raw, 2000));
+    lines.push("（無法從輸出定位到具體檔案，錯誤節錄如下）");
+    lines.push(summarizeBuildErrors(raw, 2000));
   }
   return {
     clean: false,
@@ -185,6 +253,8 @@ export async function runBuildAndTests(
   opts: { allowZeroTests?: boolean } = {},
 ): Promise<GateResult> {
   const isWin = process.platform === "win32";
+  // Taken before the build so stale reports from an earlier round can be told apart.
+  const startedAt = Date.now();
   let r: { code: number; out: string; timedOut?: boolean };
 
   if (tool === "maven") {
@@ -232,12 +302,13 @@ export async function runBuildAndTests(
 
   const failures =
     tool === "maven"
-      ? collectSurefireFailures(mod.moduleRoot)
+      ? collectSurefireFailures(mod.moduleRoot, startedAt)
       : collectGradleFailures(mod.moduleRoot);
 
   return {
     passed: false,
-    report: `編譯或測試失敗（exit=${r.code}）。\n建置輸出（節錄）：\n${tail(r.out)}\n${failures}`,
+    report:
+      `編譯或測試失敗（exit=${r.code}）。\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
     raw: r.out,
   };
 }
