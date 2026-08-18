@@ -31,6 +31,13 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **stuck 偵測對 build 失敗從未生效**。判定條件是「連續兩輪報告完全相同」，但舊報告用
+  `tail` 保留了 `[INFO] Total time: 1.570 s` 與 `Finished at: <timestamp>`，每輪都在變，
+  條件永遠不成立——任何 build 失敗都會硬燒滿 `MAX_ITER`。改為抽取錯誤後 INFO 噪音消失，
+  編譯錯誤的報告已逐字節穩定；測試失敗還差 surefire 的 `Time elapsed: 0.018 s`，因此
+  stuck 改以 `feedbackFingerprint` 正規化後比對（時間與 JVM identity hash），writer 看到的
+  報告仍保留真實數值。正規化刻意收窄——誤判成 stuck 會中止一個其實還在進步的 run，
+  比多燒幾輪更糟。
 - **build 失敗報告改為抽取錯誤，不再 tail 整份 log**。maven 的 `-> [Help 1]`、
   `To see the full stack trace`、`Re-run Maven` 樣板正好落在輸出尾端，`tail` 會完整保留樣板
   卻把編譯錯誤本身推出視窗外。現在只保留 `[ERROR]` 行與 javac 的無前綴接續行
@@ -46,7 +53,7 @@
   欄位會讓整個檔案編譯失敗）；測試類別可見性依 pipeline 掃描結論撰寫，不自行假設。
 - `runBuildAndTests` 新增 `allowZeroTests` 選項（預檢專用：模組還沒有測試是本工具的正常
   起點，不該被零測試 guard 判 FAIL）。
-- selftest 擴充至 127 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
+- selftest 擴充至 133 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
   防護、錯誤抽取與樣板剔除、surefire 計數判定、可見性與套件偵測、各 prompt 區塊的實際
   注入與留空行為）。
 

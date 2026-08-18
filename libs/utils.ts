@@ -73,6 +73,30 @@ export function clampText(s: string, max: number): string {
   return `${s.slice(0, max)}\n…（報告過長，已截斷 ${s.length - max} 字元；完整輸出見 build.log）`;
 }
 
+/**
+ * Pure: reduce a failure report to what actually happened, for the stuck detector.
+ *
+ * "Two rounds produced the same failure" is the signal; the clock is not part of it. A
+ * surefire block re-runs at 0.018s and then 0.015s, and identical failures compare unequal
+ * — so the loop burns every remaining round on a failure it had already diagnosed as fixed.
+ * The report the writer sees keeps its real values; only the comparison is normalized.
+ *
+ * Deliberately narrow. Over-normalizing collapses two *different* failures into one
+ * fingerprint, and a false "stuck" aborts a run that was still making progress — a worse
+ * failure than a few wasted rounds. Only patterns observed to vary between identical runs
+ * belong here.
+ */
+export function feedbackFingerprint(s: string): string {
+  return (
+    s
+      // surefire: "Time elapsed: 0.018 s"
+      .replace(/Time elapsed:\s*[\d.,]+\s*s(ec)?\b/gi, "Time elapsed: <t>")
+      // JVM identity hash codes, e.g. "expected: <com.x.Foo@1b6d3586>" — the class name
+      // stays, so two different objects still produce different fingerprints.
+      .replace(/@[0-9a-f]{6,}\b/g, "@<id>")
+  );
+}
+
 // Pure: does `fileName` look like an existing test for `className`?
 // Deliberately narrow — only the canonical name and the qualifiers a previous run or a
 // colleague actually uses (FooTest / FooTests / FooUnitTest / TestFoo). A looser pattern
