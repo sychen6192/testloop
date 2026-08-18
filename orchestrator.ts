@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { MAX_ITER, MAX_FEEDBACK_CHARS } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
-import { clampText, diffSnapshots, snapshotTree, stripRaw } from "./libs/utils";
+import { clampText, diffSnapshots, feedbackFingerprint, snapshotTree, stripRaw } from "./libs/utils";
 import {
   buildGeneratePrompt,
   buildFixPrompt,
@@ -69,7 +69,9 @@ export interface OrchestratorResult {
 
 export async function orchestrate(cfg: OrchestratorConfig): Promise<OrchestratorResult> {
   let feedback: string | null = null;
-  let prevFeedback: string | null = null;
+  // Previous round's report, normalized — see feedbackFingerprint for why the raw strings
+  // cannot be compared directly. null until a round has failed; a string never equals it.
+  let prevFingerprint: string | null = null;
   let lastVerdict: ReviewVerdict | undefined;
   let lastCov = "（尚未執行覆蓋率檢查）";
   const funnel: IterationRecord[] = [];
@@ -167,18 +169,19 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         changedFiles: changed.length,
         writerOutputTokens: writer.outputTokens,
       });
-      prevFeedback = feedback;
       // Bounded here as well as at the source: the invariant is "the writer never receives
       // more than MAX_FEEDBACK_CHARS", and it must hold whichever gate wrote the report.
       feedback = clampText(build.report, MAX_FEEDBACK_CHARS);
       save("feedback.md", feedback);
-      if (prevFeedback !== null && prevFeedback === feedback) {
+      const fingerprint = feedbackFingerprint(feedback);
+      if (prevFingerprint === fingerprint) {
         return fail(
           "stuck",
           `連續兩輪得到完全相同的失敗報告，判定迴圈卡住，提前結束。\n${feedback}`,
           iter,
         );
       }
+      prevFingerprint = fingerprint;
       log("→ 帶著失敗報告進入下一輪");
       continue;
     }
@@ -196,19 +199,20 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         changedFiles: changed.length,
         writerOutputTokens: writer.outputTokens,
       });
-      prevFeedback = feedback;
       feedback = clampText(
         `測試全數通過，但覆蓋率未達門檻，請補強缺漏情境的測試。\n${cov.report}`,
         MAX_FEEDBACK_CHARS,
       );
       save("feedback.md", feedback);
-      if (prevFeedback !== null && prevFeedback === feedback) {
+      const fingerprint = feedbackFingerprint(feedback);
+      if (prevFingerprint === fingerprint) {
         return fail(
           "stuck",
           `連續兩輪得到完全相同的覆蓋率缺口，判定迴圈卡住，提前結束。\n${cov.report}`,
           iter,
         );
       }
+      prevFingerprint = fingerprint;
       log("→ 帶著覆蓋率缺口進入下一輪");
       continue;
     }
@@ -290,16 +294,17 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       fb.push(`低於門檻的維度：${verdict.belowThreshold.join("、")}。請針對該維度定義補強。`);
     }
     fb.push("（advisories 為建議級，本輪不需處理。）");
-    prevFeedback = feedback;
     feedback = clampText(fb.join("\n"), MAX_FEEDBACK_CHARS);
     save("feedback.md", feedback);
-    if (prevFeedback !== null && prevFeedback === feedback) {
+    const fingerprint = feedbackFingerprint(feedback);
+    if (prevFingerprint === fingerprint) {
       return fail(
         "stuck",
         `連續兩輪得到完全相同的審查意見，判定迴圈卡住，提前結束。\n${feedback}`,
         iter,
       );
     }
+    prevFingerprint = fingerprint;
     log("→ 帶著審查意見進入下一輪");
   }
 

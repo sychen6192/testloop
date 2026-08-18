@@ -18,6 +18,7 @@ import {
   matchesTestNaming,
   findExistingTests,
   clampText,
+  feedbackFingerprint,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
@@ -852,6 +853,41 @@ console.log("\n[13] summarizeBuildErrors / clampText（回饋預算）");
     "surefireHasFailure：無彙總行時退回逐項標記",
     surefireHasFailure("com.x.FooTest.bar  Time elapsed: 0.01 s  <<< FAILURE!") &&
       !surefireHasFailure("完全無關的文字"),
+  );
+
+  // stuck 偵測比對的是「發生了什麼」，不是碼錶。同一個失敗重跑兩次只有耗時會變。
+  const roundA =
+    "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.018 s <<< FAILURE! -- in com.x.FooTest\n" +
+    "[ERROR] com.x.FooTest.bar:12 expected: <1> but was: <2>";
+  const roundB = roundA.replace("0.018", "0.015");
+  check(
+    "regression：同一個測試失敗重跑，耗時不同但 fingerprint 相同 → stuck 會觸發",
+    roundA !== roundB && feedbackFingerprint(roundA) === feedbackFingerprint(roundB),
+  );
+  check(
+    "feedbackFingerprint：JVM identity hash 正規化",
+    feedbackFingerprint("expected: <com.x.Foo@1b6d3586>") ===
+      feedbackFingerprint("expected: <com.x.Foo@4554617c>"),
+  );
+  // 誤判成 stuck 會中止一個其實還在進步的 run，比多燒幾輪更糟——這幾條是防線
+  check(
+    "feedbackFingerprint：不同類別的 identity hash 不會collapse 成同一個",
+    feedbackFingerprint("expected: <com.x.Foo@1b6d3586>") !==
+      feedbackFingerprint("expected: <com.x.Bar@1b6d3586>"),
+  );
+  check(
+    "feedbackFingerprint：不同的斷言值不會被 collapse",
+    feedbackFingerprint("expected: <1> but was: <2>") !==
+      feedbackFingerprint("expected: <1> but was: <3>"),
+  );
+  check(
+    "feedbackFingerprint：不同的失敗行號不會被 collapse",
+    feedbackFingerprint("FooTest.bar:12 failed") !== feedbackFingerprint("FooTest.bar:13 failed"),
+  );
+  check(
+    "feedbackFingerprint：沒有時間戳的報告原樣返回（review blockers 不受影響）",
+    feedbackFingerprint("Blockers：\n1. FooTest.foo 無意義斷言") ===
+      "Blockers：\n1. FooTest.foo 無意義斷言",
   );
 
   check("clampText：未超限原樣返回", clampText("abc", 10) === "abc");
