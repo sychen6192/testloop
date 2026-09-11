@@ -26,6 +26,13 @@
   但跨 package 的 class-symbol 套件（常見於 `SonarTestSuite`）沒有 `public` 就會
   `cannot find symbol` 讓整個模組編不過。所以由 pipeline 量測該 repo 後給結論，而非在
   standards 裡押一邊。
+- **writer 範圍 assert**：orchestrator 每輪在 writer 前後對整個 repo 拍快照（扣除目標模組
+  `src/test/`、`target`/`build`/`node_modules` 與 dot-dirs），production code、`pom.xml`
+  或其他模組有任何新增／修改／刪除即中止（stopReason=scope-violation），清單寫入
+  `iter-N/scope-violations.txt`。先前這條只靠 prompt 的「嚴禁修改 production code」，實測
+  writer 往 production 加一個 method，loop 照樣 gates-passed 零警告——被改過的 production
+  code 會讓後面每個 gate 都在驗證錯的東西。不自動還原：沒有內容快照，而 `git checkout`
+  會連操作者自己未提交的改動一起清掉，所以停下來交人處理。
 - **回饋預算**：每輪餵回 writer 的失敗報告受 `UT_MAX_FEEDBACK_CHARS`（預設 12000）約束，
   由 orchestrator 統一 clamp，與產生報告的是哪個 gate 無關；surefire 明細另受
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。

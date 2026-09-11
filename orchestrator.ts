@@ -8,12 +8,21 @@
 // - runner spawn-error: the agent never ran; retrying cannot help.
 // - writer no-op after a failed round: nothing changed, the same gates would fail identically.
 // - identical feedback twice in a row: the loop is stuck, more rounds add cost, not progress.
+// - writer touched a file outside its test tree: every later gate would judge tests against
+//   production code the writer rewrote, and the loop cannot safely undo it.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MAX_ITER, MAX_FEEDBACK_CHARS } from "./config";
+import { MAX_ITER, MAX_FEEDBACK_CHARS, REPO_ROOT } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
-import { clampText, diffSnapshots, feedbackFingerprint, snapshotTree, stripRaw } from "./libs/utils";
+import {
+  clampText,
+  diffSnapshots,
+  feedbackFingerprint,
+  snapshotTree,
+  stripRaw,
+  writerScopeSkip,
+} from "./libs/utils";
 import {
   buildGeneratePrompt,
   buildFixPrompt,
@@ -58,6 +67,7 @@ export interface OrchestratorResult {
   success: boolean;
   iterations: number;
   // "gates-passed" | "max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
+  // | "scope-violation"
   stopReason: string;
   targetClasses: string[];
   coverageReport: string;
@@ -77,6 +87,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const funnel: IterationRecord[] = [];
   let totalOutputTokens: number | undefined;
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
+  // Everything in the repo outside the module's test source set is read-only for the writer.
+  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot);
+  const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
 
   const fail = (stopReason: string, finalFeedback: string, iter: number): OrchestratorResult => ({
     success: false,
@@ -120,6 +133,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     save("prompt.md", prompt);
 
     const before = snapshotTree(testRoot);
+    const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
@@ -138,8 +152,27 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     }
 
     const changed = diffSnapshots(before, snapshotTree(testRoot));
+    const outOfScope = diffSnapshots(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
+
+    // Scope check comes before any gate: a modified production file would have the build
+    // gate validate the tests against code the writer rewrote to make them pass. The loop
+    // cannot safely undo it — there is no content snapshot, and a git checkout would also
+    // discard the operator's own uncommitted work — so it stops and hands the diff to a human.
+    if (outOfScope.length) {
+      save("scope-violations.txt", outOfScope.join("\n"));
+      record({ gate: "writer", outcome: "scope-violation", changedFiles: changed.length });
+      return fail(
+        "scope-violation",
+        `writer 修改了測試範圍以外的檔案，本次執行中止：\n` +
+          outOfScope.map((f) => `  - ${f}`).join("\n") +
+          `\n這些變更「未被還原」——請以 git diff 檢視並自行還原後重跑。` +
+          `\n（writer 的可寫範圍只有目標模組的 src/test/；production code、建置檔與其他模組一律唯讀。）`,
+        iter,
+      );
+    }
+
     if (changed.length === 0) {
       if (feedback) {
         // A failed gate demanded changes and none arrived — the same gates would fail

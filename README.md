@@ -131,6 +131,12 @@ testgen <package 路徑>                  # 端對端執行
 先跑 `testgen doctor <目標> --smoke`，多數問題會直接指出修法。常見情形如下。
 
 - **doctor 說 agent 找不到。** 回工具 clone 目錄執行 `npm run setup`。
+- **中途中止，說「writer 修改了測試範圍以外的檔案」。** writer 動了 production code、
+  `pom.xml` 或其他模組（常見於它想幫目標類別「順手」加 constructor 好注入 mock）。loop 不會
+  替你還原——沒有內容快照，而 `git checkout` 會連你自己未提交的改動一起清掉——所以停下來
+  交給你：`git diff` 看一眼，還原後重跑。檔案清單在 `runs/<repo>/<ts>/iter-N/scope-violations.txt`。
+  如果 production code 真的需要那個改動才可測（抽 constructor、注入 `Clock`），那是人的工作，
+  先改完再跑。
 - **啟動就中止，說「模組在本工具介入前就無法通過建置」。** 預檢基準抓到既有紅燈。build gate
   跑的是 `mvn -pl <module> -am test`，整個模組**連同上游模組**的測試原始碼都要編得過，所以一個
   本工具沒碰過的壞檔就能擋掉每一輪。先修好訊息列出的檔案是最省事的做法。真的要照跑就設

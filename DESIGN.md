@@ -37,7 +37,10 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
 1. **單一 orchestrator**：迭代控制流 100% 在 TS loop，LLM 永不掌握重試/停止決策。
    （否則 loop 收斂性交給模型心情。）
 2. **驗證權不外包**：writer 無 bash；所有 hard gate 由 script 執行並解析原始輸出。
-   （writer 能自跑測試 = 能自述通過 = gate 被架空。）
+   （writer 能自跑測試 = 能自述通過 = gate 被架空。）同理 writer 的寫入範圍也由 script
+   assert：每輪前後對 repo 拍快照，`src/test` 以外有變動即中止。（writer 能改 production
+   code = 能把測試「改到會過」= build gate 被架空。這條先前只靠 prompt 勸導，實測 writer
+   加一個 method 進 production 後 loop 照樣 gates-passed。）
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；
    agent .md body 只放不變的角色契約。（skill 機制是 description-triggered
    的機率性載入，自動 loop 不能靠機率。）

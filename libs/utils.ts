@@ -145,29 +145,66 @@ export function runsDirFor(testgenRoot: string, repoRoot: string): string {
 // JSON.stringify replacer that drops the bulky `raw` fields from persisted artifacts.
 export const stripRaw = (k: string, v: unknown) => (k === "raw" ? undefined : v);
 
-// ─── Test-tree snapshots ─────────────────────────────────────────────────────
-// The loop verifies after every writer session that the test tree actually changed.
-// Without this, a writer that silently no-ops (context exhausted, permission-blocked)
-// lets the gates judge the repo's PRE-EXISTING tests — and a run can "succeed" having
-// generated nothing. mtime+size per file is enough to detect that.
+// ─── Tree snapshots ──────────────────────────────────────────────────────────
+// The loop snapshots the filesystem around every writer session, for two opposite reasons.
+// The test tree MUST have changed: a writer that silently no-ops (context exhausted,
+// permission-blocked) would otherwise let the gates judge the repo's PRE-EXISTING tests, and
+// a run could "succeed" having generated nothing. Everything else MUST NOT have changed: a
+// writer that edits production code makes every later gate result meaningless — the tests
+// would be validated against code it rewrote to make them pass. mtime+size per file is
+// enough to detect a write either way.
 
 export type TreeSnapshot = Record<string, string>;
 
-export function snapshotTree(root: string): TreeSnapshot {
+export interface SnapshotOptions {
+  // Return true to leave a directory, and everything under it, out of the snapshot.
+  // `rel` is the directory's path relative to the snapshot root, forward slashes.
+  skipDir?: (rel: string, name: string) => boolean;
+}
+
+export function snapshotTree(root: string, opts: SnapshotOptions = {}): TreeSnapshot {
   const snap: TreeSnapshot = {};
   if (!fs.existsSync(root)) return snap;
   const walk = (d: string) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else {
-        const st = fs.statSync(p);
-        snap[path.relative(root, p).replace(/\\/g, "/")] = `${st.mtimeMs}:${st.size}`;
+      const rel = path.relative(root, p).replace(/\\/g, "/");
+      if (e.isDirectory()) {
+        if (!opts.skipDir?.(rel, e.name)) walk(p);
+        continue;
       }
+      let st: fs.Stats;
+      try {
+        st = fs.statSync(p);
+      } catch {
+        continue; // dangling symlink or a file that vanished mid-walk — nothing to compare
+      }
+      snap[rel] = `${st.mtimeMs}:${st.size}`;
     }
   };
   walk(root);
   return snap;
+}
+
+// Never part of the writer-scope check: build output changes under the loop's own builds,
+// dependency caches are huge and irrelevant, and dot-directories hold tooling state
+// (.git, .opencode, .idea) the agent runtime itself may touch.
+const SCOPE_IGNORED_DIRS = new Set(["target", "build", "node_modules"]);
+
+/**
+ * Skip predicate for the writer-scope snapshot: the whole repo is protected except the
+ * target module's test source set. The prompt's contract is "only <module>/src/test/java";
+ * `src/test` as a whole is granted so a test resource file does not fail a run. Production
+ * code, build files, and every other module — their test trees included — stay read-only.
+ * The prompt says "嚴禁修改 production code"; this is what makes it an assert.
+ */
+export function writerScopeSkip(
+  repoRoot: string,
+  moduleRoot: string,
+): (rel: string, name: string) => boolean {
+  const moduleRel = path.relative(repoRoot, moduleRoot).replace(/\\/g, "/");
+  const writable = moduleRel ? `${moduleRel}/src/test` : "src/test";
+  return (rel, name) => name.startsWith(".") || SCOPE_IGNORED_DIRS.has(name) || rel === writable;
 }
 
 // Paths that were added, removed, or modified between two snapshots.

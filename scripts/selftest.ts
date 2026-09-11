@@ -19,6 +19,7 @@ import {
   findExistingTests,
   clampText,
   feedbackFingerprint,
+  writerScopeSkip,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
@@ -1033,6 +1034,107 @@ console.log("\n[14] classVisibility / isClassRefSuite / scanTestConventions（�
         conventions: conv,
       }).includes("必須"),
   );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Writer scope: everything outside <module>/src/test is read-only, and the loop asserts it
+// ---------------------------------------------------------------------------
+console.log("\n[15] snapshotTree(skipDir) / writerScopeSkip（writer 可寫範圍）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-scope-"));
+  const mk = (rel: string, body = "x") => {
+    const p = path.join(tmp, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+  };
+  mk("pom.xml");
+  mk("modA/pom.xml");
+  mk("modA/src/main/java/com/x/Foo.java", "class Foo {}");
+  mk("modA/src/main/resources/application.yml");
+  mk("modA/src/test/java/com/x/FooTest.java");
+  mk("modA/target/classes/Foo.class");
+  mk("modB/src/main/java/com/y/Bar.java");
+  mk("modB/src/test/java/com/y/BarTest.java");
+  mk(".git/HEAD");
+  mk(".opencode/agent/ut-writer.md");
+  mk("node_modules/x/index.js");
+
+  const skip = writerScopeSkip(tmp, path.join(tmp, "modA"));
+  const snap = snapshotTree(tmp, { skipDir: skip });
+  const keys = Object.keys(snap);
+  check(
+    "受保護：pom.xml、src/main、src/main/resources 都在快照裡",
+    "pom.xml" in snap &&
+      "modA/pom.xml" in snap &&
+      "modA/src/main/java/com/x/Foo.java" in snap &&
+      "modA/src/main/resources/application.yml" in snap,
+    JSON.stringify(keys),
+  );
+  check(
+    "可寫：目標模組的 src/test 整棵不在快照裡",
+    !keys.some((k) => k.startsWith("modA/src/test/")),
+    JSON.stringify(keys),
+  );
+  check(
+    "受保護：其他模組的 src/test 仍在快照裡（只有目標模組可寫）",
+    "modB/src/test/java/com/y/BarTest.java" in snap && "modB/src/main/java/com/y/Bar.java" in snap,
+  );
+  check(
+    "排除：target / node_modules / dot-dirs 不進快照",
+    !keys.some((k) => k.startsWith("modA/target/") || k.startsWith("node_modules/") || k.startsWith(".")),
+    JSON.stringify(keys),
+  );
+
+  // the regression itself: a writer that "helpfully" edits production code must be caught,
+  // while its legitimate test writes must not be
+  const before = snapshotTree(tmp, { skipDir: skip });
+  mk("modA/src/main/java/com/x/Foo.java", "class Foo { String tag() { return \"x\"; } }");
+  mk("modA/src/test/java/com/x/FooTest.java", "class FooTest { void t() {} }");
+  mk("modA/src/test/resources/fixture.json", "{}");
+  const diff = diffSnapshots(before, snapshotTree(tmp, { skipDir: skip }));
+  check(
+    "regression：writer 改了 production code → 被抓到，且只列出那個檔",
+    JSON.stringify(diff) === JSON.stringify(["modA/src/main/java/com/x/Foo.java"]),
+    JSON.stringify(diff),
+  );
+  const before2 = snapshotTree(tmp, { skipDir: skip });
+  mk("modA/pom.xml", "<project><dependencies/></project>");
+  check(
+    "writer 改了 pom.xml → 被抓到",
+    diffSnapshots(before2, snapshotTree(tmp, { skipDir: skip })).includes("modA/pom.xml"),
+  );
+
+  // single-module repo: module root == repo root, so the writable tree is plain src/test
+  const single = writerScopeSkip(tmp, tmp);
+  check("單一模組：可寫範圍是 src/test", single("src/test", "test") && !single("src/main", "main"));
+
+  // snapshotTree without options keeps its old behaviour (the test-tree diff relies on it)
+  check(
+    "snapshotTree 無選項：走訪全部（含 target 與 dot-dirs）",
+    "modA/target/classes/Foo.class" in snapshotTree(tmp) && ".git/HEAD" in snapshotTree(tmp),
+  );
+
+  // a dangling symlink used to throw out of the walk; now it is simply not a file to compare
+  let symlinkOk = true;
+  try {
+    fs.symlinkSync(path.join(tmp, "does-not-exist"), path.join(tmp, "modA", "dangling"));
+  } catch {
+    symlinkOk = false; // symlink creation needs privileges on some Windows setups — skip
+  }
+  if (symlinkOk) {
+    check(
+      "snapshotTree：dangling symlink 不會讓走訪炸掉",
+      (() => {
+        try {
+          snapshotTree(tmp, { skipDir: skip });
+          return true;
+        } catch {
+          return false;
+        }
+      })(),
+    );
+  }
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

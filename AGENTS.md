@@ -32,7 +32,12 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 
 ### 六個必須理解的機制
 1. **驗證權在 loop，不在 LLM。** writer 永遠拿不到 bash；所有 hard gate 由 `gates/` 執行並解析
-   原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。
+   原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。同一個原則的另一面：writer 的
+   可寫範圍只有目標模組的 `src/test/`，orchestrator 每輪在 writer 前後對整個 repo（扣除該
+   `src/test`、建置輸出與 dot-dirs）拍快照，production code、`pom.xml` 或其他模組有任何變動
+   即中止（stopReason=scope-violation），變更留在磁碟交人檢視。prompt 裡的「嚴禁修改
+   production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
+   gate 的結果都失去意義。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
    （`opencode` 預設，`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或 spawn agent CLI。
@@ -94,7 +99,7 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 ## 目錄結構
 ```
 loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基準/runs 建立/版本戳記）
-orchestrator.ts       迭代迴圈（零 SDK import）＋ artifacts 落盤
+orchestrator.ts       迭代迴圈（零 SDK import）＋ writer 範圍 assert ＋ artifacts 落盤
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
 gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要＋預檢基準
@@ -131,7 +136,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（11 組，數量以 `npm run selftest` 輸出為準），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（15 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門
