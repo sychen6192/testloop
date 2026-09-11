@@ -96,7 +96,10 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
 | `UT_SKIP_BASELINE` | - | 1 = 跳過預檢基準建置（省一次 build，但既有紅燈將無法與 writer 造成的失敗區分） |
-| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 預檢發現既有紅燈時照樣執行。預設中止 |
+| `UT_REPAIR_BASELINE` | 1 | 0 = 預檢發現既有紅燈時直接中止，不進修復迴圈 |
+| `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
+| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行，紅燈標記為 pre-existing。預設中止 |
+| `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
@@ -137,11 +140,20 @@ testgen <package 路徑>                  # 端對端執行
   交給你：`git diff` 看一眼，還原後重跑。檔案清單在 `runs/<repo>/<ts>/iter-N/scope-violations.txt`。
   如果 production code 真的需要那個改動才可測（抽 constructor、注入 `Clock`），那是人的工作，
   先改完再跑。
-- **啟動就中止，說「模組在本工具介入前就無法通過建置」。** 預檢基準抓到既有紅燈。build gate
+- **啟動先跑了一段「修復既有紅燈」。** 預檢基準抓到模組本來就編不過或測不過。build gate
   跑的是 `mvn -pl <module> -am test`，整個模組**連同上游模組**的測試原始碼都要編得過，所以一個
-  本工具沒碰過的壞檔就能擋掉每一輪。先修好訊息列出的檔案是最省事的做法。真的要照跑就設
-  `UT_ALLOW_DIRTY_BASELINE=1`——已知紅燈會被標記為 pre-existing 寫進 writer 的修正 prompt，
-  並明確要求它不要去修。完整輸出在 `runs/<repo>/<ts>/baseline.log`。
+  本工具沒碰過的壞檔就能擋掉每一輪。預設會先用同一個 writer 修這些檔（範圍 guard 與防掏空
+  guard 全程有效），修到綠才開始產生新測試；修好的檔案會列在 log 與 `repair-summary.md`，
+  **那是 writer 對別人測試的改動，commit 前一定要看 diff**。
+- **中止，說「修復 N 輪後模組仍無法通過建置」。** 修復迴圈放棄了。最常見的根因不在測試檔而在
+  建置設定——例如 `pom.xml` 沒讓 Lombok 的 annotation processor 在 test scope 生效，`@Slf4j`
+  產不出 `log` 欄位——writer 無權改 pom，只能繞。人工修好再跑最省事；`UT_ALLOW_DIRTY_BASELINE=1`
+  可硬跑（紅燈標記為 pre-existing，但 build gate 每輪仍紅）；`UT_REPAIR_BASELINE=0` 關掉修復
+  直接中止。每一輪修復的 prompt / build log 在 `runs/<repo>/<ts>/repair-N/`。
+- **某一輪說「既有測試被刪減」並直接進下一輪。** writer 在既有測試檔裡拿掉了 `@Test` 方法或
+  斷言，或加了 `@Disabled`。對 build gate 來說「修好」和「刪掉」都是綠燈，所以 loop 量數量：
+  少了就判該輪 FAIL、把前後數字餵回去要它補回來。改寫、改名都可以，數量不能少。確定是合理
+  整併就設 `UT_ALLOW_TEST_SHRINK=1`。
 - **smoke FAIL，或 writer 沒動靜。** provider 未設定，或 model 欄位為空。見「Provider 與
   模型設定」。
 - **writer 有跑但沒寫檔。** 非互動模式下 permission 被擋。常見根因是 global

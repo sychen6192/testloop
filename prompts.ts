@@ -6,6 +6,7 @@ import { ModuleInfo, REVIEW_DIMENSIONS } from "./libs/types";
 import { SCORE_THRESHOLDS } from "./config";
 import { expectedTestPath } from "./libs/utils";
 import { TestConventions } from "./libs/conventions";
+import { ShrinkViolation } from "./libs/testmetrics";
 
 // Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
 export const DIMENSION_ONELINERS = `你產出的測試之後會依以下六個維度被審查（評分細則由審查方持有）：
@@ -164,6 +165,63 @@ ${DIMENSION_ONELINERS}
 - 不要執行任何建置或測試指令（由外部 pipeline 負責驗證）
 
 完成後以清單列出你修改的檔案。`;
+}
+
+export interface RepairPromptInput {
+  // Repo-relative test files (compile errors) and FQCNs (failing test classes).
+  brokenFiles: string[];
+  // Classification + error extract from the last build.
+  report: string;
+  standards: string;
+  mod: ModuleInfo;
+  round: number;
+}
+
+// The repair loop's writer prompt. Its definition of "fixed" is the one the guards enforce:
+// the build is green AND nothing was taken away to get there.
+export function buildRepairPrompt(input: RepairPromptInput): string {
+  const root = testRootRel(input.mod);
+  return `本模組在產生任何新測試之前就已經無法通過建置。你的任務是**修復既有測試**，讓模組回到綠燈；
+這一步完成之後 pipeline 才會開始產生新測試。（第 ${input.round} 輪修復）
+
+需要修復的既有測試：
+${input.brokenFiles.map((f) => `- ${f}`).join("\n")}
+
+<build_report>
+${input.report}
+</build_report>
+
+修復的定義：讓測試**正確地通過**，不是讓它消失。以下由 pipeline 以確定性方式檢查，違反即判 FAIL 或中止：
+- 只能修改 ${root} 下的測試檔；不得修改 production code、pom.xml / build.gradle 或其他任何檔案
+- 既有測試檔的 @Test 方法數與斷言數不得減少、不得新增 @Disabled
+- 若根因在 production code 或建置設定（例如 Lombok 的 annotation processor 未在 test scope 生效，
+  導致 @Slf4j 產不出 log 欄位），以測試碼能自足的方式處理（例如移除測試碼中的 logging），
+  並在總結中說明根因，讓人類決定要不要修 production 端
+- 若測試失敗是因為它的預期值已與 production 行為不符，先確認 production 行為是刻意的再更新
+  預期值，並在總結中明確標示每一個被更動的預期值——那是人類 review 時最需要看的地方
+
+仍然嚴格遵守：
+<standards>
+${input.standards}
+</standards>
+
+不要執行任何建置或測試指令（由外部 pipeline 負責驗證）。
+完成後以清單列出你修改的檔案，以及每個檔案的修法與根因。`;
+}
+
+export function renderShrinkFeedback(violations: ShrinkViolation[]): string {
+  const rows = violations.map((v) =>
+    v.after === null
+      ? `- ${v.file}：檔案被刪除（原有 @Test ${v.before.tests}、斷言 ${v.before.assertions}）`
+      : `- ${v.file}：@Test ${v.before.tests} → ${v.after.tests}、斷言 ${v.before.assertions} → ${v.after.assertions}` +
+        (v.after.disabled > v.before.disabled
+          ? `、@Disabled ${v.before.disabled} → ${v.after.disabled}`
+          : ""),
+  );
+  return `writer 刪減了既有測試，本輪判 FAIL——修復或補強是讓測試正確，不是讓它消失：
+${rows.join("\n")}
+請把被移除的測試方法與斷言補回來（內容可以改寫，但數量不得少於原本），並移除新增的 @Disabled。
+若某些既有測試確實應該整併，請保留等量的行為驗證。`;
 }
 
 export interface ReviewPromptInput {

@@ -26,6 +26,18 @@
   但跨 package 的 class-symbol 套件（常見於 `SonarTestSuite`）沒有 `public` 就會
   `cannot find symbol` 讓整個模組編不過。所以由 pipeline 量測該 repo 後給結論，而非在
   standards 裡押一邊。
+- **既有紅燈自動修復**：預檢基準紅燈時不再中止，改進入 `repairBaseline` 修復迴圈——同一個
+  writer、同樣的範圍與防掏空 guard、同一道建置指令，修到綠才開始產生新測試；修不好才中止
+  （stopReason=`repair-failed:<原因>`），`UT_ALLOW_DIRTY_BASELINE=1` 仍可硬跑。修復輪沒有
+  coverage / review gate（它們的範圍是目標類別），要證明的只有「模組綠了、而且沒有東西被
+  拿掉」。每輪 artifacts 在 `repair-N/`，修了哪些檔列在 `repair-summary.md`——那是 writer
+  對別人測試的改動，commit 前該看 diff。`UT_REPAIR_BASELINE=0` 回到直接中止，
+  `UT_REPAIR_MAX_ITER` 控制輪數。
+- **防掏空 guard**：build gate 分不出「修好失敗的測試」和「刪掉失敗的測試」——兩者都是綠燈。
+  loop 現在在第一輪前量下每個既有測試檔的 `@Test` 數、斷言數與 `@Disabled` 數，任一檔案
+  數量減少或 `@Disabled` 增加，該輪即 FAIL 並把前後數字餵回，不進建置；主迴圈與修復迴圈
+  共用。刻意用數量不用方法名——standards 要求「方法_情境_預期」命名，writer 補強既有檔案時
+  本來就會改名重寫。`UT_ALLOW_TEST_SHRINK=1` 只警告。
 - **writer 範圍 assert**：orchestrator 每輪在 writer 前後對整個 repo 拍快照（扣除目標模組
   `src/test/`、`target`/`build`/`node_modules` 與 dot-dirs），production code、`pom.xml`
   或其他模組有任何新增／修改／刪除即中止（stopReason=scope-violation），清單寫入

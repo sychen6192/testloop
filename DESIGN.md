@@ -14,7 +14,8 @@ npx tsx <工具 clone>/loop.ts <目標>        （於目標 Java repo 根執行�
 loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ 建立
         │  既有測試偵測（findExistingTests）→ 寫進 generate prompt
         │  專案慣例掃描（scanTestConventions）→ 可見性結論寫進 prompt
-        │  預檢基準（runBaseline，與 build gate 同一道指令）→ 紅燈預設中止
+        │  預檢基準（runBaseline，與 build gate 同一道指令）
+        │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
         │
 orchestrator.ts  ←-- 唯一 loop controller（確定性）
         │  每輪迭代：
@@ -40,7 +41,10 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    （writer 能自跑測試 = 能自述通過 = gate 被架空。）同理 writer 的寫入範圍也由 script
    assert：每輪前後對 repo 拍快照，`src/test` 以外有變動即中止。（writer 能改 production
    code = 能把測試「改到會過」= build gate 被架空。這條先前只靠 prompt 勸導，實測 writer
-   加一個 method 進 production 後 loop 照樣 gates-passed。）
+   加一個 method 進 production 後 loop 照樣 gates-passed。）同樣由 script 守的還有既有測試
+   的數量：`@Test` 數、斷言數不得減少、`@Disabled` 不得增加，否則該輪 FAIL 餵回。（writer 能
+   刪測試 = 能把失敗「刪到會過」= 同一個洞的另一面。有了這兩道 assert，「修復既有紅燈」才敢
+   交給 writer 做——先前否決的理由是修好與掏空在 build gate 眼裡一模一樣，現在分得出來。）
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；
    agent .md body 只放不變的角色契約。（skill 機制是 description-triggered
    的機率性載入，自動 loop 不能靠機率。）

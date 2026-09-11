@@ -167,9 +167,20 @@ function collectFailingTestClasses(moduleRoot: string, since: number): string[] 
  * Zero tests is not a baseline failure: a module with no tests yet is the normal case for
  * this tool, so the zero-test guard is suppressed here and left to the real gate.
  */
-export async function runBaseline(tool: BuildTool, mod: ModuleInfo): Promise<BaselineResult> {
+export async function runBaseline(
+  tool: BuildTool,
+  mod: ModuleInfo,
+  // The repair loop re-runs this after every fix round: same command, same classification,
+  // different wording in the log and summary.
+  phase: "baseline" | "repair" = "baseline",
+): Promise<BaselineResult> {
   const startedAt = Date.now();
-  log("預檢：在 writer 介入前先建置一次，取得既有紅燈基準");
+  const tag = phase === "repair" ? "修復後建置" : "預檢基準";
+  log(
+    phase === "repair"
+      ? "修復驗證：重新建置，確認既有紅燈是否清除"
+      : "預檢：在 writer 介入前先建置一次，取得既有紅燈基準",
+  );
   const r = await runBuildAndTests(tool, mod, { allowZeroTests: true });
 
   if (r.passed) {
@@ -177,7 +188,7 @@ export async function runBaseline(tool: BuildTool, mod: ModuleInfo): Promise<Bas
       clean: true,
       compileErrorFiles: [],
       failingTestClasses: [],
-      summary: "預檢基準：乾淨（模組在 writer 介入前即可編譯且測試全過）。",
+      summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
     };
   }
@@ -186,7 +197,9 @@ export async function runBaseline(tool: BuildTool, mod: ModuleInfo): Promise<Bas
   const compileErrorFiles = extractCompileErrorFiles(raw);
   const failingTestClasses =
     tool === "maven" ? collectFailingTestClasses(mod.moduleRoot, startedAt) : [];
-  const lines = ["預檢基準：模組在 writer 介入前就已經是紅的。"];
+  const lines = [
+    phase === "repair" ? `${tag}：模組仍然是紅的。` : `${tag}：模組在 writer 介入前就已經是紅的。`,
+  ];
   if (compileErrorFiles.length) {
     lines.push(`編譯失敗的檔案（${compileErrorFiles.length}）：`);
     compileErrorFiles.forEach((f) => lines.push(`  - ${f}`));

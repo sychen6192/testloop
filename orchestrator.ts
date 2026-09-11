@@ -10,9 +10,21 @@
 // - identical feedback twice in a row: the loop is stuck, more rounds add cost, not progress.
 // - writer touched a file outside its test tree: every later gate would judge tests against
 //   production code the writer rewrote, and the loop cannot safely undo it.
+// Round-failing (not aborting) guard:
+// - writer shrank a pre-existing test file: "fixed" and "deleted" look the same to the build
+//   gate; the round fails with the numbers and the writer restores what it removed.
+//
+// repairBaseline() below is the second loop in this file: same writer, same guards, same build
+// command, run before any generation when the module is already red.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MAX_ITER, MAX_FEEDBACK_CHARS, REPO_ROOT } from "./config";
+import {
+  MAX_ITER,
+  MAX_FEEDBACK_CHARS,
+  REPO_ROOT,
+  ALLOW_TEST_SHRINK,
+  REPAIR_MAX_ITER,
+} from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
 import {
@@ -26,13 +38,16 @@ import {
 import {
   buildGeneratePrompt,
   buildFixPrompt,
+  buildRepairPrompt,
   buildReviewPrompt,
+  renderShrinkFeedback,
   testRootRel,
   ExistingTests,
   PreExistingFailures,
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
-import { runBuildAndTests } from "./gates/build";
+import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
+import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate } from "./gates/review";
 
@@ -90,6 +105,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   // Everything in the repo outside the module's test source set is read-only for the writer.
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
+  // What every pre-existing test file had before round 1. The writer may reshape the files it
+  // creates, but may not take anything away from these — see libs/testmetrics.ts.
+  const originalMetrics = collectTestMetrics(testRoot);
 
   const fail = (stopReason: string, finalFeedback: string, iter: number): OrchestratorResult => ({
     success: false,
@@ -109,6 +127,18 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const save = (name: string, content: string) =>
       fs.writeFileSync(path.join(iterDir, name), content);
     const record = (rec: Omit<IterationRecord, "iter">) => funnel.push({ iter, ...rec });
+    // A failed round: bound the report, persist it, and stop if it is the same failure as last
+    // round (see feedbackFingerprint). Returns the abort result, or null to go on.
+    const failRound = (report: string, stuckMsg: string): OrchestratorResult | null => {
+      // Bounded here as well as at the source: the invariant is "the writer never receives
+      // more than MAX_FEEDBACK_CHARS", and it must hold whichever gate wrote the report.
+      feedback = clampText(report, MAX_FEEDBACK_CHARS);
+      save("feedback.md", feedback);
+      const fingerprint = feedbackFingerprint(feedback);
+      if (prevFingerprint === fingerprint) return fail("stuck", `${stuckMsg}\n${feedback}`, iter);
+      prevFingerprint = fingerprint;
+      return null;
+    };
 
     banner(`第 ${iter}/${MAX_ITER} 輪迭代`);
 
@@ -190,6 +220,30 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       log("[WARN] writer 首輪未變更任何測試檔——gate 仍會執行，但本次執行未新增測試");
     }
 
+    // Shrink guard: to the build gate, "fixed the failing test" and "deleted the failing test"
+    // are the same green. The round fails before any build, with the numbers, so the writer
+    // puts back what it removed instead of the loop validating a hollowed-out suite.
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    if (shrunk.length) {
+      const report = renderShrinkFeedback(shrunk);
+      save("test-shrink.txt", report);
+      if (ALLOW_TEST_SHRINK) {
+        log(`[WARN] UT_ALLOW_TEST_SHRINK=1：既有測試被刪減（${shrunk.length} 檔），依設定放行`);
+      } else {
+        log(`[FAIL] 既有測試被刪減（${shrunk.length} 檔）——本輪判 FAIL，不進 build gate`);
+        record({
+          gate: "writer",
+          outcome: "test-shrink",
+          changedFiles: changed.length,
+          writerOutputTokens: writer.outputTokens,
+        });
+        const stop = failRound(report, "連續兩輪刪減相同的既有測試，判定迴圈卡住，提前結束。");
+        if (stop) return stop;
+        log("→ 帶著刪減報告進入下一輪");
+        continue;
+      }
+    }
+
     // Step 2: hard gate — compile & test
     log("Step 2/4：執行編譯與測試 gate");
     // The coverage gate only trusts a report written after this instant.
@@ -204,19 +258,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         changedFiles: changed.length,
         writerOutputTokens: writer.outputTokens,
       });
-      // Bounded here as well as at the source: the invariant is "the writer never receives
-      // more than MAX_FEEDBACK_CHARS", and it must hold whichever gate wrote the report.
-      feedback = clampText(build.report, MAX_FEEDBACK_CHARS);
-      save("feedback.md", feedback);
-      const fingerprint = feedbackFingerprint(feedback);
-      if (prevFingerprint === fingerprint) {
-        return fail(
-          "stuck",
-          `連續兩輪得到完全相同的失敗報告，判定迴圈卡住，提前結束。\n${feedback}`,
-          iter,
-        );
-      }
-      prevFingerprint = fingerprint;
+      const stop = failRound(build.report, "連續兩輪得到完全相同的失敗報告，判定迴圈卡住，提前結束。");
+      if (stop) return stop;
       log("→ 帶著失敗報告進入下一輪");
       continue;
     }
@@ -234,20 +277,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         changedFiles: changed.length,
         writerOutputTokens: writer.outputTokens,
       });
-      feedback = clampText(
+      const stop = failRound(
         `測試全數通過，但覆蓋率未達門檻，請補強缺漏情境的測試。\n${cov.report}`,
-        MAX_FEEDBACK_CHARS,
+        "連續兩輪得到完全相同的覆蓋率缺口，判定迴圈卡住，提前結束。",
       );
-      save("feedback.md", feedback);
-      const fingerprint = feedbackFingerprint(feedback);
-      if (prevFingerprint === fingerprint) {
-        return fail(
-          "stuck",
-          `連續兩輪得到完全相同的覆蓋率缺口，判定迴圈卡住，提前結束。\n${cov.report}`,
-          iter,
-        );
-      }
-      prevFingerprint = fingerprint;
+      if (stop) return stop;
       log("→ 帶著覆蓋率缺口進入下一輪");
       continue;
     }
@@ -329,19 +363,175 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       fb.push(`低於門檻的維度：${verdict.belowThreshold.join("、")}。請針對該維度定義補強。`);
     }
     fb.push("（advisories 為建議級，本輪不需處理。）");
-    feedback = clampText(fb.join("\n"), MAX_FEEDBACK_CHARS);
-    save("feedback.md", feedback);
-    const fingerprint = feedbackFingerprint(feedback);
-    if (prevFingerprint === fingerprint) {
-      return fail(
-        "stuck",
-        `連續兩輪得到完全相同的審查意見，判定迴圈卡住，提前結束。\n${feedback}`,
-        iter,
-      );
-    }
-    prevFingerprint = fingerprint;
+    const stop = failRound(fb.join("\n"), "連續兩輪得到完全相同的審查意見，判定迴圈卡住，提前結束。");
+    if (stop) return stop;
     log("→ 帶著審查意見進入下一輪");
   }
 
   return fail("max-iterations", feedback ?? "達到最大迭代次數", MAX_ITER);
+}
+
+// ─── Baseline repair ─────────────────────────────────────────────────────────
+
+export interface RepairConfig {
+  runner: AgentRunner;
+  buildTool: BuildTool;
+  standards: string;
+  mod: ModuleInfo;
+  runDir: string;
+  baseline: BaselineResult;
+}
+
+export interface RepairResult {
+  success: boolean;
+  rounds: number;
+  // "repaired" | "repair-max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
+  // | "scope-violation"
+  stopReason: string;
+  // Still red when repair gave up; empty on success.
+  remaining: PreExistingFailures;
+  report: string;
+  // Every test file the repair rounds touched — the diff a human should read before committing.
+  changedFiles: string[];
+}
+
+/**
+ * Repair a red baseline before generating anything: the same writer, the same scope and shrink
+ * guards, and the same build command as the gate, looped until the module is green.
+ *
+ * No coverage or review gate here — both are scoped to the target classes. What repair has to
+ * prove is narrower: the module builds, its tests pass, and nothing was gutted to get there.
+ * Success is defined as "runBaseline would now report clean", by construction.
+ */
+export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
+  const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
+  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot);
+  const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
+  const originalMetrics = collectTestMetrics(testRoot);
+  const touched = new Set<string>();
+  let current = cfg.baseline;
+  let prevFingerprint: string | null = null;
+
+  // Classification plus the error lines: the summary says which files, the extract says why.
+  const describe = (b: BaselineResult) =>
+    clampText(`${b.summary}\n錯誤節錄：\n${summarizeBuildErrors(b.raw)}`, MAX_FEEDBACK_CHARS);
+  let report = describe(current);
+
+  const brokenList = (b: BaselineResult) => [
+    ...b.compileErrorFiles.map((f) =>
+      (path.isAbsolute(f) ? path.relative(REPO_ROOT, f) : f).replace(/\\/g, "/"),
+    ),
+    ...b.failingTestClasses,
+  ];
+  const remaining = (b: BaselineResult): PreExistingFailures => ({
+    compileErrorFiles: b.compileErrorFiles,
+    failingTestClasses: b.failingTestClasses,
+  });
+  const giveUp = (stopReason: string, why: string, rounds: number): RepairResult => ({
+    success: false,
+    rounds,
+    stopReason,
+    remaining: remaining(current),
+    report: why,
+    changedFiles: [...touched].sort(),
+  });
+
+  for (let round = 1; round <= REPAIR_MAX_ITER; round++) {
+    const dir = path.join(cfg.runDir, `repair-${round}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const save = (name: string, content: string) =>
+      fs.writeFileSync(path.join(dir, name), content);
+    banner(`修復既有紅燈 第 ${round}/${REPAIR_MAX_ITER} 輪`);
+
+    const prompt = buildRepairPrompt({
+      brokenFiles: brokenList(current),
+      report,
+      standards: cfg.standards,
+      mod: cfg.mod,
+      round,
+    });
+    save("prompt.md", prompt);
+
+    const before = snapshotTree(testRoot);
+    const protectedBefore = snapshotProtected();
+    const writer = await cfg.runner.runWriter(prompt);
+    save("writer-summary.md", writer.text || "（writer 未回傳文字）");
+    log(`[writer 總結] ${tail(writer.text, 1500)}`);
+    if (writer.status === "spawn-error") {
+      return giveUp(
+        "runner-spawn-error",
+        "writer 程序未能啟動（spawn 失敗）。這是環境問題，重試不會改善：請確認 opencode CLI 可用，或以 UT_OPENCODE_BIN 指定路徑。",
+        round,
+      );
+    }
+
+    const changed = diffSnapshots(before, snapshotTree(testRoot));
+    const outOfScope = diffSnapshots(protectedBefore, snapshotProtected());
+    changed.forEach((f) => touched.add(f));
+    save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
+    log(`writer 變更了 ${changed.length} 個測試檔`);
+    if (outOfScope.length) {
+      save("scope-violations.txt", outOfScope.join("\n"));
+      return giveUp(
+        "scope-violation",
+        `修復輪 writer 修改了測試範圍以外的檔案：\n${outOfScope.map((f) => `  - ${f}`).join("\n")}\n` +
+          "這些變更「未被還原」——請以 git diff 檢視並自行還原後重跑。",
+        round,
+      );
+    }
+    if (changed.length === 0) {
+      return giveUp(
+        "writer-no-op",
+        `修復輪 writer 未變更 ${testRootRel(cfg.mod)} 下任何檔案。常見原因：模型 context 耗盡、` +
+          "非互動模式寫檔被 permission 擋下（見 README Troubleshooting）。",
+        round,
+      );
+    }
+
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    if (shrunk.length) {
+      const shrinkReport = renderShrinkFeedback(shrunk);
+      save("test-shrink.txt", shrinkReport);
+      if (!ALLOW_TEST_SHRINK) {
+        log(`[FAIL] 修復輪刪減了既有測試（${shrunk.length} 檔）——本輪判 FAIL，不進建置`);
+        report = clampText(shrinkReport, MAX_FEEDBACK_CHARS);
+        save("feedback.md", report);
+        const fingerprint = feedbackFingerprint(report);
+        if (prevFingerprint === fingerprint) {
+          return giveUp("stuck", `連續兩輪刪減相同的既有測試，判定迴圈卡住。\n${report}`, round);
+        }
+        prevFingerprint = fingerprint;
+        continue;
+      }
+      log(`[WARN] UT_ALLOW_TEST_SHRINK=1：修復輪刪減了既有測試（${shrunk.length} 檔），依設定放行`);
+    }
+
+    current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+    save("build.log", current.raw);
+    save("build-summary.md", current.summary);
+    console.log(current.summary);
+    if (current.clean) {
+      return {
+        success: true,
+        rounds: round,
+        stopReason: "repaired",
+        remaining: { compileErrorFiles: [], failingTestClasses: [] },
+        report: current.summary,
+        changedFiles: [...touched].sort(),
+      };
+    }
+    report = describe(current);
+    save("feedback.md", report);
+    const fingerprint = feedbackFingerprint(report);
+    if (prevFingerprint === fingerprint) {
+      return giveUp("stuck", `連續兩輪修復後得到相同的紅燈，判定迴圈卡住。\n${report}`, round);
+    }
+    prevFingerprint = fingerprint;
+    log("→ 仍有紅燈，帶著報告進入下一輪修復");
+  }
+  return giveUp(
+    "repair-max-iterations",
+    `修復 ${REPAIR_MAX_ITER} 輪後模組仍是紅的。\n${report}`,
+    REPAIR_MAX_ITER,
+  );
 }

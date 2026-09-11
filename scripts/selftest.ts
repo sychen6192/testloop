@@ -27,10 +27,13 @@ import { parseVerdict, runReviewGate } from "../gates/review";
 import {
   buildFixPrompt,
   buildGeneratePrompt,
+  buildRepairPrompt,
   renderExistingTests,
   renderPreExisting,
   renderConventions,
+  renderShrinkFeedback,
 } from "../prompts";
+import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics";
 import {
   countTestsRun,
   extractCompileErrorFiles,
@@ -1151,6 +1154,103 @@ console.log("\n[16] reportIsStale（JaCoCo 報告新鮮度）");
   check("不給 since → 不檢查（相容舊呼叫）", reportIsStale(xml, undefined) === false);
   check("報告檔不存在 → 視為陳舊而非拋錯", reportIsStale(path.join(tmp, "nope.xml"), now) === true);
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 17. Shrink guard + repair prompt: "fixed" must not mean "deleted"
+// ---------------------------------------------------------------------------
+console.log("\n[17] testMetrics / findShrunk / buildRepairPrompt（防掏空）");
+{
+  const src = `package com.x;
+import org.junit.jupiter.api.*;
+class FooTest {
+    // @Test in a line comment must not count
+    /* assertEquals(1, 1); in a block comment */
+    @Test void a() { assertEquals(1, 1); assertThat(x).isEqualTo(2); }
+    @ParameterizedTest @ValueSource(ints = {1}) void b(int i) { verify(mock).run(); }
+    @Test void c() { String s = "assertTrue( inside a string"; fail("boom"); }
+    @Disabled("flaky") @Test void d() { then(mock).should().go(); }
+}`;
+  const m = testMetrics(src);
+  check(
+    "testMetrics：@Test 類註解計 4（含 @ParameterizedTest；註解裡的不算）",
+    m.tests === 4,
+    JSON.stringify(m),
+  );
+  check(
+    "testMetrics：斷言計 5（assert*/verify*/fail/should；註解與字串裡的不算）",
+    m.assertions === 5,
+    JSON.stringify(m),
+  );
+  check("testMetrics：@Disabled 計 1", m.disabled === 1, JSON.stringify(m));
+
+  const foo = { tests: 4, assertions: 5, disabled: 1 };
+  const bar = { tests: 2, assertions: 2, disabled: 0 };
+  const before = { "com/x/FooTest.java": foo, "com/x/BarTest.java": bar };
+  const with_ = (m2: Partial<typeof foo>) => ({ ...before, "com/x/FooTest.java": { ...foo, ...m2 } });
+  check("findShrunk：無變化 → 空", findShrunk(before, before).length === 0);
+  const fewerTests = findShrunk(before, with_({ tests: 3 }));
+  check(
+    "findShrunk：@Test 減少 → 違規並點名",
+    fewerTests.length === 1 && fewerTests[0].file === "com/x/FooTest.java",
+  );
+  check("findShrunk：斷言減少 → 違規", findShrunk(before, with_({ assertions: 4 })).length === 1);
+  check("findShrunk：新增 @Disabled → 違規", findShrunk(before, with_({ disabled: 2 })).length === 1);
+  const del = findShrunk(before, { "com/x/FooTest.java": foo });
+  check(
+    "findShrunk：檔案被刪 → 違規且 after=null",
+    del.length === 1 && del[0].file === "com/x/BarTest.java" && del[0].after === null,
+  );
+  const grown = {
+    ...before,
+    "com/x/FooTest.java": { tests: 6, assertions: 9, disabled: 0 },
+    "com/x/NewTest.java": { tests: 3, assertions: 3, disabled: 0 },
+  };
+  check("findShrunk：增加、或 writer 新建的檔 → 不違規", findShrunk(before, grown).length === 0);
+  check(
+    "findShrunk：writer 自己新建的檔之後縮水也不受約束（不在 before 裡）",
+    findShrunk(before, { ...grown, "com/x/NewTest.java": { tests: 0, assertions: 0, disabled: 0 } })
+      .length === 0,
+  );
+
+  const fb = renderShrinkFeedback([...del, ...fewerTests]);
+  check(
+    "renderShrinkFeedback：點名檔案與前後數字",
+    fb.includes("BarTest.java：檔案被刪除") && fb.includes("@Test 4 → 3"),
+    fb,
+  );
+
+  // collectTestMetrics walks the tree and keys by test-root-relative path
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-metrics-"));
+  fs.mkdirSync(path.join(tmp, "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(tmp, "com", "x", "FooTest.java"), src);
+  fs.writeFileSync(path.join(tmp, "com", "x", "notes.txt"), "@Test not java");
+  const snap = collectTestMetrics(tmp);
+  check(
+    "collectTestMetrics：只收 .java，key 為相對路徑",
+    Object.keys(snap).length === 1 && snap["com/x/FooTest.java"]?.tests === 4,
+    JSON.stringify(snap),
+  );
+  check("collectTestMetrics：不存在的目錄 → 空", Object.keys(collectTestMetrics(path.join(tmp, "nope"))).length === 0);
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  const rp = buildRepairPrompt({
+    brokenFiles: ["modA/src/test/java/com/x/CacheServiceImplTest.java", "com.x.SamlServiceImplTest"],
+    report: "[ERROR] CacheServiceImplTest.java:[4,27] cannot find symbol",
+    standards: "STANDARDS-HERE",
+    mod: { moduleRoot: "/x", moduleRel: "modA", multiModule: true },
+    round: 2,
+  });
+  check(
+    "buildRepairPrompt：列出壞檔、帶錯誤節錄、講明不得刪減與不得碰 production、帶輪次與 standards",
+    rp.includes("CacheServiceImplTest.java") &&
+      rp.includes("com.x.SamlServiceImplTest") &&
+      rp.includes("cannot find symbol") &&
+      rp.includes("不得減少") &&
+      rp.includes("production code") &&
+      rp.includes("第 2 輪") &&
+      rp.includes("STANDARDS-HERE"),
+  );
 }
 
 // ---------------------------------------------------------------------------
