@@ -38,6 +38,13 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **coverage gate 會被上一次的覆蓋率灌水**。JaCoCo agent 預設 `append=true`，exec 資料跨次
+  累加進 `target/jacoco.exec`——開發者自己跑過 `mvn test`、或上一次 testgen 跑過，這一輪的
+  弱測試就繼承那份覆蓋率。fixture 實測：只蓋 6 行中的 2 行，gate 報 100%。build gate 現在
+  固定帶 `-Djacoco.append=false`，每次建置只量自己。
+- **coverage gate 會讀到陳舊的 `jacoco.xml`**。report goal 綁在 `verify` 時 `mvn test` 不會重新
+  產生報告，gate 讀的是上次留下的檔案（可能是幾天前的）。現在只信 mtime 晚於本輪建置開始的
+  報告，陳舊報告視同無報告——訊息會點名 phase 綁定，`UT_STRICT_COV` 的政策不變。
 - **stuck 偵測對 build 失敗從未生效**。判定條件是「連續兩輪報告完全相同」，但舊報告用
   `tail` 保留了 `[INFO] Total time: 1.570 s` 與 `Finished at: <timestamp>`，每輪都在變，
   條件永遠不成立——任何 build 失敗都會硬燒滿 `MAX_ITER`。改為抽取錯誤後 INFO 噪音消失，

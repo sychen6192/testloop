@@ -158,8 +158,13 @@ testgen <package 路徑>                  # 端對端執行
   context 仍然吃緊時可再調小。注意跨輪 context 本來就不累積——每輪都是全新 session，
   只帶上一輪的報告，所以 summary 的「writer output tokens 合計」是各輪輸出的加總，
   不是單輪 context 佔用。
-- **覆蓋率永遠略過。** 模組沒綁 JaCoCo。加上 jacoco-maven-plugin，將 prepare-agent 與 report
+- **覆蓋率永遠略過，或說「報告比本輪建置還舊」。** 模組沒綁 JaCoCo，或 report goal 綁在
+  `verify` 而非 `test`——`mvn test` 不會重新產生 `jacoco.xml`，gate 讀到的是上次留下的檔案，
+  所以 loop 只信本輪建置之後才寫出的報告。加上 jacoco-maven-plugin，將 prepare-agent 與 report
   綁到 test phase；或設 `UT_MAVEN_ARGS="jacoco:report"`。要強制擋關則設 `UT_STRICT_COV=1`。
+  另外 build gate 固定帶 `-Djacoco.append=false`：JaCoCo agent 預設會把 exec 資料**累加**進
+  `target/jacoco.exec`，你自己跑過的 `mvn test` 或上一次 testgen 的覆蓋率會被算進這一輪，
+  空測試也能「過」coverage gate。
 - **review gate 一直 REJECT，訊息含「tool calls = 0」。** reviewer 沒讀任何檔案就輸出判決，
   fail-closed 防的是捏造的假 verdict。改用更強的 `UT_REVIEWER_MODEL`。確定要放行設
   `UT_REVIEWER_MUST_READ=0`，或暫時 `UT_SKIP_REVIEW=1` 只跑 hard gate。

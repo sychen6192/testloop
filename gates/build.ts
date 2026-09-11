@@ -267,6 +267,12 @@ export async function runBuildAndTests(
     const args = [
       ...(useReactor ? ["-pl", mod.moduleRel, "-am"] : []),
       "-DskipITs",
+      // JaCoCo's agent appends to target/jacoco.exec by default, so coverage accumulates
+      // across builds: a round-1 test that covers nothing inherits the previous run's — or
+      // the developer's own — coverage and passes the gate. Measured on the fixture: 2 of 6
+      // lines covered reported as 100%. Each build must measure only itself. Harmless when
+      // the module has no JaCoCo.
+      "-Djacoco.append=false",
       "test",
       ...MAVEN_EXTRA_ARGS,
     ];

@@ -22,7 +22,7 @@ import {
   writerScopeSkip,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
-import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
+import { parseJacocoReport, toRanges, missedLines, reportIsStale } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
 import {
   buildFixPrompt,
@@ -1134,6 +1134,22 @@ console.log("\n[15] snapshotTree(skipDir) / writerScopeSkip（writer 可寫範�
       })(),
     );
   }
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 16. Coverage report freshness: a report older than this round's build is not this round's
+// ---------------------------------------------------------------------------
+console.log("\n[16] reportIsStale（JaCoCo 報告新鮮度）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-fresh-"));
+  const xml = path.join(tmp, "jacoco.xml");
+  fs.writeFileSync(xml, "<report/>");
+  const now = Date.now();
+  check("建置開始前就寫好的報告 → 視為陳舊", reportIsStale(xml, now + 60_000) === true);
+  check("建置開始後才寫的報告 → 新鮮", reportIsStale(xml, now - 60_000) === false);
+  check("不給 since → 不檢查（相容舊呼叫）", reportIsStale(xml, undefined) === false);
+  check("報告檔不存在 → 視為陳舊而非拋錯", reportIsStale(path.join(tmp, "nope.xml"), now) === true);
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

@@ -192,6 +192,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 2: hard gate — compile & test
     log("Step 2/4：執行編譯與測試 gate");
+    // The coverage gate only trusts a report written after this instant.
+    const buildStartedAt = Date.now();
     const build = await runBuildAndTests(cfg.buildTool, cfg.mod);
     save("build.log", build.raw ?? build.report);
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
@@ -221,7 +223,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 3: hard gate — coverage
     log("Step 3/4：檢查覆蓋率 gate");
-    const cov = checkCoverage(cfg.targetClasses, cfg.mod);
+    const cov = checkCoverage(cfg.targetClasses, cfg.mod, buildStartedAt);
     lastCov = cov.report;
     save("coverage.txt", cov.report);
     log(cov.passed ? "[OK] 覆蓋率 gate：PASS" : "[FAIL] 覆蓋率 gate：FAIL");
