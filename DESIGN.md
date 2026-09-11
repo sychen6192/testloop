@@ -54,7 +54,10 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    config.ts（門檻參數），互不重複。writer 只拿到六維「名稱＋一句話」，
    不拿評分細則（防 teaching-to-the-test）。
 6. **Runtime adapter**：核心零 SDK import；AgentRunner interface 隔離，
-   換 runtime = 換一個 runner 檔（runners/opencode.ts ↔ runners/qwen.ts）。
+   換 runtime = 換一個 runner 檔（runners/opencode.ts ↔ runners/api.ts ↔ runners/qwen.ts）。
+   api runner 是這條原則的直接受益者：整個 tool loop（工具定義、tool_call 解析、結果回送、
+   回合與逾時預算、重試）約三百行，全部在 runners/ 內，核心一行未動。它同時把原則 2 從
+   「設定檔＋guard assert」變成結構：沒定義 bash 工具就沒有 bash 可拿。
 7. **可觀測性**：每輪 artifacts 落盤；startup guard 把「文件契約」變成
    「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。
 8. **範圍與慣例用量的，不用猜的**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），

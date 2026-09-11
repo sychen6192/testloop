@@ -8,6 +8,17 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **api runner（`UT_RUNNER=api`）**：不經任何 agent CLI，直接對 OpenAI-compatible 的
+  `/v1/chat/completions` 做 tool calling，tool loop 由本工具自己跑（`runners/api.ts` +
+  `runners/api-tools.ts`）。權限就是工具清單——writer 拿到 read/list/search/write/replace，
+  沒有 bash 可給；reviewer 只有唯讀三個；`write_file` 只接受目標模組 `src/test/`，其他路徑
+  回錯誤給模型自己修正。沒有 opencode 的 session 固定開銷、不需要 ripgrep 與 `npm run setup`、
+  Windows 沒有 spawn 問題。tool call 精確計數（reviewer must-read guard）、output tokens 從
+  `usage` 累計、429/5xx 重試、4xx 直接判 spawn-error、回合與逾時預算。角色契約仍讀 agent
+  `.md` 本文，解析順序同 opencode，最後退回工具內建。`testgen doctor` 在此模式改檢查端點、
+  模型與角色契約。新增 `UT_API_BASE_URL` / `UT_API_KEY` / `UT_API_MAX_TURNS` /
+  `UT_API_MAX_TOKENS` / `UT_API_MAX_TOOL_RESULT_CHARS` / `UT_WRITER_TEMPERATURE`
+  （reviewer 溫度固定 0）。
 - **預檢基準（baseline pre-check）**：第一輪之前先跑一次與 build gate 完全相同的指令，
   取得「writer 介入前」的紅燈基準。build gate 跑的是 `mvn -pl <module> -am test`，整個模組
   連同上游模組的測試原始碼都要編得過，所以一個本工具沒碰過的壞檔就足以擋掉每一輪；先前

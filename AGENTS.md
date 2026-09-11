@@ -44,7 +44,11 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
-   （`opencode` 預設，`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或 spawn agent CLI。
+   （`opencode` 預設；`api` 直接打 OpenAI-compatible endpoint、tool loop 自己跑，工具在
+   `runners/api-tools.ts`；`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或
+   spawn agent CLI。api runner 的權限就是工具清單：writer 沒有 bash 可拿、reviewer 的清單裡
+   沒有寫入工具、`write_file` 只接受目標模組 `src/test/`——不看 agent `.md` 的 frontmatter，
+   只讀它的本文當 system prompt（解析順序同 opencode，最後退回工具內建那份）。
 3. **Injection over discovery。** standards（writer 契約，`standards/java-ut-standards.md`）
    與 rubric（reviewer 評分細則）由 loop **讀檔注入 prompt**，不靠 skill discovery 的機率性載入。
    rubric 只注入 `references/rubric.md`，**刻意不注入 SKILL.md 全文**（那是批次稽核 workflow，
@@ -86,7 +90,7 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 | 測試撰寫標準 | <工具 clone>/standards/java-ut-standards.md | writer prompt（loop 注入） |
 | 評分 rubric | skill 的 references/rubric.md（UT_SKILL_DIR → 目標 repo .opencode/.claude → 工具內建） | reviewer prompt（loop 注入；SKILL.md 不注入） |
 | 門檻與參數 | config.ts（env 可覆蓋） | gates / verdict |
-| 角色契約與權限 | 目標 repo .opencode/agent/ 優先，否則 ~/.config/opencode/agent/（npm run setup 安裝） | opencode runtime + startup guard |
+| 角色契約與權限 | 目標 repo .opencode/agent/ 優先，否則 ~/.config/opencode/agent/（npm run setup 安裝），api runner 再退回工具內建 .opencode/agent/ | opencode runtime + startup guard；api runner 只取本文作 system prompt，權限由 runners/api-tools.ts 的工具清單決定 |
 
 門檻與參數**只能改 `config.ts`**（透過 env 覆蓋），不得寫死在 prompt 或 gate 內。
 
@@ -113,7 +117,8 @@ prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入
 gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要＋預檢基準
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
-runners/…             factory＋兩個 AgentRunner 實作（SDK 隔離邊界）
+runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
+runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印）
@@ -145,7 +150,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（17 組，數量以 `npm run selftest` 輸出為準），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（18 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門

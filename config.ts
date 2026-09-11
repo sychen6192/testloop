@@ -85,8 +85,9 @@ export const QUIET = process.env.UT_QUIET === "1";
 // 1 = skip the agent frontmatter permission guard (not recommended).
 export const SKIP_GUARD = process.env.UT_SKIP_GUARD === "1";
 
-// Runner: opencode (default) | qwen (needs the qwen-code SDK installed).
-export const RUNNER_KIND = (process.env.UT_RUNNER ?? "opencode") as "opencode" | "qwen";
+// Runner: opencode (default) | api (direct OpenAI-compatible endpoint, no agent CLI)
+// | qwen (needs the qwen-code SDK installed).
+export const RUNNER_KIND = (process.env.UT_RUNNER ?? "opencode") as "opencode" | "api" | "qwen";
 
 // Models: empty = don't pass --model; the agent .md's model field decides (agent file is SSOT).
 // Env vars only override.
@@ -95,6 +96,27 @@ export const REVIEWER_MODEL = process.env.UT_REVIEWER_MODEL ?? "";
 
 // Per-run agent wall-clock timeout (replaces the SDK's maxSessionTurns).
 export const AGENT_TIMEOUT_MS = numEnv("UT_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1000);
+
+// --- api runner (UT_RUNNER=api): POST <base>/chat/completions with tools ---
+// Base URL of any OpenAI-compatible server, e.g. http://localhost:11434/v1 (Ollama),
+// http://host:8000/v1 (vLLM). OPENAI_BASE_URL / OPENAI_API_KEY are honoured as fallbacks so an
+// existing qwen-runner .env keeps working. Models come from UT_WRITER_MODEL / UT_REVIEWER_MODEL
+// (required for this runner — there is no agent file to default from).
+export const API_BASE_URL = (process.env.UT_API_BASE_URL ?? process.env.OPENAI_BASE_URL ?? "")
+  .trim()
+  .replace(/\/+$/, "");
+export const API_KEY = process.env.UT_API_KEY ?? process.env.OPENAI_API_KEY ?? "";
+// Assistant turns per session before the run is cut off — the loop's own bound, since the
+// model has none.
+export const API_MAX_TURNS = numEnv("UT_API_MAX_TURNS", 60, 1);
+// Passed as max_tokens when > 0; 0 = server default (some local servers default too low to
+// write a full test class).
+export const API_MAX_TOKENS = numEnv("UT_API_MAX_TOKENS", 8192);
+// Tool results are clipped to this many characters so one read cannot fill the context.
+export const API_MAX_TOOL_RESULT_CHARS = numEnv("UT_API_MAX_TOOL_RESULT_CHARS", 24000, 500);
+export const WRITER_TEMPERATURE = numEnv("UT_WRITER_TEMPERATURE", 0.2);
+// The reviewer's temperature is 0 by architecture (hard rule 3), not by configuration.
+export const REVIEWER_TEMPERATURE = 0;
 // Build/test gate wall-clock timeout. A hung mvn (unreachable repo, a test with a real
 // socket) was the one unbounded wait left in the pipeline.
 export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000);

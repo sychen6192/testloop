@@ -45,6 +45,8 @@ import { loadRubric } from "../libs/rubric";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
 import { traceEvent, buildInvocation } from "../runners/opencode";
+import { ApiRunner } from "../runners/api";
+import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree } from "../libs/shell";
 import { spawn } from "node:child_process";
 
@@ -1251,6 +1253,187 @@ class FooTest {
       rp.includes("第 2 輪") &&
       rp.includes("STANDARDS-HERE"),
   );
+}
+
+// ---------------------------------------------------------------------------
+// 18. api runner: the tool list is the permission model; the loop drives a scripted transport
+// ---------------------------------------------------------------------------
+console.log("\n[18] api runner（api-tools 權限 + 假 transport 的 tool loop）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-api-"));
+  const repo = path.join(tmp, "repo");
+  const mk = (rel: string, body: string) => {
+    const p = path.join(repo, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+  };
+  mk("pom.xml", "<project/>");
+  mk("modA/src/main/java/com/x/Foo.java", "package com.x;\npublic class Foo { public int a() { return 1; } }\n");
+  mk("modA/src/test/java/com/x/OldTest.java", "package com.x;\nclass OldTest { void t() { int x = 1; int y = 1; } }\n");
+  mk("modA/target/classes/Foo.class", "bin");
+  const writable = path.join(repo, "modA", "src", "test");
+  const ctx = { repoRoot: repo, writableRoot: writable, maxResultChars: 4000 };
+  const all = toolsFor(false);
+  const ro = toolsFor(true);
+  const prod = path.join(repo, "modA/src/main/java/com/x/Foo.java");
+
+  check("resolveInside：repo 內 → 絕對路徑", resolveInside(repo, "modA/pom.xml") === path.join(repo, "modA", "pom.xml"));
+  check("resolveInside：../ 逃逸 → null", resolveInside(repo, "../../etc/passwd") === null);
+  check("resolveInside：repo 外的絕對路徑 → null", resolveInside(repo, tmp) === null);
+  check("resolveInside：root 本身 → 允許", resolveInside(repo, ".") === repo);
+
+  check("read_file：讀到內容", execTool("read_file", { path: "modA/src/main/java/com/x/Foo.java" }, ctx, all).includes("class Foo"));
+  check(
+    "read_file：超過上限截斷並標明",
+    execTool("read_file", { path: "modA/src/main/java/com/x/Foo.java" }, { ...ctx, maxResultChars: 10 }, all).includes("已截斷"),
+  );
+  check("read_file：repo 外 → 錯誤字串、不拋例外", execTool("read_file", { path: "../../x" }, ctx, all).startsWith("錯誤"));
+  check("read_file：不存在 → 錯誤", execTool("read_file", { path: "nope.java" }, ctx, all).startsWith("錯誤"));
+
+  const ls = execTool("list_files", { dir: "modA", pattern: "*.java" }, ctx, all);
+  check(
+    "list_files：glob 過濾、略過 target",
+    ls.includes("modA/src/main/java/com/x/Foo.java") && ls.includes("OldTest.java") && !ls.includes("Foo.class"),
+    ls,
+  );
+  const sr = execTool("search", { pattern: "class \\w+", dir: "modA", glob: "*.java" }, ctx, all);
+  check("search：回傳 路徑:行號: 內容", /Foo\.java:2: .*class Foo/.test(sr) && sr.includes("OldTest.java:2:"), sr);
+  check("search：無效 regex → 錯誤字串", execTool("search", { pattern: "(" }, ctx, all).startsWith("錯誤"));
+
+  const refused = execTool("write_file", { path: "modA/src/main/java/com/x/Foo.java", content: "x" }, ctx, all);
+  check(
+    "write_file：production 路徑被拒，檔案未動",
+    refused.startsWith("錯誤：拒絕寫入") && fs.readFileSync(prod, "utf8").includes("return 1"),
+    refused,
+  );
+  check("write_file：pom.xml 被拒", execTool("write_file", { path: "modA/pom.xml", content: "x" }, ctx, all).startsWith("錯誤：拒絕"));
+  check(
+    "write_file：src/test 內成功並自動建目錄",
+    execTool("write_file", { path: "modA/src/test/java/com/x/FooTest.java", content: "class FooTest {}" }, ctx, all).startsWith("已寫入") &&
+      fs.existsSync(path.join(writable, "java/com/x/FooTest.java")),
+  );
+  check(
+    "write_file：沒有 writableRoot → 一律拒絕",
+    execTool("write_file", { path: "modA/src/test/java/X.java", content: "" }, { ...ctx, writableRoot: undefined }, all).startsWith("錯誤"),
+  );
+  const oldTest = "modA/src/test/java/com/x/OldTest.java";
+  check(
+    "replace_in_file：唯一片段 → 替換",
+    execTool("replace_in_file", { path: oldTest, old_string: "void t()", new_string: "void t2()" }, ctx, all).startsWith("已替換") &&
+      fs.readFileSync(path.join(repo, oldTest), "utf8").includes("t2()"),
+  );
+  check("replace_in_file：找不到 → 錯誤", execTool("replace_in_file", { path: oldTest, old_string: "nope", new_string: "" }, ctx, all).startsWith("錯誤"));
+  check(
+    "replace_in_file：多處命中 → 錯誤（要求更長片段）",
+    execTool("replace_in_file", { path: oldTest, old_string: "= 1;", new_string: "= 2;" }, ctx, all).includes("2 次"),
+  );
+  check("reviewer 工具集：全部唯讀、沒有 write/replace", ro.length > 0 && ro.every((t) => t.readOnly) && !ro.some((t) => /write|replace/.test(t.name)));
+  check(
+    "reviewer 呼叫 write_file → 未知工具（結構性唯讀）",
+    execTool("write_file", { path: "modA/src/test/java/Z.java", content: "" }, ctx, ro).startsWith("錯誤：未知"),
+  );
+  check(
+    "toOpenAiTools：OpenAI function 形狀",
+    (toOpenAiTools(all) as Array<{ type: string; function: { name: string; parameters: { type: string } } }>).every(
+      (t) => t.type === "function" && typeof t.function.name === "string" && t.function.parameters.type === "object",
+    ),
+  );
+
+  // --- the loop over a scripted transport ---
+  type Body = { model: string; temperature: number; tools: Array<{ function: { name: string } }>; messages: Array<Record<string, any>> };
+  const reply = (message: Record<string, unknown>, tokens = 7) =>
+    new Response(JSON.stringify({ choices: [{ message, finish_reason: "stop" }], usage: { completion_tokens: tokens } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  const call = (id: string, name: string, args: unknown) => ({ id, type: "function", function: { name, arguments: JSON.stringify(args) } });
+  const base = { repoRoot: repo, writableRoot: writable, baseUrl: "http://fake/v1", models: { writer: "m", reviewer: "m" }, retryDelayMs: 0 };
+
+  const seen: Body[] = [];
+  const scripted: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as Body;
+    seen.push(body);
+    const n = body.messages.filter((m) => m.role === "tool").length;
+    if (n === 0) return reply({ role: "assistant", content: null, tool_calls: [call("c1", "read_file", { path: "modA/src/main/java/com/x/Foo.java" })] });
+    if (n === 1) {
+      return reply({
+        role: "assistant",
+        content: "",
+        tool_calls: [call("c2", "write_file", { path: "modA/src/test/java/com/x/FooTest.java", content: "class FooTest { @Test void a() {} }" })],
+      });
+    }
+    return reply({ role: "assistant", content: "完成：FooTest.java" }, 11);
+  };
+  const out = await new ApiRunner({ ...base, fetchImpl: scripted }).runWriter("寫測試");
+  check("ApiRunner：3 個回合跑完，回傳最終文字", out.status === "ok" && out.text === "完成：FooTest.java", JSON.stringify(out));
+  check("ApiRunner：tool call 精確計數 = 2", out.toolCallCount === 2, String(out.toolCallCount));
+  check("ApiRunner：output tokens 為各回合加總 = 25", out.outputTokens === 25, String(out.outputTokens));
+  check("ApiRunner：write_file 真的落地", fs.readFileSync(path.join(writable, "java/com/x/FooTest.java"), "utf8").includes("@Test"));
+  check(
+    "ApiRunner：請求帶 tools / model / temperature / system 角色契約",
+    seen[0].tools.length === all.length && seen[0].model === "m" && seen[0].temperature === 0.2 &&
+      seen[0].messages[0].role === "system" && String(seen[0].messages[0].content).includes("測試"),
+    JSON.stringify({ tools: seen[0].tools.length, model: seen[0].model, temperature: seen[0].temperature }),
+  );
+  const last1 = seen[1].messages[seen[1].messages.length - 1];
+  check("ApiRunner：tool 結果以 role=tool 回送並帶 tool_call_id", last1.role === "tool" && last1.tool_call_id === "c1" && String(last1.content).includes("class Foo"));
+
+  const seenR: Body[] = [];
+  const reviewerFetch: typeof fetch = async (_u, init) => {
+    seenR.push(JSON.parse(String(init?.body)) as Body);
+    return reply({ role: "assistant", content: "{}" });
+  };
+  await new ApiRunner({ ...base, fetchImpl: reviewerFetch }).runReview("審查");
+  check(
+    "ApiRunner：reviewer 的 tools 只有唯讀那幾個",
+    seenR[0].tools.length === ro.length && seenR[0].tools.every((t) => ro.some((s) => s.name === t.function.name)),
+  );
+  check("ApiRunner：reviewer temperature = 0（架構規定）", seenR[0].temperature === 0);
+
+  const dead: typeof fetch = async () => {
+    throw new Error("ECONNREFUSED");
+  };
+  check("ApiRunner：第一個請求就連不上 → spawn-error（環境問題）", (await new ApiRunner({ ...base, fetchImpl: dead }).runWriter("x")).status === "spawn-error");
+  check("ApiRunner：未設 base URL → spawn-error", (await new ApiRunner({ ...base, baseUrl: "", fetchImpl: dead }).runWriter("x")).status === "spawn-error");
+  check(
+    "ApiRunner：未設模型 → spawn-error",
+    (await new ApiRunner({ ...base, models: { writer: "", reviewer: "" }, fetchImpl: dead }).runWriter("x")).status === "spawn-error",
+  );
+
+  const forever: typeof fetch = async () => reply({ role: "assistant", content: null, tool_calls: [call("c", "list_files", { dir: "." })] });
+  const o5 = await new ApiRunner({ ...base, fetchImpl: forever, maxTurns: 3 }).runWriter("x");
+  check("ApiRunner：回合預算用盡 → status=timeout，不會無限迴圈", o5.status === "timeout" && o5.toolCallCount === 3, JSON.stringify(o5));
+
+  let badSeen = false;
+  const badArgs: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    const n = b.messages.filter((m) => m.role === "tool").length;
+    if (n === 0) return reply({ role: "assistant", content: null, tool_calls: [{ id: "b1", type: "function", function: { name: "read_file", arguments: "{not json" } }] });
+    badSeen = String(b.messages[b.messages.length - 1].content).includes("不是合法 JSON");
+    return reply({ role: "assistant", content: "ok" });
+  };
+  const o6 = await new ApiRunner({ ...base, fetchImpl: badArgs }).runWriter("x");
+  check("ApiRunner：arguments 非 JSON → 錯誤回送模型、loop 繼續", o6.status === "ok" && badSeen);
+
+  // 5xx is retried, then succeeds
+  let hits = 0;
+  const flaky: typeof fetch = async () => {
+    hits++;
+    if (hits < 3) return new Response("overloaded", { status: 503 });
+    return reply({ role: "assistant", content: "recovered" });
+  };
+  const o7 = await new ApiRunner({ ...base, fetchImpl: flaky }).runWriter("x");
+  check("ApiRunner：5xx 重試後成功", o7.status === "ok" && o7.text === "recovered" && hits === 3, `hits=${hits}`);
+  // 4xx is final: no retry storm against a bad key or unknown model
+  hits = 0;
+  const denied: typeof fetch = async () => {
+    hits++;
+    return new Response('{"error":"invalid api key"}', { status: 401 });
+  };
+  const o8 = await new ApiRunner({ ...base, fetchImpl: denied }).runWriter("x");
+  check("ApiRunner：401 不重試、判 spawn-error", o8.status === "spawn-error" && hits === 1, `hits=${hits}`);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------
