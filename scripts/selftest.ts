@@ -20,6 +20,7 @@ import {
   clampText,
   feedbackFingerprint,
   writerScopeSkip,
+  testClassNames,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines, reportIsStale } from "../gates/coverage";
@@ -1434,6 +1435,38 @@ console.log("\n[18] api runner（api-tools 權限 + 假 transport 的 tool loop�
   check("ApiRunner：401 不重試、判 spawn-error", o8.status === "spawn-error" && hits === 1, `hits=${hits}`);
 
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 19. Scoped test runs: -Dtest values must be stable, deduped and complete
+// ---------------------------------------------------------------------------
+console.log("\n[19] testClassNames（UT_TEST_SCOPE=generated 的 -Dtest 組裝）");
+{
+  const names = testClassNames([
+    "modA/src/test/java/com/x/FooTest.java",
+    "modA/src/test/java/com/x/BarTest.java",
+    "com/x/FooTest.java", // 同一個類別、不同相對基準 → 只算一次
+    "modA\\src\\test\\java\\com\\x\\WinTest.java", // Windows 分隔符
+    "modA/src/test/resources/fixture.json", // 非 .java → 排除
+    ".java", // 退化輸入 → 排除
+  ]);
+  check(
+    "去重、排序、跨基準與 Windows 路徑都取到簡單類名",
+    JSON.stringify(names) === JSON.stringify(["BarTest", "FooTest", "WinTest"]),
+    JSON.stringify(names),
+  );
+  check("空輸入 → 空陣列", testClassNames([]).length === 0);
+  // 排序不只是美觀：build 指令若在相同兩輪之間變動，stuck 偵測就會失效
+  check(
+    "順序不同的相同輸入 → 相同結果（build 指令必須穩定）",
+    JSON.stringify(testClassNames(["b/BTest.java", "a/ATest.java"])) ===
+      JSON.stringify(testClassNames(["a/ATest.java", "b/BTest.java"])),
+  );
+  check(
+    "-Dtest 字串",
+    `-Dtest=${testClassNames(["x/OrderServiceTest.java", "x/CalcTest.java"]).join(",")}` ===
+      "-Dtest=CalcTest,OrderServiceTest",
+  );
 }
 
 // ---------------------------------------------------------------------------

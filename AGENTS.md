@@ -26,11 +26,13 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
-  2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知）
+  2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
+     `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>` 只限縮**執行**，
+     並在宣告成功前補一次完整模組重跑當驗收）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
 
-### 六個必須理解的機制
+### 七個必須理解的機制
 1. **驗證權在 loop，不在 LLM。** writer 永遠拿不到 bash；所有 hard gate 由 `gates/` 執行並解析
    原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。同一個原則的另一面：writer 的
    可寫範圍只有目標模組的 `src/test/`，orchestrator 每輪在 writer 前後對整個 repo（扣除該
@@ -77,6 +79,12 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 6. **回饋有預算。** 每輪餵回 writer 的失敗報告受 `MAX_FEEDBACK_CHARS` 上限約束（orchestrator
    統一 clamp，與產生報告的是哪個 gate 無關），且 build 報告是**抽取** `[ERROR]` 行而非
    `tail` 整份 log——maven 的 Help/stack trace 樣板正好落在尾端，tail 會留下樣板、丟掉錯誤。
+7. **限縮可以延後完整驗證，不可以取消它。** `UT_TEST_SCOPE=generated` 讓迭代期間只跑目標類別
+   的測試（實測 200 隻既有測試下每輪 23.3s → 4.0s），但 build gate 的承諾有兩半——「新測試會過」
+   與「沒打壞別人」——後者只有完整模組重跑證明得了。所以成功前一定補跑一次（`final-verify.log`），
+   失敗就以 `final-verify-fail` 餵回下一輪。禁止把這次重跑改成可選或省略：那是拿保證換速度，
+   而限縮本來就已經拿到速度了。限縮只影響**執行**，不影響編譯——既有編譯錯誤照樣擋，那是修復
+   迴圈的事。
 
 ### Review gate 判定（fail-closed）
 通過 = **blockers 空** 且 **六維（0-10 整數）皆達門檻**。維度：effectiveness / coverage /
@@ -150,7 +158,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（18 組，數量以 `npm run selftest` 輸出為準），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（19 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門

@@ -137,6 +137,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
 | `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行，紅燈標記為 pre-existing。預設中止 |
 | `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
+| `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
@@ -165,6 +166,38 @@ testgen <package 路徑>                  # 端對端執行
 25/20/15/15/15/10 計算，`grade` 依 85/70/55 分界為 A/B/C/D。兩者都由 pipeline 確定性計算、
 僅供報告。gate 的通過條件是 blockers 為空且六維皆達門檻。advisories 屬建議級，不擋關、也
 不進下一輪 feedback。
+
+## 加速：`UT_TEST_SCOPE=generated`
+
+預設每輪 build gate 都跑完整模組（含上游）的測試。既有測試越多、越慢——尤其 Spring Boot 測試，
+每輪都重新載入一次 context。
+
+```bash
+UT_TEST_SCOPE=generated testgen <package 路徑>
+```
+
+開啟後：**迭代期間** surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），**所有 gate 通過之後、
+宣告成功之前**，再以完整模組範圍重跑一次驗收。「新測試有沒有打壞既有測試」這個保證沒有被拿掉，
+只是從每輪一次改成整個 run 一次。
+
+200 隻既有測試（模擬 Spring context 載入）的實測：
+
+| | 每輪 build | 2 輪總時間 |
+| --- | --- | --- |
+| `module`（預設） | 23.3 s | 70.5 s |
+| `generated` | **4.0 s** | 56.0 s（含最後 21.8 s 的完整驗收） |
+
+省下的量隨輪數放大：2 輪省 21%，5 輪約省一半。輪數少時固定成本（預檢 + 最終驗收）佔比高，
+效益就沒那麼明顯。
+
+注意事項：
+
+- **只限縮執行，不限縮編譯。** 整個模組的測試原始碼還是要編得過，所以既有的編譯錯誤照樣擋你——
+  那是修復迴圈的工作。
+- **最終驗收失敗會餵回 writer**，報告明說「目標類別的測試本身通過，但打壞了既有測試」，附上失敗的
+  類別與斷言，然後進下一輪。
+- **覆蓋率反而更準**：限縮後 JaCoCo 只記錄目標測試造成的覆蓋，不會被別的測試順帶碰到而灌水。
+- Maven only。Gradle 會顯示警告並退回 `module`。
 
 ## Troubleshooting
 

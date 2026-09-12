@@ -123,6 +123,18 @@ export function findExistingTests(clsRelPath: string, repoRoot: string): string[
     .sort((a, b) => (a === expected ? -1 : b === expected ? 1 : a.localeCompare(b)));
 }
 
+// Pure: surefire `-Dtest` values (simple class names) from test file paths. Deduped and
+// sorted so the same round always produces the same argument — a build command that varies
+// between identical rounds would defeat the stuck detector.
+export function testClassNames(paths: string[]): string[] {
+  const set = new Set<string>();
+  for (const p of paths) {
+    const base = p.replace(/\\/g, "/").split("/").pop() ?? "";
+    if (base.endsWith(".java") && base.length > 5) set.add(base.slice(0, -5));
+  }
+  return [...set].sort();
+}
+
 // Skill-dir search order: env override -> target repo (.opencode, .claude) -> the tool's own copy.
 export function skillDirCandidates(
   repoRoot: string,

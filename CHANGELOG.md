@@ -8,6 +8,13 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **`UT_TEST_SCOPE=generated`**：迭代期間 surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），
+  所有 gate 通過後、宣告成功前再以完整模組範圍重跑一次驗收（`final-verify.log`），失敗以
+  `final-verify-fail` 餵回下一輪。build gate 的承諾有兩半——「新測試會過」與「沒打壞別人」
+  ——後者只有完整重跑證明得了，所以這次重跑是**延後**不是省略。200 隻既有測試（模擬 Spring
+  context）實測：每輪 build 23.3s → 4.0s，2 輪總時間 70.5s → 56.0s，省下的量隨輪數放大。
+  只限縮執行不限縮編譯，既有編譯錯誤照樣擋。附帶好處是覆蓋率更準——JaCoCo 只記錄目標測試造成
+  的覆蓋，不會被別的測試順帶碰到而灌水。預設 `module` 維持原行為；Maven only，Gradle 警告後退回。
 - **api runner（`UT_RUNNER=api`）**：不經任何 agent CLI，直接對 OpenAI-compatible 的
   `/v1/chat/completions` 做 tool calling，tool loop 由本工具自己跑（`runners/api.ts` +
   `runners/api-tools.ts`）。權限就是工具清單——writer 拿到 read/list/search/write/replace，

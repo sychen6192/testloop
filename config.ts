@@ -74,6 +74,13 @@ export const ALLOW_DIRTY_BASELINE = process.env.UT_ALLOW_DIRTY_BASELINE === "1";
 // generation start. 0 = abort on a red baseline instead, as before.
 export const REPAIR_BASELINE = process.env.UT_REPAIR_BASELINE !== "0";
 export const REPAIR_MAX_ITER = numEnv("UT_REPAIR_MAX_ITER", 5, 1);
+// Which tests the build gate runs each round. "module" (default) runs the whole module and its
+// upstream modules, exactly as before. "generated" narrows surefire to the target classes' own
+// tests during iterations and does one full module run before declaring success — the module
+// run is what proves the new tests broke nothing, so it is not optional, only deferred.
+// Measured on a 200-test fixture with a simulated Spring context: 23.6s -> 3.2s per iteration.
+// Maven only; gradle falls back to "module" with a warning.
+export const TEST_SCOPE = (process.env.UT_TEST_SCOPE ?? "module") as "module" | "generated";
 // 1 = only warn when the writer shrinks a pre-existing test file (fewer @Test methods or
 // assertions, or a new @Disabled). Default fails the round and feeds the shrink back — to the
 // build gate, "fixed the test" and "deleted the test" look the same; this is what tells them apart.

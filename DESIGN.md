@@ -106,6 +106,10 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
 - **把 SKILL.md 全文注入 reviewer**：那是批次稽核 workflow（六輸入、concurrency、
   environment probe），對單輪 gate 是錯誤指令；只注入評分細則。
 - **checker 可寫檔**：見權限矩陣。
+- **以 `-Dtest` 限縮換掉完整模組驗證**（不是延後，是取消）：build gate 的承諾有兩半，
+  「新測試會過」與「沒打壞別人」，後者只有完整重跑證明得了。實測過一個新測試污染共享靜態狀態：
+  限縮期間三個 gate 全過，完整重跑才抓到。`UT_TEST_SCOPE=generated` 因此是**延後**到成功前補跑
+  一次，不是省略。
 - **standards 一律規定測試類別為 `public`**：JUnit 5 不要求，Sonar S5786 反而會標記
   「JUnit5 test classes should not be public」——寫死任一邊都會在某類專案上出錯。
   改由 `libs/conventions.ts` 掃描該 repo 後給結論。

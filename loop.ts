@@ -15,6 +15,7 @@ import {
   REPAIR_BASELINE,
   REPAIR_MAX_ITER,
   ALLOW_TEST_SHRINK,
+  TEST_SCOPE,
   STANDARDS_PATH,
   SKILL_DIR_CANDIDATES,
   RUNS_DIR,
@@ -160,6 +161,7 @@ async function main() {
         repairBaseline: REPAIR_BASELINE,
         repairMaxIter: REPAIR_MAX_ITER,
         allowTestShrink: ALLOW_TEST_SHRINK,
+        testScope: TEST_SCOPE,
         existingTests: Object.fromEntries(
           existingTests.filter((e) => e.tests.length).map((e) => [e.cls, e.tests]),
         ),
