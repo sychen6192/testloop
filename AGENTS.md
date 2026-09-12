@@ -32,7 +32,16 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 
 ### 六個必須理解的機制
 1. **驗證權在 loop，不在 LLM。** writer 永遠拿不到 bash；所有 hard gate 由 `gates/` 執行並解析
-   原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。
+   原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。同一個原則的另一面：writer 的
+   可寫範圍只有目標模組的 `src/test/`，orchestrator 每輪在 writer 前後對整個 repo（扣除該
+   `src/test`、建置輸出與 dot-dirs）拍快照，production code、`pom.xml` 或其他模組有任何變動
+   即中止（stopReason=scope-violation），變更留在磁碟交人檢視。prompt 裡的「嚴禁修改
+   production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
+   gate 的結果都失去意義。第三面是**防掏空**：build gate 分不出「修好失敗的測試」和「刪掉
+   失敗的測試」，兩者都是綠燈，所以 `libs/testmetrics.ts` 在第一輪前量下每個既有測試檔的
+   `@Test` 數、斷言數與 `@Disabled` 數，任一檔案數量減少（或 `@Disabled` 增加）該輪即 FAIL
+   餵回，不進建置（`UT_ALLOW_TEST_SHRINK=1` 只警告）。刻意用數量不用方法名：standards 要求
+   「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
    （`opencode` 預設，`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或 spawn agent CLI。
@@ -48,8 +57,12 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 5. **範圍由 loop 界定，不靠 writer 自律。** build gate 跑的是 `mvn -pl <module> -am test`，
    整個模組連同上游模組的測試原始碼都要編得過——一個本工具沒碰過的壞檔就能擋掉每一輪，而
    writer 看到錯誤就會去修別人的檔案。所以 loop 在第一輪之前先做兩件確定性的事：
-   **預檢基準**（`gates/build.ts` 的 `runBaseline`，跑與 gate 完全相同的指令；紅燈預設中止，
-   `UT_ALLOW_DIRTY_BASELINE=1` 才帶著已知紅燈續跑並標記為 pre-existing 要求 writer 別碰）與
+   **預檢基準**（`gates/build.ts` 的 `runBaseline`，跑與 gate 完全相同的指令；紅燈預設進入
+   **修復迴圈** `orchestrator.ts` 的 `repairBaseline`——同一個 writer、同樣的範圍與防掏空
+   guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
+   `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
+   pre-existing 要求 writer 別碰。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
+   修復要證明的只有「模組綠了、而且沒有東西被拿掉」）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
@@ -94,7 +107,7 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 ## 目錄結構
 ```
 loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基準/runs 建立/版本戳記）
-orchestrator.ts       迭代迴圈（零 SDK import）＋ artifacts 落盤
+orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
 gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要＋預檢基準
@@ -106,6 +119,7 @@ libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印）
 libs/utils.ts         純函式（含 skillDirCandidates / runsDirFor / findExistingTests / clampText）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
+libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防掏空 guard 的量尺）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
@@ -131,7 +145,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（11 組，數量以 `npm run selftest` 輸出為準），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（17 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門

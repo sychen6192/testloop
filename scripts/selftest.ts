@@ -18,17 +18,22 @@ import {
   matchesTestNaming,
   findExistingTests,
   clampText,
+  feedbackFingerprint,
+  writerScopeSkip,
 } from "../libs/utils";
 import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
-import { parseJacocoReport, toRanges, missedLines } from "../gates/coverage";
+import { parseJacocoReport, toRanges, missedLines, reportIsStale } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
 import {
   buildFixPrompt,
   buildGeneratePrompt,
+  buildRepairPrompt,
   renderExistingTests,
   renderPreExisting,
   renderConventions,
+  renderShrinkFeedback,
 } from "../prompts";
+import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics";
 import {
   countTestsRun,
   extractCompileErrorFiles,
@@ -854,6 +859,41 @@ console.log("\n[13] summarizeBuildErrors / clampText（回饋預算）");
       !surefireHasFailure("完全無關的文字"),
   );
 
+  // stuck 偵測比對的是「發生了什麼」，不是碼錶。同一個失敗重跑兩次只有耗時會變。
+  const roundA =
+    "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.018 s <<< FAILURE! -- in com.x.FooTest\n" +
+    "[ERROR] com.x.FooTest.bar:12 expected: <1> but was: <2>";
+  const roundB = roundA.replace("0.018", "0.015");
+  check(
+    "regression：同一個測試失敗重跑，耗時不同但 fingerprint 相同 → stuck 會觸發",
+    roundA !== roundB && feedbackFingerprint(roundA) === feedbackFingerprint(roundB),
+  );
+  check(
+    "feedbackFingerprint：JVM identity hash 正規化",
+    feedbackFingerprint("expected: <com.x.Foo@1b6d3586>") ===
+      feedbackFingerprint("expected: <com.x.Foo@4554617c>"),
+  );
+  // 誤判成 stuck 會中止一個其實還在進步的 run，比多燒幾輪更糟——這幾條是防線
+  check(
+    "feedbackFingerprint：不同類別的 identity hash 不會collapse 成同一個",
+    feedbackFingerprint("expected: <com.x.Foo@1b6d3586>") !==
+      feedbackFingerprint("expected: <com.x.Bar@1b6d3586>"),
+  );
+  check(
+    "feedbackFingerprint：不同的斷言值不會被 collapse",
+    feedbackFingerprint("expected: <1> but was: <2>") !==
+      feedbackFingerprint("expected: <1> but was: <3>"),
+  );
+  check(
+    "feedbackFingerprint：不同的失敗行號不會被 collapse",
+    feedbackFingerprint("FooTest.bar:12 failed") !== feedbackFingerprint("FooTest.bar:13 failed"),
+  );
+  check(
+    "feedbackFingerprint：沒有時間戳的報告原樣返回（review blockers 不受影響）",
+    feedbackFingerprint("Blockers：\n1. FooTest.foo 無意義斷言") ===
+      "Blockers：\n1. FooTest.foo 無意義斷言",
+  );
+
   check("clampText：未超限原樣返回", clampText("abc", 10) === "abc");
   const clamped = clampText("x".repeat(100), 20);
   check(
@@ -996,6 +1036,220 @@ console.log("\n[14] classVisibility / isClassRefSuite / scanTestConventions（�
         targetClasses: ["modA/src/main/java/com/x/Foo.java"],
         conventions: conv,
       }).includes("必須"),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Writer scope: everything outside <module>/src/test is read-only, and the loop asserts it
+// ---------------------------------------------------------------------------
+console.log("\n[15] snapshotTree(skipDir) / writerScopeSkip（writer 可寫範圍）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-scope-"));
+  const mk = (rel: string, body = "x") => {
+    const p = path.join(tmp, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+  };
+  mk("pom.xml");
+  mk("modA/pom.xml");
+  mk("modA/src/main/java/com/x/Foo.java", "class Foo {}");
+  mk("modA/src/main/resources/application.yml");
+  mk("modA/src/test/java/com/x/FooTest.java");
+  mk("modA/target/classes/Foo.class");
+  mk("modB/src/main/java/com/y/Bar.java");
+  mk("modB/src/test/java/com/y/BarTest.java");
+  mk(".git/HEAD");
+  mk(".opencode/agent/ut-writer.md");
+  mk("node_modules/x/index.js");
+
+  const skip = writerScopeSkip(tmp, path.join(tmp, "modA"));
+  const snap = snapshotTree(tmp, { skipDir: skip });
+  const keys = Object.keys(snap);
+  check(
+    "受保護：pom.xml、src/main、src/main/resources 都在快照裡",
+    "pom.xml" in snap &&
+      "modA/pom.xml" in snap &&
+      "modA/src/main/java/com/x/Foo.java" in snap &&
+      "modA/src/main/resources/application.yml" in snap,
+    JSON.stringify(keys),
+  );
+  check(
+    "可寫：目標模組的 src/test 整棵不在快照裡",
+    !keys.some((k) => k.startsWith("modA/src/test/")),
+    JSON.stringify(keys),
+  );
+  check(
+    "受保護：其他模組的 src/test 仍在快照裡（只有目標模組可寫）",
+    "modB/src/test/java/com/y/BarTest.java" in snap && "modB/src/main/java/com/y/Bar.java" in snap,
+  );
+  check(
+    "排除：target / node_modules / dot-dirs 不進快照",
+    !keys.some((k) => k.startsWith("modA/target/") || k.startsWith("node_modules/") || k.startsWith(".")),
+    JSON.stringify(keys),
+  );
+
+  // the regression itself: a writer that "helpfully" edits production code must be caught,
+  // while its legitimate test writes must not be
+  const before = snapshotTree(tmp, { skipDir: skip });
+  mk("modA/src/main/java/com/x/Foo.java", "class Foo { String tag() { return \"x\"; } }");
+  mk("modA/src/test/java/com/x/FooTest.java", "class FooTest { void t() {} }");
+  mk("modA/src/test/resources/fixture.json", "{}");
+  const diff = diffSnapshots(before, snapshotTree(tmp, { skipDir: skip }));
+  check(
+    "regression：writer 改了 production code → 被抓到，且只列出那個檔",
+    JSON.stringify(diff) === JSON.stringify(["modA/src/main/java/com/x/Foo.java"]),
+    JSON.stringify(diff),
+  );
+  const before2 = snapshotTree(tmp, { skipDir: skip });
+  mk("modA/pom.xml", "<project><dependencies/></project>");
+  check(
+    "writer 改了 pom.xml → 被抓到",
+    diffSnapshots(before2, snapshotTree(tmp, { skipDir: skip })).includes("modA/pom.xml"),
+  );
+
+  // single-module repo: module root == repo root, so the writable tree is plain src/test
+  const single = writerScopeSkip(tmp, tmp);
+  check("單一模組：可寫範圍是 src/test", single("src/test", "test") && !single("src/main", "main"));
+
+  // snapshotTree without options keeps its old behaviour (the test-tree diff relies on it)
+  check(
+    "snapshotTree 無選項：走訪全部（含 target 與 dot-dirs）",
+    "modA/target/classes/Foo.class" in snapshotTree(tmp) && ".git/HEAD" in snapshotTree(tmp),
+  );
+
+  // a dangling symlink used to throw out of the walk; now it is simply not a file to compare
+  let symlinkOk = true;
+  try {
+    fs.symlinkSync(path.join(tmp, "does-not-exist"), path.join(tmp, "modA", "dangling"));
+  } catch {
+    symlinkOk = false; // symlink creation needs privileges on some Windows setups — skip
+  }
+  if (symlinkOk) {
+    check(
+      "snapshotTree：dangling symlink 不會讓走訪炸掉",
+      (() => {
+        try {
+          snapshotTree(tmp, { skipDir: skip });
+          return true;
+        } catch {
+          return false;
+        }
+      })(),
+    );
+  }
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 16. Coverage report freshness: a report older than this round's build is not this round's
+// ---------------------------------------------------------------------------
+console.log("\n[16] reportIsStale（JaCoCo 報告新鮮度）");
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-fresh-"));
+  const xml = path.join(tmp, "jacoco.xml");
+  fs.writeFileSync(xml, "<report/>");
+  const now = Date.now();
+  check("建置開始前就寫好的報告 → 視為陳舊", reportIsStale(xml, now + 60_000) === true);
+  check("建置開始後才寫的報告 → 新鮮", reportIsStale(xml, now - 60_000) === false);
+  check("不給 since → 不檢查（相容舊呼叫）", reportIsStale(xml, undefined) === false);
+  check("報告檔不存在 → 視為陳舊而非拋錯", reportIsStale(path.join(tmp, "nope.xml"), now) === true);
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 17. Shrink guard + repair prompt: "fixed" must not mean "deleted"
+// ---------------------------------------------------------------------------
+console.log("\n[17] testMetrics / findShrunk / buildRepairPrompt（防掏空）");
+{
+  const src = `package com.x;
+import org.junit.jupiter.api.*;
+class FooTest {
+    // @Test in a line comment must not count
+    /* assertEquals(1, 1); in a block comment */
+    @Test void a() { assertEquals(1, 1); assertThat(x).isEqualTo(2); }
+    @ParameterizedTest @ValueSource(ints = {1}) void b(int i) { verify(mock).run(); }
+    @Test void c() { String s = "assertTrue( inside a string"; fail("boom"); }
+    @Disabled("flaky") @Test void d() { then(mock).should().go(); }
+}`;
+  const m = testMetrics(src);
+  check(
+    "testMetrics：@Test 類註解計 4（含 @ParameterizedTest；註解裡的不算）",
+    m.tests === 4,
+    JSON.stringify(m),
+  );
+  check(
+    "testMetrics：斷言計 5（assert*/verify*/fail/should；註解與字串裡的不算）",
+    m.assertions === 5,
+    JSON.stringify(m),
+  );
+  check("testMetrics：@Disabled 計 1", m.disabled === 1, JSON.stringify(m));
+
+  const foo = { tests: 4, assertions: 5, disabled: 1 };
+  const bar = { tests: 2, assertions: 2, disabled: 0 };
+  const before = { "com/x/FooTest.java": foo, "com/x/BarTest.java": bar };
+  const with_ = (m2: Partial<typeof foo>) => ({ ...before, "com/x/FooTest.java": { ...foo, ...m2 } });
+  check("findShrunk：無變化 → 空", findShrunk(before, before).length === 0);
+  const fewerTests = findShrunk(before, with_({ tests: 3 }));
+  check(
+    "findShrunk：@Test 減少 → 違規並點名",
+    fewerTests.length === 1 && fewerTests[0].file === "com/x/FooTest.java",
+  );
+  check("findShrunk：斷言減少 → 違規", findShrunk(before, with_({ assertions: 4 })).length === 1);
+  check("findShrunk：新增 @Disabled → 違規", findShrunk(before, with_({ disabled: 2 })).length === 1);
+  const del = findShrunk(before, { "com/x/FooTest.java": foo });
+  check(
+    "findShrunk：檔案被刪 → 違規且 after=null",
+    del.length === 1 && del[0].file === "com/x/BarTest.java" && del[0].after === null,
+  );
+  const grown = {
+    ...before,
+    "com/x/FooTest.java": { tests: 6, assertions: 9, disabled: 0 },
+    "com/x/NewTest.java": { tests: 3, assertions: 3, disabled: 0 },
+  };
+  check("findShrunk：增加、或 writer 新建的檔 → 不違規", findShrunk(before, grown).length === 0);
+  check(
+    "findShrunk：writer 自己新建的檔之後縮水也不受約束（不在 before 裡）",
+    findShrunk(before, { ...grown, "com/x/NewTest.java": { tests: 0, assertions: 0, disabled: 0 } })
+      .length === 0,
+  );
+
+  const fb = renderShrinkFeedback([...del, ...fewerTests]);
+  check(
+    "renderShrinkFeedback：點名檔案與前後數字",
+    fb.includes("BarTest.java：檔案被刪除") && fb.includes("@Test 4 → 3"),
+    fb,
+  );
+
+  // collectTestMetrics walks the tree and keys by test-root-relative path
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-metrics-"));
+  fs.mkdirSync(path.join(tmp, "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(tmp, "com", "x", "FooTest.java"), src);
+  fs.writeFileSync(path.join(tmp, "com", "x", "notes.txt"), "@Test not java");
+  const snap = collectTestMetrics(tmp);
+  check(
+    "collectTestMetrics：只收 .java，key 為相對路徑",
+    Object.keys(snap).length === 1 && snap["com/x/FooTest.java"]?.tests === 4,
+    JSON.stringify(snap),
+  );
+  check("collectTestMetrics：不存在的目錄 → 空", Object.keys(collectTestMetrics(path.join(tmp, "nope"))).length === 0);
+  fs.rmSync(tmp, { recursive: true, force: true });
+
+  const rp = buildRepairPrompt({
+    brokenFiles: ["modA/src/test/java/com/x/CacheServiceImplTest.java", "com.x.SamlServiceImplTest"],
+    report: "[ERROR] CacheServiceImplTest.java:[4,27] cannot find symbol",
+    standards: "STANDARDS-HERE",
+    mod: { moduleRoot: "/x", moduleRel: "modA", multiModule: true },
+    round: 2,
+  });
+  check(
+    "buildRepairPrompt：列出壞檔、帶錯誤節錄、講明不得刪減與不得碰 production、帶輪次與 standards",
+    rp.includes("CacheServiceImplTest.java") &&
+      rp.includes("com.x.SamlServiceImplTest") &&
+      rp.includes("cannot find symbol") &&
+      rp.includes("不得減少") &&
+      rp.includes("production code") &&
+      rp.includes("第 2 輪") &&
+      rp.includes("STANDARDS-HERE"),
   );
 }
 

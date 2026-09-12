@@ -12,6 +12,9 @@ import {
   SKIP_REVIEW,
   SKIP_BASELINE,
   ALLOW_DIRTY_BASELINE,
+  REPAIR_BASELINE,
+  REPAIR_MAX_ITER,
+  ALLOW_TEST_SHRINK,
   STANDARDS_PATH,
   SKILL_DIR_CANDIDATES,
   RUNS_DIR,
@@ -35,7 +38,8 @@ import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
 import { detectBuildTool, runBaseline } from "./gates/build";
 import { createRunner } from "./runners/runner";
-import { orchestrate } from "./orchestrator";
+import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
+import { PreExistingFailures } from "./prompts";
 
 async function main() {
   banner("write-java-ut pipeline 啟動");
@@ -153,6 +157,9 @@ async function main() {
         allowZeroTests: ALLOW_ZERO_TESTS,
         skipBaseline: SKIP_BASELINE,
         allowDirtyBaseline: ALLOW_DIRTY_BASELINE,
+        repairBaseline: REPAIR_BASELINE,
+        repairMaxIter: REPAIR_MAX_ITER,
+        allowTestShrink: ALLOW_TEST_SHRINK,
         existingTests: Object.fromEntries(
           existingTests.filter((e) => e.tests.length).map((e) => [e.cls, e.tests]),
         ),
@@ -174,9 +181,12 @@ async function main() {
 
   // Baseline pre-check. The build gate runs `mvn -pl <module> -am test`, so every test source
   // in the module *and its upstream modules* must compile — a test file the tool never touched
-  // can fail the gate on round 1 and keep failing it forever. Establishing the baseline first
-  // makes that legible instead of sending the writer to fix other people's code.
-  let preExisting: { compileErrorFiles: string[]; failingTestClasses: string[] } | undefined;
+  // can fail the gate on round 1 and keep failing it forever. A red baseline is repaired first:
+  // same writer, same guards, same build command, and no generation until it is green. Only
+  // when repair gives up does the run stop; UT_ALLOW_DIRTY_BASELINE=1 pushes on regardless.
+  const runner = await createRunner();
+  let preExisting: PreExistingFailures | undefined;
+  let repair: RepairResult | undefined;
   if (SKIP_BASELINE) {
     log("[WARN] UT_SKIP_BASELINE=1：跳過預檢，既有紅燈將無法與 writer 造成的失敗區分");
   } else {
@@ -185,33 +195,81 @@ async function main() {
     fs.writeFileSync(path.join(runDir, "baseline.md"), baseline.summary);
     fs.writeFileSync(path.join(runDir, "baseline.log"), baseline.raw);
     console.log(baseline.summary);
-    if (!baseline.clean) {
-      preExisting = {
-        compileErrorFiles: baseline.compileErrorFiles,
-        failingTestClasses: baseline.failingTestClasses,
-      };
+
+    let clean = baseline.clean;
+    if (!clean && REPAIR_BASELINE) {
+      banner("修復既有紅燈（repair）");
+      repair = await repairBaseline({ runner, buildTool, standards, mod, runDir, baseline });
+      fs.writeFileSync(
+        path.join(runDir, "repair-summary.md"),
+        [
+          `結果：${repair.success ? "已修復" : "未修復"}（${repair.stopReason}，${repair.rounds} 輪）`,
+          `變更的測試檔（commit 前請檢視 diff）：`,
+          ...(repair.changedFiles.length ? repair.changedFiles.map((f) => `  - ${f}`) : ["  （無）"]),
+          ...(repair.success
+            ? []
+            : [
+                "仍然紅燈：",
+                ...repair.remaining.compileErrorFiles.map((f) => `  - ${f}（編譯失敗）`),
+                ...repair.remaining.failingTestClasses.map((c) => `  - ${c}（測試失敗）`),
+                "",
+                repair.report,
+              ]),
+        ].join("\n"),
+      );
+      if (repair.success) {
+        clean = true;
+        log(
+          `[OK] 既有紅燈已修復（${repair.rounds} 輪，變更 ${repair.changedFiles.length} 個測試檔）` +
+            "——這些是 writer 對別人測試的改動，commit 前請檢視 diff：",
+        );
+        repair.changedFiles.forEach((f) => log(`  - ${f}`));
+      } else {
+        log(`[FAIL] 修復未能讓模組回到綠燈（${repair.stopReason}，${repair.rounds} 輪）`);
+      }
+    }
+
+    if (!clean) {
+      preExisting = repair
+        ? repair.remaining
+        : {
+            compileErrorFiles: baseline.compileErrorFiles,
+            failingTestClasses: baseline.failingTestClasses,
+          };
       if (!ALLOW_DIRTY_BASELINE) {
         fs.writeFileSync(
           path.join(runDir, "summary.json"),
           JSON.stringify(
-            { success: false, stopReason: "dirty-baseline", ...preExisting },
+            {
+              success: false,
+              stopReason: repair ? `repair-failed:${repair.stopReason}` : "dirty-baseline",
+              ...preExisting,
+              repair,
+            },
             null,
             2,
           ),
         );
+        const still = [
+          ...preExisting.compileErrorFiles.map((f) => `  - ${f}（編譯失敗）`),
+          ...preExisting.failingTestClasses.map((c) => `  - ${c}（測試失敗）`),
+        ].join("\n");
         die(
-          "模組在本工具介入前就無法通過建置，因此 build gate 無法區分「既有問題」與「writer 產生的問題」，\n" +
-            "writer 會把迭代次數花在修別人的檔案上。請先修好上列檔案，或：\n" +
+          (repair
+            ? `修復 ${repair.rounds} 輪後模組仍無法通過建置（${repair.stopReason}）。仍然紅燈的：\n${still}\n` +
+              "常見原因：根因在 production code 或建置設定（例如 pom.xml 的 Lombok annotation processor），" +
+              "writer 無權修改。請人工修好後重跑，或：\n"
+            : "模組在本工具介入前就無法通過建置，而 UT_REPAIR_BASELINE=0 關閉了自動修復。請先修好：\n" +
+              `${still}\n或：\n`) +
             "  UT_ALLOW_DIRTY_BASELINE=1  照樣執行（已知紅燈會標記為 pre-existing 並要求 writer 不要碰）\n" +
             "  UT_SKIP_BASELINE=1         完全跳過預檢\n" +
-            `詳見 ${path.join(runDir, "baseline.log")}`,
+            `詳見 ${runDir}`,
         );
       }
       log("[WARN] UT_ALLOW_DIRTY_BASELINE=1：帶著既有紅燈繼續，已知失敗會標記為 pre-existing");
     }
   }
 
-  const runner = await createRunner();
   let result;
   try {
     result = await orchestrate({
@@ -256,7 +314,7 @@ async function main() {
   if (!result.success && result.finalFeedback) {
     console.log(`最後失敗報告：\n${result.finalFeedback}`);
   }
-  fs.writeFileSync(path.join(runDir, "summary.json"), JSON.stringify(result, stripRaw, 2));
+  fs.writeFileSync(path.join(runDir, "summary.json"), JSON.stringify({ ...result, repair }, stripRaw, 2));
   log(`artifacts 已寫入：${runDir}`);
   process.exit(result.success ? 0 : 2);
 }

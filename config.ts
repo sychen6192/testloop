@@ -69,6 +69,15 @@ export const SKIP_BASELINE = process.env.UT_SKIP_BASELINE === "1";
 // 1 = run the pre-check but proceed on a red baseline instead of aborting. The known-broken
 // files are then carried into every fix prompt as "not yours, do not fix".
 export const ALLOW_DIRTY_BASELINE = process.env.UT_ALLOW_DIRTY_BASELINE === "1";
+// A red baseline is repaired by default: a bounded writer loop fixes the pre-existing failures
+// (scope- and shrink-guarded) until the same build command is green, and only then does test
+// generation start. 0 = abort on a red baseline instead, as before.
+export const REPAIR_BASELINE = process.env.UT_REPAIR_BASELINE !== "0";
+export const REPAIR_MAX_ITER = numEnv("UT_REPAIR_MAX_ITER", 5, 1);
+// 1 = only warn when the writer shrinks a pre-existing test file (fewer @Test methods or
+// assertions, or a new @Disabled). Default fails the round and feeds the shrink back — to the
+// build gate, "fixed the test" and "deleted the test" look the same; this is what tells them apart.
+export const ALLOW_TEST_SHRINK = process.env.UT_ALLOW_TEST_SHRINK === "1";
 // 0 = accept reviewer verdicts produced without a single tool call (default: fail-closed).
 export const REVIEWER_MUST_READ = process.env.UT_REVIEWER_MUST_READ !== "0";
 export const SKIP_REVIEW = process.env.UT_SKIP_REVIEW === "1";

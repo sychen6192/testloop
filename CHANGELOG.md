@@ -26,11 +26,44 @@
   但跨 package 的 class-symbol 套件（常見於 `SonarTestSuite`）沒有 `public` 就會
   `cannot find symbol` 讓整個模組編不過。所以由 pipeline 量測該 repo 後給結論，而非在
   standards 裡押一邊。
+- **既有紅燈自動修復**：預檢基準紅燈時不再中止，改進入 `repairBaseline` 修復迴圈——同一個
+  writer、同樣的範圍與防掏空 guard、同一道建置指令，修到綠才開始產生新測試；修不好才中止
+  （stopReason=`repair-failed:<原因>`），`UT_ALLOW_DIRTY_BASELINE=1` 仍可硬跑。修復輪沒有
+  coverage / review gate（它們的範圍是目標類別），要證明的只有「模組綠了、而且沒有東西被
+  拿掉」。每輪 artifacts 在 `repair-N/`，修了哪些檔列在 `repair-summary.md`——那是 writer
+  對別人測試的改動，commit 前該看 diff。`UT_REPAIR_BASELINE=0` 回到直接中止，
+  `UT_REPAIR_MAX_ITER` 控制輪數。
+- **防掏空 guard**：build gate 分不出「修好失敗的測試」和「刪掉失敗的測試」——兩者都是綠燈。
+  loop 現在在第一輪前量下每個既有測試檔的 `@Test` 數、斷言數與 `@Disabled` 數，任一檔案
+  數量減少或 `@Disabled` 增加，該輪即 FAIL 並把前後數字餵回，不進建置；主迴圈與修復迴圈
+  共用。刻意用數量不用方法名——standards 要求「方法_情境_預期」命名，writer 補強既有檔案時
+  本來就會改名重寫。`UT_ALLOW_TEST_SHRINK=1` 只警告。
+- **writer 範圍 assert**：orchestrator 每輪在 writer 前後對整個 repo 拍快照（扣除目標模組
+  `src/test/`、`target`/`build`/`node_modules` 與 dot-dirs），production code、`pom.xml`
+  或其他模組有任何新增／修改／刪除即中止（stopReason=scope-violation），清單寫入
+  `iter-N/scope-violations.txt`。先前這條只靠 prompt 的「嚴禁修改 production code」，實測
+  writer 往 production 加一個 method，loop 照樣 gates-passed 零警告——被改過的 production
+  code 會讓後面每個 gate 都在驗證錯的東西。不自動還原：沒有內容快照，而 `git checkout`
+  會連操作者自己未提交的改動一起清掉，所以停下來交人處理。
 - **回饋預算**：每輪餵回 writer 的失敗報告受 `UT_MAX_FEEDBACK_CHARS`（預設 12000）約束，
   由 orchestrator 統一 clamp，與產生報告的是哪個 gate 無關；surefire 明細另受
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **coverage gate 會被上一次的覆蓋率灌水**。JaCoCo agent 預設 `append=true`，exec 資料跨次
+  累加進 `target/jacoco.exec`——開發者自己跑過 `mvn test`、或上一次 testgen 跑過，這一輪的
+  弱測試就繼承那份覆蓋率。fixture 實測：只蓋 6 行中的 2 行，gate 報 100%。build gate 現在
+  固定帶 `-Djacoco.append=false`，每次建置只量自己。
+- **coverage gate 會讀到陳舊的 `jacoco.xml`**。report goal 綁在 `verify` 時 `mvn test` 不會重新
+  產生報告，gate 讀的是上次留下的檔案（可能是幾天前的）。現在只信 mtime 晚於本輪建置開始的
+  報告，陳舊報告視同無報告——訊息會點名 phase 綁定，`UT_STRICT_COV` 的政策不變。
+- **stuck 偵測對 build 失敗從未生效**。判定條件是「連續兩輪報告完全相同」，但舊報告用
+  `tail` 保留了 `[INFO] Total time: 1.570 s` 與 `Finished at: <timestamp>`，每輪都在變，
+  條件永遠不成立——任何 build 失敗都會硬燒滿 `MAX_ITER`。改為抽取錯誤後 INFO 噪音消失，
+  編譯錯誤的報告已逐字節穩定；測試失敗還差 surefire 的 `Time elapsed: 0.018 s`，因此
+  stuck 改以 `feedbackFingerprint` 正規化後比對（時間與 JVM identity hash），writer 看到的
+  報告仍保留真實數值。正規化刻意收窄——誤判成 stuck 會中止一個其實還在進步的 run，
+  比多燒幾輪更糟。
 - **build 失敗報告改為抽取錯誤，不再 tail 整份 log**。maven 的 `-> [Help 1]`、
   `To see the full stack trace`、`Re-run Maven` 樣板正好落在輸出尾端，`tail` 會完整保留樣板
   卻把編譯錯誤本身推出視窗外。現在只保留 `[ERROR]` 行與 javac 的無前綴接續行
@@ -46,7 +79,7 @@
   欄位會讓整個檔案編譯失敗）；測試類別可見性依 pipeline 掃描結論撰寫，不自行假設。
 - `runBuildAndTests` 新增 `allowZeroTests` 選項（預檢專用：模組還沒有測試是本工具的正常
   起點，不該被零測試 guard 判 FAIL）。
-- selftest 擴充至 127 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
+- selftest 擴充至 133 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
   防護、錯誤抽取與樣板剔除、surefire 計數判定、可見性與套件偵測、各 prompt 區塊的實際
   注入與留空行為）。
 

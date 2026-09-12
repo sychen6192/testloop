@@ -111,9 +111,30 @@ export function locateJacocoXml(mod: ModuleInfo): string | undefined {
   return candidates.find((p) => fs.existsSync(p));
 }
 
-export function checkCoverage(targetClasses: string[], mod: ModuleInfo): GateResult {
+// Pure-ish: a report older than the build that was supposed to produce it is not this
+// round's coverage — it is whatever the last run left behind (report goal bound to verify,
+// not test, is the usual cause). Reading it inflates the gate the same way appended exec
+// data does: the tests may cover nothing and still pass. `since` undefined = no check.
+export function reportIsStale(xmlPath: string, since: number | undefined): boolean {
+  if (since === undefined) return false;
+  try {
+    return fs.statSync(xmlPath).mtimeMs < since;
+  } catch {
+    return true;
+  }
+}
+
+export function checkCoverage(
+  targetClasses: string[],
+  mod: ModuleInfo,
+  since?: number,
+): GateResult {
   const xmlPath = locateJacocoXml(mod);
-  if (!xmlPath) {
+  if (!xmlPath || reportIsStale(xmlPath, since)) {
+    const why = xmlPath
+      ? `${xmlPath} 的 JaCoCo 報告比本輪建置還舊——report goal 沒有在 test phase 重新產生` +
+        `（常見原因：report 綁在 verify），視同本輪無報告`
+      : `在 ${mod.moduleRoot} 未偵測到 JaCoCo 報告`;
     const strictMsg =
       "，UT_STRICT_COV=1 → 覆蓋率 gate 判定 FAIL。請在模組加入 jacoco-maven-plugin" +
       "（prepare-agent + report 綁定 test phase），或設 UT_JACOCO_XML 指定報告路徑";
@@ -121,7 +142,7 @@ export function checkCoverage(targetClasses: string[], mod: ModuleInfo): GateRes
       "，略過覆蓋率 gate。建議加入 jacoco plugin，或設 UT_STRICT_COV=1 強制要求";
     return {
       passed: !STRICT_COV,
-      report: `（在 ${mod.moduleRoot} 未偵測到 JaCoCo 報告${STRICT_COV ? strictMsg : looseMsg}。）`,
+      report: `（${why}${STRICT_COV ? strictMsg : looseMsg}。）`,
     };
   }
   log(`解析覆蓋率報告：${xmlPath}`);
