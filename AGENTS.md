@@ -26,11 +26,13 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
-  2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知）
+  2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
+     `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>` 只限縮**執行**，
+     並在宣告成功前補一次完整模組重跑當驗收）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
 
-### 六個必須理解的機制
+### 七個必須理解的機制
 1. **驗證權在 loop，不在 LLM。** writer 永遠拿不到 bash；所有 hard gate 由 `gates/` 執行並解析
    原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。同一個原則的另一面：writer 的
    可寫範圍只有目標模組的 `src/test/`，orchestrator 每輪在 writer 前後對整個 repo（扣除該
@@ -44,7 +46,11 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
-   （`opencode` 預設，`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或 spawn agent CLI。
+   （`opencode` 預設；`api` 直接打 OpenAI-compatible endpoint、tool loop 自己跑，工具在
+   `runners/api-tools.ts`；`qwen` 走動態 import 作備援）。`runners/` 外禁止 import agent SDK 或
+   spawn agent CLI。api runner 的權限就是工具清單：writer 沒有 bash 可拿、reviewer 的清單裡
+   沒有寫入工具、`write_file` 只接受目標模組 `src/test/`——不看 agent `.md` 的 frontmatter，
+   只讀它的本文當 system prompt（解析順序同 opencode，最後退回工具內建那份）。
 3. **Injection over discovery。** standards（writer 契約，`standards/java-ut-standards.md`）
    與 rubric（reviewer 評分細則）由 loop **讀檔注入 prompt**，不靠 skill discovery 的機率性載入。
    rubric 只注入 `references/rubric.md`，**刻意不注入 SKILL.md 全文**（那是批次稽核 workflow，
@@ -73,6 +79,12 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 6. **回饋有預算。** 每輪餵回 writer 的失敗報告受 `MAX_FEEDBACK_CHARS` 上限約束（orchestrator
    統一 clamp，與產生報告的是哪個 gate 無關），且 build 報告是**抽取** `[ERROR]` 行而非
    `tail` 整份 log——maven 的 Help/stack trace 樣板正好落在尾端，tail 會留下樣板、丟掉錯誤。
+7. **限縮可以延後完整驗證，不可以取消它。** `UT_TEST_SCOPE=generated` 讓迭代期間只跑目標類別
+   的測試（實測 200 隻既有測試下每輪 23.3s → 4.0s），但 build gate 的承諾有兩半——「新測試會過」
+   與「沒打壞別人」——後者只有完整模組重跑證明得了。所以成功前一定補跑一次（`final-verify.log`），
+   失敗就以 `final-verify-fail` 餵回下一輪。禁止把這次重跑改成可選或省略：那是拿保證換速度，
+   而限縮本來就已經拿到速度了。限縮只影響**執行**，不影響編譯——既有編譯錯誤照樣擋，那是修復
+   迴圈的事。
 
 ### Review gate 判定（fail-closed）
 通過 = **blockers 空** 且 **六維（0-10 整數）皆達門檻**。維度：effectiveness / coverage /
@@ -86,7 +98,7 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 | 測試撰寫標準 | <工具 clone>/standards/java-ut-standards.md | writer prompt（loop 注入） |
 | 評分 rubric | skill 的 references/rubric.md（UT_SKILL_DIR → 目標 repo .opencode/.claude → 工具內建） | reviewer prompt（loop 注入；SKILL.md 不注入） |
 | 門檻與參數 | config.ts（env 可覆蓋） | gates / verdict |
-| 角色契約與權限 | 目標 repo .opencode/agent/ 優先，否則 ~/.config/opencode/agent/（npm run setup 安裝） | opencode runtime + startup guard |
+| 角色契約與權限 | 目標 repo .opencode/agent/ 優先，否則 ~/.config/opencode/agent/（npm run setup 安裝），api runner 再退回工具內建 .opencode/agent/ | opencode runtime + startup guard；api runner 只取本文作 system prompt，權限由 runners/api-tools.ts 的工具清單決定 |
 
 門檻與參數**只能改 `config.ts`**（透過 env 覆蓋），不得寫死在 prompt 或 gate 內。
 
@@ -113,7 +125,8 @@ prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入
 gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要＋預檢基準
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
-runners/…             factory＋兩個 AgentRunner 實作（SDK 隔離邊界）
+runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
+runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印）
@@ -145,7 +158,7 @@ grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modu
 ```
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（17 組，數量以 `npm run selftest` 輸出為準），改
+沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（19 組，數量以 `npm run selftest` 輸出為準），改
 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
 
 ## 高風險操作與授權閘門

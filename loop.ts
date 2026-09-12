@@ -15,6 +15,7 @@ import {
   REPAIR_BASELINE,
   REPAIR_MAX_ITER,
   ALLOW_TEST_SHRINK,
+  TEST_SCOPE,
   STANDARDS_PATH,
   SKILL_DIR_CANDIDATES,
   RUNS_DIR,
@@ -160,6 +161,7 @@ async function main() {
         repairBaseline: REPAIR_BASELINE,
         repairMaxIter: REPAIR_MAX_ITER,
         allowTestShrink: ALLOW_TEST_SHRINK,
+        testScope: TEST_SCOPE,
         existingTests: Object.fromEntries(
           existingTests.filter((e) => e.tests.length).map((e) => [e.cls, e.tests]),
         ),
@@ -184,7 +186,7 @@ async function main() {
   // can fail the gate on round 1 and keep failing it forever. A red baseline is repaired first:
   // same writer, same guards, same build command, and no generation until it is green. Only
   // when repair gives up does the run stop; UT_ALLOW_DIRTY_BASELINE=1 pushes on regardless.
-  const runner = await createRunner();
+  const runner = await createRunner({ writableRoot: path.join(mod.moduleRoot, "src", "test") });
   let preExisting: PreExistingFailures | undefined;
   let repair: RepairResult | undefined;
   if (SKIP_BASELINE) {

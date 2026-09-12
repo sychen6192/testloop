@@ -54,7 +54,10 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    config.ts（門檻參數），互不重複。writer 只拿到六維「名稱＋一句話」，
    不拿評分細則（防 teaching-to-the-test）。
 6. **Runtime adapter**：核心零 SDK import；AgentRunner interface 隔離，
-   換 runtime = 換一個 runner 檔（runners/opencode.ts ↔ runners/qwen.ts）。
+   換 runtime = 換一個 runner 檔（runners/opencode.ts ↔ runners/api.ts ↔ runners/qwen.ts）。
+   api runner 是這條原則的直接受益者：整個 tool loop（工具定義、tool_call 解析、結果回送、
+   回合與逾時預算、重試）約三百行，全部在 runners/ 內，核心一行未動。它同時把原則 2 從
+   「設定檔＋guard assert」變成結構：沒定義 bash 工具就沒有 bash 可拿。
 7. **可觀測性**：每輪 artifacts 落盤；startup guard 把「文件契約」變成
    「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。
 8. **範圍與慣例用量的，不用猜的**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），
@@ -103,6 +106,10 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
 - **把 SKILL.md 全文注入 reviewer**：那是批次稽核 workflow（六輸入、concurrency、
   environment probe），對單輪 gate 是錯誤指令；只注入評分細則。
 - **checker 可寫檔**：見權限矩陣。
+- **以 `-Dtest` 限縮換掉完整模組驗證**（不是延後，是取消）：build gate 的承諾有兩半，
+  「新測試會過」與「沒打壞別人」，後者只有完整重跑證明得了。實測過一個新測試污染共享靜態狀態：
+  限縮期間三個 gate 全過，完整重跑才抓到。`UT_TEST_SCOPE=generated` 因此是**延後**到成功前補跑
+  一次，不是省略。
 - **standards 一律規定測試類別為 `public`**：JUnit 5 不要求，Sonar S5786 反而會標記
   「JUnit5 test classes should not be public」——寫死任一邊都會在某類專案上出錯。
   改由 `libs/conventions.ts` 掃描該 repo 後給結論。

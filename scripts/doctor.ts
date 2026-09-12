@@ -27,33 +27,72 @@ const target = args.find((a) => !a.startsWith("--"));
 const major = Number(process.versions.node.split(".")[0]);
 add(major >= 20 ? "OK" : "FAIL", "node >= 20", `目前 ${process.versions.node}`);
 
-// 2. opencode CLI — resolved exactly the way the runner will spawn it. A plain `where`
-// (or a bare spawn) reports the extensionless bash shim as a hit on Windows, so doctor
-// would pass while the real spawn fails — the worst split, since preflight then vouches
-// for a broken setup.
-const verPlan = planSpawn(config.OPENCODE_BIN, ["--version"]);
-const ver = spawnSync(verPlan.file, verPlan.args, {
-  encoding: "utf8",
-  windowsVerbatimArguments: verPlan.windowsVerbatimArguments,
-});
-if (ver.status === 0) {
-  const via = verPlan.file === config.OPENCODE_BIN ? "" : `，實際執行 ${verPlan.file}`;
-  add("OK", "opencode CLI", `${ver.stdout.trim()}${via}`);
+if (config.RUNNER_KIND === "api") {
+  // 2. api endpoint — no CLI to find; the runner needs a reachable OpenAI-compatible server
+  // and a model name for each role.
+  if (!config.API_BASE_URL) {
+    add("FAIL", "api endpoint", "UT_API_BASE_URL 未設定（例如 http://localhost:11434/v1）");
+  } else {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 5000);
+      const res = await fetch(`${config.API_BASE_URL}/models`, {
+        headers: config.API_KEY ? { authorization: `Bearer ${config.API_KEY}` } : {},
+        signal: ctl.signal,
+      });
+      clearTimeout(timer);
+      if (res.status === 401 || res.status === 403) {
+        add("FAIL", "api endpoint", `${config.API_BASE_URL} 認證失敗（HTTP ${res.status}）——檢查 UT_API_KEY`);
+      } else {
+        add("OK", "api endpoint", `${config.API_BASE_URL}（GET /models → HTTP ${res.status}）`);
+      }
+    } catch (e) {
+      add("FAIL", "api endpoint", `${config.API_BASE_URL} 連不上：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  for (const [role, model] of [
+    ["writer", config.WRITER_MODEL],
+    ["reviewer", config.REVIEWER_MODEL],
+  ] as const) {
+    add(model ? "OK" : "FAIL", `${role} model`, model || "未設定——api runner 需要 UT_WRITER_MODEL 與 UT_REVIEWER_MODEL");
+  }
+  // 3. role contracts — the agent files' bodies; permissions are the tool list, so the
+  // frontmatter is not checked here.
+  const { loadRoleContract } = await import("../runners/api");
+  for (const { name } of AGENT_SPECS) {
+    const rc = loadRoleContract(name, config.REPO_ROOT);
+    if (rc) add("OK", `agent ${name}`, `角色契約來源 ${rc.source}：${rc.path}`);
+    else add("FAIL", `agent ${name}`, "repo、global 與工具內建皆無 agent 定義");
+  }
 } else {
-  const why = ver.error
-    ? explainSpawnError(ver.error as NodeJS.ErrnoException, config.OPENCODE_BIN)
-    : `找不到 ${config.OPENCODE_BIN}`;
-  add("FAIL", "opencode CLI", `${why}——安裝 opencode 或設 UT_OPENCODE_BIN`);
-}
+  // 2. opencode CLI — resolved exactly the way the runner will spawn it. A plain `where`
+  // (or a bare spawn) reports the extensionless bash shim as a hit on Windows, so doctor
+  // would pass while the real spawn fails — the worst split, since preflight then vouches
+  // for a broken setup.
+  const verPlan = planSpawn(config.OPENCODE_BIN, ["--version"]);
+  const ver = spawnSync(verPlan.file, verPlan.args, {
+    encoding: "utf8",
+    windowsVerbatimArguments: verPlan.windowsVerbatimArguments,
+  });
+  if (ver.status === 0) {
+    const via = verPlan.file === config.OPENCODE_BIN ? "" : `，實際執行 ${verPlan.file}`;
+    add("OK", "opencode CLI", `${ver.stdout.trim()}${via}`);
+  } else {
+    const why = ver.error
+      ? explainSpawnError(ver.error as NodeJS.ErrnoException, config.OPENCODE_BIN)
+      : `找不到 ${config.OPENCODE_BIN}`;
+    add("FAIL", "opencode CLI", `${why}——安裝 opencode 或設 UT_OPENCODE_BIN`);
+  }
 
-// 3. agents (repo-local wins, global fallback)
-for (const { name, rules } of AGENT_SPECS) {
-  const res = resolveAgentPath(name, config.REPO_ROOT, config.GLOBAL_OPENCODE_DIR);
-  if (!res) add("FAIL", `agent ${name}`, "repo 與 global 皆無——在工具 clone 執行 npm run setup");
-  else {
-    const errs = contractViolations(res.path, rules);
-    if (errs.length) add("FAIL", `agent ${name}`, errs.join("；"));
-    else add("OK", `agent ${name}`, `${res.source}：${res.path}`);
+  // 3. agents (repo-local wins, global fallback)
+  for (const { name, rules } of AGENT_SPECS) {
+    const res = resolveAgentPath(name, config.REPO_ROOT, config.GLOBAL_OPENCODE_DIR);
+    if (!res) add("FAIL", `agent ${name}`, "repo 與 global 皆無——在工具 clone 執行 npm run setup");
+    else {
+      const errs = contractViolations(res.path, rules);
+      if (errs.length) add("FAIL", `agent ${name}`, errs.join("；"));
+      else add("OK", `agent ${name}`, `${res.source}：${res.path}`);
+    }
   }
 }
 

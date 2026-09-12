@@ -263,7 +263,9 @@ function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string 
 export async function runBuildAndTests(
   tool: BuildTool,
   mod: ModuleInfo,
-  opts: { allowZeroTests?: boolean } = {},
+  // onlyTests: run just these test classes (simple names). Compilation is unaffected — the
+  // whole module's test sources still have to compile — so this narrows execution, not scope.
+  opts: { allowZeroTests?: boolean; onlyTests?: string[] } = {},
 ): Promise<GateResult> {
   const isWin = process.platform === "win32";
   // Taken before the build so stale reports from an earlier round can be told apart.
@@ -286,6 +288,12 @@ export async function runBuildAndTests(
       // lines covered reported as 100%. Each build must measure only itself. Harmless when
       // the module has no JaCoCo.
       "-Djacoco.append=false",
+      // failIfNoSpecifiedTests=false is required, not cosmetic: with -am the same -Dtest is
+      // applied to the upstream modules, where those classes do not exist, and surefire
+      // would fail the reactor for finding nothing to run.
+      ...(opts.onlyTests?.length
+        ? [`-Dtest=${opts.onlyTests.join(",")}`, "-Dsurefire.failIfNoSpecifiedTests=false"]
+        : []),
       "test",
       ...MAVEN_EXTRA_ARGS,
     ];

@@ -70,6 +70,43 @@ self-agreement bias。但單張 GPU 通常放不下兩顆模型並存，此時 w
 即可，省去每輪換模的 reload 成本。共用同一顆時，review gate 的 must-read 防護會擋掉 reviewer
 不讀檔就給出的假判決。
 
+## 直接打 API（`UT_RUNNER=api`，不需要 opencode）
+
+第三種 runner：不經任何 agent CLI，直接對 OpenAI-compatible 的 `POST /v1/chat/completions` 做
+tool calling，tool loop 由本工具自己跑。Ollama、vLLM、LM Studio、OpenAI，以及 Anthropic 的
+OpenAI 相容端點都可以。
+
+```bash
+UT_RUNNER=api \
+UT_API_BASE_URL=http://localhost:11434/v1 \
+UT_WRITER_MODEL=qwen3.6:27b UT_REVIEWER_MODEL=qwen3.6:27b \
+testgen <package 路徑>
+```
+
+跟 opencode runner 的差別：
+
+- **權限是工具清單，不是設定檔。** writer 拿到 `read_file / list_files / search / write_file /
+  replace_in_file`，沒有 bash 可給；reviewer 只有前三個。`write_file` 只接受目標模組 `src/test/`
+  底下的路徑，其他路徑直接回錯誤給模型自己修正，不用等到 orchestrator 的快照 guard 才中止。
+- **沒有 session 固定開銷。** 不載 plugin / MCP schema，context 全部留給程式碼。
+- **不需要 ripgrep、不需要 `npm run setup`。** 角色契約（system prompt）仍讀 agent `.md` 的本文，
+  解析順序同 opencode runner（目標 repo → global → 工具內建），所以 repo 級的 reviewer 覆寫兩種
+  runner 都吃得到。
+- **Windows 沒有 spawn 問題。** 唯一的子行程是 mvn。
+
+前提：模型端要支援 tool calling。vLLM 需 `--enable-auto-tool-choice --tool-call-parser <parser>`
+（qwen 系列通常用 `hermes` 或 `qwen3_coder`）；Ollama 對支援 tools 的模型（qwen3 系列在內）直接
+可用。`testgen doctor` 在 `UT_RUNNER=api` 下改檢查端點連得上、兩個模型有設、角色契約找得到。
+
+| 變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `UT_API_BASE_URL` | - | OpenAI-compatible base URL（含 `/v1`）。也接受 `OPENAI_BASE_URL` |
+| `UT_API_KEY` | - | Bearer token；本地 Ollama / vLLM 通常不用。也接受 `OPENAI_API_KEY` |
+| `UT_API_MAX_TURNS` | 60 | 單次 session 最多幾個 assistant 回合 |
+| `UT_API_MAX_TOKENS` | 8192 | 傳給 `max_tokens`；0 = 用伺服器預設 |
+| `UT_API_MAX_TOOL_RESULT_CHARS` | 24000 | 單次工具結果上限，超過截斷 |
+| `UT_WRITER_TEMPERATURE` | 0.2 | writer 溫度；reviewer 固定 0，不可設定 |
+
 ## 第一次執行
 
 ```bash
@@ -89,7 +126,7 @@ testgen <package 路徑>                  # 端對端執行
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `UT_RUNNER` | opencode | opencode 或 qwen。qwen 需另裝：`npm i -D @qwen-code/sdk` |
+| `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
@@ -100,6 +137,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
 | `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行，紅燈標記為 pre-existing。預設中止 |
 | `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
+| `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
@@ -128,6 +166,38 @@ testgen <package 路徑>                  # 端對端執行
 25/20/15/15/15/10 計算，`grade` 依 85/70/55 分界為 A/B/C/D。兩者都由 pipeline 確定性計算、
 僅供報告。gate 的通過條件是 blockers 為空且六維皆達門檻。advisories 屬建議級，不擋關、也
 不進下一輪 feedback。
+
+## 加速：`UT_TEST_SCOPE=generated`
+
+預設每輪 build gate 都跑完整模組（含上游）的測試。既有測試越多、越慢——尤其 Spring Boot 測試，
+每輪都重新載入一次 context。
+
+```bash
+UT_TEST_SCOPE=generated testgen <package 路徑>
+```
+
+開啟後：**迭代期間** surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），**所有 gate 通過之後、
+宣告成功之前**，再以完整模組範圍重跑一次驗收。「新測試有沒有打壞既有測試」這個保證沒有被拿掉，
+只是從每輪一次改成整個 run 一次。
+
+200 隻既有測試（模擬 Spring context 載入）的實測：
+
+| | 每輪 build | 2 輪總時間 |
+| --- | --- | --- |
+| `module`（預設） | 23.3 s | 70.5 s |
+| `generated` | **4.0 s** | 56.0 s（含最後 21.8 s 的完整驗收） |
+
+省下的量隨輪數放大：2 輪省 21%，5 輪約省一半。輪數少時固定成本（預檢 + 最終驗收）佔比高，
+效益就沒那麼明顯。
+
+注意事項：
+
+- **只限縮執行，不限縮編譯。** 整個模組的測試原始碼還是要編得過，所以既有的編譯錯誤照樣擋你——
+  那是修復迴圈的工作。
+- **最終驗收失敗會餵回 writer**，報告明說「目標類別的測試本身通過，但打壞了既有測試」，附上失敗的
+  類別與斷言，然後進下一輪。
+- **覆蓋率反而更準**：限縮後 JaCoCo 只記錄目標測試造成的覆蓋，不會被別的測試順帶碰到而灌水。
+- Maven only。Gradle 會顯示警告並退回 `module`。
 
 ## Troubleshooting
 

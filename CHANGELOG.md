@@ -8,6 +8,24 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **`UT_TEST_SCOPE=generated`**：迭代期間 surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），
+  所有 gate 通過後、宣告成功前再以完整模組範圍重跑一次驗收（`final-verify.log`），失敗以
+  `final-verify-fail` 餵回下一輪。build gate 的承諾有兩半——「新測試會過」與「沒打壞別人」
+  ——後者只有完整重跑證明得了，所以這次重跑是**延後**不是省略。200 隻既有測試（模擬 Spring
+  context）實測：每輪 build 23.3s → 4.0s，2 輪總時間 70.5s → 56.0s，省下的量隨輪數放大。
+  只限縮執行不限縮編譯，既有編譯錯誤照樣擋。附帶好處是覆蓋率更準——JaCoCo 只記錄目標測試造成
+  的覆蓋，不會被別的測試順帶碰到而灌水。預設 `module` 維持原行為；Maven only，Gradle 警告後退回。
+- **api runner（`UT_RUNNER=api`）**：不經任何 agent CLI，直接對 OpenAI-compatible 的
+  `/v1/chat/completions` 做 tool calling，tool loop 由本工具自己跑（`runners/api.ts` +
+  `runners/api-tools.ts`）。權限就是工具清單——writer 拿到 read/list/search/write/replace，
+  沒有 bash 可給；reviewer 只有唯讀三個；`write_file` 只接受目標模組 `src/test/`，其他路徑
+  回錯誤給模型自己修正。沒有 opencode 的 session 固定開銷、不需要 ripgrep 與 `npm run setup`、
+  Windows 沒有 spawn 問題。tool call 精確計數（reviewer must-read guard）、output tokens 從
+  `usage` 累計、429/5xx 重試、4xx 直接判 spawn-error、回合與逾時預算。角色契約仍讀 agent
+  `.md` 本文，解析順序同 opencode，最後退回工具內建。`testgen doctor` 在此模式改檢查端點、
+  模型與角色契約。新增 `UT_API_BASE_URL` / `UT_API_KEY` / `UT_API_MAX_TURNS` /
+  `UT_API_MAX_TOKENS` / `UT_API_MAX_TOOL_RESULT_CHARS` / `UT_WRITER_TEMPERATURE`
+  （reviewer 溫度固定 0）。
 - **預檢基準（baseline pre-check）**：第一輪之前先跑一次與 build gate 完全相同的指令，
   取得「writer 介入前」的紅燈基準。build gate 跑的是 `mvn -pl <module> -am test`，整個模組
   連同上游模組的測試原始碼都要編得過，所以一個本工具沒碰過的壞檔就足以擋掉每一輪；先前

@@ -24,15 +24,18 @@ import {
   REPO_ROOT,
   ALLOW_TEST_SHRINK,
   REPAIR_MAX_ITER,
+  TEST_SCOPE,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
 import {
   clampText,
   diffSnapshots,
+  expectedTestPath,
   feedbackFingerprint,
   snapshotTree,
   stripRaw,
+  testClassNames,
   writerScopeSkip,
 } from "./libs/utils";
 import {
@@ -108,6 +111,23 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   // What every pre-existing test file had before round 1. The writer may reshape the files it
   // creates, but may not take anything away from these — see libs/testmetrics.ts.
   const originalMetrics = collectTestMetrics(testRoot);
+
+  // Scoped iterations: surefire runs only the target classes' tests, and the module-wide run
+  // is deferred to a single verification before success rather than skipped. Maven only —
+  // -Dtest is a surefire property, and gradle's --tests is a different shape.
+  const scoped = TEST_SCOPE === "generated" && cfg.buildTool === "maven";
+  if (TEST_SCOPE === "generated" && !scoped) {
+    log("[WARN] UT_TEST_SCOPE=generated 目前只支援 maven，本次退回完整模組範圍");
+  }
+  if (scoped) {
+    log("測試範圍：迭代期間只跑目標類別的測試，通過前會以完整模組範圍重跑一次驗收");
+  }
+  // Fixed part of the scope: where the tests for the target classes are expected to live, plus
+  // any existing test files already found for them.
+  const scopeSeed = [
+    ...cfg.targetClasses.map(expectedTestPath),
+    ...cfg.existingTests.flatMap((e) => e.tests),
+  ];
 
   const fail = (stopReason: string, finalFeedback: string, iter: number): OrchestratorResult => ({
     success: false,
@@ -248,7 +268,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     log("Step 2/4：執行編譯與測試 gate");
     // The coverage gate only trusts a report written after this instant.
     const buildStartedAt = Date.now();
-    const build = await runBuildAndTests(cfg.buildTool, cfg.mod);
+    // Whatever the writer just touched counts too: it may have named its file something the
+    // expected-path derivation does not predict, and a test that is not in -Dtest never runs.
+    const onlyTests = scoped ? testClassNames([...scopeSeed, ...changed]) : undefined;
+    if (onlyTests) log(`  範圍限縮：-Dtest=${onlyTests.join(",")}`);
+    const build = await runBuildAndTests(cfg.buildTool, cfg.mod, { onlyTests });
     save("build.log", build.raw ?? build.report);
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
@@ -287,43 +311,56 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     }
 
     // Step 4: review gate
+    let verdict: ReviewVerdict | undefined;
     if (cfg.skipReview) {
       log("Step 4/4：依設定跳過 review gate");
-      log("[OK] 全部 hard gate 通過");
-      record({
-        gate: "pass",
-        outcome: "hard-gates-passed",
-        changedFiles: changed.length,
-        writerOutputTokens: writer.outputTokens,
-      });
-      return {
-        success: true,
-        iterations: iter,
-        stopReason: "gates-passed",
+    } else {
+      log("Step 4/4：執行品質 review gate");
+      const reviewPrompt = buildReviewPrompt({
         targetClasses: cfg.targetClasses,
-        coverageReport: cov.report,
-        funnel,
-        totalOutputTokens,
-      };
+        rubric: cfg.rubric,
+        mod: cfg.mod,
+      });
+      save("review-prompt.md", reviewPrompt);
+      verdict = await runReviewGate(cfg.runner, reviewPrompt);
+      lastVerdict = verdict;
+      save("verdict.json", JSON.stringify(verdict, stripRaw, 2));
+      if (verdict.raw) save("review-raw.txt", verdict.raw);
     }
-    log("Step 4/4：執行品質 review gate");
-    const reviewPrompt = buildReviewPrompt({
-      targetClasses: cfg.targetClasses,
-      rubric: cfg.rubric,
-      mod: cfg.mod,
-    });
-    save("review-prompt.md", reviewPrompt);
-    const verdict = await runReviewGate(cfg.runner, reviewPrompt);
-    lastVerdict = verdict;
-    save("verdict.json", JSON.stringify(verdict, stripRaw, 2));
-    if (verdict.raw) save("review-raw.txt", verdict.raw);
 
-    if (verdict.passed) {
-      log("[OK] 品質 review gate：PASS");
-      log("所有關卡通過（編譯 / 測試 / 覆蓋率 / 品質審查）");
+    if (!verdict || verdict.passed) {
+      if (verdict) log("[OK] 品質 review gate：PASS");
+      // Every gate is satisfied for the target classes. Under a scoped run that is only half
+      // the build gate's promise — the other half, "and nothing else broke", needs the module
+      // -wide run. Deferring it to here costs one build per run instead of one per round;
+      // skipping it would trade the promise away for the same saving.
+      if (scoped) {
+        log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
+        const full = await runBuildAndTests(cfg.buildTool, cfg.mod);
+        save("final-verify.log", full.raw ?? full.report);
+        if (!full.passed) {
+          log("[FAIL] 最終驗收：模組其他測試被打壞");
+          record({
+            gate: "build",
+            outcome: "final-verify-fail",
+            changedFiles: changed.length,
+            writerOutputTokens: writer.outputTokens,
+          });
+          const stop = failRound(
+            "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——" +
+              `新測試打壞了既有測試，請修正。\n${full.report}`,
+            "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
+          );
+          if (stop) return stop;
+          log("→ 帶著最終驗收失敗進入下一輪");
+          continue;
+        }
+        log("[OK] 最終驗收：PASS");
+      }
+      log(verdict ? "所有關卡通過（編譯 / 測試 / 覆蓋率 / 品質審查）" : "[OK] 全部 hard gate 通過");
       record({
         gate: "pass",
-        outcome: "all-gates-passed",
+        outcome: verdict ? "all-gates-passed" : "hard-gates-passed",
         changedFiles: changed.length,
         writerOutputTokens: writer.outputTokens,
       });
