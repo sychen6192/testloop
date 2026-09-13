@@ -8,7 +8,7 @@
 // real child process, the real coverage and review gates. Only the writer and the model
 // endpoint are scripted.
 import * as path from "node:path";
-import { applyWriterAction, RUN_DIR, Scenario, TARGET_DIR } from "./itest-lib";
+import { applyWriterAction, RUN_DIR, Scenario, targetDirOf } from "./itest-lib";
 import { byName } from "./itest-scenarios";
 import { orchestrate, repairBaseline } from "../orchestrator";
 import { runBaseline } from "../gates/build";
@@ -50,7 +50,7 @@ async function main() {
   const sc = byName(process.argv[2]);
   const runner = new ScriptedRunner(sc);
   const runDir = path.join(REPO_ROOT, RUN_DIR);
-  const absTarget = path.join(REPO_ROOT, TARGET_DIR);
+  const absTarget = path.join(REPO_ROOT, targetDirOf(sc));
   const mod = findModuleInfo(absTarget, REPO_ROOT);
   const targetClasses = listJavaClasses(absTarget, REPO_ROOT);
   const conventions = scanTestConventions(

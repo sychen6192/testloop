@@ -19,6 +19,9 @@ import {
   SUREFIRE_PASS,
   SUREFIRE_TXT_BLIND,
   SUREFIRE_XML,
+  REACTOR_TEST_FAILURE,
+  MULTI_TEST_DIR,
+  UPSTREAM_TEST_DIR,
   TEST_DIR,
   TEST_FAILURE,
 } from "./itest-lib";
@@ -115,7 +118,7 @@ export const SCENARIOS: Scenario[] = [
     env: { UT_SKIP_REVIEW: "1" },
     writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, {}],
     mvn: [
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${CALC_TEST_PATH}`), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`), cleanSurefire: true },
     ],
   },
 
@@ -396,6 +399,120 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
 
+  // ── 多模組 reactor（core / common / web） ─────────────────────────────────
+  {
+    name: "multimodule-reactor-args",
+    desc: "多模組時 build gate 必須從 repo 根跑 -pl <模組> -am，且限縮同時套用到整個 reactor",
+    entry: "orchestrate",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(4),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.web.CalcTest", body: SUREFIRE_PASS("com.x.web.CalcTest"), module: "web" }],
+        jacoco: { ...JACOCO_GREEN, pkg: "com/x/web" },
+        jacocoModule: "web",
+      },
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(210),
+        jacoco: { ...JACOCO_GREEN, pkg: "com/x/web" },
+        jacocoModule: "web",
+      },
+    ],
+  },
+  {
+    name: "multimodule-upstream-failure-detail",
+    desc: "上游模組測試失敗時，明細在 common/target 底下——gate 必須讀得到，不能只看目標模組",
+    entry: "orchestrate",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      { write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: calcTest(1) } },
+      { write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: calcTest(9) } },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        // The failing module is common; its reports never land under web/target.
+        surefire: [
+          { cls: "com.x.common.UtilTest", body: SUREFIRE_TXT_BLIND("com.x.common.UtilTest"), module: "common" },
+        ],
+        surefireXml: [
+          {
+            suite: "com.x.common.UtilTest",
+            module: "common",
+            body: SUREFIRE_XML("com.x.common.UtilTest", 1, [
+              {
+                nested: "Trim",
+                method: "trim_stripsWhitespace",
+                message: "expected: <a> but was: < a >",
+                line: 11,
+              },
+            ]),
+          },
+        ],
+      },
+    ],
+  },
+  {
+    name: "multimodule-baseline-outside-scope",
+    desc: "紅燈在上游模組時，writer 根本無權修——必須立刻中止並點名，不得進修復迴圈燒輪數",
+    entry: "loop",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [
+      {
+        exit: 1,
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [
+          { cls: "com.x.common.UtilTest", body: SUREFIRE_TXT_BLIND("com.x.common.UtilTest"), module: "common" },
+        ],
+        surefireXml: [
+          {
+            suite: "com.x.common.UtilTest",
+            module: "common",
+            body: SUREFIRE_XML("com.x.common.UtilTest", 1, [
+              {
+                nested: "Trim",
+                method: "trim_stripsWhitespace",
+                message: "expected: <a> but was: < a >",
+                line: 11,
+              },
+            ]),
+          },
+        ],
+      },
+    ],
+  },
+
+  {
+    name: "multimodule-upstream-compile-error",
+    desc: "上游模組的測試編譯不過也一樣修不了——這條走的是檔案路徑分類，不是模組比對",
+    entry: "loop",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [
+      {
+        exit: 1,
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        out: COMPILE_FAILURE(`{{root}}/${UPSTREAM_TEST_DIR}/UtilTest.java`),
+      },
+    ],
+  },
+
   // ── 既有紅燈修復迴圈 ───────────────────────────────────────────────────────
   {
     name: "repair-success",
@@ -404,7 +521,7 @@ export const SCENARIOS: Scenario[] = [
     extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
     writer: [{ write: { [BROKEN_PATH]: FIXED_TEST } }],
     mvn: [
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
       GREEN_BUILD,
     ],
   },
@@ -417,7 +534,7 @@ export const SCENARIOS: Scenario[] = [
       { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 1\n` } },
       { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 22\n` } },
     ],
-    mvn: [{ exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true }],
+    mvn: [{ exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true }],
   },
   {
     name: "repair-scope-violation",
@@ -432,7 +549,7 @@ export const SCENARIOS: Scenario[] = [
         },
       },
     ],
-    mvn: [{ exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true }],
+    mvn: [{ exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true }],
   },
   {
     name: "repair-shrink-refused",
@@ -444,7 +561,7 @@ export const SCENARIOS: Scenario[] = [
       { write: { [EXISTING_PATH]: EXISTING_TEST } },
     ],
     mvn: [
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
       GREEN_BUILD,
     ],
   },
@@ -459,9 +576,9 @@ export const SCENARIOS: Scenario[] = [
       { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 22\n` } },
     ],
     mvn: [
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`, "log"), cleanSurefire: true },
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`, "logger"), cleanSurefire: true },
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`, "LOG"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`, "log"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`, "logger"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`, "LOG"), cleanSurefire: true },
     ],
   },
 
@@ -484,7 +601,7 @@ export const SCENARIOS: Scenario[] = [
     env: { UT_SKIP_REVIEW: "1", UT_REPAIR_BASELINE: "0" },
     extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
     api: [],
-    mvn: [{ exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true }],
+    mvn: [{ exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true }],
   },
   {
     name: "loop-repair-then-generate",
@@ -499,7 +616,7 @@ export const SCENARIOS: Scenario[] = [
       { content: "已建立 CalcTest.java" },
     ],
     mvn: [
-      { exit: 1, out: COMPILE_FAILURE(`/fixture/${BROKEN_PATH}`), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
       GREEN_BUILD,
       GREEN_BUILD,
     ],

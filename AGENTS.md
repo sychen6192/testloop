@@ -68,7 +68,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
    `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
    pre-existing 要求 writer 別碰。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
-   修復要證明的只有「模組綠了、而且沒有東西被拿掉」）與
+   修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈在不在
+   `<目標模組>/src/test` 內——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，
+   writer 沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，那種情況直接中止並點名）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
@@ -122,7 +124,7 @@ loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基�
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先，.txt 退路）＋預檢基準
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）

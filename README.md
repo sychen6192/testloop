@@ -218,6 +218,11 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
   本工具沒碰過的壞檔就能擋掉每一輪。預設會先用同一個 writer 修這些檔（範圍 guard 與防掏空
   guard 全程有效），修到綠才開始產生新測試；修好的檔案會列在 log 與 `repair-summary.md`，
   **那是 writer 對別人測試的改動，commit 前一定要看 diff**。
+- **中止，說「紅燈全部落在 writer 的可寫範圍之外」。** 預檢抓到的紅燈不在
+  `<目標模組>/src/test` 裡——多模組時最常見的是上游模組（`common`、`core`）的測試壞掉，也可能是
+  production code 或 `pom.xml`。writer 對這些檔案沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，
+  所以預檢就直接中止並逐一點名是哪個模組的哪個類別。人工修好再跑；`UT_ALLOW_DIRTY_BASELINE=1`
+  可硬跑，但那些紅燈每一輪都還在。
 - **中止，說「修復 N 輪後模組仍無法通過建置」。** 修復迴圈放棄了。最常見的根因不在測試檔而在
   建置設定——例如 `pom.xml` 沒讓 Lombok 的 annotation processor 在 test scope 生效，`@Slf4j`
   產不出 `log` 欄位——writer 無權改 pom，只能繞。人工修好再跑最省事；`UT_ALLOW_DIRTY_BASELINE=1`

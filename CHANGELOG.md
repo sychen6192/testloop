@@ -68,6 +68,18 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **多模組時，上游模組的失敗明細讀不到**。build gate 跑的是 `mvn -pl <module> -am test`，
+  上游模組也會編譯與執行測試，但失敗報告只從目標模組的 `target/surefire-reports` 撈。`common`
+  的測試失敗時，報告在 `common/target/surefire-reports`，永遠不會被讀到——writer 只拿到 maven
+  stdout 的方法名，沒有斷言訊息。現在掃描整個 reactor 的 `target/surefire-reports`，mtime 過濾
+  保證只會撈到本輪真的寫出來的報告。
+- **紅燈在 writer 可寫範圍之外時，修復迴圈會空轉到用完輪數**。writer 的可寫範圍只有
+  `<目標模組>/src/test`，但預檢紅燈可能來自上游模組的測試、production code 或 `pom.xml`——
+  那不是「難修」，是**沒有權限修**。先前 loop 照樣進修復迴圈，writer 每輪不是什麼都不做就是
+  嘗試寫到範圍外，最後以 `repair-failed:writer-no-op` 或 scope-violation 收場，錯誤訊息還去猜
+  是 Lombok annotation processor 的問題。現在預檢就把紅燈分類：任何一項落在可寫範圍外就不進
+  修復迴圈，直接中止並逐一點名「哪個檔／哪個類別、位於哪個模組」，`stopReason` 為
+  `dirty-baseline:out-of-scope`。`UT_ALLOW_DIRTY_BASELINE=1` 行為不變。
 - **`@Nested` 測試的失敗明細完全讀不到**。surefire 對「所有測試都在 `@Nested` 內層類別」的
   測試類別——JUnit 5 的常見寫法——`.txt` 摘要寫的是 `Tests run: 0, Failures: 0`，真實結果只在
   `TEST-*.xml`（同一次執行記的是 `tests=14 failures=12`）。build gate 讀 `.txt` 的計數，於是
@@ -128,7 +140,10 @@
     什麼都不做、建置綠但 0 測試、覆蓋率報告陳舊、限縮範圍綠但完整模組紅、reviewer 沒讀檔
     就給滿分。其中 5 個跑既有紅燈修復迴圈，3 個跑 `loop.ts` 全流程——經 api runner 打本機
     假端點，驗到 exit code 與 `summary.json` / `params.json` / `repair-summary.md`。
-  - 驗收方式是變異測試：把 14 道 guard 的判斷條件逐一反轉，對應情境必須紅。14/14 全中。
+  - itest 另含一個**多模組 reactor** fixture：root pom 加 common/core/web，假 mvnw 模擬 reactor
+    輸出與各模組自己的 `target/`。上面兩條多模組的 Fixed 就是先在它身上寫成會失敗的情境、
+    確認問題真的存在，才動手修的。
+  - 驗收方式是變異測試：把 guard 的判斷條件逐一反轉，對應情境必須紅。18/18 全中。
   - 情境環境是密封的——`BASE_ENV` 釘住每一個 `UT_*`，否則工具自己的 `.env`（例如
     `UT_STRICT_COV=1`）會決定斷言的成敗。新增旋鈕而沒釘住，itest 第一項就紅。
 

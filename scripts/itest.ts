@@ -12,7 +12,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, RUN_DIR, Scenario, TESTGEN_ROOT } from "./itest-lib";
+import { ApiTurn, buildFixture, envKnobsInSource, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
 import { SCENARIOS } from "./itest-scenarios";
 import { planSpawn } from "../libs/shell";
 
@@ -184,7 +184,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     const runsBase = path.join(root, ".itest", "runs");
     out = await runTsx(
       path.join(TESTGEN_ROOT, "loop.ts"),
-      ["src/main/java/com/x"],
+      [targetDirOf(sc)],
       root,
       childEnv({
         ...sc.env,
@@ -327,6 +327,57 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("回饋說明執行了 0 個測試", fb.includes("0 個測試"), fb.slice(0, 200));
     check("funnel 記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
     check("相同報告第 2 輪判 stuck", c.result.stopReason === "stuck", String(c.result.stopReason));
+  },
+
+  "multimodule-reactor-args": (c) => {
+    check("一輪全綠", c.result.success === true && c.result.iterations === 1, JSON.stringify(c.result.stopReason));
+    check("從 repo 根跑 reactor：帶 -pl web -am", c.argv[0]?.includes("-pl") && c.argv[0]?.includes("web") && c.argv[0]?.includes("-am"), JSON.stringify(c.argv[0]));
+    check("限縮同時套用到整個 reactor", c.argv[0]?.includes("-Dtest=CalcTest"), JSON.stringify(c.argv[0]));
+    check(
+      "上游模組沒有那些類別，必須關掉 failIfNoSpecifiedTests",
+      c.argv[0]?.includes("-Dsurefire.failIfNoSpecifiedTests=false"),
+      JSON.stringify(c.argv[0]),
+    );
+    check("最終驗收跑完整 reactor，不帶 -Dtest", c.argv[1]?.includes("-am") && !c.argv[1]?.some((a) => a.startsWith("-Dtest=")), JSON.stringify(c.argv[1]));
+    check("覆蓋率讀目標模組自己的報告", c.runRead("iter-1/coverage.txt").includes("Calc.java"), c.runRead("iter-1/coverage.txt"));
+  },
+
+  "multimodule-upstream-failure-detail": (c) => {
+    const fb = c.runRead("iter-1/feedback.md");
+    check("失敗類別點名上游模組", fb.includes("com.x.common.UtilTest"), fb.slice(0, 500));
+    check(
+      "斷言訊息要讀得到（報告在 common/target，不在 web/target）",
+      fb.includes("expected: <a> but was: < a >"),
+      fb.slice(0, 500),
+    );
+    check("帶到上游模組的 stack frame", fb.includes("UtilTest.java:11"), fb.slice(0, 500));
+    check("相同失敗第 2 輪判 stuck", c.result.stopReason === "stuck", String(c.result.stopReason));
+  },
+
+  "multimodule-baseline-outside-scope": (c) => {
+    check("以失敗結束", c.code !== 0, `code=${c.code}`);
+    check(
+      "不進修復迴圈——writer 對 common/src/test 沒有寫入權，修不了",
+      !c.runExists("repair-1/prompt.md"),
+      "repair-1 存在，代表 loop 花輪數去修一件它做不到的事",
+    );
+    check("stopReason 標示超出可修範圍", String(c.result.stopReason).includes("out-of-scope"), JSON.stringify(c.result.stopReason));
+    check("錯誤訊息點名是哪個模組壞了", /common/.test(c.stderr), c.stderr.slice(-400));
+    check("也點名具體的測試類別", c.stderr.includes("com.x.common.UtilTest"), c.stderr.slice(-400));
+    check("完全沒有產生測試", !c.exists("web/src/test/java/com/x/web/CalcTest.java"));
+  },
+
+  "multimodule-upstream-compile-error": (c) => {
+    check("以失敗結束", c.code !== 0, `code=${c.code}`);
+    check("不進修復迴圈", !c.runExists("repair-1/prompt.md"), "repair-1 存在");
+    check("stopReason 標示超出可修範圍", String(c.result.stopReason).includes("out-of-scope"), JSON.stringify(c.result.stopReason));
+    check(
+      "點名上游模組那個編譯不過的檔（相對 repo 根，不是絕對路徑）",
+      JSON.stringify(c.result.outOfScope).includes("common/src/test/java/com/x/common/UtilTest.java"),
+      JSON.stringify(c.result.outOfScope),
+    );
+    check("錯誤訊息看得到那個檔", c.stderr.includes("common/src/test/java/com/x/common/UtilTest.java"), c.stderr.slice(-400));
+    check("只跑了預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
   },
 
   "nested-surefire-failure": (c) => {

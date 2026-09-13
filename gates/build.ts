@@ -24,9 +24,17 @@ export interface BaselineResult {
   clean: boolean;
   compileErrorFiles: string[];
   failingTestClasses: string[];
+  // Broken things outside the writer's write scope (the target module's src/test): another
+  // module's tests, production code, build files. Repairing these is not slow, it is
+  // impossible — the writer has no permission to touch them — so the loop must not try.
+  outOfScope: string[];
   summary: string;
   raw: string;
 }
+
+/** The writer's only writable path, repo-relative, for messages. */
+export const writableRel = (mod: ModuleInfo) =>
+  path.join(mod.moduleRel || ".", "src", "test").replace(/\\/g, "/");
 
 export function detectBuildTool(moduleRoot: string): BuildTool {
   if (fs.existsSync(path.join(moduleRoot, "pom.xml"))) return "maven";
@@ -117,6 +125,9 @@ export interface SurefireSuite {
   // testsuite/@name, the reliable class identifier: a case's @classname may be a @DisplayName
   // ("handleValidation") rather than a type name.
   suite: string;
+  // The surefire-reports directory it was read from. In a reactor build that identifies the
+  // module, which is what says whether the writer is allowed to touch it.
+  dir?: string;
   tests: number;
   failures: number;
   errors: number;
@@ -213,6 +224,50 @@ export function renderSurefireSuite(s: SurefireSuite, maxCases = MAX_FAILURE_CAS
 const surefireDirOf = (moduleRoot: string) =>
   path.join(moduleRoot, "target", "surefire-reports");
 
+/**
+ * Every surefire-reports directory in the build, target module first.
+ *
+ * `mvn -pl web -am test` compiles and runs the upstream modules too, so the failure that
+ * turned the build red may sit in common/target/surefire-reports and never appear under the
+ * target module at all. Looking only at the target module leaves the writer with maven's
+ * stdout — the failing method's name, and nothing about why.
+ *
+ * The mtime filter downstream is what keeps this safe: extra directories can only contribute
+ * reports this build actually wrote.
+ */
+function surefireDirs(moduleRoot: string): string[] {
+  const dirs = [surefireDirOf(moduleRoot)];
+  const seen = new Set(dirs.map((d) => path.resolve(d)));
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith(".")) continue;
+      if (e.name === "node_modules" || e.name === "src") continue;
+      if (e.name === "target" || e.name === "build") {
+        const sr = path.join(dir, e.name, "surefire-reports");
+        const key = path.resolve(sr);
+        if (!seen.has(key) && fs.existsSync(sr)) {
+          seen.add(key);
+          dirs.push(sr);
+        }
+        continue;
+      }
+      walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  walk(REPO_ROOT, 0);
+  return dirs;
+}
+
+/** The module a surefire-reports directory belongs to: <module>/target/surefire-reports. */
+export const moduleOfSurefireDir = (dir: string) => path.dirname(path.dirname(dir));
+
 // Reports older than `since` are left over from an earlier build. Quoting them tells the
 // writer about tests that this round never ran — the compile step may have failed first.
 function freshFiles(dir: string, prefix: string, suffix: string, since: number): string[] {
@@ -231,16 +286,17 @@ function freshFiles(dir: string, prefix: string, suffix: string, since: number):
 }
 
 function failingSuites(moduleRoot: string, since: number): SurefireSuite[] {
-  const dir = surefireDirOf(moduleRoot);
   const out: SurefireSuite[] = [];
-  for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
-    let suite: SurefireSuite | null = null;
-    try {
-      suite = parseSurefireXml(fs.readFileSync(path.join(dir, f), "utf8"));
-    } catch {
-      /* unreadable, or truncated by a crashed JVM — the .txt fallback still applies */
+  for (const dir of surefireDirs(moduleRoot)) {
+    for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
+      let suite: SurefireSuite | null = null;
+      try {
+        suite = parseSurefireXml(fs.readFileSync(path.join(dir, f), "utf8"));
+      } catch {
+        /* unreadable, or truncated by a crashed JVM — the .txt fallback still applies */
+      }
+      if (suite && suite.failures + suite.errors > 0) out.push({ ...suite, dir });
     }
-    if (suite && suite.failures + suite.errors > 0) out.push(suite);
   }
   return out;
 }
@@ -263,12 +319,14 @@ function collectSurefireFailures(moduleRoot: string, since: number): string {
   }
 
   // No usable XML this build (disableXmlReport, or the JVM died before writing one).
-  const surefireDir = surefireDirOf(moduleRoot);
-  const failing = failingReports(surefireDir, since);
+  const failing: Array<{ dir: string; file: string }> = [];
+  for (const dir of surefireDirs(moduleRoot)) {
+    for (const file of failingReports(dir, since)) failing.push({ dir, file });
+  }
   let failures = "";
-  for (const f of failing.slice(0, MAX_FAILURE_BLOCKS)) {
-    const txt = fs.readFileSync(path.join(surefireDir, f), "utf8");
-    failures += `\n----- ${f} -----\n${tail(txt, 1500)}`;
+  for (const { dir, file } of failing.slice(0, MAX_FAILURE_BLOCKS)) {
+    const txt = fs.readFileSync(path.join(dir, file), "utf8");
+    failures += `\n----- ${file} -----\n${tail(txt, 1500)}`;
   }
   if (failing.length > MAX_FAILURE_BLOCKS) {
     failures += `\n（另有 ${failing.length - MAX_FAILURE_BLOCKS} 個失敗的測試類別未列出，見 build.log）`;
@@ -316,7 +374,9 @@ export function extractCompileErrorFiles(raw: string): string[] {
 function collectFailingTestClasses(moduleRoot: string, since: number): string[] {
   const suites = failingSuites(moduleRoot, since);
   if (suites.length) return suites.map((s) => s.suite);
-  return failingReports(surefireDirOf(moduleRoot), since).map((f) => f.replace(/\.txt$/, ""));
+  return surefireDirs(moduleRoot).flatMap((dir) =>
+    failingReports(dir, since).map((f) => f.replace(/\.txt$/, "")),
+  );
 }
 
 /**
@@ -348,6 +408,7 @@ export async function runBaseline(
       clean: true,
       compileErrorFiles: [],
       failingTestClasses: [],
+      outOfScope: [],
       summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
     };
@@ -355,8 +416,34 @@ export async function runBaseline(
 
   const raw = r.raw ?? "";
   const compileErrorFiles = extractCompileErrorFiles(raw);
-  const failingTestClasses =
-    tool === "maven" ? collectFailingTestClasses(mod.moduleRoot, startedAt) : [];
+  const suites = tool === "maven" ? failingSuites(mod.moduleRoot, startedAt) : [];
+  const failingTestClasses = suites.length
+    ? suites.map((s) => s.suite)
+    : tool === "maven"
+      ? collectFailingTestClasses(mod.moduleRoot, startedAt)
+      : [];
+
+  // What the writer is allowed to change. Everything red outside it is a human's job: the
+  // repair loop would spend its whole budget discovering it cannot write there.
+  const writable = path.join(mod.moduleRoot, "src", "test");
+  const inside = (abs: string) => {
+    const rel = path.relative(writable, abs);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  };
+  const show = (abs: string) => (path.relative(REPO_ROOT, abs) || ".").replace(/\\/g, "/");
+  const outOfScope: string[] = [];
+  for (const f of compileErrorFiles) {
+    const abs = path.isAbsolute(f) ? f : path.join(REPO_ROOT, f);
+    if (!inside(abs)) outOfScope.push(`${show(abs)}（編譯失敗）`);
+  }
+  for (const s of suites) {
+    if (!s.dir) continue;
+    const owner = moduleOfSurefireDir(s.dir);
+    if (path.resolve(owner) !== path.resolve(mod.moduleRoot)) {
+      outOfScope.push(`${s.suite}（測試失敗，位於模組 ${show(owner)}）`);
+    }
+  }
+
   const lines = [
     phase === "repair" ? `${tag}：模組仍然是紅的。` : `${tag}：模組在 writer 介入前就已經是紅的。`,
   ];
@@ -372,10 +459,15 @@ export async function runBaseline(
     lines.push("（無法從輸出定位到具體檔案，錯誤節錄如下）");
     lines.push(summarizeBuildErrors(raw, 2000));
   }
+  if (outOfScope.length) {
+    lines.push(`超出 writer 可寫範圍（${writableRel(mod)}）的有 ${outOfScope.length} 項：`);
+    outOfScope.forEach((f) => lines.push(`  - ${f}`));
+  }
   return {
     clean: false,
     compileErrorFiles,
     failingTestClasses,
+    outOfScope,
     summary: lines.join("\n"),
     raw,
   };

@@ -43,12 +43,16 @@ export interface MvnStep {
   out?: string;
   /** Wipe target/surefire-reports first (a compile failure leaves no fresh reports). */
   cleanSurefire?: boolean;
-  /** Surefire .txt reports to write. `{{elapsed}}` varies per call. */
-  surefire?: Array<{ cls: string; body: string }>;
-  /** Surefire XML reports to write as TEST-<suite>.xml — the source the gate prefers. */
-  surefireXml?: Array<{ suite: string; body: string }>;
+  /** Extra module dirs whose surefire reports cleanSurefire should also wipe. */
+  modules?: string[];
+  /** Surefire .txt reports. `module` selects the reactor module; "" is the root. */
+  surefire?: Array<{ cls: string; body: string; module?: string }>;
+  /** Surefire XML reports written as TEST-<suite>.xml — the source the gate prefers. */
+  surefireXml?: Array<{ suite: string; body: string; module?: string }>;
   /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. */
   jacoco?: JacocoSpec;
+  /** Which module's target/ the jacoco report lands in; "" is the root. */
+  jacocoModule?: string;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
   jacocoAgeMs?: number;
 }
@@ -89,6 +93,8 @@ export interface Scenario {
   extraFiles?: Record<string, string>;
   /** Leave the pre-existing test out (nothing for the shrink guard to protect). */
   omitExisting?: boolean;
+  /** "multi" builds a reactor with common/core/web and targets web. Default "single". */
+  layout?: "single" | "multi";
   writer?: WriterAction[];
   review?: ReviewAction[];
   /** For entry=loop: the fake endpoint's scripted turns, consumed in order. */
@@ -232,22 +238,28 @@ fs.appendFileSync(path.join(itest, "mvn-argv.log"), JSON.stringify(process.argv.
 
 const step = plan[Math.min(n - 1, plan.length - 1)] || { exit: 0, out: "" };
 const vary = (s) => String(s)
+  .replace(/{{root}}/g, root)
   .replace(/{{time}}/g, new Date(1767225600000 + n * 1013).toISOString())
   .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3));
 
-const surefireDir = path.join(root, "target", "surefire-reports");
-if (step.cleanSurefire) fs.rmSync(surefireDir, { recursive: true, force: true });
-if (step.surefire) {
-  fs.mkdirSync(surefireDir, { recursive: true });
-  for (const r of step.surefire) {
-    fs.writeFileSync(path.join(surefireDir, r.cls + ".txt"), vary(r.body));
-  }
+const sfDir = (mod) => path.join(root, mod || ".", "target", "surefire-reports");
+if (step.cleanSurefire) {
+  const mods = new Set([""].concat(
+    (step.surefire || []).map((r) => r.module || ""),
+    (step.surefireXml || []).map((r) => r.module || ""),
+    step.modules || [],
+  ));
+  for (const m of mods) fs.rmSync(sfDir(m), { recursive: true, force: true });
 }
-if (step.surefireXml) {
-  fs.mkdirSync(surefireDir, { recursive: true });
-  for (const r of step.surefireXml) {
-    fs.writeFileSync(path.join(surefireDir, "TEST-" + r.suite + ".xml"), vary(r.body));
-  }
+for (const r of step.surefire || []) {
+  const d = sfDir(r.module);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, r.cls + ".txt"), vary(r.body));
+}
+for (const r of step.surefireXml || []) {
+  const d = sfDir(r.module);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "TEST-" + r.suite + ".xml"), vary(r.body));
 }
 
 if (step.jacoco) {
@@ -259,7 +271,7 @@ if (step.jacoco) {
     '<counter type="LINE" missed="' + j.line[0] + '" covered="' + j.line[1] + '"/>\\n' +
     '<counter type="BRANCH" missed="' + j.branch[0] + '" covered="' + j.branch[1] + '"/>\\n' +
     '</sourcefile>\\n</package>\\n</report>\\n';
-  const out = path.join(root, "target", "site", "jacoco", "jacoco.xml");
+  const out = path.join(root, step.jacocoModule || ".", "target", "site", "jacoco", "jacoco.xml");
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, xml);
   if (step.jacocoAgeMs) {
@@ -287,6 +299,8 @@ export const BUILD_SUCCESS = (tests = 3) =>
   ].join("\n");
 
 /** Maven's boilerplate footer sits at the end on purpose — tail() would keep it. */
+/** `file` should start with `{{root}}/` — maven prints absolute paths, and the scope
+ *  classification in runBaseline reads them as such. */
 export const COMPILE_FAILURE = (file: string, symbol = "log") =>
   [
     "[INFO] Scanning for projects...",
@@ -369,6 +383,27 @@ export const SUREFIRE_XML = (suite: string, tests: number, cases: XmlCase[]) => 
 `;
 };
 
+/** What a reactor build prints when an upstream module's test fails: downstream is skipped. */
+export const REACTOR_TEST_FAILURE = (module: string, cls: string) =>
+  [
+    "[INFO] Scanning for projects...",
+    "[INFO] Reactor Build Order:",
+    "[INFO] common",
+    "[INFO] core",
+    "[INFO] web",
+    `[INFO] --- surefire:3.5.6:test (default-test) @ ${module} ---`,
+    "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0",
+    `[ERROR] ${cls}.trim_stripsWhitespace -- Time elapsed: {{elapsed}} s <<< FAILURE!`,
+    "[INFO] Reactor Summary:",
+    `[INFO] ${module} .......................................... FAILURE`,
+    "[INFO] core ............................................ SKIPPED",
+    "[INFO] web ............................................. SKIPPED",
+    "[INFO] BUILD FAILURE",
+    "[INFO] Total time:  {{elapsed}} s",
+    "[INFO] Finished at: {{time}}",
+    "[ERROR] -> [Help 1]",
+  ].join("\n");
+
 export const SUREFIRE_PASS = (cls: string) =>
   [
     `Test set: ${cls}`,
@@ -399,6 +434,57 @@ export const TARGET_DIR = "src/main/java/com/x";
 export const TEST_DIR = "src/test/java/com/x";
 export const RUN_DIR = ".itest/run";
 
+// Reactor layout: web depends on core depends on common — the shape the build gate meets as
+// `mvn -pl web -am test`, where every upstream module compiles and tests too.
+export const MULTI_MODULES = ["common", "core", "web"] as const;
+export const MULTI_TARGET_DIR = "web/src/main/java/com/x/web";
+export const MULTI_TEST_DIR = "web/src/test/java/com/x/web";
+export const UPSTREAM_TEST_DIR = "common/src/test/java/com/x/common";
+
+export const targetDirOf = (sc: Scenario) =>
+  sc.layout === "multi" ? MULTI_TARGET_DIR : TARGET_DIR;
+
+const REACTOR_POM = `<project><modelVersion>4.0.0</modelVersion>
+  <groupId>com.x</groupId><artifactId>reactor</artifactId><version>1.0</version>
+  <packaging>pom</packaging>
+  <modules>
+${MULTI_MODULES.map((m) => `    <module>${m}</module>`).join("\n")}
+  </modules>
+</project>
+`;
+
+const MODULE_POM = (name: string) => `<project><modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.x</groupId><artifactId>reactor</artifactId><version>1.0</version></parent>
+  <artifactId>${name}</artifactId>
+</project>
+`;
+
+/** A pre-existing upstream test. The writer must never be able to reach it. */
+export const UPSTREAM_TEST = `package com.x.common;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class UtilTest {
+
+    @Test
+    void trim_stripsWhitespace() {
+        assertEquals("a", Util.trim(" a "));
+    }
+}
+`;
+
+const UPSTREAM_MAIN = `package com.x.common;
+
+public final class Util {
+    private Util() {}
+
+    public static String trim(String s) {
+        return s == null ? null : s.strip();
+    }
+}
+`;
+
 function write(root: string, rel: string, content: string) {
   const p = path.join(root, rel);
   fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -410,15 +496,26 @@ export function buildFixture(root: string, sc: Scenario): void {
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(root, { recursive: true });
 
-  write(root, "pom.xml", POM);
+  const multi = sc.layout === "multi";
+  write(root, "pom.xml", multi ? REACTOR_POM : POM);
   // The fake mvnw is CommonJS; pin it so an ancestor package.json cannot flip it to ESM.
   write(root, "package.json", JSON.stringify({ name: "fixture", type: "commonjs" }, null, 2));
   write(root, "mvnw", FAKE_MVNW);
   fs.chmodSync(path.join(root, "mvnw"), 0o755);
   write(root, "mvnw.cmd", FAKE_MVNW_CMD);
 
-  write(root, `${TARGET_DIR}/Calc.java`, CALC_JAVA);
-  if (!sc.omitExisting) write(root, `${TEST_DIR}/ExistingTest.java`, EXISTING_TEST);
+  if (multi) {
+    for (const m of MULTI_MODULES) write(root, `${m}/pom.xml`, MODULE_POM(m));
+    write(root, "common/src/main/java/com/x/common/Util.java", UPSTREAM_MAIN);
+    write(root, `${UPSTREAM_TEST_DIR}/UtilTest.java`, UPSTREAM_TEST);
+    write(root, `${MULTI_TARGET_DIR}/Calc.java`, CALC_JAVA.replace("package com.x;", "package com.x.web;"));
+    if (!sc.omitExisting) {
+      write(root, `${MULTI_TEST_DIR}/ExistingTest.java`, EXISTING_TEST.replace("package com.x;", "package com.x.web;"));
+    }
+  } else {
+    write(root, `${TARGET_DIR}/Calc.java`, CALC_JAVA);
+    if (!sc.omitExisting) write(root, `${TEST_DIR}/ExistingTest.java`, EXISTING_TEST);
+  }
   for (const [rel, content] of Object.entries(sc.extraFiles ?? {})) write(root, rel, content);
 
   // .itest is a dot-directory, so the writer-scope snapshot ignores it — the plan, the call
