@@ -150,8 +150,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     // A failed round: bound the report, persist it, and stop if it is the same failure as last
     // round (see feedbackFingerprint). Returns the abort result, or null to go on.
     const failRound = (report: string, stuckMsg: string): OrchestratorResult | null => {
-      // Bounded here as well as at the source: the invariant is "the writer never receives
-      // more than MAX_FEEDBACK_CHARS", and it must hold whichever gate wrote the report.
+      // Bounded here as well as at the source, so the invariant holds whichever gate wrote
+      // the report: the writer never receives more than MAX_FEEDBACK_CHARS *of report*, plus
+      // clampText's short truncation notice when it had to cut. The notice is deliberate —
+      // a silently shortened report reads as a complete one — so the string is a few dozen
+      // characters over the number, not under it.
       feedback = clampText(report, MAX_FEEDBACK_CHARS);
       save("feedback.md", feedback);
       const fingerprint = feedbackFingerprint(feedback);
