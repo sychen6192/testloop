@@ -131,6 +131,27 @@ export const REVIEWER_TEMPERATURE = 0;
 // socket) was the one unbounded wait left in the pipeline.
 export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000);
 export const OPENCODE_BIN = process.env.UT_OPENCODE_BIN ?? "opencode";
+
+// --- Corporate network: proxy and TLS interception ---------------------------
+// The UT_ form wins so a run can override a shell that already exports the standard names;
+// otherwise the standard lowercase/uppercase variables are honoured, the way curl and git do.
+function envAny(names: string[]): string {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v) return v.trim();
+  }
+  return "";
+}
+
+export const HTTPS_PROXY = envAny(["UT_HTTPS_PROXY", "HTTPS_PROXY", "https_proxy"]);
+export const HTTP_PROXY = envAny(["UT_HTTP_PROXY", "HTTP_PROXY", "http_proxy"]);
+export const NO_PROXY = envAny(["UT_NO_PROXY", "NO_PROXY", "no_proxy"]);
+// CA bundle(s) to trust where a proxy re-signs TLS. Comma-separated; a root and its
+// intermediate often arrive as two files. Read at request time rather than process start,
+// so it works however the tool was launched — NODE_EXTRA_CA_CERTS does not.
+export const CA_CERTS = envAny(["UT_CA_CERTS"]);
+// Some proxies filter the CONNECT request by User-Agent.
+export const USER_AGENT_OVERRIDE = envAny(["UT_USER_AGENT"]);
 // 0 = drop --format json (fallback for versions without JSONL events; loses live progress).
 export const OPENCODE_JSON_EVENTS = process.env.UT_OPENCODE_JSON !== "0";
 // 1 = append --dangerously-skip-permissions to the writer call.

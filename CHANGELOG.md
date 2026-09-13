@@ -8,6 +8,18 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **公司網路支援：proxy 與 TLS 攔截**（`libs/proxy.ts`、`libs/tls.ts`，作法參考姊妹專案
+  prloop 的實戰版本）。Node 內建的 fetch **完全無視** `HTTP_PROXY` / `HTTPS_PROXY`——curl、
+  git、mvn 都吃，它不吃——所以在只能經 proxy 出去的網路上，症狀是一個沒頭沒尾的
+  `ECONNREFUSED`，完全看不出跟 proxy 有關。現在自己讀標準變數並交給 undici 的 dispatcher。
+  `UT_NO_PROXY` 支援 `host:port` 形式，這是內網模型端點唯一寫得對的方式；少了它，
+  `NO_PROXY=llm.corp:8080` 會靜默地什麼都不匹配，流量照樣送去 proxy。CA 在**執行時**載入交給
+  dispatcher，而不是靠 `NODE_EXTRA_CA_CERTS`——後者只在 node 啟動前就 export 才有效，等於
+  `npx tsx loop.ts` 直接跑時完全失效。傳 `ca` 會**取代**信任庫而非附加，所以一定串上
+  `tls.rootCertificates`，否則設了公司 CA 之後所有公開 HTTPS 都會壞。新增
+  `UT_HTTPS_PROXY` / `UT_HTTP_PROXY` / `UT_NO_PROXY` / `UT_CA_CERTS` / `UT_USER_AGENT`，
+  `testgen doctor` 會列出 proxy 與 CA 狀態（帳密遮蔽），端點連不上時的訊息會依是否設了 proxy
+  給不同的下一步。新增第一個 runtime dependency：`undici`。
 - **`UT_TEST_SCOPE=generated`**：迭代期間 surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），
   所有 gate 通過後、宣告成功前再以完整模組範圍重跑一次驗收（`final-verify.log`），失敗以
   `final-verify-fail` 餵回下一輪。build gate 的承諾有兩半——「新測試會過」與「沒打壞別人」
@@ -68,6 +80,11 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **undici 的預設逾時坐在 agent 逾時底下，300 秒就砍掉請求**。`headersTimeout` 與
+  `bodyTimeout` 預設都是 300 秒，而它們在 api runner 的 AbortController **下面**——模型若超過
+  五分鐘才吐第一個 byte，會在約 301 秒以一句 `TypeError: fetch failed` 死掉，而不是等到
+  `UT_AGENT_TIMEOUT_MS`（預設 15 分鐘，慢模型常設到 25 分鐘）。現在所有 dispatcher 都把這兩個
+  逾時關掉，逾時只由 runner 自己的計時器決定。這條與 proxy 無關，沒有 proxy 的環境一樣中招。
 - **多模組時，上游模組的失敗明細讀不到**。build gate 跑的是 `mvn -pl <module> -am test`，
   上游模組也會編譯與執行測試，但失敗報告只從目標模組的 `target/surefire-reports` 撈。`common`
   的測試失敗時，報告在 `common/target/surefire-reports`，永遠不會被讀到——writer 只拿到 maven

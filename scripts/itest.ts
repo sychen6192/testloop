@@ -9,6 +9,7 @@
 // Run: npx tsx scripts/itest.ts [情境名稱]
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
@@ -45,6 +46,11 @@ const BASE_ENV: Record<string, string> = {
   UT_API_MAX_TOOL_RESULT_CHARS: "20000",
   UT_API_MAX_TURNS: "8",
   UT_BUILD_TIMEOUT_MS: "60000",
+  UT_CA_CERTS: "",
+  UT_HTTPS_PROXY: "",
+  UT_HTTP_PROXY: "",
+  UT_NO_PROXY: "",
+  UT_USER_AGENT: "",
   UT_JACOCO_XML: "",
   UT_MAVEN_ARGS: "",
   UT_MAX_FAILURE_BLOCKS: "5",
@@ -153,6 +159,49 @@ function startFakeApi(turns: ApiTurn[]): Promise<{ url: string; close: () => Pro
   });
 }
 
+/**
+ * A real forward proxy, so "the request went through the proxy" is observed rather than
+ * asserted about a pure function. Handles CONNECT (what undici's ProxyAgent uses) and
+ * absolute-form requests, and records every origin it was asked to reach.
+ */
+function startProxy(): Promise<{ url: string; seen: string[]; close: () => Promise<void> }> {
+  const seen: string[] = [];
+  const sockets = new Set<import("node:stream").Duplex>();
+  const server = http.createServer((req, res) => {
+    seen.push(req.url ?? "");
+    res.writeHead(502).end("this fixture proxy only tunnels");
+  });
+  server.on("connect", (req, clientSocket, head) => {
+    seen.push(req.url ?? "");
+    const [host, port] = (req.url ?? "").split(":");
+    const upstream = net.connect(Number(port), host, () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    for (const s of [clientSocket, upstream]) {
+      sockets.add(s);
+      s.on("close", () => sockets.delete(s));
+      s.on("error", () => s.destroy());
+    }
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const port = (server.address() as { port: number }).port;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        seen,
+        close: () =>
+          new Promise<void>((r) => {
+            for (const s of sockets) s.destroy();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
 // ─── Scenario execution ──────────────────────────────────────────────────────
 
 interface Ctx {
@@ -165,6 +214,8 @@ interface Ctx {
   stderr: string;
   argv: string[][];
   mvnCalls: number;
+  /** Origins the fixture proxy was asked to reach; undefined when no proxy ran. */
+  proxySeen?: string[];
   read(rel: string): string;
   exists(rel: string): boolean;
   runRead(rel: string): string;
@@ -178,9 +229,13 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
   let out: RunOut;
   let runDir = path.join(root, RUN_DIR);
   let result: Record<string, unknown> = {};
+  let proxySeen: string[] | undefined;
 
   if (sc.entry === "loop") {
     const api = await startFakeApi(sc.api ?? []);
+    const proxy = sc.proxy ? await startProxy() : undefined;
+    proxySeen = proxy?.seen;
+    const apiHost = new URL(api.url).host;
     const runsBase = path.join(root, ".itest", "runs");
     out = await runTsx(
       path.join(TESTGEN_ROOT, "loop.ts"),
@@ -191,9 +246,13 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
         UT_RUNNER: "api",
         UT_API_BASE_URL: api.url,
         UT_RUNS_DIR: runsBase,
+        ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
+        // Scenarios opt into the bypass by naming the endpoint's own host:port.
+        ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
       }),
     );
     await api.close();
+    await proxy?.close();
     // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; exactly one run per scenario.
     const repoRuns = path.join(runsBase, path.basename(root));
     const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
@@ -236,6 +295,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     stderr: out.stderr,
     argv,
     mvnCalls: argv.length,
+    proxySeen,
     read: rd(root),
     exists: ex(root),
     runRead: rd(runDir),
@@ -533,6 +593,29 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("params.json 記錄 runner 與 testScope", params.runner === "api" && params.testScope === "module", JSON.stringify(params));
     check("api runner 真的把測試寫進 src/test", c.exists("src/test/java/com/x/CalcTest.java"));
     check("writer 摘要落地", c.runExists("iter-1/writer-summary.md"));
+  },
+
+  "loop-through-proxy": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("proxy 確實收到連線", (c.proxySeen?.length ?? 0) > 0, JSON.stringify(c.proxySeen));
+    check(
+      "proxy 被要求連到假端點的 host:port",
+      (c.proxySeen ?? []).some((t) => /^127\.0\.0\.1:\d+$/.test(t)),
+      JSON.stringify(c.proxySeen),
+    );
+    check("測試仍然照常產生", c.exists("src/test/java/com/x/CalcTest.java"));
+  },
+
+  "loop-proxy-bypassed": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check(
+      "NO_PROXY 生效：proxy 一次連線都沒收到",
+      (c.proxySeen?.length ?? 0) === 0,
+      JSON.stringify(c.proxySeen),
+    );
+    check("測試仍然照常產生", c.exists("src/test/java/com/x/CalcTest.java"));
   },
 
   "loop-dirty-baseline-abort": (c) => {

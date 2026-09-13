@@ -132,6 +132,8 @@ runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/sear
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印）
+libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 逾時覆寫
+libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
 libs/utils.ts         純函式（含 skillDirCandidates / runsDirFor / findExistingTests / clampText）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防掏空 guard 的量尺）

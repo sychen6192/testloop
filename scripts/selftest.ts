@@ -59,6 +59,8 @@ import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree } from "../libs/shell";
 import { spawn } from "node:child_process";
 import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
+import { bypassesProxy, redactProxy } from "../libs/proxy";
+import { bundleFrom, caSummary, load, sourcePaths } from "../libs/tls";
 
 let passCount = 0;
 let failCount = 0;
@@ -1566,11 +1568,77 @@ console.log("\n[20] parseSurefireXml / renderSurefireSuite（@Nested 失敗明�
 }
 
 // ---------------------------------------------------------------------------
-// 21. Architecture invariants: the hard rules in AGENTS.md, as asserts
+// 21. Corporate network: NO_PROXY matching, credential redaction, CA bundles
+// ---------------------------------------------------------------------------
+console.log("\n[21] bypassesProxy / redactProxy / CA bundle（公司網路）");
+{
+  // The case that matters most here: a self-hosted model endpoint must bypass the proxy that
+  // fronts external traffic, and the obvious way to write that is host:port.
+  check("host:port 完全相符 → 繞過", bypassesProxy("llm.corp", "llm.corp:8080", "8080"));
+  check("host:port 但連接埠不同 → 不繞過", !bypassesProxy("llm.corp", "llm.corp:8080", "443"));
+  check("host:port 但不知道連接埠 → 不繞過", !bypassesProxy("llm.corp", "llm.corp:8080"));
+  check("IP 加連接埠", bypassesProxy("100.77.16.46", "100.77.16.46:8080", "8080"));
+
+  check("裸主機名相符", bypassesProxy("api.corp", "api.corp", "443"));
+  check("前綴點比對子網域", bypassesProxy("a.b.corp", ".corp", "443"));
+  check("裸後綴也比對子網域", bypassesProxy("a.b.corp", "corp", "443"));
+  check("不是子網域就不該相符", !bypassesProxy("evilcorp", "corp", "443"));
+  check("萬用字元前綴", bypassesProxy("a.corp", "*.corp", "443"));
+  check("單一 * 關閉整個 proxy", bypassesProxy("anything.example", "*", "443"));
+  check("多筆以逗號分隔、容忍空白", bypassesProxy("b.corp", " a.corp , b.corp ", "443"));
+  check("空字串 → 不繞過", !bypassesProxy("a.corp", "", "443"));
+  check("大小寫不敏感", bypassesProxy("A.CORP", "a.corp", "443"));
+
+  // A proxy URL goes into logs and into doctor's output; the password must not.
+  check("遮蔽帳密", redactProxy("http://user:pw@proxy.corp:8080") === "http://user:***@proxy.corp:8080");
+  check("只有使用者名稱也遮蔽", redactProxy("http://user@proxy.corp:8080") === "http://user:***@proxy.corp:8080");
+  check("沒有帳密就原樣", redactProxy("http://proxy.corp:8080") === "http://proxy.corp:8080");
+  // new URL() would normalise :80 away, which reads as "我設的連接埠不見了".
+  check("預設連接埠不得被正規化掉", redactProxy("http://proxy.corp:80") === "http://proxy.corp:80");
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-ca-"));
+  const pem = path.join(tmp, "root.pem");
+  const oneCert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+  fs.writeFileSync(pem, `${oneCert}\n${oneCert.replace("AAAA", "BBBB")}\n`);
+  const der = path.join(tmp, "corp.cer");
+  fs.writeFileSync(der, "\u0000\u0001binary not pem");
+
+  check(
+    "兩個來源合併、去重、保留順序",
+    JSON.stringify(sourcePaths("a.pem, b.pem", "b.pem,c.pem").map((x) => `${x.path}:${x.from}`)) ===
+      JSON.stringify(["a.pem:UT_CA_CERTS", "b.pem:UT_CA_CERTS", "c.pem:NODE_EXTRA_CA_CERTS"]),
+    JSON.stringify(sourcePaths("a.pem, b.pem", "b.pem,c.pem")),
+  );
+  const ok = load([{ path: pem, from: "UT_CA_CERTS" }]);
+  check("讀得到一個檔裡的多張憑證", ok.sources[0].certs === 2 && ok.pems.length === 2, JSON.stringify(ok.sources));
+  const missing = load([{ path: path.join(tmp, "nope.pem"), from: "UT_CA_CERTS" }]);
+  check("檔案不存在 → 記下錯誤而不是拋例外", !!missing.sources[0].error && missing.pems.length === 0);
+  const derLoad = load([{ path: der, from: "UT_CA_CERTS" }]);
+  check("DER 檔給出可行動的訊息", (derLoad.sources[0].error ?? "").includes("DER"), JSON.stringify(derLoad.sources));
+
+  // Passing `ca` REPLACES the trust store; without the built-in roots, configuring a
+  // corporate CA would break every ordinary HTTPS call the tool makes.
+  check("沒有設定 → undefined，不動預設信任庫", bundleFrom([]) === undefined);
+  const bundle = bundleFrom(["CORP"], ["ROOT_A", "ROOT_B"]);
+  check(
+    "有設定 → 內建根憑證 + 自訂憑證，不是只有自訂",
+    JSON.stringify(bundle) === JSON.stringify(["ROOT_A", "ROOT_B", "CORP"]),
+    JSON.stringify(bundle),
+  );
+  check("未設定時的摘要說得清楚", caSummary([]).includes("未設定"));
+  check(
+    "讀取失敗的摘要點名檔案與原因",
+    caSummary([{ path: "/x.pem", from: "UT_CA_CERTS", certs: 0, error: "ENOENT" }]).includes("/x.pem"),
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 22. Architecture invariants: the hard rules in AGENTS.md, as asserts
 // ---------------------------------------------------------------------------
 // Each of these was a written rule that nothing enforced. A grep in a doc is a rule people
 // remember; a grep in the selftest is a rule CI remembers.
-console.log("\n[21] 架構不變式（AGENTS.md 硬規則的可執行版本）");
+console.log("\n[22] 架構不變式（AGENTS.md 硬規則的可執行版本）");
 {
   const sources: string[] = [];
   const walk = (d: string) => {

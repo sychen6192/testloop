@@ -32,6 +32,7 @@ import {
 import { log, logVerbose, startHeartbeat } from "../libs/log";
 import { resolveAgentPath } from "../libs/guard";
 import { ToolSpec, execTool, toOpenAiTools, toolsFor } from "./api-tools";
+import { dispatcherFor, USER_AGENT } from "../libs/proxy";
 
 export interface RoleContract {
   text: string;
@@ -171,16 +172,21 @@ export class ApiRunner implements AgentRunner {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), remaining);
       let res: Response;
+      const url = `${this.baseUrl}/chat/completions`;
       try {
-        res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+        res = await this.fetchImpl(url, {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            "user-agent": USER_AGENT,
             ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
           },
           body: JSON.stringify(body),
           signal: ctl.signal,
-        });
+          // Node's fetch ignores HTTP_PROXY, and undici's own 300s timeouts would fire
+          // underneath the AbortController above. Both are the dispatcher's job.
+          dispatcher: dispatcherFor(url),
+        } as RequestInit);
       } catch (e) {
         clearTimeout(timer);
         if (ctl.signal.aborted) return { ok: false, error: "逾時", timedOut: true };
