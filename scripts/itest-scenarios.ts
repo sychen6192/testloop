@@ -17,6 +17,8 @@ import {
   Scenario,
   SUREFIRE_FAIL,
   SUREFIRE_PASS,
+  SUREFIRE_TXT_BLIND,
+  SUREFIRE_XML,
   TEST_DIR,
   TEST_FAILURE,
 } from "./itest-lib";
@@ -265,6 +267,45 @@ export const SCENARIOS: Scenario[] = [
           "[INFO] BUILD FAILURE",
           "[INFO] Finished at: {{time}}",
         ].join("\n"),
+      },
+    ],
+  },
+
+  {
+    name: "nested-surefire-failure",
+    desc: "@Nested 測試失敗時 .txt 摘要是 0/0，必須改讀 XML 才拿得到斷言訊息",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      { write: { [CALC_TEST_PATH]: calcTest(1) } },
+      { write: { [CALC_TEST_PATH]: calcTest(9) } },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        // The two halves of one real surefire run: the .txt reports nothing, the XML has it all.
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_TXT_BLIND("com.x.CalcTest") }],
+        surefireXml: [
+          {
+            suite: "com.x.CalcTest",
+            body: SUREFIRE_XML("com.x.CalcTest", 4, [
+              {
+                nested: "DivByZero",
+                method: "div_byZero_throwsIllegalArgument",
+                message: "expected: 400 BAD_REQUEST but was: 400",
+                line: 41,
+              },
+              {
+                nested: "Add",
+                method: "add_twoPositives_returnsSum",
+                message: "expected: <3> but was: <4>",
+                line: 17,
+              },
+            ]),
+          },
+        ],
       },
     ],
   },

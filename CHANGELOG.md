@@ -68,6 +68,20 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **`@Nested` 測試的失敗明細完全讀不到**。surefire 對「所有測試都在 `@Nested` 內層類別」的
+  測試類別——JUnit 5 的常見寫法——`.txt` 摘要寫的是 `Tests run: 0, Failures: 0`，真實結果只在
+  `TEST-*.xml`（同一次執行記的是 `tests=14 failures=12`）。build gate 讀 `.txt` 的計數，於是
+  `surefireHasFailure` 判定沒失敗，整份斷言訊息被丟掉：writer 只被告知「這 12 個方法失敗了」，
+  永遠看不到為什麼。真實執行實測的代價是**燒掉一整輪**——真正的原因是
+  `expected: 400 BAD_REQUEST but was: 400`，一行 `isEqualTo(404)` 就能修；拿不到這句話的
+  writer 從方法名推理，方向對了卻改過頭，下一輪收到 `int cannot be dereferenced`。
+  現在改以 XML 為來源，`.txt` 只在建置關掉 XML 報告時當退路。餵回的區塊也從「貼一段 .txt」
+  改成訊息優先：`✗ <容器>.<方法>` 加斷言訊息加**專案自己的** stack frame，junit / assertj /
+  mockito / reflection 的框架 frame 一律濾掉。類別識別改用 `testsuite@name`——case 的
+  `classname` 在有 `@DisplayName` 時是顯示名而不是型別名，`runBaseline` 的失敗類別清單先前
+  也因此定位不到檔案，修復迴圈少了目標。新增 `UT_MAX_FAILURE_CASES`（預設 10）限制每個類別
+  引用的失敗案例數：一個 `@Nested` 類別一次失敗數十個時，不該把整份回饋預算花在同一個錯誤的
+  數十次重複上。
 - **coverage gate 會被上一次的覆蓋率灌水**。JaCoCo agent 預設 `append=true`，exec 資料跨次
   累加進 `target/jacoco.exec`——開發者自己跑過 `mvn test`、或上一次 testgen 跑過，這一輪的
   弱測試就繼承那份覆蓋率。fixture 實測：只蓋 6 行中的 2 行，gate 報 100%。build gate 現在

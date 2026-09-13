@@ -45,6 +45,8 @@ export interface MvnStep {
   cleanSurefire?: boolean;
   /** Surefire .txt reports to write. `{{elapsed}}` varies per call. */
   surefire?: Array<{ cls: string; body: string }>;
+  /** Surefire XML reports to write as TEST-<suite>.xml — the source the gate prefers. */
+  surefireXml?: Array<{ suite: string; body: string }>;
   /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. */
   jacoco?: JacocoSpec;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
@@ -241,6 +243,12 @@ if (step.surefire) {
     fs.writeFileSync(path.join(surefireDir, r.cls + ".txt"), vary(r.body));
   }
 }
+if (step.surefireXml) {
+  fs.mkdirSync(surefireDir, { recursive: true });
+  for (const r of step.surefireXml) {
+    fs.writeFileSync(path.join(surefireDir, "TEST-" + r.suite + ".xml"), vary(r.body));
+  }
+}
 
 if (step.jacoco) {
   const j = step.jacoco;
@@ -315,6 +323,51 @@ export const SUREFIRE_FAIL = (cls: string, message: string) =>
     `org.opentest4j.AssertionFailedError: ${message}`,
     "\tat com.x.CalcTest.div_byZero_throwsIllegalArgument(CalcTest.java:17)",
   ].join("\n");
+
+/**
+ * What surefire writes into the .txt for a class whose tests all live in @Nested inner
+ * classes: zero of everything, however many actually failed. The XML below is the same run.
+ */
+export const SUREFIRE_TXT_BLIND = (cls: string) =>
+  [
+    `Test set: ${cls}`,
+    "-------------------------------------------------------------------------------",
+    `Tests run: 0, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in ${cls}`,
+  ].join("\n");
+
+export interface XmlCase {
+  /** @Nested container, as surefire records it in @classname. */
+  nested: string;
+  method: string;
+  message: string;
+  line: number;
+}
+
+/** A surefire TEST-*.xml with the real shape: escaped @message, CDATA stack, framework frames. */
+export const SUREFIRE_XML = (suite: string, tests: number, cases: XmlCase[]) => {
+  const esc = (t: string) =>
+    t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const blocks = cases.map(
+    (c) => `<testcase name="${c.method}" classname="${suite}$${c.nested}" time="0.03">
+    <failure message="${esc(c.message)}" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: ${c.message}
+\tat org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+\tat org.assertj.core.api.Assertions.assertThat(Assertions.java:1)
+\tat ${suite}$${c.nested}.${c.method}(${suite.split(".").pop()}.java:${c.line})
+\tat java.base/java.lang.reflect.Method.invoke(Method.java:565)
+]]></failure>
+  </testcase>`,
+  );
+  const passing = Array.from(
+    { length: Math.max(0, tests - cases.length) },
+    (_, i) => `<testcase name="passes_${i}" classname="${suite}$Ok" time="0.01"/>`,
+  );
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="${suite}" time="0.5" tests="${tests}" errors="0" skipped="0" failures="${cases.length}" flakes="0">
+  <properties><property name="java.version" value="26"/></properties>
+  ${[...blocks, ...passing].join("\n  ")}
+</testsuite>
+`;
+};
 
 export const SUREFIRE_PASS = (cls: string) =>
   [

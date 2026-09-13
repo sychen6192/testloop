@@ -48,6 +48,7 @@ const BASE_ENV: Record<string, string> = {
   UT_JACOCO_XML: "",
   UT_MAVEN_ARGS: "",
   UT_MAX_FAILURE_BLOCKS: "5",
+  UT_MAX_FAILURE_CASES: "10",
   UT_MAX_FEEDBACK_CHARS: "12000",
   UT_MAX_ITER: "5",
   UT_MIN_BRANCH_COV: "70",
@@ -326,6 +327,23 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("回饋說明執行了 0 個測試", fb.includes("0 個測試"), fb.slice(0, 200));
     check("funnel 記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
     check("相同報告第 2 輪判 stuck", c.result.stopReason === "stuck", String(c.result.stopReason));
+  },
+
+  "nested-surefire-failure": (c) => {
+    const fb = c.runRead("iter-1/feedback.md");
+    // The whole point: without the XML the writer gets method names and no reason.
+    check("回饋帶到斷言訊息", fb.includes("expected: 400 BAD_REQUEST but was: 400"), fb.slice(0, 400));
+    check("兩個失敗案例都在", fb.includes("expected: <3> but was: <4>"), fb.slice(0, 400));
+    check("保留 @Nested 容器名，定位得到程式碼", fb.includes("DivByZero.div_byZero_throwsIllegalArgument"), fb.slice(0, 400));
+    check("帶到專案自己的 stack frame（檔案:行號）", fb.includes("CalcTest.java:41"), fb.slice(0, 400));
+    check(
+      "框架 frame 被濾掉（junit / assertj / reflect 不入報告）",
+      !/AssertionFailureBuilder|org\.assertj|reflect\.Method/.test(fb),
+      fb.slice(0, 400),
+    );
+    check("標題帶真實計數，不是 .txt 的 0/0", fb.includes("測試 4、失敗 2、錯誤 0"), fb.slice(0, 400));
+    check("不再退回引用 .txt 摘要", !fb.includes("Tests run: 0, Failures: 0"), fb.slice(0, 400));
+    check("相同失敗第 2 輪判 stuck（報告仍然逐輪穩定）", c.result.stopReason === "stuck", String(c.result.stopReason));
   },
 
   "stuck-test-failure": (c) => {

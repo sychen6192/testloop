@@ -141,6 +141,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
+| `UT_MAX_FAILURE_CASES` | 10 | 每個失敗類別最多引用幾個失敗案例。`@Nested` 測試一次可能失敗數十個 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |

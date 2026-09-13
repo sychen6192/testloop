@@ -57,6 +57,9 @@ export const MAX_FEEDBACK_CHARS = numEnv("UT_MAX_FEEDBACK_CHARS", 12000, 500);
 // Per-round caps on surefire failure detail: how many failing test classes get quoted, and
 // how much of each. Without these, one broken module produces a report longer than the tests.
 export const MAX_FAILURE_BLOCKS = numEnv("UT_MAX_FAILURE_BLOCKS", 5, 1);
+// Failing test cases quoted per class. One @Nested test class can fail 50 cases at once, and
+// quoting all of them would spend the whole feedback budget on one mistake repeated 50 times.
+export const MAX_FAILURE_CASES = numEnv("UT_MAX_FAILURE_CASES", 10, 1);
 export const MIN_LINE_COV = numEnv("UT_MIN_LINE_COV", 80);
 export const MIN_BRANCH_COV = numEnv("UT_MIN_BRANCH_COV", 70);
 // 1 = fail the coverage gate when no JaCoCo report is found (default: skip leniently).

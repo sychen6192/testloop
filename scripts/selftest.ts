@@ -44,6 +44,8 @@ import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics
 import {
   countTestsRun,
   extractCompileErrorFiles,
+  parseSurefireXml,
+  renderSurefireSuite,
   summarizeBuildErrors,
   surefireHasFailure,
 } from "../gates/build";
@@ -1477,11 +1479,98 @@ console.log("\n[19] testClassNames（UT_TEST_SCOPE=generated 的 -Dtest 組裝�
 }
 
 // ---------------------------------------------------------------------------
-// 20. Architecture invariants: the hard rules in AGENTS.md, as asserts
+// 20. parseSurefireXml / renderSurefireSuite (@Nested 的失敗只在 XML 裡)
+// ---------------------------------------------------------------------------
+// Shapes taken verbatim from a real surefire 3.5.6 run: the .txt for a @Nested-only class
+// says "Tests run: 0, Failures: 0" while the XML for the same run records the real counts,
+// the assertion message and the frame. Reading the .txt drops every reason.
+console.log("\n[20] parseSurefireXml / renderSurefireSuite（@Nested 失敗明細）");
+{
+  const nestedXml = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="3.0.2" name="com.x.ProbeNestedTest" time="0.068" tests="3" errors="0" skipped="0" failures="1" flakes="0">
+  <properties><property name="java.version" value="26"/></properties>
+  <testcase name="deliberately_fails" classname="com.x.ProbeNestedTest$Inner" time="0.034">
+    <failure message="訊息 ==&gt; expected: &lt;404&gt; but was: &lt;400&gt;" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: 訊息 ==> expected: <404> but was: <400>
+\tat org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+\tat org.assertj.core.api.Assertions.assertThat(Assertions.java:1)
+\tat com.x.ProbeNestedTest$Inner.deliberately_fails(ProbeNestedTest.java:13)
+\tat java.base/java.lang.reflect.Method.invoke(Method.java:565)
+]]></failure>
+  </testcase>
+  <testcase name="passes" classname="com.x.ProbeNestedTest$Inner" time="0.001"/>
+  <testcase name="ignored" classname="com.x.ProbeNestedTest$Inner" time="0"><skipped/></testcase>
+</testsuite>`;
+  const blindTxt =
+    "Test set: com.x.ProbeNestedTest\n" +
+    "Tests run: 0, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.068 s -- in com.x.ProbeNestedTest";
+
+  // The regression itself: the old .txt-based path is blind to exactly this report.
+  check("舊路徑：@Nested 的 .txt 摘要看不出有失敗", surefireHasFailure(blindTxt) === false);
+
+  const suite = parseSurefireXml(nestedXml);
+  check("XML 解析出 suite/計數", suite?.suite === "com.x.ProbeNestedTest" && suite?.tests === 3 && suite?.failures === 1, JSON.stringify(suite));
+  check("類別名取自 testsuite@name，不是 case 的 classname", suite?.suite === "com.x.ProbeNestedTest");
+  check("只有真正失敗的 case 進來（自閉合＝通過、skipped 不算）", suite?.cases.length === 1, JSON.stringify(suite?.cases));
+  const c0 = suite!.cases[0];
+  check("保留 @Nested 容器名", c0.name === "Inner.deliberately_fails", c0.name);
+  check("message 的 XML entity 已還原", c0.message === "訊息 ==> expected: <404> but was: <400>", c0.message);
+  check(
+    "frame 取專案自己那一行，略過 junit/assertj/reflect",
+    c0.frame === "at com.x.ProbeNestedTest$Inner.deliberately_fails(ProbeNestedTest.java:13)",
+    c0.frame,
+  );
+  check("kind = failure", c0.kind === "failure");
+
+  const rendered = renderSurefireSuite(suite!);
+  check("渲染出的區塊帶真實計數", rendered.includes("測試 3、失敗 1、錯誤 0"), rendered);
+  check("渲染出的區塊帶訊息與行號", rendered.includes("expected: <404>") && rendered.includes("ProbeNestedTest.java:13"), rendered);
+
+  // surefire uses @DisplayName as classname when one is set — then it is not a type name,
+  // which is why the suite name is the identifier and the classname only prefixes the method.
+  const displayNameXml = `<testsuite name="com.x.HandlerTest" tests="1" errors="0" skipped="0" failures="1">
+  <testcase name="returns400" classname="handleValidation" time="0.01"><failure message="boom" type="java.lang.AssertionError">stack</failure></testcase>
+</testsuite>`;
+  const dn = parseSurefireXml(displayNameXml);
+  check("classname 是 @DisplayName 時仍當前綴用", dn?.cases[0].name === "handleValidation.returns400", dn?.cases[0].name);
+  check("classname 是 display name 不影響類別識別", dn?.suite === "com.x.HandlerTest");
+
+  // An <error> without a message must still say something; the type is all there is.
+  const errXml = `<testsuite name="com.x.BoomTest" tests="1" errors="1" skipped="0" failures="0">
+  <testcase name="explodes" classname="com.x.BoomTest" time="0.01"><error type="java.lang.NullPointerException">stack</error></testcase>
+</testsuite>`;
+  const er = parseSurefireXml(errXml);
+  check("error 無 message 時退回 type", er?.cases[0].message === "java.lang.NullPointerException", er?.cases[0].message);
+  check("classname 等於 suite 時不加前綴", er?.cases[0].name === "explodes", er?.cases[0].name);
+  check("errors 計數讀到", er?.errors === 1 && er?.failures === 0);
+
+  check("不是 surefire 報告 → null", parseSurefireXml("<html><body>nope</body></html>") === null);
+  check("截斷的 XML 不拋錯", parseSurefireXml('<testsuite name="a" tests="1"><testcase name="x"') !== undefined);
+
+  // One @Nested class can fail dozens of cases; quoting all of them would spend the whole
+  // feedback budget on one mistake repeated.
+  const many = {
+    suite: "com.x.ManyTest",
+    tests: 30,
+    failures: 30,
+    errors: 0,
+    cases: Array.from({ length: 30 }, (_, i) => ({
+      kind: "failure" as const,
+      name: `N.case${i}`,
+      message: `boom ${i}`,
+      frame: `at com.x.ManyTest.case${i}(ManyTest.java:${i + 1})`,
+    })),
+  };
+  const capped = renderSurefireSuite(many, 3);
+  check("超過上限只列前 N 個", (capped.match(/✗/g) ?? []).length === 3, capped);
+  check("被省略的數量據實標明，不靜默丟棄", capped.includes("另有 27 個失敗的測試未列出"), capped);
+}
+
+// ---------------------------------------------------------------------------
+// 21. Architecture invariants: the hard rules in AGENTS.md, as asserts
 // ---------------------------------------------------------------------------
 // Each of these was a written rule that nothing enforced. A grep in a doc is a rule people
 // remember; a grep in the selftest is a rule CI remembers.
-console.log("\n[20] 架構不變式（AGENTS.md 硬規則的可執行版本）");
+console.log("\n[21] 架構不變式（AGENTS.md 硬規則的可執行版本）");
 {
   const sources: string[] = [];
   const walk = (d: string) => {
