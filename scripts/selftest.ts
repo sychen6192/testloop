@@ -22,7 +22,13 @@ import {
   writerScopeSkip,
   testClassNames,
 } from "../libs/utils";
-import { resolveAgentPath, contractViolations, parseToolsBlock, WRITER_RULES } from "../libs/guard";
+import {
+  resolveAgentPath,
+  contractViolations,
+  parseToolsBlock,
+  WRITER_RULES,
+  REVIEWER_RULES,
+} from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines, reportIsStale } from "../gates/coverage";
 import { parseVerdict, runReviewGate } from "../gates/review";
 import {
@@ -50,6 +56,7 @@ import { ApiRunner } from "../runners/api";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree } from "../libs/shell";
 import { spawn } from "node:child_process";
+import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
 
 let passCount = 0;
 let failCount = 0;
@@ -1467,6 +1474,68 @@ console.log("\n[19] testClassNames（UT_TEST_SCOPE=generated 的 -Dtest 組裝�
     `-Dtest=${testClassNames(["x/OrderServiceTest.java", "x/CalcTest.java"]).join(",")}` ===
       "-Dtest=CalcTest,OrderServiceTest",
   );
+}
+
+// ---------------------------------------------------------------------------
+// 20. Architecture invariants: the hard rules in AGENTS.md, as asserts
+// ---------------------------------------------------------------------------
+// Each of these was a written rule that nothing enforced. A grep in a doc is a rule people
+// remember; a grep in the selftest is a rule CI remembers.
+console.log("\n[20] 架構不變式（AGENTS.md 硬規則的可執行版本）");
+{
+  const sources: string[] = [];
+  const walk = (d: string) => {
+    for (const e of fs.readdirSync(path.join(TESTGEN_ROOT, d), { withFileTypes: true })) {
+      const rel = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (!["node_modules", "runs", ".git"].includes(e.name) && !e.name.startsWith(".")) walk(rel);
+      } else if (e.name.endsWith(".ts")) {
+        sources.push(rel);
+      }
+    }
+  };
+  walk(".");
+  const read = (rel: string) => fs.readFileSync(path.join(TESTGEN_ROOT, rel), "utf8");
+  const outsideRunners = sources.filter((f) => !f.startsWith(`runners${path.sep}`));
+
+  // 硬規則 6：SDK 只能出現在 runners/ 裡，否則核心就綁死在某個 runtime 上。
+  const sdkLeaks = outsideRunners.filter((f) =>
+    /from\s+["'](@qwen-code\/sdk|@opencode-ai)/.test(read(f)),
+  );
+  check("runners/ 以外沒有 import 任何 agent SDK", sdkLeaks.length === 0, sdkLeaks.join(", "));
+
+  // 同一條規則的另一半：gate 或 orchestrator 不得自己去叫 agent CLI。比對的是「把 CLI 路徑
+  // 當成識別字拿來用」，不是字面出現——每道 gate 的錯誤訊息裡都寫著 UT_OPENCODE_BIN，那是
+  // 給操作者看的文字。doctor 的 --version 探測是刻意的例外，它不執行 agent。
+  const usesCliPath = (src: string) =>
+    /import\s*\{[^}]*\bOPENCODE_BIN\b[^}]*\}/s.test(src) || /\bconfig\.OPENCODE_BIN\b/.test(src);
+  const cliLeaks = outsideRunners.filter(
+    (f) => f !== "config.ts" && f !== path.join("scripts", "doctor.ts") && usesCliPath(read(f)),
+  );
+  check("runners/ 與 doctor 以外沒有 spawn agent CLI", cliLeaks.length === 0, cliLeaks.join(", "));
+
+  // 硬規則 2、3：隨 repo 版控的那兩份 agent 定義本身必須守約，不只是解析器會解析而已。
+  const agentDir = path.join(TESTGEN_ROOT, ".opencode", "agent");
+  const writerViolations = contractViolations(path.join(agentDir, "ut-writer.md"), WRITER_RULES);
+  check("內建 ut-writer.md 沒有 bash / 沒有 skill", writerViolations.length === 0, writerViolations.join("；"));
+  const reviewerViolations = contractViolations(
+    path.join(agentDir, "ut-reviewer.md"),
+    REVIEWER_RULES,
+  );
+  check("內建 ut-reviewer.md 全唯讀", reviewerViolations.length === 0, reviewerViolations.join("；"));
+  check(
+    "內建 ut-reviewer.md temperature 固定 0",
+    /^temperature:\s*0\s*$/m.test(fs.readFileSync(path.join(agentDir, "ut-reviewer.md"), "utf8")),
+  );
+
+  // 硬規則 7 的可檢查面：旋鈕加了卻沒寫進文件，操作者就不知道它存在。
+  const knobs = envKnobsInSource();
+  const envExample = read(".env.example");
+  const readme = read("README.md");
+  const undocumentedEnv = knobs.filter((k) => !envExample.includes(k));
+  const undocumentedReadme = knobs.filter((k) => !readme.includes(k));
+  check(`${knobs.length} 個 UT_* 全部寫進 .env.example`, undocumentedEnv.length === 0, undocumentedEnv.join(", "));
+  check("UT_* 全部寫進 README", undocumentedReadme.length === 0, undocumentedReadme.join(", "));
 }
 
 // ---------------------------------------------------------------------------

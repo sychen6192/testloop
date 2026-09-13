@@ -128,6 +128,7 @@ testgen <package 路徑>                  # 端對端執行
 | --- | --- | --- |
 | `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
+| `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
@@ -145,6 +146,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
 | `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |
+| `UT_STANDARDS_PATH` | 工具內建 | writer 契約（standards）路徑覆蓋 |
 | `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋。未設時依序找目標 repo、工具內建 |
 | `UT_JACOCO_XML` | 自動搜尋 | 報告路徑覆蓋 |
 | `UT_MAVEN_ARGS` | - | 額外 maven 參數，例如 `jacoco:report` |

@@ -136,7 +136,11 @@ libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
-scripts/selftest.ts   純邏輯自測
+scripts/selftest.ts   純邏輯自測＋架構不變式 assert
+scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
+scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼
+scripts/itest-scenarios.ts  情境表（每道 guard 配一個作弊劇本）
+scripts/itest-case.ts 單一情境的執行體（在 fixture 內以子行程跑）
 scripts/setup.ts      安裝 agents+skill 至 ~/.config/opencode/
 scripts/doctor.ts     preflight 自診（--smoke 經 AgentRunner 實測 reviewer）
 bin/testgen           bash wrapper（doctor/setup/loop）
@@ -148,18 +152,27 @@ runs/<repo>/<ts>/     artifacts（gitignore）
 ## 常用指令
 ```bash
 npm install
-npm run check                          # tsc --noEmit + selftest
+npm run check                          # tsc --noEmit + selftest + itest
+npm run itest                          # 只跑整合自測；加情境名可單跑一個
 npm run setup                          # agents+skill → ~/.config/opencode/
 # 在目標 Java repo 根執行：
 npx tsx <clone>/scripts/doctor.ts [目標路徑] [--smoke]
 npx tsx <clone>/loop.ts <目標路徑>
-# 驗證 SDK 隔離（runners/ 以外不得 import SDK / spawn agent CLI）：
-grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modules --exclude-dir=runners . && echo LEAK || echo CLEAN
 ```
+（SDK 隔離、agent 權限契約、UT_* 文件同步都已是 selftest 第 20 組的 assert，不必再手動 grep。）
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（19 組，數量以 `npm run selftest` 輸出為準），改
-`libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
+
+## 測試分兩層（沒有測試框架，都是手寫斷言）
+- **`scripts/selftest.ts`** — 純函式與架構不變式（組數與斷言數以 `npm run selftest` 輸出為準）。
+  改 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
+- **`scripts/itest.ts`** — 接線。每個情境建一個假的 Maven repo，`mvnw` 是重播腳本的 node 程式、
+  writer 是實作 `AgentRunner` 的物件，其餘全是真的：真的 orchestrator、真的 spawn 子行程、真的
+  解析 surefire 與 jacoco.xml。改 `orchestrator.ts`、`loop.ts` 或任何 gate 的控制流後必須跑它。
+  每個情境都是**對抗性**的——假 writer 嘗試一種作弊（改 production code、刪掉失敗的測試、
+  什麼都不做），斷言 loop 擋下來。新增 guard 時一併新增情境，並確認把 guard 的判斷條件
+  反轉後該情境會紅；反轉後仍綠的情境沒有在測那道 guard。
+- 情境用的環境是密封的：`itest.ts` 的 `BASE_ENV` 釘住每一個 `UT_*`，新增旋鈕而沒釘住會直接紅。
 
 ## 高風險操作與授權閘門
 以下必須先向人類說明影響並取得明確確認：

@@ -97,9 +97,26 @@
   欄位會讓整個檔案編譯失敗）；測試類別可見性依 pipeline 掃描結論撰寫，不自行假設。
 - `runBuildAndTests` 新增 `allowZeroTests` 選項（預檢專用：模組還沒有測試是本工具的正常
   起點，不該被零測試 guard 判 FAIL）。
-- selftest 擴充至 133 項（編譯錯誤檔名解析的 maven/javac 兩種格式、測試檔命名比對的誤判
-  防護、錯誤抽取與樣板剔除、surefire 計數判定、可見性與套件偵測、各 prompt 區塊的實際
-  注入與留空行為）。
+- `UT_MODEL` 與 `UT_STANDARDS_PATH` 補進文件。前者是 `UT_WRITER_MODEL` 未設時的後備，
+  兩份文件都沒提；後者只在 `.env.example` 有。由新的文件同步 assert 抓出。
+- **測試分成兩層，`npm run check` 兩層都跑**（約 13 秒，不需要 Java、Maven 或模型）。
+  先前的自測全部停在純函式與注入假 transport 的 runner 兩層：每道 guard 的零件都驗過，
+  但沒有一項驗到它接在 loop 上真的會擋——`orchestrator.ts` 的 574 行與 `loop.ts` 的 324 行
+  零覆蓋，而那正是上面每一條 Fixed 發生的地方。
+  - `scripts/selftest.ts` 擴充至 207 項，新增第 20 組**架構不變式**：AGENTS.md 的硬規則改寫成
+    可執行的 assert——`runners/` 以外不得 import agent SDK 或取用 CLI 路徑、內建兩份 agent `.md`
+    必須各自守約（writer 無 bash、reviewer 全唯讀且 temperature 0）、每個 `UT_*` 都必須出現在
+    `.env.example` 與 README。原本這幾條是文件裡的一行 grep 指令，靠人記得跑。
+  - `scripts/itest.ts` 新增**整合自測**，130 項。每個情境建一個假的 Maven repo：`mvnw` 是重播
+    腳本的 node 程式，writer 是實作 `AgentRunner` 的物件，其餘全是真的——真的 orchestrator、
+    真的 spawn 子行程、真的解析 surefire 與 `jacoco.xml`。25 個情境全是對抗性的，每一個對應
+    一道 guard 存在的理由：writer 改 production code、刪掉失敗的測試、加 `@Disabled`、
+    什麼都不做、建置綠但 0 測試、覆蓋率報告陳舊、限縮範圍綠但完整模組紅、reviewer 沒讀檔
+    就給滿分。其中 5 個跑既有紅燈修復迴圈，3 個跑 `loop.ts` 全流程——經 api runner 打本機
+    假端點，驗到 exit code 與 `summary.json` / `params.json` / `repair-summary.md`。
+  - 驗收方式是變異測試：把 14 道 guard 的判斷條件逐一反轉，對應情境必須紅。14/14 全中。
+  - 情境環境是密封的——`BASE_ENV` 釘住每一個 `UT_*`，否則工具自己的 `.env`（例如
+    `UT_STRICT_COV=1`）會決定斷言的成敗。新增旋鈕而沒釘住，itest 第一項就紅。
 
 ## [1.2.0] - 2026-07-30
 
