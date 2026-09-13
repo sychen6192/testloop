@@ -19,6 +19,11 @@ export const TESTGEN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.
  * Every UT_* the tool actually reads. Two consumers: selftest asserts each one is documented,
  * itest asserts each one is pinned before a scenario runs. Both break the moment a new knob
  * is added without the paperwork, which is the point.
+ *
+ * config.ts is matched loosely — every UT_* token in it, whatever the syntax — because it is
+ * the declared SSOT for knobs and the reader must not have to keep up with how they are read.
+ * A scanner that only knew `process.env.X` and `numEnv("X")` silently missed five knobs added
+ * through an `envAny([...])` helper, which is exactly the drift these asserts exist to catch.
  */
 export function envKnobsInSource(): string[] {
   const files = ["config.ts", "loop.ts", "orchestrator.ts", ...["gates", "libs", "runners"].flatMap((d) =>
@@ -27,8 +32,12 @@ export function envKnobsInSource(): string[] {
   const found = new Set<string>();
   for (const f of files) {
     const src = fs.readFileSync(path.join(TESTGEN_ROOT, f), "utf8");
-    for (const m of src.matchAll(/process\.env\.(UT_[A-Z0-9_]+)|numEnv\("(UT_[A-Z0-9_]+)"/g)) {
-      found.add(m[1] ?? m[2]);
+    const re =
+      f === "config.ts"
+        ? /\bUT_[A-Z0-9_]+/g
+        : /process\.env\.(UT_[A-Z0-9_]+)|process\.env\["(UT_[A-Z0-9_]+)"\]|numEnv\("(UT_[A-Z0-9_]+)"/g;
+    for (const m of src.matchAll(re)) {
+      found.add(m[1] ?? m[2] ?? m[3] ?? m[0]);
     }
   }
   return [...found].sort();
@@ -99,6 +108,10 @@ export interface Scenario {
   review?: ReviewAction[];
   /** For entry=loop: the fake endpoint's scripted turns, consumed in order. */
   api?: ApiTurn[];
+  /** entry=loop: run a real forward proxy and point UT_HTTP_PROXY at it. */
+  proxy?: boolean;
+  /** entry=loop: also set UT_NO_PROXY to the endpoint's host:port, so it bypasses. */
+  noProxy?: boolean;
   mvn: MvnStep[];
 }
 

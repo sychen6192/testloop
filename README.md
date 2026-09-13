@@ -153,6 +153,10 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_MAVEN_ARGS` | - | 額外 maven 參數，例如 `jacoco:report` |
 | `UT_RUNS_DIR` | 工具 clone 內 | artifacts 落點覆蓋（共用或唯讀安裝時使用） |
 | `UT_OPENCODE_BIN` | opencode | opencode 執行檔路徑覆蓋 |
+| `UT_HTTPS_PROXY` / `UT_HTTP_PROXY` | 讀 `HTTPS_PROXY` / `HTTP_PROXY` | 公司 proxy。Node 的 fetch 不吃標準變數，本工具自己讀 |
+| `UT_NO_PROXY` | 讀 `NO_PROXY` | 繞過 proxy 的主機，支援 `host:port`。內網模型端點要列進來 |
+| `UT_CA_CERTS` | - | TLS 被攔截時額外信任的 CA（PEM，逗號分隔）。比 `NODE_EXTRA_CA_CERTS` 可靠 |
+| `UT_USER_AGENT` | `testgen/<版本>` | 送出的 User-Agent，供依此過濾 CONNECT 的 proxy 使用 |
 | `UT_OPENCODE_JSON` | 1 | 0 = 不用 `--format json`（失去即時 tracing 與 must-read 觀測） |
 | `UT_OC_SKIP_PERMS` | - | 1 = writer 附加 `--dangerously-skip-permissions`（最後手段） |
 | `UT_SKIP_GUARD` | - | 1 = 跳過 agent 權限 guard（不建議） |

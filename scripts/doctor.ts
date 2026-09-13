@@ -14,6 +14,8 @@ const { resolveAgentPath, contractViolations, AGENT_SPECS } = await import(
 const { loadRubric } = await import("../libs/rubric");
 const { findModuleInfo } = await import("../libs/utils");
 const { planSpawn, explainSpawnError } = await import("../libs/shell");
+const { dispatcherFor, proxySummary, USER_AGENT } = await import("../libs/proxy");
+const { CA_SOURCES, caSummary } = await import("../libs/tls");
 
 type Status = "OK" | "WARN" | "FAIL";
 const rows: Array<{ status: Status; name: string; note: string }> = [];
@@ -28,7 +30,17 @@ const major = Number(process.versions.node.split(".")[0]);
 add(major >= 20 ? "OK" : "FAIL", "node >= 20", `目前 ${process.versions.node}`);
 
 if (config.RUNNER_KIND === "api") {
-  // 2. api endpoint — no CLI to find; the runner needs a reachable OpenAI-compatible server
+  // 2a. network — the two things that make a corporate network fail silently. Reported
+  // before the endpoint check, because they are what the endpoint check is subject to.
+  // Informational, not a verdict: a direct connection is the normal state, and doctor cannot
+  // know whether this network needs a proxy. The endpoint check below is what decides, and
+  // its failure message is where the guidance lives. Only a CA that was configured and could
+  // not be read is an actual fault.
+  add("OK", "proxy", `${proxySummary()}（UA=${USER_AGENT}）`);
+  const caBroken = CA_SOURCES.filter((c) => c.error);
+  add(caBroken.length ? "FAIL" : "OK", "CA 信任", caSummary());
+
+  // 2b. api endpoint — no CLI to find; the runner needs a reachable OpenAI-compatible server
   // and a model name for each role.
   if (!config.API_BASE_URL) {
     add("FAIL", "api endpoint", "UT_API_BASE_URL 未設定（例如 http://localhost:11434/v1）");
@@ -36,10 +48,17 @@ if (config.RUNNER_KIND === "api") {
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 5000);
-      const res = await fetch(`${config.API_BASE_URL}/models`, {
-        headers: config.API_KEY ? { authorization: `Bearer ${config.API_KEY}` } : {},
+      // Same dispatcher the runner uses: a preflight that bypasses the proxy would pass on
+      // a network where the real run cannot connect at all.
+      const modelsUrl = `${config.API_BASE_URL}/models`;
+      const res = await fetch(modelsUrl, {
+        headers: {
+          "user-agent": USER_AGENT,
+          ...(config.API_KEY ? { authorization: `Bearer ${config.API_KEY}` } : {}),
+        },
         signal: ctl.signal,
-      });
+        dispatcher: dispatcherFor(modelsUrl),
+      } as RequestInit);
       clearTimeout(timer);
       if (res.status === 401 || res.status === 403) {
         add("FAIL", "api endpoint", `${config.API_BASE_URL} 認證失敗（HTTP ${res.status}）——檢查 UT_API_KEY`);
@@ -47,7 +66,12 @@ if (config.RUNNER_KIND === "api") {
         add("OK", "api endpoint", `${config.API_BASE_URL}（GET /models → HTTP ${res.status}）`);
       }
     } catch (e) {
-      add("FAIL", "api endpoint", `${config.API_BASE_URL} 連不上：${e instanceof Error ? e.message : String(e)}`);
+      const why = e instanceof Error ? e.message : String(e);
+      const hint =
+        config.HTTP_PROXY || config.HTTPS_PROXY
+          ? "（已設定 proxy——若端點在內網，把它加進 UT_NO_PROXY，含連接埠）"
+          : "（若公司只能經 proxy 出去，設 UT_HTTPS_PROXY / UT_HTTP_PROXY）";
+      add("FAIL", "api endpoint", `${config.API_BASE_URL} 連不上：${why}${hint}`);
     }
   }
   for (const [role, model] of [

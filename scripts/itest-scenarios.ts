@@ -595,6 +595,31 @@ export const SCENARIOS: Scenario[] = [
     mvn: [GREEN_BUILD, GREEN_BUILD],
   },
   {
+    name: "loop-through-proxy",
+    desc: "設了 proxy 時，api runner 的請求必須真的走它——Node 的 fetch 預設無視 HTTP_PROXY",
+    entry: "loop",
+    proxy: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-proxy-bypassed",
+    desc: "UT_NO_PROXY 含 host:port 時要繞過 proxy 直連——內網模型端點的正常設定",
+    entry: "loop",
+    proxy: true,
+    noProxy: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
     name: "loop-dirty-baseline-abort",
     desc: "預檢紅燈且關閉自動修復 → exit 非 0，summary.json 記錄 dirty-baseline",
     entry: "loop",
