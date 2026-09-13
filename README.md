@@ -128,6 +128,7 @@ testgen <package 路徑>                  # 端對端執行
 | --- | --- | --- |
 | `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
+| `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
@@ -140,11 +141,13 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
+| `UT_MAX_FAILURE_CASES` | 10 | 每個失敗類別最多引用幾個失敗案例。`@Nested` 測試一次可能失敗數十個 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
 | `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |
+| `UT_STANDARDS_PATH` | 工具內建 | writer 契約（standards）路徑覆蓋 |
 | `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋。未設時依序找目標 repo、工具內建 |
 | `UT_JACOCO_XML` | 自動搜尋 | 報告路徑覆蓋 |
 | `UT_MAVEN_ARGS` | - | 額外 maven 參數，例如 `jacoco:report` |
@@ -215,6 +218,11 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
   本工具沒碰過的壞檔就能擋掉每一輪。預設會先用同一個 writer 修這些檔（範圍 guard 與防掏空
   guard 全程有效），修到綠才開始產生新測試；修好的檔案會列在 log 與 `repair-summary.md`，
   **那是 writer 對別人測試的改動，commit 前一定要看 diff**。
+- **中止，說「紅燈全部落在 writer 的可寫範圍之外」。** 預檢抓到的紅燈不在
+  `<目標模組>/src/test` 裡——多模組時最常見的是上游模組（`common`、`core`）的測試壞掉，也可能是
+  production code 或 `pom.xml`。writer 對這些檔案沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，
+  所以預檢就直接中止並逐一點名是哪個模組的哪個類別。人工修好再跑；`UT_ALLOW_DIRTY_BASELINE=1`
+  可硬跑，但那些紅燈每一輪都還在。
 - **中止，說「修復 N 輪後模組仍無法通過建置」。** 修復迴圈放棄了。最常見的根因不在測試檔而在
   建置設定——例如 `pom.xml` 沒讓 Lombok 的 annotation processor 在 test scope 生效，`@Slf4j`
   產不出 `log` 欄位——writer 無權改 pom，只能繞。人工修好再跑最省事；`UT_ALLOW_DIRTY_BASELINE=1`

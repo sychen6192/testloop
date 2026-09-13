@@ -37,7 +37,7 @@ import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
-import { detectBuildTool, runBaseline } from "./gates/build";
+import { detectBuildTool, runBaseline, writableRel } from "./gates/build";
 import { createRunner } from "./runners/runner";
 import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
 import { PreExistingFailures } from "./prompts";
@@ -199,7 +199,15 @@ async function main() {
     console.log(baseline.summary);
 
     let clean = baseline.clean;
-    if (!clean && REPAIR_BASELINE) {
+    // Repairing is only possible where the writer may write. A red common/ in a reactor, or a
+    // broken production file, is not a slow repair — it is an impossible one, and entering the
+    // loop spends the whole budget discovering that the writes are refused.
+    const repairable = baseline.outOfScope.length === 0;
+    if (!clean && REPAIR_BASELINE && !repairable) {
+      log(`[FAIL] 既有紅燈不在 writer 的可寫範圍（${writableRel(mod)}）內，略過修復迴圈：`);
+      baseline.outOfScope.forEach((f) => log(`  - ${f}`));
+    }
+    if (!clean && REPAIR_BASELINE && repairable) {
       banner("修復既有紅燈（repair）");
       repair = await repairBaseline({ runner, buildTool, standards, mod, runDir, baseline });
       fs.writeFileSync(
@@ -244,8 +252,13 @@ async function main() {
           JSON.stringify(
             {
               success: false,
-              stopReason: repair ? `repair-failed:${repair.stopReason}` : "dirty-baseline",
+              stopReason: repair
+                ? `repair-failed:${repair.stopReason}`
+                : baseline.outOfScope.length
+                  ? "dirty-baseline:out-of-scope"
+                  : "dirty-baseline",
               ...preExisting,
+              outOfScope: baseline.outOfScope,
               repair,
             },
             null,
@@ -256,13 +269,20 @@ async function main() {
           ...preExisting.compileErrorFiles.map((f) => `  - ${f}（編譯失敗）`),
           ...preExisting.failingTestClasses.map((c) => `  - ${c}（測試失敗）`),
         ].join("\n");
+        const outOfScopeList = baseline.outOfScope.map((f) => `  - ${f}`).join("\n");
         die(
           (repair
             ? `修復 ${repair.rounds} 輪後模組仍無法通過建置（${repair.stopReason}）。仍然紅燈的：\n${still}\n` +
               "常見原因：根因在 production code 或建置設定（例如 pom.xml 的 Lombok annotation processor），" +
               "writer 無權修改。請人工修好後重跑，或：\n"
-            : "模組在本工具介入前就無法通過建置，而 UT_REPAIR_BASELINE=0 關閉了自動修復。請先修好：\n" +
-              `${still}\n或：\n`) +
+            : baseline.outOfScope.length
+              ? `模組在本工具介入前就無法通過建置，而紅燈全部落在 writer 的可寫範圍` +
+                `（${writableRel(mod)}）之外——它沒有權限修改這些檔案，所以沒有進入修復迴圈：\n` +
+                `${outOfScopeList}\n` +
+                `多模組常見原因：build gate 跑的是 \`mvn -pl ${mod.moduleRel || "."} -am test\`，` +
+                "上游模組的測試原始碼也要編得過、也會被執行。請先人工修好上面這些，或：\n"
+              : "模組在本工具介入前就無法通過建置，而 UT_REPAIR_BASELINE=0 關閉了自動修復。請先修好：\n" +
+                `${still}\n或：\n`) +
             "  UT_ALLOW_DIRTY_BASELINE=1  照樣執行（已知紅燈會標記為 pre-existing 並要求 writer 不要碰）\n" +
             "  UT_SKIP_BASELINE=1         完全跳過預檢\n" +
             `詳見 ${runDir}`,

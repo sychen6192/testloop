@@ -68,7 +68,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
    `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
    pre-existing 要求 writer 別碰。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
-   修復要證明的只有「模組綠了、而且沒有東西被拿掉」）與
+   修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈在不在
+   `<目標模組>/src/test` 內——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，
+   writer 沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，那種情況直接中止並點名）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
@@ -122,7 +124,7 @@ loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基�
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要＋預檢基準
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
@@ -136,7 +138,11 @@ libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
-scripts/selftest.ts   純邏輯自測
+scripts/selftest.ts   純邏輯自測＋架構不變式 assert
+scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
+scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼
+scripts/itest-scenarios.ts  情境表（每道 guard 配一個作弊劇本）
+scripts/itest-case.ts 單一情境的執行體（在 fixture 內以子行程跑）
 scripts/setup.ts      安裝 agents+skill 至 ~/.config/opencode/
 scripts/doctor.ts     preflight 自診（--smoke 經 AgentRunner 實測 reviewer）
 bin/testgen           bash wrapper（doctor/setup/loop）
@@ -148,18 +154,27 @@ runs/<repo>/<ts>/     artifacts（gitignore）
 ## 常用指令
 ```bash
 npm install
-npm run check                          # tsc --noEmit + selftest
+npm run check                          # tsc --noEmit + selftest + itest
+npm run itest                          # 只跑整合自測；加情境名可單跑一個
 npm run setup                          # agents+skill → ~/.config/opencode/
 # 在目標 Java repo 根執行：
 npx tsx <clone>/scripts/doctor.ts [目標路徑] [--smoke]
 npx tsx <clone>/loop.ts <目標路徑>
-# 驗證 SDK 隔離（runners/ 以外不得 import SDK / spawn agent CLI）：
-grep -rn "@qwen-code/sdk\|@opencode-ai" --include="*.ts" --exclude-dir=node_modules --exclude-dir=runners . && echo LEAK || echo CLEAN
 ```
+（SDK 隔離、agent 權限契約、UT_* 文件同步都已是 selftest 第 20 組的 assert，不必再手動 grep。）
 
 環境變數見 README.md 與 .env.example。
-沒有測試框架；`scripts/selftest.ts` 是手寫斷言的純函式自測（19 組，數量以 `npm run selftest` 輸出為準），改
-`libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
+
+## 測試分兩層（沒有測試框架，都是手寫斷言）
+- **`scripts/selftest.ts`** — 純函式與架構不變式（組數與斷言數以 `npm run selftest` 輸出為準）。
+  改 `libs/utils.ts`、`gates/review.ts`、`gates/coverage.ts`、`gates/build.ts` 等純邏輯後先跑它。
+- **`scripts/itest.ts`** — 接線。每個情境建一個假的 Maven repo，`mvnw` 是重播腳本的 node 程式、
+  writer 是實作 `AgentRunner` 的物件，其餘全是真的：真的 orchestrator、真的 spawn 子行程、真的
+  解析 surefire 與 jacoco.xml。改 `orchestrator.ts`、`loop.ts` 或任何 gate 的控制流後必須跑它。
+  每個情境都是**對抗性**的——假 writer 嘗試一種作弊（改 production code、刪掉失敗的測試、
+  什麼都不做），斷言 loop 擋下來。新增 guard 時一併新增情境，並確認把 guard 的判斷條件
+  反轉後該情境會紅；反轉後仍綠的情境沒有在測那道 guard。
+- 情境用的環境是密封的：`itest.ts` 的 `BASE_ENV` 釘住每一個 `UT_*`，新增旋鈕而沒釘住會直接紅。
 
 ## 高風險操作與授權閘門
 以下必須先向人類說明影響並取得明確確認：

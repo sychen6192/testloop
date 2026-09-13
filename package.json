@@ -9,7 +9,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "selftest": "tsx scripts/selftest.ts",
-    "check": "tsc --noEmit && tsx scripts/selftest.ts",
+    "itest": "tsx scripts/itest.ts",
+    "check": "tsc --noEmit && tsx scripts/selftest.ts && tsx scripts/itest.ts",
     "setup": "tsx scripts/setup.ts",
     "doctor": "tsx scripts/doctor.ts"
   },
