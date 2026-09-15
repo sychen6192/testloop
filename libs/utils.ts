@@ -64,6 +64,17 @@ export function expectedTestPath(clsRelPath: string): string {
   return renamed;
 }
 
+// Pure: drop ANSI escape sequences from captured build output.
+//
+// Maven colours its level tags whenever jansi believes it is attached to a terminal, and the
+// escape lands *inside* the tag — the bytes are `[<ESC>[1;31mERROR<ESC>[m]`, not `<ESC>[1;31m`
+// followed by `[ERROR]`. So a parser looking for a literal `[ERROR]` matches nothing at all,
+// not even unanchored, and every classifier downstream silently reports "no files". Gradle is
+// pinned with --console=plain; maven now gets -B, and this is the belt to that pair of braces
+// (a project's own .mvn/maven.config can still force colour back on).
+const ANSI_ESCAPE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
+export const stripAnsi = (s: string): string => s.replace(ANSI_ESCAPE, "");
+
 // Pure: bound a writer-facing report, keeping the head. Reports are written most-actionable
 // first (compile errors, then failing tests, then log noise), so the head is what the writer
 // needs — tail() would keep maven's "-> [Help 1]" footer and drop the error itself.

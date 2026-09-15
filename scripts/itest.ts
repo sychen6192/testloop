@@ -577,6 +577,37 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("刪減報告落地", c.runExists("repair-1/test-shrink.txt"));
   },
 
+  "repair-ansi-coloured-build-output": (c) => {
+    check("上色的輸出照樣修得好", c.result.stopReason === "repaired", String(c.result.stopReason));
+    check("一輪就修好", c.result.rounds === 1, String(c.result.rounds));
+    const prompt = c.runRead("repair-1/prompt.md");
+    check(
+      "prompt 真的點名了壞掉的檔案（空清單就是這個 bug 的樣子）",
+      prompt.includes("BrokenTest.java"),
+      prompt.slice(0, 400),
+    );
+  },
+
+  "repair-unlocatable-failure": (c) => {
+    check("判為 unlocatable-failure", c.result.stopReason === "unlocatable-failure", String(c.result.stopReason));
+    check("一輪都沒跑", c.result.rounds === 0, String(c.result.rounds));
+    check("連 repair-1 目錄都不該建立（writer 沒被叫過）", !c.runExists("repair-1"));
+    check("只建置過預檢那一次", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+    const report = String(c.result.report ?? "");
+    check(
+      "訊息帶出錯誤節錄，而不是一份空清單",
+      report.includes("Could not resolve dependencies"),
+      report.slice(0, 300),
+    );
+    // runBaseline's summary already embeds the extract when it can name no file; appending a
+    // second copy spends the feedback budget twice on the same text.
+    check(
+      "錯誤節錄只出現一次（summary 已內含，不該再貼一份）",
+      report.split("Could not resolve dependencies").length - 1 === 1,
+      String(report.split("Could not resolve dependencies").length - 1),
+    );
+  },
+
   "repair-max-iterations": (c) => {
     check("用完輪數就停", c.result.stopReason === "repair-max-iterations", String(c.result.stopReason));
     check("剛好 UT_REPAIR_MAX_ITER=2 輪", c.result.rounds === 2, String(c.result.rounds));
@@ -625,6 +656,13 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("只跑了預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
     check("完全沒有產生測試", !c.exists("src/test/java/com/x/CalcTest.java"));
     check("錯誤訊息提示可用的旁路", c.stderr.includes("UT_ALLOW_DIRTY_BASELINE=1"), c.stderr.slice(-300));
+    // The boundary strip's own job: the parsers would cope either way, but a log an operator
+    // cannot read is how the original bug stayed invisible for four rounds.
+    check(
+      "落地的 baseline.log 不留色碼（診斷時人要讀得懂）",
+      !c.runRead("baseline.log").includes(String.fromCharCode(27)),
+      c.runRead("baseline.log").slice(0, 200),
+    );
   },
 
   "loop-repair-then-generate": (c) => {
