@@ -426,6 +426,7 @@ export interface RepairResult {
   success: boolean;
   rounds: number;
   // "repaired" | "repair-max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
+  // | "scope-violation" | "unlocatable-failure"
   // | "scope-violation"
   stopReason: string;
   // Still red when repair gave up; empty on success.
@@ -452,17 +453,23 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   let current = cfg.baseline;
   let prevFingerprint: string | null = null;
 
-  // Classification plus the error lines: the summary says which files, the extract says why.
-  const describe = (b: BaselineResult) =>
-    clampText(`${b.summary}\n錯誤節錄：\n${summarizeBuildErrors(b.raw)}`, MAX_FEEDBACK_CHARS);
-  let report = describe(current);
-
   const brokenList = (b: BaselineResult) => [
     ...b.compileErrorFiles.map((f) =>
       (path.isAbsolute(f) ? path.relative(REPO_ROOT, f) : f).replace(/\\/g, "/"),
     ),
     ...b.failingTestClasses,
   ];
+  // Classification plus the error lines: the summary says which files, the extract says why.
+  // When runBaseline could name no file its summary already carries the extract, so appending
+  // a second copy would spend the feedback budget on the same text twice.
+  const describe = (b: BaselineResult) =>
+    clampText(
+      brokenList(b).length === 0
+        ? b.summary
+        : `${b.summary}\n錯誤節錄：\n${summarizeBuildErrors(b.raw)}`,
+      MAX_FEEDBACK_CHARS,
+    );
+  let report = describe(current);
   const remaining = (b: BaselineResult): PreExistingFailures => ({
     compileErrorFiles: b.compileErrorFiles,
     failingTestClasses: b.failingTestClasses,
@@ -477,6 +484,20 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   });
 
   for (let round = 1; round <= REPAIR_MAX_ITER; round++) {
+    // A red build the classifier could pin to no file at all leaves buildRepairPrompt listing
+    // nothing: the writer is handed an empty "需要修復的既有測試" and spends the round reading
+    // around for a target it was never given, then no-ops. That is the same "impossible, not
+    // slow" case as outOfScope, so it ends the loop here rather than burning the budget — and
+    // the message carries the extract, which is the only thing that can actually be acted on.
+    if (brokenList(current).length === 0) {
+      return giveUp(
+        "unlocatable-failure",
+        "建置失敗，但無法從輸出定位到任何檔案或測試類別，writer 沒有可下手的目標。\n" +
+          "請直接檢視建置 log（baseline.log 或 repair-*/build.log）。\n" +
+          report,
+        round - 1,
+      );
+    }
     const dir = path.join(cfg.runDir, `repair-${round}`);
     fs.mkdirSync(dir, { recursive: true });
     const save = (name: string, content: string) =>

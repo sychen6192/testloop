@@ -21,6 +21,7 @@ import {
   feedbackFingerprint,
   writerScopeSkip,
   testClassNames,
+  stripAnsi,
 } from "../libs/utils";
 import {
   resolveAgentPath,
@@ -702,6 +703,25 @@ console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍
     extractCompileErrorFiles("[INFO] BUILD SUCCESS").length === 0,
   );
 
+  // (a2) Regression, from a real corporate Maven 3.9 run: jansi colours the level WORD, so the
+  // bytes are `[<ESC>[1;31mERROR<ESC>[m]` — the literal "[ERROR]" does not occur anywhere in the
+  // log, not even unanchored. Every classifier reported "no files", the repair prompt listed
+  // nothing, and the writer burned four rounds looking for a target it was never given.
+  const ESC = String.fromCharCode(27);
+  const paint = (out: string) =>
+    out.replace(/\[(ERROR|INFO)\]/g, (_m, lvl: string) => `[${ESC}[1;31m${lvl}${ESC}[m]`);
+  check(
+    "stripAnsi：色碼夾在中括號內也剝得掉",
+    stripAnsi(`[${ESC}[1;31mERROR${ESC}[m] boom`) === "[ERROR] boom",
+    stripAnsi(`[${ESC}[1;31mERROR${ESC}[m] boom`),
+  );
+  const colouredFiles = extractCompileErrorFiles(paint(mavenOut));
+  check(
+    "regression：maven 上色時仍定位得到檔案（否則 writer 收到空清單）",
+    colouredFiles.length === 2 && colouredFiles[0].endsWith("CacheServiceImplTest.java"),
+    JSON.stringify(colouredFiles),
+  );
+
   // (b) existing-test detection: the duplicate-file bug is <Class>UnitTest.java beside <Class>Test.java
   check("matchesTestNaming：正規名稱", matchesTestNaming("CommonServiceImpl", "CommonServiceImplTest.java"));
   check("matchesTestNaming：UnitTest 變體", matchesTestNaming("CommonServiceImpl", "CommonServiceImplUnitTest.java"));
@@ -842,6 +862,30 @@ console.log("\n[13] summarizeBuildErrors / clampText（回饋預算）");
   check(
     "summarizeBuildErrors：完全沒有 [ERROR] 行時退回 tail（不能回空字串）",
     summarizeBuildErrors("[INFO] weird failure with no error lines").length > 0,
+  );
+
+  // The same colour regression from the other side: with the escape inside the tag, not one
+  // line matched, kept stayed empty, and the whole report fell back to tail() — which is how a
+  // build report ends up being maven's footer plus a word cut in half.
+  const ESC13 = String.fromCharCode(27);
+  const colouredFail = mavenFail.replace(
+    /\[(ERROR|INFO)\]/g,
+    (_m, lvl: string) => `[${ESC13}[1;31m${lvl}${ESC13}[m]`,
+  );
+  const colouredSummary = summarizeBuildErrors(colouredFail);
+  check(
+    // Not "does it contain the truncation marker": tail() only marks when the input exceeds the
+    // cap, and this fixture is short, so that assertion passes even unstripped. A surviving
+    // escape byte is the discriminator — the filtered path cannot emit one, tail() always does.
+    "regression：maven 上色時不得退回 tail（殘留色碼即證明整份被 tail 原樣吐回）",
+    colouredSummary.includes("CacheServiceImplTest.java:[4,27] cannot find symbol") &&
+      !colouredSummary.includes(ESC13),
+    colouredSummary.slice(0, 300),
+  );
+  check(
+    "regression：上色時樣板一樣要被丟掉（剝除後才輪得到 boilerplate 比對）",
+    !/Help 1|Re-run Maven|-rf :modA/.test(colouredSummary),
+    colouredSummary.slice(0, 300),
   );
   check(
     "summarizeBuildErrors：超過上限時截斷並標明",

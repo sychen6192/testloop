@@ -329,6 +329,22 @@ export const COMPILE_FAILURE = (file: string, symbol = "log") =>
     "[ERROR] Re-run Maven using the -X switch to enable full debug logging.",
   ].join("\n");
 
+/** Maven colours the level WORD, so the bytes are `[<ESC>[1;31mERROR<ESC>[m]` and the literal
+ *  "[ERROR]" never appears in the log. Sample taken from a real corporate Maven 3.9 run. */
+const ESC = String.fromCharCode(27);
+export const withAnsi = (out: string) =>
+  out.replace(/\[(ERROR|INFO|WARNING)\]/g, (_m, lvl: string) => `[${ESC}[1;31m${lvl}${ESC}[m]`);
+
+/** A red build that names no file and produces no surefire report: the classifier has nothing
+ *  to hand the writer, so there is no repair to attempt. */
+export const UNLOCATABLE_FAILURE = [
+  "[INFO] Scanning for projects...",
+  "[ERROR] Failed to execute goal on project fixture: Could not resolve dependencies",
+  "[ERROR] dependency com.corp:missing-lib:jar:2.1 was not found in https://repo.corp/maven",
+  "[INFO] BUILD FAILURE",
+  "[ERROR] -> [Help 1]",
+].join("\n");
+
 export const TEST_FAILURE = (cls = "com.x.CalcTest") =>
   [
     "[INFO] Scanning for projects...",

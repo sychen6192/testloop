@@ -80,6 +80,23 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **maven 上色時，整條錯誤解析鏈會靜默失效**（實地回報）。jansi 上色的是 level **字**，
+  位元組是 `[<ESC>[1;31mERROR<ESC>[m]`——log 裡根本不存在 `[ERROR]` 這個字串，連不錨定的
+  `grep -c '\[ERROR\]'` 都是 0。於是 `summarizeBuildErrors` 一行都沒配到、整份退回 `tail()`
+  （報告變成 maven 的頁尾加一個被切一半的字），`extractCompileErrorFiles` 回空陣列，
+  `runBaseline` 印「無法從輸出定位到具體檔案」，`buildRepairPrompt` 的「需要修復的既有測試」
+  下面**一片空白**，writer 沒有目標只能翻別的檔案瞎找，四輪後以 `writer-no-op` 中止——而真正的
+  紅燈只是兩個測試檔少了欄位，writer 完全有權限修。現在在擷取邊界剝一次 ANSI（所有解析、
+  零測試計數與落地的 `build.log` 都吃乾淨文字，終端機的即時輸出保留顏色），兩個純函式自己
+  再剝一次，maven 另外補上 `-B`（對齊 gradle 早就有的 `--console=plain`）。
+- **修復迴圈不再空燒在「定位不到檔案」的紅燈上。** 建置紅但分類器指不出任何檔案或測試類別時，
+  writer 拿到的是空清單，那跟 `outOfScope` 一樣是「修不動」而非「修得慢」——現在直接以
+  `unlocatable-failure` 中止並帶出錯誤節錄，不再耗掉整個輪數預算。
+- **中止訊息不再印出一份空清單再猜 Lombok。** `仍然紅燈的：` 在分類器指不出檔案時是空的，
+  後面卻接著一句通用的「常見原因：Lombok annotation processor」，跟實際狀況可能毫無關係。
+  現在清單為空時改印建置摘要，也就是唯一能據以行動的東西。
+- **修復輪的失敗報告不再重複貼同一份錯誤節錄。** 分類器指不出檔案時 `runBaseline` 的 summary
+  已經內含節錄，`describe()` 又接了第二份，等於拿一半的 feedback 預算放同樣的文字。
 - **undici 的預設逾時坐在 agent 逾時底下，300 秒就砍掉請求**。`headersTimeout` 與
   `bodyTimeout` 預設都是 300 秒，而它們在 api runner 的 AbortController **下面**——模型若超過
   五分鐘才吐第一個 byte，會在約 301 秒以一句 `TypeError: fetch failed` 死掉，而不是等到

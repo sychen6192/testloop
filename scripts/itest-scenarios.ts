@@ -24,7 +24,9 @@ import {
   UPSTREAM_TEST_DIR,
   TEST_DIR,
   TEST_FAILURE,
-} from "./itest-lib";
+
+  withAnsi,
+  UNLOCATABLE_FAILURE,} from "./itest-lib";
 
 const CALC_TEST_PATH = `${TEST_DIR}/CalcTest.java`;
 const EXISTING_PATH = `${TEST_DIR}/ExistingTest.java`;
@@ -566,6 +568,30 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    name: "repair-ansi-coloured-build-output",
+    desc: "maven 上色時 [ERROR] 夾著色碼——解析仍須定位到檔案，否則 writer 收到空清單",
+    entry: "repair",
+    extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
+    writer: [{ write: { [BROKEN_PATH]: FIXED_TEST } }],
+    mvn: [
+      {
+        exit: 1,
+        out: withAnsi(COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`)),
+        cleanSurefire: true,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "repair-unlocatable-failure",
+    desc: "建置紅但定位不到任何檔案 → 立刻中止，不得空燒修復輪",
+    entry: "repair",
+    extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
+    // The writer must never be asked: a prompt with an empty broken-file list has no target.
+    writer: [{ write: { [BROKEN_PATH]: FIXED_TEST } }],
+    mvn: [{ exit: 1, out: UNLOCATABLE_FAILURE, cleanSurefire: true }],
+  },
+  {
     name: "repair-max-iterations",
     desc: "UT_REPAIR_MAX_ITER 用完仍紅 → repair-max-iterations，不無限重試",
     entry: "repair",
@@ -621,12 +647,20 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "loop-dirty-baseline-abort",
-    desc: "預檢紅燈且關閉自動修復 → exit 非 0，summary.json 記錄 dirty-baseline",
+    desc: "預檢紅燈且關閉自動修復 → exit 非 0，summary.json 記錄 dirty-baseline；輸出上色也一樣",
     entry: "loop",
     env: { UT_SKIP_REVIEW: "1", UT_REPAIR_BASELINE: "0" },
     extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
     api: [],
-    mvn: [{ exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true }],
+    // Coloured on purpose: this is the shape a real corporate maven emits, and the run that
+    // exposed the bug was exactly this one — a red baseline whose file could not be named.
+    mvn: [
+      {
+        exit: 1,
+        out: withAnsi(COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`)),
+        cleanSurefire: true,
+      },
+    ],
   },
   {
     name: "loop-repair-then-generate",

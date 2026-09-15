@@ -13,7 +13,7 @@ import {
   MAX_FAILURE_CASES,
 } from "../config";
 import { tail, die, log } from "../libs/log";
-import { clampText } from "../libs/utils";
+import { clampText, stripAnsi } from "../libs/utils";
 import { shLive } from "../libs/shell";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
 
@@ -62,7 +62,10 @@ const MAVEN_BOILERPLATE =
  */
 export function summarizeBuildErrors(raw: string, max = 4000): string {
   const kept: string[] = [];
-  const lines = raw.split("\n");
+  // Colour codes land inside the level tag, so an un-stripped line matches neither the
+  // `[ERROR]` test below nor the boilerplate filter, and every line falls through to the
+  // tail() fallback — a report of maven's footer instead of the compiler's errors.
+  const lines = stripAnsi(raw).split("\n");
   let inErrorBlock = false;
   for (const line of lines) {
     const isError = /^\[ERROR\]/.test(line);
@@ -360,10 +363,11 @@ function collectGradleFailures(moduleRoot: string): string {
 // Order is first-seen, so the report reads in the order the compiler produced it.
 export function extractCompileErrorFiles(raw: string): string[] {
   const seen = new Set<string>();
+  const text = stripAnsi(raw);
   const patterns = [/^\[ERROR\]\s+(.+?\.java):\[\d+,\d+\]/gm, /^(.+?\.java):\d+:\s*error:/gm];
   for (const re of patterns) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(raw))) seen.add(m[1].trim().replace(/\\/g, "/"));
+    while ((m = re.exec(text))) seen.add(m[1].trim().replace(/\\/g, "/"));
   }
   return [...seen];
 }
@@ -533,6 +537,11 @@ export async function runBuildAndTests(
     const cmd = wrapperAt ? (isWin ? wrapper : `./${wrapper}`) : "mvn";
     const args = [
       ...(useReactor ? ["-pl", mod.moduleRel, "-am"] : []),
+      // Batch mode: no ANSI colour and no download-progress spam. Gradle below is pinned with
+      // --console=plain for the same reason — the parsers must not have to guess whether maven
+      // decided this was a terminal. Colour is stripped again at capture, since a project's own
+      // .mvn/maven.config can re-enable it.
+      "-B",
       "-DskipITs",
       // JaCoCo's agent appends to target/jacoco.exec by default, so coverage accumulates
       // across builds: a round-1 test that covers nothing inherits the previous run's — or
@@ -561,6 +570,10 @@ export async function runBuildAndTests(
     ];
     r = await shLive(cmd, args, "[gradle]", REPO_ROOT, BUILD_TIMEOUT_MS);
   }
+
+  // One strip at the boundary: every parser below, the zero-test count, and the build.log
+  // artifact all see plain text. The live console output above keeps its colour.
+  r.out = stripAnsi(r.out);
 
   if (r.timedOut) {
     return {

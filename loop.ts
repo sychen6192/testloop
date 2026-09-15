@@ -265,10 +265,16 @@ async function main() {
             2,
           ),
         );
-        const still = [
+        const stillLines = [
           ...preExisting.compileErrorFiles.map((f) => `  - ${f}（編譯失敗）`),
           ...preExisting.failingTestClasses.map((c) => `  - ${c}（測試失敗）`),
-        ].join("\n");
+        ];
+        // The classifier can name nothing — a build that failed before reaching any file, or
+        // output it could not parse. Printing an empty list under "仍然紅燈的：" and then
+        // guessing at Lombok tells the operator nothing; the summary carries the real extract.
+        const still = stillLines.length
+          ? stillLines.join("\n")
+          : (repair?.report ?? baseline.summary);
         const outOfScopeList = baseline.outOfScope.map((f) => `  - ${f}`).join("\n");
         die(
           (repair
