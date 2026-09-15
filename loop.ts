@@ -202,10 +202,17 @@ async function main() {
     // Repairing is only possible where the writer may write. A red common/ in a reactor, or a
     // broken production file, is not a slow repair — it is an impossible one, and entering the
     // loop spends the whole budget discovering that the writes are refused.
-    const repairable = baseline.outOfScope.length === 0;
-    if (!clean && REPAIR_BASELINE && !repairable) {
+    // Two ways a red baseline is unfixable rather than slow to fix: the file is outside the
+    // writer's scope, or the file is inside it but the cause is the environment. Both spend the
+    // entire repair budget proving the same thing, which on a @SpringBootTest module is an hour.
+    const repairable = baseline.outOfScope.length === 0 && baseline.envFailures.length === 0;
+    if (!clean && REPAIR_BASELINE && baseline.outOfScope.length) {
       log(`[FAIL] 既有紅燈不在 writer 的可寫範圍（${writableRel(mod)}）內，略過修復迴圈：`);
       baseline.outOfScope.forEach((f) => log(`  - ${f}`));
+    }
+    if (!clean && REPAIR_BASELINE && baseline.envFailures.length) {
+      log("[FAIL] 既有紅燈來自環境/設定，不是測試碼，略過修復迴圈：");
+      baseline.envFailures.forEach((w) => log(`  - ${w}`));
     }
     if (!clean && REPAIR_BASELINE && repairable) {
       banner("修復既有紅燈（repair）");
@@ -256,9 +263,12 @@ async function main() {
                 ? `repair-failed:${repair.stopReason}`
                 : baseline.outOfScope.length
                   ? "dirty-baseline:out-of-scope"
-                  : "dirty-baseline",
+                  : baseline.envFailures.length
+                    ? "dirty-baseline:env-failure"
+                    : "dirty-baseline",
               ...preExisting,
               outOfScope: baseline.outOfScope,
+              envFailures: baseline.envFailures,
               repair,
             },
             null,
@@ -281,6 +291,11 @@ async function main() {
             ? `修復 ${repair.rounds} 輪後模組仍無法通過建置（${repair.stopReason}）。仍然紅燈的：\n${still}\n` +
               "常見原因：根因在 production code 或建置設定（例如 pom.xml 的 Lombok annotation processor），" +
               "writer 無權修改。請人工修好後重跑，或：\n"
+            : baseline.envFailures.length
+              ? "模組在本工具介入前就無法通過建置，而紅燈來自環境/設定，不是測試碼——" +
+                "檔案就算在 writer 可寫範圍內，改測試碼也不會讓它變綠：\n" +
+                `${baseline.envFailures.map((w) => `  - ${w}`).join("\n")}\n` +
+                "重量級整合測試（@SpringBootTest）的模組最常見。請先讓該環境起得來，或：\n"
             : baseline.outOfScope.length
               ? `模組在本工具介入前就無法通過建置，而紅燈全部落在 writer 的可寫範圍` +
                 `（${writableRel(mod)}）之外——它沒有權限修改這些檔案，所以沒有進入修復迴圈：\n` +

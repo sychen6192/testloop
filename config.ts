@@ -77,6 +77,12 @@ export const ALLOW_DIRTY_BASELINE = process.env.UT_ALLOW_DIRTY_BASELINE === "1";
 // generation start. 0 = abort on a red baseline instead, as before.
 export const REPAIR_BASELINE = process.env.UT_REPAIR_BASELINE !== "0";
 export const REPAIR_MAX_ITER = numEnv("UT_REPAIR_MAX_ITER", 5, 1);
+// Consecutive repair rounds whose red count did not go down before the loop gives up. The
+// stuck check needs two *identical* reports; a writer that fixes one file and breaks another
+// keeps producing fresh text forever, so only the count catches it. On a module whose existing
+// tests are @SpringBootTest a wasted round is 8-15 minutes, which is what makes this worth
+// its own cut-off rather than leaving it to REPAIR_MAX_ITER.
+export const REPAIR_NO_PROGRESS_ROUNDS = numEnv("UT_REPAIR_NO_PROGRESS_ROUNDS", 2, 1);
 // Which tests the build gate runs each round. "module" (default) runs the whole module and its
 // upstream modules, exactly as before. "generated" narrows surefire to the target classes' own
 // tests during iterations and does one full module run before declaring success — the module

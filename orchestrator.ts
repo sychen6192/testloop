@@ -24,6 +24,7 @@ import {
   REPO_ROOT,
   ALLOW_TEST_SHRINK,
   REPAIR_MAX_ITER,
+  REPAIR_NO_PROGRESS_ROUNDS,
   TEST_SCOPE,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
@@ -426,7 +427,7 @@ export interface RepairResult {
   success: boolean;
   rounds: number;
   // "repaired" | "repair-max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
-  // | "scope-violation" | "unlocatable-failure"
+  // | "scope-violation" | "unlocatable-failure" | "repair-no-progress"
   // | "scope-violation"
   stopReason: string;
   // Still red when repair gave up; empty on success.
@@ -482,6 +483,13 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     report: why,
     changedFiles: [...touched].sort(),
   });
+
+  // Progress is measured, not inferred from the report text: a round that fixes one file and
+  // breaks another writes a brand-new report every time, so the fingerprint never repeats and
+  // the stuck check never fires, while the module is no closer to green than when it started.
+  // Seeded from the baseline, so a first round that reduces nothing already counts.
+  let prevBrokenCount = brokenList(current).length;
+  let noProgressRounds = 0;
 
   for (let round = 1; round <= REPAIR_MAX_ITER; round++) {
     // A red build the classifier could pin to no file at all leaves buildRepairPrompt listing
@@ -588,7 +596,19 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       return giveUp("stuck", `連續兩輪修復後得到相同的紅燈，判定迴圈卡住。\n${report}`, round);
     }
     prevFingerprint = fingerprint;
-    log("→ 仍有紅燈，帶著報告進入下一輪修復");
+
+    const brokenCount = brokenList(current).length;
+    noProgressRounds = brokenCount >= prevBrokenCount ? noProgressRounds + 1 : 0;
+    prevBrokenCount = brokenCount;
+    if (noProgressRounds >= REPAIR_NO_PROGRESS_ROUNDS) {
+      return giveUp(
+        "repair-no-progress",
+        `連續 ${noProgressRounds} 輪紅燈數沒有下降（仍有 ${brokenCount} 項），判定修不動。\n` +
+          `（可用 UT_REPAIR_NO_PROGRESS_ROUNDS 調整容忍輪數）\n${report}`,
+        round,
+      );
+    }
+    log(`→ 仍有 ${brokenCount} 項紅燈，帶著報告進入下一輪修復`);
   }
   return giveUp(
     "repair-max-iterations",
