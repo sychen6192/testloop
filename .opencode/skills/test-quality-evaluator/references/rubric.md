@@ -264,7 +264,19 @@ Maps to **F (Fast)** and **R (Repeatable)** in FIRST.
 - `Thread.sleep(...)` — brittle timing
 - `LocalDateTime.now()` / `new Date()` / `System.currentTimeMillis()` without injection
 - `Random` without a fixed seed
-- Real network / DB calls (non-TestContainer)
+- Real network calls
+- Any database contact at all, regardless of how it is provisioned: a live datasource,
+  Testcontainers (`@Testcontainers` / `@Container`), an embedded H2/HSQLDB/Derby datasource,
+  or a Spring slice that boots a context and wires one (`@SpringBootTest`, `@DataJpaTest`,
+  `@JdbcTest`, `@MybatisTest`, `@AutoConfigureTestDatabase`, `@Sql`). An embedded database is
+  not a mitigation — it still loads a driver and a schema, and still fails for environmental
+  reasons; it just fails more slowly. **Report every occurrence as a blocker, naming the file
+  and the test method, and score this dimension in the 0-2 band.** The fix is to inject the
+  repository / mapper / `JdbcTemplate` / `EntityManager` / `DataSource` as a `@Mock`.
+  One exception, reported as an advisory rather than a blocker: when the class under test is
+  itself the persistence adapter, so that mocking its datasource would leave the test verifying
+  nothing. Name the file and say so; do not demand a meaningless mock, and never suggest
+  deleting or `@Disabled`-ing the test.
 - Async results asserted without `Awaitility` or proper synchronization
 
 **Java example — 0-2 band:**
