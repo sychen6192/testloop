@@ -135,6 +135,22 @@
   遺留的報告，等於告訴 writer 一些這輪沒執行過的測試「失敗了」。改以 mtime 過濾。
 
 ### Changed
+- **單元測試不連資料庫，嵌入式的也不行**，且既有測試違反時**就地改寫、不得刪除**。
+  standards 先前只有一句籠統的「禁止真實網路 / DB / 檔案系統 I/O（一律以 mock 或
+  in-memory 取代）」——那句話自己就開了後門：H2 也是 in-memory。現在點名
+  `@SpringBootTest` / `@DataJpaTest` / `@JdbcTest` / `@MybatisTest` /
+  `@AutoConfigureTestDatabase` / `@Sql` / Testcontainers 與嵌入式資料庫，並說明為什麼
+  嵌入式不算緩解：它一樣要載入 driver 與 schema、一樣會因環境而紅，只是紅得比較慢。
+  rubric 的 Dimension 5 同步改掉「Real network / DB calls (non-TestContainer)」——
+  那行等於在說用 Testcontainers 就沒事——並明確要求列為 **blocker** 而非 advisory；
+  advisories 不擋關也不進 feedback，寫成建議級等於沒寫。兩邊都要改，因為 writer 吃
+  standards、reviewer 吃 rubric，review prompt 不注入 standards。
+  standards 另新增「既有測試違反上述規則時」一節，講清楚 writer 能做什麼：保留測試方法、
+  只換掉違規機制，**斷言數不得少於改寫前**（一個連 DB 撈五筆的測試改成 mock 之後只剩三個
+  斷言，會被防掏空 guard 判定為刪減而讓該輪失敗，缺的驗證要補回等價斷言）；不得刪除方法、
+  刪檔或改掛 `@Disabled`；目標類別本身就是持久層 adapter 時原樣保留並在總結中點名，
+  由人決定，rubric 對應地把這種情況列為 advisory 而非 blocker——否則 reviewer 擋、writer
+  改不動，會把輪數空燒完。
 - standards 新增兩條：測試碼禁止 logging（`@Slf4j` / `log.*` / `System.out`——斷言就是測試的
   輸出，且 Lombok 的 annotation processor 在 test scope 未必生效，`@Slf4j` 產不出 `log`
   欄位會讓整個檔案編譯失敗）；測試類別可見性依 pipeline 掃描結論撰寫，不自行假設。
