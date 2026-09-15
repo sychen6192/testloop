@@ -26,7 +26,9 @@ import {
   TEST_FAILURE,
 
   withAnsi,
-  UNLOCATABLE_FAILURE,} from "./itest-lib";
+  UNLOCATABLE_FAILURE,
+  CONTEXT_FAILURE,
+  COMPILE_FAILURE_2,} from "./itest-lib";
 
 const CALC_TEST_PATH = `${TEST_DIR}/CalcTest.java`;
 const EXISTING_PATH = `${TEST_DIR}/ExistingTest.java`;
@@ -592,10 +594,33 @@ export const SCENARIOS: Scenario[] = [
     mvn: [{ exit: 1, out: UNLOCATABLE_FAILURE, cleanSurefire: true }],
   },
   {
+    name: "repair-no-progress",
+    desc: "紅燈數連續不降 → repair-no-progress 早停；報告每輪都不同，fingerprint 的 stuck 抓不到",
+    entry: "repair",
+    extraFiles: {
+      [BROKEN_PATH]: BROKEN_TEST,
+      ["src/test/java/com/x/Broken2Test.java"]: BROKEN_TEST.replace("BrokenTest", "Broken2Test"),
+    },
+    writer: [
+      { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 1\n` } },
+      { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 22\n` } },
+      { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 333\n` } },
+    ],
+    // Two files red throughout, with the symbol changing each round: the report is never
+    // byte-identical, so only the count reveals that nothing is getting fixed.
+    mvn: [
+      { exit: 1, out: COMPILE_FAILURE_2(`{{root}}/${BROKEN_PATH}`, `{{root}}/src/test/java/com/x/Broken2Test.java`, "log"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE_2(`{{root}}/${BROKEN_PATH}`, `{{root}}/src/test/java/com/x/Broken2Test.java`, "logger"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE_2(`{{root}}/${BROKEN_PATH}`, `{{root}}/src/test/java/com/x/Broken2Test.java`, "LOG"), cleanSurefire: true },
+    ],
+  },
+  {
     name: "repair-max-iterations",
     desc: "UT_REPAIR_MAX_ITER 用完仍紅 → repair-max-iterations，不無限重試",
     entry: "repair",
-    env: { UT_REPAIR_MAX_ITER: "2" },
+    // The no-progress stop is disabled here on purpose: with both at their defaults it fires
+    // first on this fixture, and this scenario exists to prove the iteration cap itself.
+    env: { UT_REPAIR_MAX_ITER: "2", UT_REPAIR_NO_PROGRESS_ROUNDS: "9" },
     extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
     writer: [
       { write: { [BROKEN_PATH]: `${BROKEN_TEST}// try 1\n` } },
@@ -659,6 +684,28 @@ export const SCENARIOS: Scenario[] = [
         exit: 1,
         out: withAnsi(COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`)),
         cleanSurefire: true,
+      },
+    ],
+  },
+  {
+    name: "loop-baseline-env-failure",
+    desc: "預檢紅燈來自 Spring context 起不來 → 不進修復迴圈（檔案在可寫範圍內也一樣）",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    // The failing class is com.x.CalcTest, inside the module's own src/test — outOfScope is
+    // empty, so without the env classification the loop would happily enter repair.
+    mvn: [
+      {
+        exit: 1,
+        out: CONTEXT_FAILURE,
+        cleanSurefire: true,
+        surefire: [
+          {
+            cls: "com.x.CalcTest",
+            body: SUREFIRE_FAIL("com.x.CalcTest", "Failed to load ApplicationContext"),
+          },
+        ],
       },
     ],
   },

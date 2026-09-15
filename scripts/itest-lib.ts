@@ -335,6 +335,34 @@ const ESC = String.fromCharCode(27);
 export const withAnsi = (out: string) =>
   out.replace(/\[(ERROR|INFO|WARNING)\]/g, (_m, lvl: string) => `[${ESC}[1;31m${lvl}${ESC}[m]`);
 
+/** A @SpringBootTest whose context will not start: the test class is squarely inside the
+ *  writer's scope, and nothing it can write to that file makes the module green. Shape taken
+ *  from a real run (HikariDataSource failing to decrypt its password). */
+export const CONTEXT_FAILURE = [
+  "[INFO] Scanning for projects...",
+  "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+  "[ERROR] com.x.CalcTest -- Time elapsed: 2.104 s <<< ERROR!",
+  "[ERROR] java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@1a2b3c]",
+  "[ERROR] Caused by: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'dataSource'",
+  "[ERROR] Caused by: org.apache.commons.codec.DecoderException: Odd number of characters.",
+  "[INFO] BUILD FAILURE",
+  "[ERROR] -> [Help 1]",
+].join("\n");
+
+/** Two files red at once, so a round can change the report text without changing the count —
+ *  the exact shape the fingerprint-based stuck check cannot see. */
+export const COMPILE_FAILURE_2 = (fileA: string, fileB: string, symbol = "log") =>
+  [
+    "[INFO] Scanning for projects...",
+    "[ERROR] COMPILATION ERROR :",
+    `[ERROR] ${fileA}:[9,9] cannot find symbol`,
+    `  symbol:   variable ${symbol}`,
+    `[ERROR] ${fileB}:[11,9] cannot find symbol`,
+    `  symbol:   variable ${symbol}`,
+    "[INFO] BUILD FAILURE",
+    "[ERROR] Failed to execute goal compiler:testCompile on project fixture -> [Help 1]",
+  ].join("\n");
+
 /** A red build that names no file and produces no surefire report: the classifier has nothing
  *  to hand the writer, so there is no repair to attempt. */
 export const UNLOCATABLE_FAILURE = [

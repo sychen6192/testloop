@@ -80,6 +80,22 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **環境問題不再被當成測試問題送進修復迴圈。** 實地案例：一個既有測試全是 `@SpringBootTest`
+  的模組，紅燈是 Spring context 起不來（HikariDataSource 解密失敗）。那些測試檔**就在 writer
+  的可寫範圍內**，所以既有的 `outOfScope` 分類擋不住它，但改測試碼永遠不會讓它變綠——
+  結果五次執行沒有一次真的開始產生新測試，全部把 3–5 輪、每輪 8–15 分鐘燒在修不動的東西上，
+  最久一次 56 分鐘。`gates/build.ts` 新增 `detectEnvFailures`，認出 context 啟動失敗、bean
+  建立失敗、連線池初始化失敗、JDBC 連不上、設定解密失敗，這類紅燈直接中止並指向環境而不是
+  測試碼。偵測**刻意寫窄**：誤判會拒絕修一個本來修得動的東西，所以編譯錯誤與一般斷言失敗
+  都不算（前者正是 writer 該修也修得動的典型），selftest 有專門的不得誤判斷言。
+- **修復迴圈新增紅燈數早停**（`UT_REPAIR_NO_PROGRESS_ROUNDS`，預設 2）。既有的 `stuck` 比對
+  feedback fingerprint，要求連續兩輪報告**完全相同**才觸發；「修好 A 又弄壞 B」每輪都產生
+  嶄新的報告，fingerprint 永遠不重複，於是一路燒到 `UT_REPAIR_MAX_ITER` 用完，而模組跟第一輪
+  一樣紅。現在改成也看紅燈數：連續幾輪沒有下降就以 `repair-no-progress` 停手。在每輪建置要
+  8–15 分鐘的模組上，這是省下半小時與省下一小時的差別。
+  行為上的連帶影響：兩者都用預設值時，`repair-max-iterations` 會變得很少見——除非紅燈數幾乎
+  每輪都在減少，否則早停會先觸發。這是刻意的，`repair-max-iterations` 現在的意思變成
+  「一直有進展但預算用完了」。
 - **maven 上色時，整條錯誤解析鏈會靜默失效**（實地回報）。jansi 上色的是 level **字**，
   位元組是 `[<ESC>[1;31mERROR<ESC>[m]`——log 裡根本不存在 `[ERROR]` 這個字串，連不錨定的
   `grep -c '\[ERROR\]'` 都是 0。於是 `summarizeBuildErrors` 一行都沒配到、整份退回 `tail()`

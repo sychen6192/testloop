@@ -44,6 +44,7 @@ import {
 import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics";
 import {
   countTestsRun,
+  detectEnvFailures,
   extractCompileErrorFiles,
   parseSurefireXml,
   renderSurefireSuite,
@@ -721,6 +722,38 @@ console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍
     colouredFiles.length === 2 && colouredFiles[0].endsWith("CacheServiceImplTest.java"),
     JSON.stringify(colouredFiles),
   );
+
+  // (a3) Environment failures: red the writer cannot fix by editing the test body, even though
+  // the file is well inside its scope. The false-positive check matters more than the hits —
+  // classifying a repairable failure as environmental refuses to repair something repairable.
+  const ctxOut =
+    "[ERROR] com.x.OrderServiceTest -- Time elapsed: 2.1 s <<< ERROR!\n" +
+    "[ERROR] java.lang.IllegalStateException: Failed to load ApplicationContext for [Web...]\n" +
+    "[ERROR] Caused by: org.apache.commons.codec.DecoderException: Odd number of characters.\n";
+  const envWhy = detectEnvFailures(ctxOut);
+  check(
+    "detectEnvFailures：context 起不來 + 解密失敗都認得",
+    envWhy.length === 2 && envWhy.some((w) => w.includes("Spring context")) && envWhy.some((w) => w.includes("解密")),
+    JSON.stringify(envWhy),
+  );
+  check(
+    "detectEnvFailures：上色時一樣認得（與其他解析共用剝除）",
+    detectEnvFailures(paint(ctxOut)).length === 2,
+    JSON.stringify(detectEnvFailures(paint(ctxOut))),
+  );
+  check(
+    "detectEnvFailures：一般斷言失敗不得誤判為環境問題",
+    detectEnvFailures(
+      "[ERROR] com.x.CalcTest.add_twoPositives -- Time elapsed: 0.01 s <<< FAILURE!\n" +
+        "org.opentest4j.AssertionFailedError: expected: <3> but was: <4>\n",
+    ).length === 0,
+  );
+  check(
+    "detectEnvFailures：編譯錯誤也不是環境問題（那是 writer 修得動的）",
+    detectEnvFailures(mavenOut).length === 0,
+    JSON.stringify(detectEnvFailures(mavenOut)),
+  );
+  check("detectEnvFailures：乾淨輸出 → 空陣列", detectEnvFailures("[INFO] BUILD SUCCESS").length === 0);
 
   // (b) existing-test detection: the duplicate-file bug is <Class>UnitTest.java beside <Class>Test.java
   check("matchesTestNaming：正規名稱", matchesTestNaming("CommonServiceImpl", "CommonServiceImplTest.java"));

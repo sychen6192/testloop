@@ -68,9 +68,17 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
    `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
    pre-existing 要求 writer 別碰。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
-   修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈在不在
-   `<目標模組>/src/test` 內——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，
-   writer 沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，那種情況直接中止並點名）與
+   修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈**修不修得動**，
+   修不動的一律不進修復迴圈、直接中止並點名，有三種：(a) 不在 `<目標模組>/src/test` 內
+   ——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，writer 沒有寫入權；
+   (b) `gates/build.ts` 的 `detectEnvFailures` 認出的環境/設定紅燈——Spring context 起不來、
+   連線池初始化失敗、設定解密失敗。這種檔案**就在可寫範圍內**，所以 (a) 擋不住它，但改測試碼
+   永遠不會讓它變綠，而重量級整合測試的模組每輪建置要 8–15 分鐘，燒滿輪數就是一小時；
+   偵測刻意寫窄——誤判會拒絕修一個本來修得動的東西；(c) 建置紅但定位不到任何檔案
+   （`unlocatable-failure`），writer 拿到的是空清單，沒有目標可打。進了迴圈之後還有
+   **紅燈數早停**：連續 `UT_REPAIR_NO_PROGRESS_ROUNDS` 輪紅燈數沒下降就停——`stuck` 比對的是
+   feedback fingerprint，要求兩輪報告完全相同，而「修好 A 又弄壞 B」每輪報告都不一樣卻毫無
+   進展，只有數量看得出來）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與

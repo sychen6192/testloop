@@ -66,6 +66,7 @@ const BASE_ENV: Record<string, string> = {
   UT_QUIET: "1",
   UT_REPAIR_BASELINE: "1",
   UT_REPAIR_MAX_ITER: "5",
+  UT_REPAIR_NO_PROGRESS_ROUNDS: "2",
   UT_REVIEWER_MODEL: "itest-reviewer",
   UT_REVIEWER_MUST_READ: "1",
   UT_RUNNER: "opencode",
@@ -608,6 +609,22 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
   },
 
+  "repair-no-progress": (c) => {
+    check("判為 repair-no-progress", c.result.stopReason === "repair-no-progress", String(c.result.stopReason));
+    check("第 2 輪就停，沒燒到 UT_REPAIR_MAX_ITER=5", c.result.rounds === 2, String(c.result.rounds));
+    check("建置 3 次：預檢 + 2 輪驗證", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    check(
+      "不是 stuck：報告每輪都不同，fingerprint 抓不到",
+      c.result.stopReason !== "stuck",
+      String(c.result.stopReason),
+    );
+    check(
+      "訊息說出紅燈數沒下降",
+      String(c.result.report ?? "").includes("紅燈數沒有下降"),
+      String(c.result.report ?? "").slice(0, 200),
+    );
+  },
+
   "repair-max-iterations": (c) => {
     check("用完輪數就停", c.result.stopReason === "repair-max-iterations", String(c.result.stopReason));
     check("剛好 UT_REPAIR_MAX_ITER=2 輪", c.result.rounds === 2, String(c.result.rounds));
@@ -663,6 +680,24 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
       !c.runRead("baseline.log").includes(String.fromCharCode(27)),
       c.runRead("baseline.log").slice(0, 200),
     );
+  },
+
+  "loop-baseline-env-failure": (c) => {
+    check("die 以 exit 1 結束", c.code === 1, `code=${c.code}`);
+    check("summary.json 記為 env-failure", c.result.stopReason === "dirty-baseline:env-failure", JSON.stringify(c.result.stopReason));
+    check(
+      "點名環境問題（context 起不來 / 解密失敗）",
+      JSON.stringify(c.result.envFailures ?? []).includes("Spring context"),
+      JSON.stringify(c.result.envFailures),
+    );
+    check(
+      "紅燈檔案其實在可寫範圍內（所以 outOfScope 擋不住，要靠這道分類）",
+      JSON.stringify(c.result.outOfScope ?? []) === "[]",
+      JSON.stringify(c.result.outOfScope),
+    );
+    check("只建置預檢那一次，沒進修復迴圈", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+    check("完全沒有產生測試", !c.exists("src/test/java/com/x/CalcTest.java"));
+    check("訊息給的是環境方向，不是叫人去修測試", c.stderr.includes("環境/設定"), c.stderr.slice(-400));
   },
 
   "loop-repair-then-generate": (c) => {

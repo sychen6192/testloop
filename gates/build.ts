@@ -28,6 +28,11 @@ export interface BaselineResult {
   // module's tests, production code, build files. Repairing these is not slow, it is
   // impossible — the writer has no permission to touch them — so the loop must not try.
   outOfScope: string[];
+  // Red that comes from the environment rather than from test code: a Spring context that will
+  // not start, a datasource that cannot connect or decrypt its password. The file is usually
+  // well inside the writer's scope, which is exactly why this needs its own classification —
+  // outOfScope would not catch it, and no edit to the test body makes it green.
+  envFailures: string[];
   summary: string;
   raw: string;
 }
@@ -356,6 +361,40 @@ function collectGradleFailures(moduleRoot: string): string {
   return failures;
 }
 
+/**
+ * Pure: reasons this build is red that no edit to a test body can fix.
+ *
+ * A @SpringBootTest whose context will not start reports as a failing test class, so the repair
+ * loop treats it as test code and spends its whole budget — 8-15 minutes a round on a module of
+ * that shape — rewriting assertions that were never the problem. The writer has full write
+ * permission on the file; the cause is a datasource, a credential or a profile.
+ *
+ * Deliberately narrow. Each signature names a subsystem failing to come up, not a test failing
+ * an assertion, because a false positive here refuses to repair something that was repairable.
+ */
+const ENV_FAILURE_SIGNATURES: ReadonlyArray<{ re: RegExp; why: string }> = [
+  { re: /Failed to load ApplicationContext/, why: "Spring context 無法啟動" },
+  {
+    re: /org\.springframework\.beans\.factory\.(?:BeanCreationException|UnsatisfiedDependencyException)/,
+    why: "Spring bean 建立失敗",
+  },
+  {
+    re: /org\.springframework\.context\.ApplicationContextException/,
+    why: "Spring context 啟動失敗",
+  },
+  { re: /com\.zaxxer\.hikari\.pool\.HikariPool\$PoolInitializationException/, why: "連線池初始化失敗（HikariCP）" },
+  {
+    re: /Unable to acquire JDBC Connection|Cannot (?:load|create) driver class|Driver class .* not found/,
+    why: "JDBC 連線無法建立",
+  },
+  { re: /org\.apache\.commons\.codec\.DecoderException/, why: "設定值解密失敗（DecoderException）" },
+];
+
+export function detectEnvFailures(raw: string): string[] {
+  const text = stripAnsi(raw);
+  return ENV_FAILURE_SIGNATURES.filter((s) => s.re.test(text)).map((s) => s.why);
+}
+
 // Pure: the distinct .java files the compiler reported errors in. Two shapes cover both
 // build tools — Maven prefixes and bracket-wraps the position, javac (gradle) does not:
 //   [ERROR] /abs/path/FooTest.java:[12,34] cannot find symbol
@@ -413,6 +452,7 @@ export async function runBaseline(
       compileErrorFiles: [],
       failingTestClasses: [],
       outOfScope: [],
+      envFailures: [],
       summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
     };
@@ -467,11 +507,17 @@ export async function runBaseline(
     lines.push(`超出 writer 可寫範圍（${writableRel(mod)}）的有 ${outOfScope.length} 項：`);
     outOfScope.forEach((f) => lines.push(`  - ${f}`));
   }
+  const envFailures = detectEnvFailures(raw);
+  if (envFailures.length) {
+    lines.push(`環境/設定問題（改測試碼修不好）：`);
+    envFailures.forEach((w) => lines.push(`  - ${w}`));
+  }
   return {
     clean: false,
     compileErrorFiles,
     failingTestClasses,
     outOfScope,
+    envFailures,
     summary: lines.join("\n"),
     raw,
   };
