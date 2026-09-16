@@ -693,6 +693,58 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
   },
 
+  "loop-dirty-tolerated": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check(
+      "既有失敗被記進 summary.json（這個綠燈要可被審計）",
+      JSON.stringify(c.result.toleratedFailures ?? []).includes("com.x.LegacyTest#old_behaviour"),
+      JSON.stringify(c.result.toleratedFailures),
+    );
+    check("測試確實產生了", c.exists("src/test/java/com/x/CalcTest.java"));
+    check("預檢 + gate 共 2 次建置", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-dirty-new-failure-blocked": (c) => {
+    check("新失敗擋下 → exit 2", c.code === 2, `code=${c.code}`);
+    check("summary.json 判定失敗", c.result.success === false, JSON.stringify(c.result.stopReason));
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "報告點名 writer 弄壞的那個，而不是只丟一堆既有失敗",
+      fb.includes("com.x.OtherTest#broken_by_writer"),
+      fb.slice(0, 400),
+    );
+    // Scoped to the "本輪造成" block itself: the pre-existing failure does appear further down,
+    // in the general failure detail, and belongs there — the writer is told to ignore it.
+    const blamed = fb.slice(fb.indexOf("本輪造成"), fb.indexOf("錯誤節錄"));
+    check(
+      "「本輪造成」那一段只列新失敗，既有失敗不該被算進去",
+      blamed.includes("broken_by_writer") && !blamed.includes("old_behaviour"),
+      blamed,
+    );
+  },
+
+  "loop-dirty-same-class-new-method-blocked": (c) => {
+    check("同類別新方法失敗擋下 → exit 2", c.code === 2, `code=${c.code}`);
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "點名的是新方法，不是整個類別（識別退回類別層級時這條會紅）",
+      fb.includes("com.x.LegacyTest#save_rollsBack"),
+      fb.slice(0, 400),
+    );
+    check(
+      "同類別裡的既有失敗仍被容忍，沒有一起算帳",
+      !fb.includes("com.x.LegacyTest#old_behaviour"),
+      fb.slice(0, 400),
+    );
+  },
+
+  "loop-skip-baseline-conflicts-dirty": (c) => {
+    check("兩個旗標並用 → die", c.code === 1, `code=${c.code}`);
+    check("訊息說明為什麼互斥", c.stderr.includes("沒有預檢就沒有"), c.stderr.slice(-400));
+    check("在建置之前就擋下，沒浪費任何一次 build", c.mvnCalls === 0, `mvnCalls=${c.mvnCalls}`);
+  },
+
   "loop-baseline-env-failure": (c) => {
     check("die 以 exit 1 結束", c.code === 1, `code=${c.code}`);
     check("summary.json 記為 env-failure", c.result.stopReason === "dirty-baseline:env-failure", JSON.stringify(c.result.stopReason));

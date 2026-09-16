@@ -38,6 +38,11 @@ export interface BaselineResult {
   // the build gate, and runBaseline discarded it — so the repair loop knew *which* classes were
   // red and never *why*, which is the one thing a writer cannot infer from a class name.
   failureDetail: string;
+  // P: the identity of every test already failing before the writer wrote anything. Under
+  // UT_ALLOW_DIRTY_BASELINE the build gate treats a round as green when this round's failing
+  // identities are a subset of these — see DESIGN.md「dirty baseline 下，gate 扣除既有失敗」.
+  // Maven only: without surefire XML there are no identities and the gate stays strict.
+  failingTests: string[];
   summary: string;
   raw: string;
 }
@@ -232,6 +237,63 @@ export function renderSurefireSuite(s: SurefireSuite, maxCases = MAX_FAILURE_CAS
     `----- ${s.suite}（測試 ${s.tests}、失敗 ${s.failures}、錯誤 ${s.errors}）-----`,
     ...lines,
   ].join("\n");
+}
+
+/**
+ * Pure: the identity of every failing test in these suites.
+ *
+ * FQCN plus the case name surefire recorded — which for a @ParameterizedTest already carries
+ * the invocation ("add(int)[2]") and for a @Nested class already carries the inner class.
+ * Per-case and deliberately not per-class: "that class was already red" would let a test the
+ * writer actually broke ride in behind one that was failing before it started.
+ */
+export function failingTestIds(suites: SurefireSuite[]): string[] {
+  const ids = new Set<string>();
+  for (const s of suites) for (const c of s.cases) ids.add(`${s.suite}#${c.name}`);
+  return [...ids].sort();
+}
+
+export interface SubtractionVerdict {
+  pass: boolean;
+  current: string[];
+  unexpected: string[];
+  reason: string;
+}
+
+/**
+ * Pure: may this red build be treated as "no worse than before the writer touched it"?
+ *
+ * Three ways it must answer no, each a guardrail the design was accepted on:
+ * - a compile error — nothing ran, so there is nothing to compare;
+ * - no failing test identified at all — the empty set is a subset of anything, so a dependency
+ *   resolution failure, a dead plugin or a build with XML reports disabled would sail through;
+ * - any identity the baseline did not already have — that is the writer breaking something,
+ *   which is the whole promise this gate exists to keep.
+ */
+export function subtractTolerated(
+  raw: string,
+  suites: SurefireSuite[],
+  tolerate: string[],
+): SubtractionVerdict {
+  const current = failingTestIds(suites);
+  const allowed = new Set(tolerate);
+  const unexpected = current.filter((id) => !allowed.has(id));
+  const compileErrors = extractCompileErrorFiles(raw);
+  if (compileErrors.length) {
+    return { pass: false, current, unexpected, reason: "編譯失敗，沒有任何測試跑過，無從比對" };
+  }
+  if (current.length === 0) {
+    return {
+      pass: false,
+      current,
+      unexpected,
+      reason: "建置紅但定位不到任何失敗的測試，不能當成「沒有變糟」",
+    };
+  }
+  if (unexpected.length) {
+    return { pass: false, current, unexpected, reason: "出現基準沒有的新失敗" };
+  }
+  return { pass: true, current, unexpected, reason: "全部都是 writer 介入前就存在的失敗" };
 }
 
 const surefireDirOf = (moduleRoot: string) =>
@@ -459,6 +521,7 @@ export async function runBaseline(
       outOfScope: [],
       envFailures: [],
       failureDetail: "",
+      failingTests: [],
       summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
     };
@@ -516,6 +579,7 @@ export async function runBaseline(
   // Same source the build gate quotes from, read here rather than plumbed through
   // runBuildAndTests' report string — that string also carries summarizeBuildErrors, which the
   // caller adds itself, and two copies of it is what the feedback budget cannot afford.
+  const failingTests = failingTestIds(suites);
   const failureDetail =
     tool === "maven"
       ? collectSurefireFailures(mod.moduleRoot, startedAt)
@@ -532,6 +596,7 @@ export async function runBaseline(
     outOfScope,
     envFailures,
     failureDetail,
+    failingTests,
     summary: lines.join("\n"),
     raw,
   };
@@ -581,7 +646,9 @@ export async function runBuildAndTests(
   mod: ModuleInfo,
   // onlyTests: run just these test classes (simple names). Compilation is unaffected — the
   // whole module's test sources still have to compile — so this narrows execution, not scope.
-  opts: { allowZeroTests?: boolean; onlyTests?: string[] } = {},
+  // tolerate: the baseline's failing identities. Set only by loop.ts under
+  // UT_ALLOW_DIRTY_BASELINE; absent means the gate keeps its "module is green" requirement.
+  opts: { allowZeroTests?: boolean; onlyTests?: string[]; tolerate?: string[] } = {},
 ): Promise<GateResult> {
   const isWin = process.platform === "win32";
   // Taken before the build so stale reports from an earlier round can be told apart.
@@ -652,6 +719,34 @@ export async function runBuildAndTests(
     return { passed: true, report: "編譯與測試全數通過。", raw: r.out };
   }
 
+  // Dirty-baseline subtraction: the gate's promise weakens from "the module is green" to
+  // "the module is no worse than before the writer touched it", and only when the operator
+  // asked for that. Every test still runs — this compares results, it does not skip any.
+  let broke = "";
+  if (opts.tolerate?.length && tool === "maven") {
+    const v = subtractTolerated(r.out, failingSuites(mod.moduleRoot, startedAt), opts.tolerate);
+    if (v.pass) {
+      return {
+        passed: true,
+        report:
+          `編譯通過。${v.current.length} 個失敗全部是 writer 介入前就存在的，` +
+          `依 UT_ALLOW_DIRTY_BASELINE 放行：\n` +
+          v.current.map((id) => `  - ${id}`).join("\n"),
+        raw: r.out,
+      };
+    }
+    log(`[dirty-baseline] 不予扣除：${v.reason}`);
+    // Named in the report, not just the log: "these are the ones you broke" is the single most
+    // actionable line the writer can get when the module was already red — without it the
+    // feedback is a wall of failures it has been told to ignore, plus the ones it must not.
+    if (v.unexpected.length) {
+      broke =
+        `\n這些失敗在 writer 介入前**不存在**，是本輪造成的，必須修好（其餘既有失敗請勿理會）：\n` +
+        v.unexpected.map((id) => `  - ${id}`).join("\n") + "\n";
+      v.unexpected.forEach((id) => log(`  新失敗：${id}`));
+    }
+  }
+
   const failures =
     tool === "maven"
       ? collectSurefireFailures(mod.moduleRoot, startedAt)
@@ -660,7 +755,7 @@ export async function runBuildAndTests(
   return {
     passed: false,
     report:
-      `編譯或測試失敗（exit=${r.code}）。\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
+      `編譯或測試失敗（exit=${r.code}）。${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
     raw: r.out,
   };
 }

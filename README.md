@@ -137,7 +137,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_REPAIR_BASELINE` | 1 | 0 = 預檢發現既有紅燈時直接中止，不進修復迴圈 |
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
 | `UT_REPAIR_NO_PROGRESS_ROUNDS` | 2 | 連續幾輪紅燈數沒下降就停。stuck 需要兩輪報告完全相同，「修好 A 又弄壞 B」的報告每輪都不一樣卻毫無進展，只有數量抓得到 |
-| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行，紅燈標記為 pre-existing。預設中止 |
+| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行。既有紅燈會標記為 pre-existing 寫進 prompt，**且 build gate 改為「失敗集合不得超出預檢基準」**——既有失敗可以續紅，writer 新弄壞的照樣擋。與 `UT_SKIP_BASELINE` 互斥（沒有基準就沒有可扣除的集合，會直接中止）。預設中止 |
 | `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |

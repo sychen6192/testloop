@@ -67,7 +67,12 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    **修復迴圈** `orchestrator.ts` 的 `repairBaseline`——同一個 writer、同樣的範圍與防掏空
    guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
    `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
-   pre-existing 要求 writer 別碰。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
+   pre-existing 要求 writer 別碰——**同時把 build gate 的判準從「模組全綠」改為「本輪失敗
+   識別集合 ⊆ 預檢基準」**（`gates/build.ts` 的 `subtractTolerated`）。識別是 FQCN + surefire
+   的 case name，到方法層級：用類別當識別，writer 在一個已失敗類別裡弄壞的新方法會被一起
+   放行。編譯錯誤、以及「紅但定位不到任何失敗測試」一律不扣除（`∅ ⊆ P` 恆真）。與
+   `UT_SKIP_BASELINE=1` 互斥，並用直接中止而非靜默退回全綠要求。完整 rationale 與六加一道
+   護欄見 DESIGN.md。修復輪沒有 coverage / review gate——它們的範圍是目標類別，
    修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈**修不修得動**，
    修不動的一律不進修復迴圈、直接中止並點名，有三種：(a) 不在 `<目標模組>/src/test` 內
    ——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，writer 沒有寫入權；
