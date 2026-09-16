@@ -45,6 +45,9 @@ import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics
 import {
   countTestsRun,
   detectEnvFailures,
+  failingTestIds,
+  subtractTolerated,
+  SurefireSuite,
   extractCompileErrorFiles,
   parseSurefireXml,
   renderSurefireSuite,
@@ -754,6 +757,62 @@ console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍
     JSON.stringify(detectEnvFailures(mavenOut)),
   );
   check("detectEnvFailures：乾淨輸出 → 空陣列", detectEnvFailures("[INFO] BUILD SUCCESS").length === 0);
+
+  // (a4) Dirty-baseline subtraction. The gate's promise becomes "no worse than before the
+  // writer touched it", so everything here is about what still has to count as worse.
+  const suite = (name: string, cases: string[]): SurefireSuite => ({
+    suite: name,
+    tests: 9,
+    failures: cases.length,
+    errors: 0,
+    cases: cases.map((c) => ({ kind: "failure" as const, name: c, message: "boom", frame: "" })),
+  });
+  const baseSuites = [
+    suite("com.x.CommonServiceImplTest", ["setUp_loadsEnum", "fetch_whenEmpty[2]"]),
+    suite("com.x.CacheServiceImplTest", ["Nested.evict_expired"]),
+  ];
+  const P = failingTestIds(baseSuites);
+  check(
+    "failingTestIds：識別到方法層級，@Nested 與 @ParameterizedTest 的案例標識都留著",
+    P.length === 3 &&
+      P.includes("com.x.CommonServiceImplTest#fetch_whenEmpty[2]") &&
+      P.includes("com.x.CacheServiceImplTest#Nested.evict_expired"),
+    JSON.stringify(P),
+  );
+  check(
+    "subtractTolerated：全部都是既有失敗 → 放行",
+    subtractTolerated("[ERROR] Tests run: 9, Failures: 3", baseSuites, P).pass,
+  );
+  check(
+    "subtractTolerated：修好一部分（子集）→ 仍放行",
+    subtractTolerated("[ERROR] Tests run: 9, Failures: 1", [suite("com.x.CacheServiceImplTest", ["Nested.evict_expired"])], P).pass,
+  );
+  // The guardrail the whole design rests on: coarsening identity to the class would pass this.
+  const sameClassNewMethod = [suite("com.x.CommonServiceImplTest", ["setUp_loadsEnum", "save_rollsBack"])];
+  const v1 = subtractTolerated("[ERROR] Tests run: 9, Failures: 2", sameClassNewMethod, P);
+  check(
+    "subtractTolerated：同一個已失敗類別裡的另一個方法失敗 → 擋下（識別退回類別層級就會漏掉）",
+    !v1.pass && v1.unexpected.length === 1 && v1.unexpected[0].endsWith("#save_rollsBack"),
+    JSON.stringify(v1),
+  );
+  const v2 = subtractTolerated("[ERROR] Tests run: 9, Failures: 1", [suite("com.x.NewTest", ["a_b_c"])], P);
+  check("subtractTolerated：全新類別的失敗 → 擋下", !v2.pass && v2.unexpected.length === 1, JSON.stringify(v2));
+  const v3 = subtractTolerated(
+    "[ERROR] /w/m/src/test/java/com/x/Foo.java:[9,9] cannot find symbol",
+    baseSuites,
+    P,
+  );
+  check(
+    "subtractTolerated：有編譯錯誤時一律不扣除（沒有測試跑過，無從比對）",
+    !v3.pass && v3.reason.includes("編譯"),
+    JSON.stringify(v3),
+  );
+  const v4 = subtractTolerated("[ERROR] Could not resolve dependencies", [], P);
+  check(
+    "subtractTolerated：紅但定位不到任何失敗測試 → 擋下（空集合是任何集合的子集）",
+    !v4.pass && v4.reason.includes("定位不到"),
+    JSON.stringify(v4),
+  );
 
   // (b) existing-test detection: the duplicate-file bug is <Class>UnitTest.java beside <Class>Test.java
   check("matchesTestNaming：正規名稱", matchesTestNaming("CommonServiceImpl", "CommonServiceImplTest.java"));

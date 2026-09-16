@@ -68,6 +68,10 @@ export interface OrchestratorConfig {
   // the module already had. Both exist to keep the writer inside its own scope.
   existingTests: ExistingTests[];
   preExisting?: PreExistingFailures;
+  // The baseline's failing identities, passed only under UT_ALLOW_DIRTY_BASELINE. Both gate
+  // call sites below get it: a final verification that did not subtract would reject a run
+  // the per-round gate had already accepted, for failures neither of them caused.
+  tolerate?: string[];
   conventions?: TestConventions;
 }
 
@@ -276,7 +280,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     // expected-path derivation does not predict, and a test that is not in -Dtest never runs.
     const onlyTests = scoped ? testClassNames([...scopeSeed, ...changed]) : undefined;
     if (onlyTests) log(`  範圍限縮：-Dtest=${onlyTests.join(",")}`);
-    const build = await runBuildAndTests(cfg.buildTool, cfg.mod, { onlyTests });
+    const build = await runBuildAndTests(cfg.buildTool, cfg.mod, {
+      onlyTests,
+      tolerate: cfg.tolerate,
+    });
     save("build.log", build.raw ?? build.report);
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
@@ -340,7 +347,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // skipping it would trade the promise away for the same saving.
       if (scoped) {
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
-        const full = await runBuildAndTests(cfg.buildTool, cfg.mod);
+        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, { tolerate: cfg.tolerate });
         save("final-verify.log", full.raw ?? full.report);
         if (!full.passed) {
           log("[FAIL] 最終驗收：模組其他測試被打壞");

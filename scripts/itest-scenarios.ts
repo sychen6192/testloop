@@ -92,6 +92,16 @@ const GREEN_BUILD = {
   jacoco: JACOCO_GREEN,
 };
 
+const LEGACY = "com.x.LegacyTest";
+const LEGACY_CASE = { nested: "", method: "old_behaviour", message: "已知失敗", line: 21 };
+/** The module arrives with one test already failing, and it keeps failing every round. */
+const LEGACY_RED = () => ({
+  exit: 1,
+  out: TEST_FAILURE(LEGACY),
+  cleanSurefire: true,
+  surefireXml: [{ suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) }],
+});
+
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
   {
@@ -706,6 +716,91 @@ export const SCENARIOS: Scenario[] = [
         cleanSurefire: true,
       },
     ],
+  },
+  // ── dirty baseline 下的 gate 扣除（DESIGN.md「gate 扣除既有失敗」） ────────
+  //
+  // 三個情境對應設計文件承諾的三道驗證：既有失敗原樣通過、新失敗被擋、
+  // 同一類別裡的另一個方法失敗被擋（最後一個是「識別到方法層級」那道護欄的 mutation 目標）。
+  {
+    name: "loop-dirty-tolerated",
+    desc: "既有失敗照樣紅，但 gate 扣除後放行 → exit 0；summary.json 留下容忍了什麼",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN }],
+  },
+  {
+    name: "loop-dirty-new-failure-blocked",
+    desc: "扣除不等於放水：基準沒有的新失敗照樣擋下",
+    entry: "loop",
+    env: {
+      UT_SKIP_REVIEW: "1",
+      UT_ALLOW_DIRTY_BASELINE: "1",
+      UT_REPAIR_BASELINE: "0",
+      UT_MAX_ITER: "1",
+    },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(),
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          {
+            suite: "com.x.OtherTest",
+            body: SUREFIRE_XML("com.x.OtherTest", 2, [
+              { nested: "", method: "broken_by_writer", message: "NPE", line: 12 },
+            ]),
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-dirty-same-class-new-method-blocked",
+    desc: "同一個已失敗類別裡的另一個方法失敗也要擋——識別退回類別層級就會漏掉這個",
+    entry: "loop",
+    env: {
+      UT_SKIP_REVIEW: "1",
+      UT_ALLOW_DIRTY_BASELINE: "1",
+      UT_REPAIR_BASELINE: "0",
+      UT_MAX_ITER: "1",
+    },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(),
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          {
+            suite: LEGACY,
+            body: SUREFIRE_XML(LEGACY, 4, [
+              LEGACY_CASE,
+              { nested: "", method: "save_rollsBack", message: "expected rollback", line: 40 },
+            ]),
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-skip-baseline-conflicts-dirty",
+    desc: "UT_SKIP_BASELINE 與 UT_ALLOW_DIRTY_BASELINE 互斥：沒有基準就沒有可扣除的集合",
+    entry: "loop",
+    env: { UT_SKIP_BASELINE: "1", UT_ALLOW_DIRTY_BASELINE: "1" },
+    api: [],
+    mvn: [GREEN_BUILD],
   },
   {
     name: "loop-baseline-env-failure",

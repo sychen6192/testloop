@@ -188,7 +188,16 @@ async function main() {
   // when repair gives up does the run stop; UT_ALLOW_DIRTY_BASELINE=1 pushes on regardless.
   const runner = await createRunner({ writableRoot: path.join(mod.moduleRoot, "src", "test") });
   let preExisting: PreExistingFailures | undefined;
+  // The baseline's failing identities, handed to the gate only under UT_ALLOW_DIRTY_BASELINE.
+  let tolerate: string[] | undefined;
   let repair: RepairResult | undefined;
+  if (SKIP_BASELINE && ALLOW_DIRTY_BASELINE) {
+    die(
+      "UT_SKIP_BASELINE=1 與 UT_ALLOW_DIRTY_BASELINE=1 不能並用：沒有預檢就沒有「writer 介入前\n" +
+        "就在失敗的測試」這份基準，gate 無從扣除。靜默退回全綠要求會讓你以為扣除生效了，\n" +
+        "所以這裡直接中止。請擇一：要扣除就留著預檢，要省一次建置就拿掉 UT_ALLOW_DIRTY_BASELINE。",
+    );
+  }
   if (SKIP_BASELINE) {
     log("[WARN] UT_SKIP_BASELINE=1：跳過預檢，既有紅燈將無法與 writer 造成的失敗區分");
   } else {
@@ -310,6 +319,18 @@ async function main() {
         );
       }
       log("[WARN] UT_ALLOW_DIRTY_BASELINE=1：帶著既有紅燈繼續，已知失敗會標記為 pre-existing");
+      // The gate now compares instead of requiring: these identities may keep failing, anything
+      // else that fails is the writer's doing and still turns the round red.
+      tolerate = baseline.failingTests;
+      if (tolerate.length) {
+        log(`[dirty-baseline] build gate 將容忍以下 ${tolerate.length} 個既有失敗：`);
+        tolerate.forEach((id) => log(`  - ${id}`));
+      } else {
+        log(
+          "[WARN] 預檢認不出任何失敗的測試（沒有 surefire XML，或紅燈不是測試失敗），" +
+            "gate 維持全綠要求——這個 run 很可能無法通過。",
+        );
+      }
     }
   }
 
@@ -326,6 +347,7 @@ async function main() {
       runDir,
       existingTests,
       preExisting,
+      tolerate,
       conventions,
     });
   } catch (e) {
@@ -357,7 +379,10 @@ async function main() {
   if (!result.success && result.finalFeedback) {
     console.log(`最後失敗報告：\n${result.finalFeedback}`);
   }
-  fs.writeFileSync(path.join(runDir, "summary.json"), JSON.stringify({ ...result, repair }, stripRaw, 2));
+  fs.writeFileSync(
+    path.join(runDir, "summary.json"),
+    JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [] }, stripRaw, 2),
+  );
   log(`artifacts 已寫入：${runDir}`);
   process.exit(result.success ? 0 : 2);
 }

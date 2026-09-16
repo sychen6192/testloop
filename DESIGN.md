@@ -98,7 +98,7 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
 - ⬜ Phase 3：mutation gate（pitest 限縮 targetClasses，門檻 60–70 起，
   掛在 coverage 之後、review 之前）——tautological test 的真 oracle
 
-## 提案（待共識）：dirty baseline 下，gate 扣除既有失敗
+## 已採納：dirty baseline 下，gate 扣除既有失敗（2026-09-16，使用者決策）
 
 **現狀是一個到不了的逃生口。** `UT_ALLOW_DIRTY_BASELINE=1` 文件上寫「帶著紅燈續跑」，
 但它實際上只把既有紅燈寫進 prompt——`preExisting` 唯一的去處是 `buildFixPrompt`，
@@ -133,9 +133,23 @@ writer 無論產得多好都不可能讓 gate 轉綠。
 所以實際的選擇不是「強保證 vs 弱保證」，而是「一個達不到的保證 vs 一個達得到且可驗證的保證」。
 模組本來就是綠的時候，兩者完全等價（P 是空集合）。
 
-**狀態：待使用者決策。** 同意才進實作。實作時 itest 至少需要三個情境：既有失敗原樣通過、
-新失敗被擋、**同一個類別裡的另一個方法失敗被擋**——第三個是「方法層級識別」這道護欄的
-mutation 目標，把識別退回類別層級時它必須變紅。
+**狀態：已實作。** 六道護欄逐條落地，另補上一條實作時才看清楚的第七道：
+- 扣除判定是純函式 `subtractTolerated`（`gates/build.ts`），識別由 `failingTestIds` 從
+  surefire XML 的 `name` 屬性取得——`@ParameterizedTest` 的案例標識與 `@Nested` 的內部類別
+  本來就在那個屬性裡，不必另外拼。
+- **第七道護欄（實作時補的）**：紅燈但**定位不到任何失敗測試**時不得扣除。空集合是任何集合的
+  子集，`∅ ⊆ P` 恆真——少了這條，依賴解析失敗、plugin 掛掉、或關閉了 XML 報告的建置都會被
+  當成「沒有變糟」直接放行。這是提案時沒想到的洞。
+- gate 的失敗報告會**點名哪些是本輪新造成的**，與既有失敗分開陳述；沒有這個，writer 面對的
+  是一堆被要求忽略的失敗混著一個必須修的。
+
+itest 三個情境如承諾：`loop-dirty-tolerated`（既有失敗原樣通過，exit 0）、
+`loop-dirty-new-failure-blocked`（新失敗被擋）、
+`loop-dirty-same-class-new-method-blocked`（同類別另一個方法失敗被擋），
+外加 `loop-skip-baseline-conflicts-dirty`（互斥）。
+
+mutation 實測：把識別退回類別層級，第三個情境**從 exit 2 變成 exit 0**——writer 弄壞的測試
+直接放行，正是這道護欄存在的理由。拿掉編譯錯誤護欄與第七道護欄，各自對應的 selftest 轉紅。
 
 ## 已否決方案（防止重新提案）
 
