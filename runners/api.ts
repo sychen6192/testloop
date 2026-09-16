@@ -81,7 +81,12 @@ interface ToolCall {
   function?: { name?: string; arguments?: unknown };
 }
 interface ChatResponse {
-  choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>;
+  choices?: Array<{
+    // reasoning_content: QwQ, DeepSeek-R1 and friends served by vLLM or Ollama put the answer
+    // there and leave content empty, so a reader of content alone sees a model that said nothing.
+    message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: ToolCall[] };
+    finish_reason?: string;
+  }>;
   usage?: { completion_tokens?: number };
 }
 type ChatMessage = Record<string, unknown>;
@@ -301,18 +306,38 @@ export class ApiRunner implements AgentRunner {
           return finish("timeout", lastText, `第 ${turn} 回合請求失敗：${r.error}`);
         }
 
-        const msg = r.json.choices?.[0]?.message ?? {};
+        const choice = r.json.choices?.[0];
+        const msg = choice?.message ?? {};
         outputTokens += Number(r.json.usage?.completion_tokens ?? 0) || 0;
         const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
         const content = typeof msg.content === "string" ? msg.content : "";
+        // Kept apart from `content`: the echo below must send back what the server actually
+        // gave us, or the next request is malformed. This is only for the run's own output.
+        const reasoning = typeof msg.reasoning_content === "string" ? msg.reasoning_content : "";
+        const said = content.trim() ? content : reasoning;
         // Echo the assistant turn back verbatim (content "" rather than null: some servers
         // reject a null-content assistant message on the next request).
         messages.push({ role: "assistant", content, ...(calls.length ? { tool_calls: calls } : {}) });
-        if (content.trim()) {
-          lastText = content;
-          logVerbose(`[${label}]  ${short(content.replace(/\s+/g, " ").trim(), 160)}`);
+        if (said.trim()) {
+          lastText = said;
+          logVerbose(`[${label}]  ${short(said.replace(/\s+/g, " ").trim(), 160)}`);
         }
-        if (!calls.length) return finish("ok", content);
+        if (!calls.length) {
+          // A turn that ends with no tool call is the run's answer — but it can carry nothing:
+          // a reasoning model answering in reasoning_content, or a server sending an empty
+          // message to close a tool round. Falling back to the last thing the model actually
+          // said recovers a verdict it already produced; reporting "ok" for an empty answer
+          // would hand the reviewer gate an empty string and blame the writer for it.
+          const answer = said.trim() ? said : lastText;
+          if (!answer.trim()) {
+            return finish(
+              "timeout",
+              "",
+              `模型回了空訊息（finish_reason=${choice?.finish_reason ?? "?"}），沒有任何可用輸出`,
+            );
+          }
+          return finish("ok", answer);
+        }
 
         for (const tc of calls) {
           toolCalls++;

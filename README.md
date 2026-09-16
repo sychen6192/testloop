@@ -145,6 +145,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_MAX_FAILURE_CASES` | 10 | 每個失敗類別最多引用幾個失敗案例。`@Nested` 測試一次可能失敗數十個 |
 | `UT_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 未讀檔就輸出判決。預設 fail-closed 擋下 |
 | `UT_SCORE_THRESHOLDS` | 7/7/7/6/7/6 | 六維門檻局部覆蓋，JSON 格式，0-10 制 |
+| `UT_REVIEW_MAX_RETRIES` | 2 | reviewer 輸出解析不出判決時額外重試幾次。用完仍失敗即以 `reviewer-unparseable` 中止——那是 reviewer 端的故障，餵回 writer 只會白燒輪數 |
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
 | `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |

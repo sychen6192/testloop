@@ -69,6 +69,7 @@ const BASE_ENV: Record<string, string> = {
   UT_REPAIR_NO_PROGRESS_ROUNDS: "2",
   UT_REVIEWER_MODEL: "itest-reviewer",
   UT_REVIEWER_MUST_READ: "1",
+  UT_REVIEW_MAX_RETRIES: "2",
   UT_RUNNER: "opencode",
   UT_RUNS_DIR: "",
   UT_SCORE_THRESHOLDS: "",
@@ -515,6 +516,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("verdict.json 不含 raw 全文", v.raw === undefined);
     const final = c.result.finalVerdict as Record<string, unknown>;
     check("最終判決 passed=true", final?.passed === true, JSON.stringify(final));
+  },
+
+  "review-unparseable-aborts": (c) => {
+    check("判為 reviewer-unparseable", c.result.stopReason === "reviewer-unparseable", String(c.result.stopReason));
+    check("只跑了 1 輪——沒有拿 writer 的輪數去換", c.result.iterations === 1, String(c.result.iterations));
+    check("重試落在 reviewer：3 份 raw 都落地", c.runExists("iter-1/review-raw.txt") && c.runExists("iter-1/review-raw-3.txt"));
+    check("沒有第 2 輪", !c.runExists("iter-2"));
+    check(
+      "訊息點名這是 reviewer 端的問題，不是測試的問題",
+      String(c.result.finalFeedback ?? "").includes("不是測試的問題"),
+      String(c.result.finalFeedback ?? "").slice(0, 300),
+    );
   },
 
   "review-zero-tool-calls": (c) => {

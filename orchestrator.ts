@@ -25,6 +25,7 @@ import {
   ALLOW_TEST_SHRINK,
   REPAIR_MAX_ITER,
   REPAIR_NO_PROGRESS_ROUNDS,
+  REVIEW_MAX_RETRIES,
   TEST_SCOPE,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
@@ -53,7 +54,7 @@ import { TestConventions } from "./libs/conventions";
 import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
 import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
-import { runReviewGate } from "./gates/review";
+import { runReviewGate, isUnparseable } from "./gates/review";
 
 export interface OrchestratorConfig {
   targetClasses: string[];
@@ -333,10 +334,41 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         mod: cfg.mod,
       });
       save("review-prompt.md", reviewPrompt);
-      verdict = await runReviewGate(cfg.runner, reviewPrompt);
+
+      // A verdict that will not parse is the reviewer malfunctioning, and the writer cannot fix
+      // it: no rewrite of the tests makes a model emit valid JSON. Feeding it back as a blocker
+      // spends a writer round, produces the identical report next time, and ends in stuck —
+      // which is exactly how one reported run burned four rounds and 52 minutes of model time.
+      // So the retries land on the reviewer, and an exhausted retry budget ends the run naming
+      // the reviewer rather than blaming the tests.
+      for (let attempt = 1; attempt <= 1 + REVIEW_MAX_RETRIES; attempt++) {
+        verdict = await runReviewGate(cfg.runner, reviewPrompt);
+        save(attempt === 1 ? "verdict.json" : `verdict-attempt-${attempt}.json`, JSON.stringify(verdict, stripRaw, 2));
+        if (verdict.raw) save(attempt === 1 ? "review-raw.txt" : `review-raw-${attempt}.txt`, verdict.raw);
+        if (!isUnparseable(verdict)) break;
+        log(
+          `[WARN] reviewer 輸出無法解析（${verdict.parseError}）——第 ${attempt}/${1 + REVIEW_MAX_RETRIES} 次嘗試`,
+        );
+      }
       lastVerdict = verdict;
-      save("verdict.json", JSON.stringify(verdict, stripRaw, 2));
-      if (verdict.raw) save("review-raw.txt", verdict.raw);
+      if (verdict && isUnparseable(verdict)) {
+        record({
+          gate: "review",
+          outcome: "reviewer-unparseable",
+          changedFiles: changed.length,
+          writerOutputTokens: writer.outputTokens,
+        });
+        return fail(
+          "reviewer-unparseable",
+          `reviewer 連續 ${1 + REVIEW_MAX_RETRIES} 次輸出無法解析成判決（${verdict.parseError}）。\n` +
+            "這是 reviewer 端的問題，不是測試的問題——writer 再怎麼改測試碼都不會讓它吐出合法 JSON，\n" +
+            "所以不把它當成 blocker 餵回下一輪。\n" +
+            "常見原因：模型把答案放在 reasoning_content、回合或 token 預算用盡、或模型不遵循 JSON schema。\n" +
+            `檢查 ${path.join(cfg.runDir, `iter-${iter}`)} 的 review-raw*.txt；` +
+            "可調 UT_REVIEW_MAX_RETRIES、UT_API_MAX_TURNS、UT_API_MAX_TOKENS，或換一個 reviewer 模型。",
+          iter,
+        );
+      }
     }
 
     if (!verdict || verdict.passed) {

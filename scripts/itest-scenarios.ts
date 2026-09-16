@@ -374,6 +374,21 @@ export const SCENARIOS: Scenario[] = [
     mvn: [GREEN_BUILD],
   },
   {
+    name: "review-unparseable-aborts",
+    desc: "reviewer 吐不出 JSON → 重試 reviewer，用完就中止，不把它當 blocker 餵回 writer",
+    entry: "orchestrate",
+    env: { UT_REVIEW_MAX_RETRIES: "2" },
+    // Only one writer action is scripted: if the loop ever fed this back and asked for another
+    // round, the writer would run out and the scenario would end some other way.
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }],
+    review: [
+      { text: "我覺得這些測試看起來還不錯，但我需要再想想。" },
+      { text: "" },
+      { text: "抱歉，我無法提供 JSON。" },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
     name: "review-zero-tool-calls",
     desc: "reviewer 沒讀任何檔就給滿分 → fail-closed 判 REJECT",
     entry: "orchestrate",

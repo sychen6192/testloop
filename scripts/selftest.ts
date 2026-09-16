@@ -56,6 +56,7 @@ import {
 } from "../gates/build";
 import { classVisibility, isClassRefSuite, scanTestConventions } from "../libs/conventions";
 import { loadRubric } from "../libs/rubric";
+import { isUnparseable, zeroToolCallVerdict, spawnErrorVerdict } from "../gates/review";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
 import { traceEvent, buildInvocation } from "../runners/opencode";
@@ -904,6 +905,25 @@ console.log("\n[12] extractCompileErrorFiles / findExistingTests / prompt 範圍
 // ---------------------------------------------------------------------------
 // 13. Feedback budget: extract the errors, drop maven's footer, bound the whole report
 // ---------------------------------------------------------------------------
+{
+  // `parseError` marks three different situations and only one of them is a reviewer that
+  // answered unreadably. Retrying the other two would change what their guards do: a spawn
+  // error is environmental, and zero tool calls is a reviewer that answered fine but read
+  // nothing. Conflating them silently broke two existing scenarios once already.
+  check("isUnparseable：真正的解析失敗 → true", isUnparseable(parseVerdict("我沒有 JSON")));
+  check("isUnparseable：分數缺漏也算解析失敗 → true", isUnparseable(parseVerdict('{"blockers":[]}')));
+  check("isUnparseable：spawn 失敗不算（環境問題，重試無用）", !isUnparseable(spawnErrorVerdict()));
+  check(
+    "isUnparseable：0 tool calls 不算（reviewer 答得出來，只是沒讀檔，那道 guard 自有處置）",
+    !isUnparseable(zeroToolCallVerdict('{"scores":{}}')),
+  );
+  check("isUnparseable：正常判決 → false", !isUnparseable(parseVerdict(JSON.stringify({
+    scores: { effectiveness: 8, coverage: 8, independence: 8, readability: 8, fast_reliable: 8, mock_appropriateness: 8 },
+    blockers: [],
+    advisories: [],
+  }))));
+}
+
 console.log("\n[13] summarizeBuildErrors / clampText（回饋預算）");
 {
   const mavenFail =
@@ -1542,6 +1562,46 @@ console.log("\n[18] api runner（api-tools 權限 + 假 transport 的 tool loop�
     throw new Error("ECONNREFUSED");
   };
   check("ApiRunner：第一個請求就連不上 → spawn-error（環境問題）", (await new ApiRunner({ ...base, fetchImpl: dead }).runWriter("x")).status === "spawn-error");
+
+  // --- an answer that is not in `content` -------------------------------------------------
+  // Reported: the reviewer ran 193s and 38 tool calls, then the gate got an empty string and
+  // blamed the writer for it. Two shapes produce that, and neither is the tests being bad.
+  const reasoningFetch: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as Body;
+    const n = body.messages.filter((m) => m.role === "tool").length;
+    if (n === 0) return reply({ role: "assistant", content: null, tool_calls: [call("c1", "read_file", { path: "modA/src/main/java/com/x/Foo.java" })] });
+    // QwQ / R1 shape: the answer is in reasoning_content and content is empty.
+    return reply({ role: "assistant", content: "", reasoning_content: '{"scores":{}}' });
+  };
+  const rOut = await new ApiRunner({ ...base, fetchImpl: reasoningFetch }).runReview("審查");
+  check(
+    "ApiRunner：推理型模型把答案放 reasoning_content 時也讀得到（content 空不等於沒說話）",
+    rOut.status === "ok" && rOut.text.includes('"scores"'),
+    JSON.stringify(rOut),
+  );
+
+  const lateEmptyFetch: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as Body;
+    const n = body.messages.filter((m) => m.role === "tool").length;
+    if (n === 0) {
+      return reply({ role: "assistant", content: '{"scores":{"x":1}}', tool_calls: [call("c1", "read_file", { path: "modA/src/main/java/com/x/Foo.java" })] });
+    }
+    return reply({ role: "assistant", content: "" }); // empty message closing the tool round
+  };
+  const lOut = await new ApiRunner({ ...base, fetchImpl: lateEmptyFetch }).runReview("審查");
+  check(
+    "ApiRunner：最後一則空訊息不得丟掉先前說過的話（判決已經給了就別扔）",
+    lOut.status === "ok" && lOut.text.includes('"scores"'),
+    JSON.stringify(lOut),
+  );
+
+  const allEmptyFetch: typeof fetch = async () => reply({ role: "assistant", content: "" });
+  const eOut = await new ApiRunner({ ...base, fetchImpl: allEmptyFetch }).runReview("審查");
+  check(
+    "ApiRunner：從頭到尾都沒說話 → 不得報 ok（空字串不是判決）",
+    eOut.status !== "ok" && eOut.text === "",
+    JSON.stringify(eOut),
+  );
   check("ApiRunner：未設 base URL → spawn-error", (await new ApiRunner({ ...base, baseUrl: "", fetchImpl: dead }).runWriter("x")).status === "spawn-error");
   check(
     "ApiRunner：未設模型 → spawn-error",
