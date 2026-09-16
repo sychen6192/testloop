@@ -463,11 +463,17 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   // Classification plus the error lines: the summary says which files, the extract says why.
   // When runBaseline could name no file its summary already carries the extract, so appending
   // a second copy would spend the feedback budget on the same text twice.
+  // The surefire detail leads: clampText keeps the head, and for a failing test the assertion
+  // message is the actionable half while the [ERROR] extract is mostly surefire's own summary
+  // of it. For a compile error the detail is empty and the extract is everything, so the same
+  // order serves both.
   const describe = (b: BaselineResult) =>
     clampText(
       brokenList(b).length === 0
         ? b.summary
-        : `${b.summary}\n錯誤節錄：\n${summarizeBuildErrors(b.raw)}`,
+        : `${b.summary}` +
+            (b.failureDetail ? `\n失敗明細：${b.failureDetail}` : "") +
+            `\n錯誤節錄：\n${summarizeBuildErrors(b.raw)}`,
       MAX_FEEDBACK_CHARS,
     );
   let report = describe(current);

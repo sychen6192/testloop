@@ -594,6 +594,26 @@ export const SCENARIOS: Scenario[] = [
     mvn: [{ exit: 1, out: UNLOCATABLE_FAILURE, cleanSurefire: true }],
   },
   {
+    name: "repair-test-failure-detail",
+    desc: "修復輪的 prompt 必須帶斷言訊息——只給類別名，writer 只能翻檔案瞎猜",
+    entry: "repair",
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [
+          {
+            cls: "com.x.CalcTest",
+            body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>"),
+          },
+        ],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
     name: "repair-no-progress",
     desc: "紅燈數連續不降 → repair-no-progress 早停；報告每輪都不同，fingerprint 的 stuck 抓不到",
     entry: "repair",

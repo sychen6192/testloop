@@ -33,6 +33,11 @@ export interface BaselineResult {
   // well inside the writer's scope, which is exactly why this needs its own classification —
   // outOfScope would not catch it, and no edit to the test body makes it green.
   envFailures: string[];
+  // Why the failing tests failed, quoted from the surefire reports: assertion messages plus the
+  // first stack frame in the project's own code. runBuildAndTests puts this in its `report` for
+  // the build gate, and runBaseline discarded it — so the repair loop knew *which* classes were
+  // red and never *why*, which is the one thing a writer cannot infer from a class name.
+  failureDetail: string;
   summary: string;
   raw: string;
 }
@@ -453,6 +458,7 @@ export async function runBaseline(
       failingTestClasses: [],
       outOfScope: [],
       envFailures: [],
+      failureDetail: "",
       summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
     };
@@ -507,6 +513,13 @@ export async function runBaseline(
     lines.push(`超出 writer 可寫範圍（${writableRel(mod)}）的有 ${outOfScope.length} 項：`);
     outOfScope.forEach((f) => lines.push(`  - ${f}`));
   }
+  // Same source the build gate quotes from, read here rather than plumbed through
+  // runBuildAndTests' report string — that string also carries summarizeBuildErrors, which the
+  // caller adds itself, and two copies of it is what the feedback budget cannot afford.
+  const failureDetail =
+    tool === "maven"
+      ? collectSurefireFailures(mod.moduleRoot, startedAt)
+      : collectGradleFailures(mod.moduleRoot);
   const envFailures = detectEnvFailures(raw);
   if (envFailures.length) {
     lines.push(`環境/設定問題（改測試碼修不好）：`);
@@ -518,6 +531,7 @@ export async function runBaseline(
     failingTestClasses,
     outOfScope,
     envFailures,
+    failureDetail,
     summary: lines.join("\n"),
     raw,
   };
