@@ -609,6 +609,17 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
   },
 
+  "repair-test-failure-detail": (c) => {
+    const prompt = c.runRead("repair-1/prompt.md");
+    check(
+      "prompt 帶了斷言訊息（只有類別名的話 writer 沒有東西可依據）",
+      prompt.includes("expected: <3> but was: <4>"),
+      prompt.slice(0, 600),
+    );
+    check("prompt 也點名了失敗的類別", prompt.includes("com.x.CalcTest"), prompt.slice(0, 300));
+    check("修得好", c.result.stopReason === "repaired", String(c.result.stopReason));
+  },
+
   "repair-no-progress": (c) => {
     check("判為 repair-no-progress", c.result.stopReason === "repair-no-progress", String(c.result.stopReason));
     check("第 2 輪就停，沒燒到 UT_REPAIR_MAX_ITER=5", c.result.rounds === 2, String(c.result.rounds));

@@ -80,6 +80,16 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **修復迴圈現在拿得到「為什麼失敗」，不只是「哪些類別失敗」。** `collectSurefireFailures`
+  （把斷言訊息與專案自己的 stack frame 從 surefire 報告挖出來的那個函式）全專案只有一處呼叫，
+  結果放進 `runBuildAndTests` 的 `report`——而 `runBaseline` 只取 `passed` 與 `raw`，把 `report`
+  丟掉了。於是修復輪的 prompt 只有類別名加上 maven stdout 的 `[ERROR]` 摘要行，writer 拿不到
+  任何一條斷言訊息。實地症狀：三個 service 測試同時紅，writer 在總結裡反覆寫「讓我停止這個
+  循環思考」、句子被砍在半途，最後一個檔案都沒改就 `writer-no-op`——沒有失敗原因可依據，它只能
+  一直翻檔案找線索，把回合預算燒光。這正是 v1.2.0 那次「surefire 改讀 XML」修好的問題（當時的
+  描述是「writer 一直被告知哪些方法失敗、卻從來不知道為什麼，而且花掉一輪」），但那次只修了主
+  gate 迴圈，修復迴圈漏掉了。現在 `runBaseline` 自己讀同一份報告存進 `BaselineResult.failureDetail`，
+  而且**排在錯誤節錄前面**——`clampText` 保留開頭，測試失敗時斷言訊息才是可據以行動的那一半。
 - **環境問題不再被當成測試問題送進修復迴圈。** 實地案例：一個既有測試全是 `@SpringBootTest`
   的模組，紅燈是 Spring context 起不來（HikariDataSource 解密失敗）。那些測試檔**就在 writer
   的可寫範圍內**，所以既有的 `outOfScope` 分類擋不住它，但改測試碼永遠不會讓它變綠——
