@@ -96,6 +96,10 @@ export const TEST_SCOPE = (process.env.UT_TEST_SCOPE ?? "module") as "module" | 
 export const ALLOW_TEST_SHRINK = process.env.UT_ALLOW_TEST_SHRINK === "1";
 // 0 = accept reviewer verdicts produced without a single tool call (default: fail-closed).
 export const REVIEWER_MUST_READ = process.env.UT_REVIEWER_MUST_READ !== "0";
+// Extra reviewer attempts when its output cannot be parsed into a verdict. A parse failure is
+// the reviewer malfunctioning, not the tests being bad — the writer cannot fix it by rewriting
+// them, so the retries happen here rather than costing writer rounds. 0 disables them.
+export const REVIEW_MAX_RETRIES = numEnv("UT_REVIEW_MAX_RETRIES", 2, 0);
 export const SKIP_REVIEW = process.env.UT_SKIP_REVIEW === "1";
 export const QUIET = process.env.UT_QUIET === "1";
 // 1 = skip the agent frontmatter permission guard (not recommended).

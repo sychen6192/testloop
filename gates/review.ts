@@ -81,6 +81,11 @@ export function parseVerdict(
   return { passed, scores, blockers, advisories, belowThreshold, weightedScore: weighted, grade, raw };
 }
 
+// `parseError` is set by three different situations, and only one of them is worth retrying.
+// The sentinels live here so the orchestrator does not match on prose that may be reworded.
+export const REVIEWER_SPAWN_ERROR = "reviewer spawn error";
+export const REVIEWER_ZERO_TOOL_CALLS = "reviewer 0 tool calls";
+
 // Fail-closed: a verdict produced without a single tool call means the reviewer read nothing
 // (observed failure mode: schema-valid verdicts with fabricated findings).
 export function zeroToolCallVerdict(raw: string): ReviewVerdict {
@@ -94,7 +99,7 @@ export function zeroToolCallVerdict(raw: string): ReviewVerdict {
     ],
     advisories: [],
     belowThreshold: [],
-    parseError: "reviewer 0 tool calls",
+    parseError: REVIEWER_ZERO_TOOL_CALLS,
     raw,
   };
 }
@@ -111,8 +116,25 @@ export function spawnErrorVerdict(): ReviewVerdict {
     ],
     advisories: [],
     belowThreshold: [],
-    parseError: "reviewer spawn error",
+    parseError: REVIEWER_SPAWN_ERROR,
   };
+}
+
+/**
+ * True when the reviewer answered but the answer could not be read as a verdict.
+ *
+ * Deliberately narrower than "parseError is set". A spawn error is environmental — retrying
+ * three times changes nothing and the message already names the fix. Zero tool calls is a
+ * reviewer that answered perfectly well, just without reading anything; that guard has its own
+ * fail-closed treatment and its own scenario, and folding it in here would quietly change what
+ * that guard does.
+ */
+export function isUnparseable(v: ReviewVerdict): boolean {
+  return (
+    !!v.parseError &&
+    v.parseError !== REVIEWER_SPAWN_ERROR &&
+    v.parseError !== REVIEWER_ZERO_TOOL_CALLS
+  );
 }
 
 export async function runReviewGate(

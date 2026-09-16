@@ -80,6 +80,25 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **reviewer 解析失敗不再拿 writer 的輪數去換。** 實地回報：reviewer 跑了 193 秒、38 次工具
+  呼叫，最後回一個**空訊息**；`parseVerdict` 依 fail-closed 判 REJECT（這部分是對的），但那句
+  「Reviewer 輸出無法解析，請重新輸出符合 schema 的單一 JSON 物件」被包成 blocker **餵給
+  writer**——而 writer 再怎麼改測試碼，都不可能讓 reviewer 吐出合法 JSON。於是每輪拿到一模
+  一樣的意見，第 4 輪判 stuck，**52 分鐘的模型時間沒有一分鐘花在可能有結果的方向上**。
+  現在重試落在 reviewer 自己身上（`UT_REVIEW_MAX_RETRIES`，預設 2），用完仍解析不出就以
+  `reviewer-unparseable` 中止，訊息明說這是 reviewer 端的故障、不是測試的問題，並列出常見
+  原因與可調的旋鈕。這改動了 review gate 的判定語意（AGENTS.md 高風險項），已取得使用者確認。
+  重試**刻意只涵蓋真正的解析失敗**（`gates/review.ts` 的 `isUnparseable`）：`parseError` 這個
+  欄位其實由三種情況共用，spawn 失敗是環境問題（重試三次不會變），0 tool calls 是 reviewer
+  答得出來只是沒讀檔（那道 guard 自有 fail-closed 處置）——把三者混為一談會靜默改掉另外兩道
+  guard 的行為，實作時就這樣弄紅了兩個既有情境。
+- **api runner 不再把「模型沒說話」當成完成。** `finish("ok", content)` 直接回最後一輪的
+  `content`，有兩個洞：(a) 丟掉 `lastText`——模型若在倒數第二輪就給了判決、最後一輪回空訊息
+  收尾，那份判決會被扔掉；(b) 空字串照樣報 `[OK] 完成`，一個什麼都沒產出的 run 被當成成功。
+  另補上 `reasoning_content` 的讀取：QwQ / DeepSeek-R1 這類推理模型由 vLLM / Ollama 服務時，
+  答案放在該欄位而 `content` 是空的，只讀 `content` 會看到一個「什麼都沒說」的模型。三者皆有
+  對應 selftest；`content` 與 `reasoning_content` 分開處理，回送給伺服器的 assistant 訊息
+  仍是伺服器原本給的內容，不影響下一個請求的合法性。
 - **修復迴圈現在拿得到「為什麼失敗」，不只是「哪些類別失敗」。** `collectSurefireFailures`
   （把斷言訊息與專案自己的 stack frame 從 surefire 報告挖出來的那個函式）全專案只有一處呼叫，
   結果放進 `runBuildAndTests` 的 `report`——而 `runBaseline` 只取 `passed` 與 `raw`，把 `report`
