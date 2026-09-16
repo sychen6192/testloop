@@ -98,6 +98,45 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
 - ⬜ Phase 3：mutation gate（pitest 限縮 targetClasses，門檻 60–70 起，
   掛在 coverage 之後、review 之前）——tautological test 的真 oracle
 
+## 提案（待共識）：dirty baseline 下，gate 扣除既有失敗
+
+**現狀是一個到不了的逃生口。** `UT_ALLOW_DIRTY_BASELINE=1` 文件上寫「帶著紅燈續跑」，
+但它實際上只把既有紅燈寫進 prompt——`preExisting` 唯一的去處是 `buildFixPrompt`，
+build gate 本身仍是整個模組的 pass/fail。那些既有失敗每輪照樣讓 gate 紅，所以這個旗標
+**永遠到不了綠燈**：測試會產生、會落地，run 必定以 exit 2 結束。它看起來是逃生口，
+實際上只是把同一個失敗延後到最後一輪。實地案例：一個模組有三個既有 service 測試紅著，
+writer 無論產得多好都不可能讓 gate 轉綠。
+
+**提案。** 預檢基準記下「writer 介入前就在失敗的測試識別」集合 P。設了
+`UT_ALLOW_DIRTY_BASELINE=1` 時，build gate 的通過條件改為：
+
+> 編譯成功 **且** 本輪的失敗識別集合 ⊆ P
+
+**為什麼這不是已否決的 `-Dtest` 限縮換皮。** 那條否決的理由是「gate 對『新測試破壞既有
+測試』完全失明」——因為 `-Dtest` 讓那些測試**根本不執行**，沒有結果可言。扣除不同：
+所有測試照跑，只是把結果跟基準比對。writer 打壞任何一個既有測試，都會產生一個不在 P 裡的
+識別，gate 照樣紅。差別是「不看」與「看了再比」，而 gate 的承諾靠的是後者。
+
+**必要的護欄**（少任何一條，這個提案就該被否決）：
+- **編譯錯誤永不扣除。** 編不過就沒有測試跑過，任何比對都失去意義。
+- **識別到方法層級，不到類別層級。** 一個類別裡 `a` 本來就紅、`b` 是這輪被打壞的——
+  用類別當識別會把 `b` 一起放行，等於用 P 當免死金牌。
+- **`@ParameterizedTest` 的識別要含案例標識。** 否則同方法的既有失敗會遮住一個新失敗的案例。
+- **預設不變。** 沒設旗標時維持現在的 fail-closed 全綠要求，這個機制完全不生效。
+- **與 `UT_SKIP_BASELINE=1` 互斥。** 沒有基準就沒有 P，此時應直接報錯，不得靜默退回全綠要求
+  ——靜默退回會讓操作者以為扣除生效了。
+- **扣除了什麼必須寫進 `summary.json`**（原則 7）。一個人要看得出這次 run 容忍了哪些失敗，
+  否則這個綠燈無法被審計，也就不值得信任。
+
+**放棄了什麼，講清楚。** gate 的承諾從「模組是綠的」降為「模組沒有比 writer 介入前更糟」。
+這是真的降級。值不值得取決於一件事：對一個既有測試就已經紅的模組，前者根本達不到——
+所以實際的選擇不是「強保證 vs 弱保證」，而是「一個達不到的保證 vs 一個達得到且可驗證的保證」。
+模組本來就是綠的時候，兩者完全等價（P 是空集合）。
+
+**狀態：待使用者決策。** 同意才進實作。實作時 itest 至少需要三個情境：既有失敗原樣通過、
+新失敗被擋、**同一個類別裡的另一個方法失敗被擋**——第三個是「方法層級識別」這道護欄的
+mutation 目標，把識別退回類別層級時它必須變紅。
+
 ## 已否決方案（防止重新提案）
 
 - **LLM orchestrator / Task tool delegation**：雙重 orchestration 增加不確定性；
@@ -119,6 +158,8 @@ cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定�
   surefire「執行」哪些測試，不限制 `test-compile` 編哪些檔——既有壞檔照樣擋死整輪，
   解不了它想解的問題；而且會讓 gate 對「新測試破壞既有測試」完全失明。改採預檢基準：
   gate 維持全模組解析度，落差由「介入前的紅燈快照」在 prompt 層標記。
+  （最後這句正由上面「dirty baseline 下，gate 扣除既有失敗」提案修訂——把快照從 prompt 層
+  延伸到 gate 層。本條的核心「不得用不執行測試的方式限縮 gate」不受影響。）
 - **binary 零缺陷 review**：LLM judge 幾乎不回空 issues，會震盪到 MAX_ITER 燒完。
 - **full-SOLID 拆分（v5，已回退）**：Gate 介面 + BuildToolStrategy + 全面 DI
   對這個規模（~1000 行、單用途內部工具）是 overdesign——20+ 檔案的間接層
