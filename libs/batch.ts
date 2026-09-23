@@ -130,6 +130,20 @@ export interface RollbackReport {
   failed: string[];
   /** Files whose attempted version could not be kept in the rejected directory (put back anyway). */
   notKept: string[];
+  /** Changed while the batch ran, but not by its writer (an editor, a test writing files): left as they are. */
+  foreign: string[];
+}
+
+// What a directory the batch left where a file was holds once its created files are gone: empty
+// directories, at any depth. Removed deepest first; anything else in it is an error — a file that
+// could not be moved away is not deleted with it.
+function removeEmptyTree(dir: string): void {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory() && !e.isSymbolicLink()) removeEmptyTree(p);
+    else throw Object.assign(new Error(`${p} is not empty`), { code: "ENOTEMPTY" });
+  }
+  fs.rmdirSync(dir);
 }
 
 /**
@@ -138,9 +152,14 @@ export interface RollbackReport {
  * path>` first, so an attempt that did not pass is still there to read, and to copy back by hand.
  * Compared by content, not mtime: a file rewritten with identical bytes was not changed. A file
  * that cannot be put back is reported, not thrown: the rest of the tree still is.
+ *
+ * `only`, when given, is what the batch's writer changed (relative paths): anything else that
+ * changed meanwhile — an edit in the developer's IDE, a file a test wrote — is not the batch's to
+ * undo, and is listed as foreign instead.
  */
-export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejectedPrefix = ""): RollbackReport {
-  const report: RollbackReport = { created: [], restored: [], undeleted: [], unrestorable: [], failed: [], notKept: [] };
+export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejectedPrefix = "", only?: Set<string>): RollbackReport {
+  const report: RollbackReport = { created: [], restored: [], undeleted: [], unrestorable: [], failed: [], notKept: [], foreign: [] };
+  const ours = (rel: string) => !only || only.has(rel);
   const keep = (rel: string, abs: string) => {
     try {
       const dest = path.join(rejectedDir, rejectedPrefix, rel);
@@ -165,6 +184,10 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
     (rel, abs) => {
       seen.add(rel);
       if (!capture.files.has(rel)) {
+        if (!ours(rel)) {
+          report.foreign.push(rel);
+          return;
+        }
         keep(rel, abs);
         putBack(rel, report.created, () => fs.rmSync(abs, { force: true }));
         return;
@@ -179,6 +202,10 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
           /* gone meanwhile */
         }
         if (st && fingerprint(st) !== capture.fingerprints.get(rel)) {
+          if (!ours(rel)) {
+            report.foreign.push(rel);
+            return;
+          }
           keep(rel, abs);
           report.unrestorable.push(rel);
         }
@@ -192,6 +219,10 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
         return;
       }
       if (!now.equals(original)) {
+        if (!ours(rel)) {
+          report.foreign.push(rel);
+          return;
+        }
         keep(rel, abs);
         putBack(rel, report.restored, () => fs.writeFileSync(abs, original));
       }
@@ -202,6 +233,10 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
   );
   for (const [rel, original] of capture.files) {
     if (seen.has(rel)) continue;
+    if (!ours(rel)) {
+      report.foreign.push(rel);
+      continue;
+    }
     const abs = path.join(capture.root, rel);
     if (original === null || original === undefined) {
       report.unrestorable.push(rel);
@@ -216,7 +251,7 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
       } catch {
         st = undefined;
       }
-      if (st?.isDirectory()) fs.rmdirSync(abs);
+      if (st?.isDirectory()) removeEmptyTree(abs);
       else if (st) fs.rmSync(abs, { force: true });
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, original);
@@ -246,7 +281,8 @@ export function testOutputDirs(moduleRoot: string, tool: BuildTool): string[] {
 }
 
 export interface OutputCapture {
-  dirs: Array<{ dir: string; files: Set<string> }>;
+  /** `existed`: the directory was there when the batch started, so "not in `files`" means the batch's. */
+  dirs: Array<{ dir: string; files: Set<string>; existed: boolean }>;
 }
 
 /** Which output files exist — a batch's starting point, for its build outputs. */
@@ -255,7 +291,7 @@ export function captureOutputs(dirs: string[]): OutputCapture {
     dirs: dirs.map((dir) => {
       const files = new Set<string>();
       walkFiles(dir, (rel) => files.add(rel));
-      return { dir, files };
+      return { dir, files, existed: fs.existsSync(dir) };
     }),
   };
 }
@@ -281,9 +317,12 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
   const compiledFrom = (rel: string) =>
     rel.endsWith(".class") && stems.some((s) => rel === `${s}.class` || rel.startsWith(`${s}$`));
   const removed: string[] = [];
-  for (const { dir, files } of capture.dirs) {
+  for (const { dir, files, existed } of capture.dirs) {
     walkFiles(dir, (rel, abs) => {
-      if (files.has(rel) && !compiledFrom(rel) && !resources.has(rel)) return;
+      // A directory the batch's first build created holds every test's output, not only its own:
+      // there only the outputs of what it put back go.
+      const batchs = existed ? !files.has(rel) : false;
+      if (!batchs && !compiledFrom(rel) && !resources.has(rel)) return;
       try {
         retrying(() => fs.rmSync(abs, { force: true }));
         removed.push(abs);
@@ -310,5 +349,7 @@ export function batchFailureFingerprint(report: string | undefined, targetClasse
     .sort((a, b) => b.length - a.length);
   let s = report;
   for (const n of names) if (n) s = s.split(n).join("<target>");
+  // Object hashes, dump-file stamps, ids: different on every run of the same failure.
+  s = s.replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{6,}\b/gi, "<hex>");
   return s.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 }

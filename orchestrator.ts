@@ -96,6 +96,9 @@ export interface OrchestratorConfig {
   // The test classes the module's build ran before any writer: from the baseline, or from the
   // repair that made it green. What a green round must still run; see testsThatMustRun.
   ranAtBaseline?: string[];
+  // Filled as the run goes with every path the writer changed, relative to src/test: what a batch
+  // that does not pass has to undo — and nothing else, even when it is interrupted halfway.
+  writtenTo?: Set<string>;
 }
 
 /**
@@ -443,6 +446,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     const changed = writerChanges(rawChanged);
     changed.forEach((f) => everWritten.add(f));
+    rawChanged.forEach((f) => cfg.writtenTo?.add(f.replace(/\\/g, "/")));
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);

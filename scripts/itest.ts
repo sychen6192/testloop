@@ -1286,6 +1286,42 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("沒跑的 Zeta 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"), JSON.stringify(c.result.notRun));
   },
 
+  "loop-batches-own-crashes-continue": (c) => {
+    check("exit code 2（有批次失敗）", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "三批都跑了，沒有提前停止（stopReason 不是 stopped:）",
+      b.length === 3 && c.result.stopReason === "some-batches-failed",
+      JSON.stringify([c.result.stopReason, b.map((x) => [x.stopReason, x.success])]),
+    );
+    check("建置 4 次：預檢 + 三批", c.mvnCalls === 4, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-batches-foreign-change-kept": (c) => {
+    const b = (c.result.batches ?? []) as Array<Record<string, any>>;
+    check("第 1 批失敗、第 2 批通過", b.length === 2 && b[0].success === false && b[1].success === true, JSON.stringify(b.map((x) => [x.stopReason, x.success])));
+    check("writer 寫的 CalcTest.java 撤回了", !c.exists("src/test/java/com/x/CalcTest.java"));
+    check("測試在建置時寫的檔留著", c.exists("src/test/resources/approvals/Calc.received.txt"));
+    check(
+      "撤回報告把它列為不是 writer 做的變更",
+      JSON.stringify(b[0].rolledBack?.foreign ?? []).includes("approvals/Calc.received.txt") &&
+        JSON.stringify(c.result.attention ?? []).includes("不是 writer 做的變更"),
+      JSON.stringify([b[0].rolledBack, c.result.attention]),
+    );
+  },
+
+  "loop-batches-crash-mid-batch": (c) => {
+    check("exit code 非 0", c.code !== 0, `code=${c.code}`);
+    check("summary 記 crash", c.result.stopReason === "crash", String(c.result.stopReason));
+    const p = (c.result.inProgress ?? {}) as Record<string, any>;
+    check(
+      "當掉時正在跑的第 1 批撤回了",
+      p.batch === 1 && JSON.stringify(p.rolledBack?.created ?? []).includes("CalcTest.java") && !c.exists("src/test/java/com/x/CalcTest.java"),
+      JSON.stringify(p),
+    );
+    check("沒執行的類別列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Greeter.java"), JSON.stringify(c.result.notRun));
+  },
+
   "loop-batches-repeated-build-failure": (c) => {
     check("exit code 2", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
     check(

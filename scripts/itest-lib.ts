@@ -80,6 +80,9 @@ export interface MvnStep {
   /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
    *  a rollback cannot put a file back at, whatever its privileges. */
   pipeDirAt?: string;
+  /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file: the run
+   *  cannot write its build log — a crash in the middle of a batch. */
+  breakRunDir?: boolean;
 }
 
 export interface JacocoSpec {
@@ -295,7 +298,8 @@ const step = plan[Math.min(n - 1, plan.length - 1)] || { exit: 0, out: "" };
 const vary = (s) => String(s)
   .replace(/{{root}}/g, root)
   .replace(/{{time}}/g, new Date(1767225600000 + n * 1013).toISOString())
-  .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3));
+  .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3))
+  .replace(/{{hex}}/g, (0xabc123 + n * 7919).toString(16));
 
 if (step.failIfExists && fs.existsSync(path.join(root, step.failIfExists))) {
   process.stdout.write(vary(step.failOut || "") + "\\n");
@@ -311,6 +315,24 @@ if (step.pipeDirAt && process.platform !== "win32") {
   fs.rmSync(p, { recursive: true, force: true });
   fs.mkdirSync(p, { recursive: true });
   require("child_process").execFileSync("mkfifo", [path.join(p, "pipe")]);
+}
+if (step.breakRunDir) {
+  const found = [];
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const p = path.join(d, e.name);
+      if (/^iter-\\d+$/.test(e.name)) found.push(p); else walk(p);
+    }
+  };
+  walk(path.join(itest, "runs"));
+  found.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  if (found[0]) {
+    fs.rmSync(found[0], { recursive: true, force: true });
+    fs.writeFileSync(found[0], "not a directory any more");
+  }
 }
 if (step.interrupt) {
   process.kill(process.ppid, "SIGINT");

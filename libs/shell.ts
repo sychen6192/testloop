@@ -373,7 +373,8 @@ export function onShutdown(fn: (reason: string) => void): void {
   shutdownHooks.push(fn);
 }
 
-function killAll(): void {
+/** Takes down every child process tree still running: a writer, a build. */
+export function killAll(): void {
   for (const c of liveChildren) killTree(c, "SIGKILL");
   liveChildren.clear();
 }

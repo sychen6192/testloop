@@ -3101,6 +3101,34 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
     oddRb.failed.length === 0 && fs.readFileSync(path.join(odd, "java/com/x/ATest.java"), "utf8") === "class ATest {}\n",
     JSON.stringify(oddRb),
   );
+  // The directory in its place goes several levels down: emptied of the files the batch created,
+  // the empty levels are removed deepest first.
+  fs.rmSync(path.join(odd, "java/com/x/ATest.java"));
+  oddPut("java/com/x/ATest.java/deep/er/Inner.java", "class Inner {}\n");
+  const deepRb = rollbackTree(oddCap, oddRejected);
+  check(
+    "rollbackTree：原位被換成好幾層的目錄 → 一層層清掉後照樣放回",
+    deepRb.failed.length === 0 && fs.readFileSync(path.join(odd, "java/com/x/ATest.java"), "utf8") === "class ATest {}\n",
+    JSON.stringify(deepRb),
+  );
+  // Only what the batch's writer changed is undone: an edit in the developer's IDE, a file a test
+  // wrote during the build, are left and listed.
+  const foreignCap = captureTree(odd);
+  oddPut("java/com/x/Mine.java", "class Mine {}\n");
+  oddPut("java/com/x/ATest.java", "class ATest { /* edited in the IDE */ }\n");
+  oddPut("resources/approvals/A.received.txt", "written by a test\n");
+  const foreignRb = rollbackTree(foreignCap, oddRejected, "", new Set(["java/com/x/Mine.java"]));
+  check(
+    "rollbackTree：只撤回 writer 改過的檔，別的東西改的留著並列在 foreign",
+    JSON.stringify(foreignRb.created) === JSON.stringify(["java/com/x/Mine.java"]) &&
+      JSON.stringify(foreignRb.foreign) === JSON.stringify(["java/com/x/ATest.java", "resources/approvals/A.received.txt"]) &&
+      fs.readFileSync(path.join(odd, "java/com/x/ATest.java"), "utf8").includes("edited in the IDE") &&
+      fs.existsSync(path.join(odd, "resources/approvals/A.received.txt")) &&
+      !fs.existsSync(path.join(odd, "java/com/x/Mine.java")),
+    JSON.stringify(foreignRb),
+  );
+  fs.rmSync(path.join(odd, "resources"), { recursive: true, force: true });
+  fs.writeFileSync(path.join(odd, "java/com/x/ATest.java"), "class ATest {}\n");
   if (process.platform !== "win32") {
     // A directory that cannot be emptied (a named pipe is not a file the walk removes) stands for
     // any path the rollback cannot put a file back at — a lock, a permission — whatever the uid.
@@ -3178,6 +3206,22 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
       fs.existsSync(path.join(outDir, "com/x/RestoredHelper.class")),
   );
   fs.rmSync(outDir, { recursive: true, force: true });
+  // An output directory the batch's own first build created holds every test's classes, not only
+  // the batch's: only the outputs of what the rollback put back go.
+  const freshOut = path.join(os.tmpdir(), `testgen-out-fresh-${process.pid}`);
+  fs.rmSync(freshOut, { recursive: true, force: true });
+  const freshCap = captureOutputs([freshOut]);
+  for (const rel of ["com/x/ExistingTest.class", "com/x/NewTest.class", "app.yml"]) {
+    fs.mkdirSync(path.dirname(path.join(freshOut, rel)), { recursive: true });
+    fs.writeFileSync(path.join(freshOut, rel), "x");
+  }
+  const freshRemoved = removeBatchOutputs(freshCap, ["java/com/x/NewTest.java"]).map((f) => path.relative(freshOut, f).replace(/\\/g, "/"));
+  check(
+    "removeBatchOutputs：輸出目錄是這批的建置才建的 → 只清撤回的原始碼的輸出，其他測試的留著（不必全部重編）",
+    JSON.stringify(freshRemoved) === JSON.stringify(["com/x/NewTest.class"]) && fs.existsSync(path.join(freshOut, "com/x/ExistingTest.class")),
+    JSON.stringify(freshRemoved),
+  );
+  fs.rmSync(freshOut, { recursive: true, force: true });
 
   // Across batches: the same build failure for two classes, but for their names and numbers.
   const crash = (cls: string, t: string) =>
@@ -3193,6 +3237,15 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
       batchFailureFingerprint("[ERROR] GreeterTest.java:[9,9] cannot find symbol: variable greeting", ["src/main/java/com/x/Greeter.java"]),
   );
   check("batchFailureFingerprint：沒有報告 → 空（不當成相同）", batchFailureFingerprint(undefined, ["A.java"]) === "");
+  check(
+    "batchFailureFingerprint：每次都不一樣的 hash、request id（十六進位）也拿掉",
+    batchFailureFingerprint("Could not resolve com.corp:lib, request id abfee1, at Calc@1b6d3586", ["Calc.java"]) ===
+      batchFailureFingerprint("Could not resolve com.corp:lib, request id ac3bc8, at Calc@7a81197d", ["Calc.java"]),
+  );
+  check(
+    "batchFailureFingerprint：由 a–f 組成的英文字（facade、added）不當成 hash",
+    batchFailureFingerprint("facade added", []) === "facade added",
+  );
   check(
     "batchFailureFingerprint：Windows 路徑的類別名稱照樣拿掉",
     batchFailureFingerprint("x CalcTest y", ["src\\main\\java\\Calc.java"]) === "x <target>Test y",
