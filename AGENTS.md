@@ -193,7 +193,7 @@ libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、t
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
-libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
+libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手；持有者心跳；等不到就視為忙碌）
 libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
 libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）

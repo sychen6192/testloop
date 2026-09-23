@@ -40,7 +40,9 @@ export const TARGET_ARG = process.argv[2];
 // fires immediately and kills every agent. Exiting with the variable's name beats both.
 export function numEnv(name: string, def: number, min = 0, max = Infinity): number {
   const raw = process.env[name];
-  if (raw === undefined || raw === "") return def;
+  // Blank is unset — a quoted `NAME=" "` in .env, a blank string in a CI config — not the 0 that
+  // Number(" ") makes of it.
+  if (raw === undefined || raw.trim() === "") return def;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < min || n > max) {
     console.error(
@@ -53,10 +55,17 @@ export function numEnv(name: string, def: number, min = 0, max = Infinity): numb
 
 // A count: a fraction is a typo, not a setting — UT_API_MAX_TOKENS=4096.5 reached the endpoint as a
 // max_tokens it rejected, and UT_BATCH_SIZE=1.5 quietly ran batches of one.
+// Written out in decimal digits, too: Number() also reads "1e3" and "0x10", neither of which anyone
+// types for a count on purpose.
 export function intEnv(name: string, def: number, min = 0, max = Infinity): number {
+  const raw = process.env[name];
+  if (raw !== undefined && raw.trim() !== "" && !/^[+-]?\d+$/.test(raw.trim())) {
+    console.error(`FATAL: ${name}=${raw} 必須是十進位整數`);
+    process.exit(1);
+  }
   const n = numEnv(name, def, min, max);
-  if (!Number.isInteger(n)) {
-    console.error(`FATAL: ${name}=${process.env[name]} 必須是整數`);
+  if (!Number.isSafeInteger(n)) {
+    console.error(`FATAL: ${name}=${raw} 必須是整數`);
     process.exit(1);
   }
   return n;

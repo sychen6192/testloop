@@ -66,7 +66,7 @@ import {
   SourceEncoding,
 } from "./libs/encoding";
 import { installShutdownHandlers, killAll, onShutdown } from "./libs/shell";
-import { acquireRepoLock } from "./libs/lock";
+import { acquireRepoLock, LOCK_WAIT_MS } from "./libs/lock";
 import { PreExistingFailures } from "./prompts";
 
 async function main() {
@@ -173,7 +173,9 @@ async function main() {
   const busy = acquireRepoLock(REPO_ROOT, runDir);
   if (busy) {
     die(
-      `同一個 repo（${REPO_ROOT}）已有另一個 testgen 在執行（pid ${busy.pid}，artifacts：${busy.runDir}）。\n` +
+      (busy.pid
+        ? `同一個 repo（${REPO_ROOT}）已有另一個 testgen 在執行（pid ${busy.pid}，artifacts：${busy.runDir ?? "未知"}）。\n`
+        : `同一個 repo（${REPO_ROOT}）的執行鎖一直在被另一個 testgen 建立或接手，等了 ${LOCK_WAIT_MS / 1000} 秒仍無法確定——當作它在執行。\n`) +
         "同一個 repo 併行會互相觸發 scope-violation（對方 writer 寫的檔案落在本次範圍外），-am 建置也會共用上游模組的 target/。\n" +
         `請等它結束，或改在另一個 clone / git worktree 執行。確定沒有在跑卻看到這個訊息，刪除 ${busy.lock} 即可。`,
     );

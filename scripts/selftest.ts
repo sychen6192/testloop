@@ -81,7 +81,7 @@ import {
 } from "../runners/api";
 import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
-import { acquireRepoLock, repoLockFile } from "../libs/lock";
+import { acquireRepoLock, holderAlive, repoLockFile } from "../libs/lock";
 import { batchFailureFingerprint, captureOutputs, captureTree, chunk, removeBatchOutputs, rollbackTree, testOutputDirs } from "../libs/batch";
 import {
   closeEncodingView,
@@ -2721,7 +2721,19 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
     fractional.status === 1 && /UT_API_MAX_TOKENS/.test(fractional.stderr) && /整數/.test(fractional.stderr),
     `status=${fractional.status} ${fractional.stderr.slice(0, 200)}`,
   );
-  check("intEnv：整數照常接受", loadConfig({ UT_BATCH_SIZE: "3" }).status === 0);
+  check("intEnv：整數照常接受（前後有空白也行）", loadConfig({ UT_BATCH_SIZE: "3" }).status === 0 && loadConfig({ UT_BATCH_SIZE: " 4 " }).status === 0);
+  const sci = loadConfig({ UT_BATCH_SIZE: "1e3" });
+  const hex = loadConfig({ UT_MAX_ITER: "0x10" });
+  check(
+    "intEnv：1e3、0x10 這種 Number() 也讀得懂、但沒人會這樣寫次數的 → FATAL",
+    sci.status === 1 && /UT_BATCH_SIZE/.test(sci.stderr) && hex.status === 1 && /UT_MAX_ITER/.test(hex.stderr),
+    `${sci.status} ${sci.stderr.slice(0, 120)} / ${hex.status} ${hex.stderr.slice(0, 120)}`,
+  );
+  check(
+    "numEnv / intEnv：只有空白（.env 裡加了引號的空白、CI 設定的空白字串）視同沒設，不是 Number(\"  \") 的 0",
+    loadConfig({ UT_BATCH_SIZE: "   " }).status === 0 && loadConfig({ UT_MIN_LINE_COV: " " }).status === 0,
+  );
+  check("intEnv：超過安全整數範圍 → FATAL", loadConfig({ UT_API_MAX_TOKENS: "9007199254740993" }).status === 1);
 
   // --- the repo lock under a race: several runs finding the same stale lock at once -----------
   if (process.platform !== "win32") {
@@ -2772,8 +2784,12 @@ setTimeout(() => process.exit(0), 1500);
     // An empty lock is another run between its create and its write — never taken over while
     // young — or, once it has stayed empty for seconds, what a crash between the two left behind.
     fs.writeFileSync(lockFile, "");
-    acquireRepoLock(lockRepo, "new");
-    check("repo 鎖：剛建立、還沒寫入內容的鎖（另一個 run 正在寫）→ 不接手、不刪", fs.existsSync(lockFile) && fs.readFileSync(lockFile, "utf8") === "");
+    const young = acquireRepoLock(lockRepo, "new", { waitMs: 300, heartbeatMs: 30_000 });
+    check(
+      "repo 鎖：剛建立、還沒寫入內容的鎖（另一個 run 正在寫）→ 不接手、不刪；等不到它寫完就回報忙碌，不是照樣執行",
+      fs.existsSync(lockFile) && fs.readFileSync(lockFile, "utf8") === "" && young?.lock === lockFile && young.pid === undefined,
+      JSON.stringify(young),
+    );
     // ...and waited for: once its holder has written it, the lock is held. Spinning through the
     // attempts instead ran out of them while the holder was still writing — and ran anyway.
     const midWrite = path.join(lockRepo, "mid-write.ts");
@@ -2805,9 +2821,24 @@ console.log(acquireRepoLock(${JSON.stringify(lockRepo)}, "late") ? "BUSY" : "GOT
       "repo 鎖：空了好幾秒的鎖（建立後、寫入前當掉）→ 接手",
       acquireRepoLock(lockRepo, "new") === undefined && fs.readFileSync(lockFile, "utf8").includes(`"pid":${process.pid},`),
     );
+    // The holder's heartbeat: its lock stays fresh while it runs.
+    fs.rmSync(lockFile, { force: true });
+    check("repo 鎖：拿得到鎖", acquireRepoLock(lockRepo, "beating", { waitMs: 1000, heartbeatMs: 100 }) === undefined);
+    const backdated = (Date.now() - 600_000) / 1000;
+    fs.utimesSync(lockFile, backdated, backdated);
+    await new Promise((r) => setTimeout(r, 400));
+    check("repo 鎖：持有期間定時更新鎖的時間（心跳）", Date.now() - fs.statSync(lockFile).mtimeMs < 5_000, String(Date.now() - fs.statSync(lockFile).mtimeMs));
     fs.rmSync(lockRepo, { recursive: true, force: true });
     fs.rmSync(lockFile, { force: true });
   }
+  check(
+    "holderAlive：訊號送得到 → 活著；ESRCH → 不在了",
+    holderAlive("ok", true, Infinity) && !holderAlive("ESRCH", true, 0) && !holderAlive("ESRCH", false, 0),
+  );
+  check(
+    "holderAlive：EPERM + 別的使用者的鎖 → 活著（共用 /tmp 的別人的 run）；EPERM + 自己的鎖 → 看心跳（Windows 上以系統管理員身分跑的 run 送不到訊號）",
+    holderAlive("EPERM", false, Infinity) && holderAlive("EPERM", true, 60_000) && !holderAlive("EPERM", true, 10 * 60_000),
+  );
 
   // --- build output that outgrows memory ------------------------------------------------------
   // Scripts go in files, not `node -e`: on Windows shLive runs through cmd.exe, which would
