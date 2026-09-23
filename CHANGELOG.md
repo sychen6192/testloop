@@ -135,6 +135,14 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **防掏空的計數不再誤判，也不再漏掉讓測試不執行的寫法。** 計數前清掉註解與字串的方式改成照 lexer 的順序
+  一次掃過（`libs/javasrc.ts`）：舊的做法先刪區塊註解、再刪字串，字串裡的 `"**/*.java"` 會一路吃到下一個
+  註解，中間的測試全數消失——writer 只是加了一段 Javadoc，就會被判「刪減了既有測試」；行尾註解
+  `// assertEquals(...)` 也會被算成斷言。TestNG 的 `enabled = false` 只在 `@Test(…)` 裡算，測試裡的
+  `boolean enabled = false;` 不再被當成略過標記。另外補上原本數不到的略過方式：`Assumptions.abort()`、
+  丟 `SkipException` / `TestAbortedException` / `AssumptionViolatedException`，以及 JUnit 5 一聲不響跳過的
+  private / static / 有回傳值的 `@Test` 方法——`@Test` 還在、測試已經不會執行。全限定名的
+  `@org.junit.jupiter.api.Test` 也照樣算。
 - **沒被執行的測試不再算過關。** 以真的 Maven 實測：surefire 2.22.2、classpath 上只有 `junit-jupiter-api`
   （沒有 engine）的模組，writer 寫的 JUnit 5 測試編得過、一個都沒執行，BUILD SUCCESS；既有的 JUnit 4 測試
   剛好覆蓋滿目標類別，coverage gate 也過——一個沒執行過的測試以 gates-passed 收場。反過來，修復迴圈的

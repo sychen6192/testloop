@@ -48,7 +48,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
    gate 的結果都失去意義。第三面是**防掏空**：build gate 分不出「修好失敗的測試」和「刪掉
    失敗的測試」，兩者都是綠燈，所以 `libs/testmetrics.ts` 在第一輪前量下每個既有測試檔的
-   `@Test` 數、斷言數與略過標記數（`@Disabled`、`@Ignore`、TestNG `enabled = false`、assumption），
+   `@Test` 數、斷言數與略過標記數（`@Disabled`、`@Ignore`、TestNG `@Test(enabled = false)`、assumption、
+   `abort()`、丟 `SkipException` / `TestAbortedException`、JUnit 5 不執行的 private / static / 有回傳值的
+   `@Test`；在 `libs/javasrc.ts` 清掉註解與字串之後才數，字串裡的 `/*` 不會吃掉後面的測試），
    任一檔案數量減少（或略過標記增加）該輪即 FAIL
    餵回，不進建置（`UT_ALLOW_TEST_SHRINK=1` 只警告）。刻意用數量不用方法名：standards 要求
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。

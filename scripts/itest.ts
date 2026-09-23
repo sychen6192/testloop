@@ -415,6 +415,13 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("第 1 輪因 assumeTrue(false) 判 FAIL、不進建置", gates(c)[0] === "writer/test-shrink" && c.mvnCalls === 1, `${gates(c).join(",")} mvnCalls=${c.mvnCalls}`);
   },
 
+  "shrink-silenced": (c) => {
+    check("最終成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("第 1 輪判 test-shrink、不進建置", gates(c)[0] === "writer/test-shrink" && c.mvnCalls === 1, `${gates(c).join(",")} mvnCalls=${c.mvnCalls}`);
+    const report = c.runRead("iter-1/test-shrink.txt");
+    check("報告點出略過標記 0 → 2", report.includes("ExistingTest.java") && report.includes("0 → 2"), report);
+  },
+
   "shrink-allowed": (c) => {
     check("UT_ALLOW_TEST_SHRINK=1 → 一輪就過", c.result.success === true && c.result.iterations === 1, JSON.stringify(c.result));
     check("刪減被放行但仍建置", c.mvnCalls === 1);

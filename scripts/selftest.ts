@@ -1517,6 +1517,47 @@ class FooTest {
     skips.disabled === 5,
     JSON.stringify(skips),
   );
+  check(
+    "testMetrics：TestNG 的 enabled = false 只在 @Test(…) 裡算——測試裡的 `boolean enabled = false;` 是程式碼",
+    testMetrics("class T { @Test void a() { boolean enabled = false; config.enabled = false; assertFalse(enabled); } }").disabled === 0,
+  );
+  const silenced = testMetrics(`import static org.junit.jupiter.api.Assumptions.abort;
+class T {
+    @Test void a() { Assumptions.abort("later"); }
+    @Test void b() { abort(); }
+    @Test void c() { throw new SkipException("x"); }
+    @Test void d() { throw new org.opentest4j.TestAbortedException(); }
+    @Test public void e() { throw new AssumptionViolatedException("x"); }
+    @Test private void f() { assertEquals(1, 2); }
+    @Test static void g() { assertEquals(1, 2); }
+    @Test int h() { assertEquals(1, 2); return 0; }
+    @TestFactory Stream<DynamicTest> i() { return Stream.empty(); }
+    @ParameterizedTest @ValueSource(ints = {1, 2}) void j(int x) { transaction.abort(); }
+}`);
+  check(
+    "testMetrics：abort、丟 SkipException / TestAbortedException / AssumptionViolatedException、private / static / 有回傳值的 @Test 都算略過（@TestFactory 的回傳值與一般物件的 abort() 不算）",
+    silenced.disabled === 8 && silenced.tests === 10,
+    JSON.stringify(silenced),
+  );
+  check("testMetrics：沒有從 Assumptions 靜態 import 的 abort() 是一般方法", testMetrics("class T { @Test void a() { abort(); } }").disabled === 0);
+  check(
+    "testMetrics：字串裡的 /*（\"**/*.java\"）不會吃掉後面到下一個註解之間的測試",
+    testMetrics('class T {\n  String glob = "**/*.java";\n  @Test void a() { assertEquals(1, 1); }\n  /** doc */\n  @Test void b() { assertEquals(2, 2); }\n}').tests === 2,
+  );
+  check(
+    "testMetrics：行尾註解裡的 assertEquals( / @Disabled 不算",
+    (() => {
+      const t = testMetrics("class T { @Test void a() { run(); // assertEquals(1, 1) @Disabled\n } }");
+      return t.assertions === 0 && t.disabled === 0;
+    })(),
+  );
+  check(
+    "testMetrics：全限定名的 @org.junit.jupiter.api.Test / @org.junit.Ignore 照樣算",
+    (() => {
+      const t = testMetrics("class T { @org.junit.jupiter.api.Test void a() {} @org.junit.Ignore @org.junit.Test public void b() {} @TestInstance(PER_CLASS) class N {} }");
+      return t.tests === 2 && t.disabled === 1;
+    })(),
+  );
 
   const foo = { tests: 4, assertions: 5, disabled: 1 };
   const bar = { tests: 2, assertions: 2, disabled: 0 };

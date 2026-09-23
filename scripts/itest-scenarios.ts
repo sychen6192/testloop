@@ -396,6 +396,25 @@ export const SCENARIOS: Scenario[] = [
     mvn: [GREEN_BUILD],
   },
   {
+    name: "shrink-silenced",
+    desc: "把失敗的既有測試改成 private（JUnit 5 不執行 private 的 @Test）、另一個開頭丟 TestAbortedException：@Test 與斷言數都沒變 → 也算掏空",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      {
+        write: {
+          [EXISTING_PATH]: EXISTING_TEST.replace("    void div_byOne_returnsSameValue", "    private void div_byOne_returnsSameValue").replace(
+            "assertEquals(3, new Calc().add(1, 2));",
+            "if (true) throw new org.opentest4j.TestAbortedException(\"later\");\n        assertEquals(3, new Calc().add(1, 2));",
+          ),
+          [CALC_TEST_PATH]: calcTest(1),
+        },
+      },
+      { write: { [EXISTING_PATH]: EXISTING_TEST, [CALC_TEST_PATH]: calcTest(5) } },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
     name: "shrink-allowed",
     desc: "UT_ALLOW_TEST_SHRINK=1 只警告，照樣進建置",
     entry: "orchestrate",

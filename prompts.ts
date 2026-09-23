@@ -532,7 +532,7 @@ export function renderShrinkFeedback(violations: ShrinkViolation[]): string {
       ? `- ${v.file}：檔案被刪除（原有 @Test ${v.before.tests}、斷言 ${v.before.assertions}）`
       : `- ${v.file}：@Test ${v.before.tests} → ${v.after.tests}、斷言 ${v.before.assertions} → ${v.after.assertions}` +
         (v.after.disabled > v.before.disabled
-          ? `、略過標記（@Disabled / @Ignore / enabled = false / assume…）${v.before.disabled} → ${v.after.disabled}`
+          ? `、略過標記（@Disabled / @Ignore / @Test(enabled = false) / assume… / abort / 丟 SkipException 或 TestAbortedException / private、static 或有回傳值的 @Test）${v.before.disabled} → ${v.after.disabled}`
           : ""),
   );
   return `writer 刪減了既有測試，本輪判 FAIL——修復或補強是讓測試正確，不是讓它消失：

@@ -8,6 +8,7 @@
 // method without the count going down.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { codeOnly } from "./javasrc";
 
 // readFileSync on a FIFO or a device blocks the whole process; only regular files are sources.
 function isRegularFile(p: string): boolean {
@@ -34,28 +35,58 @@ export interface ShrinkViolation {
   after: TestMetrics | null; // null = the file is gone
 }
 
-function stripCommentsAndStrings(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^[ \t]*\/\/.*$/gm, "")
-    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
-}
+// Every way to make a test not run, or end as skipped instead of failed — each one turns a red
+// build green with the @Test count intact: JUnit 5's @Disabled and its conditional @Disabled… /
+// @Enabled… forms, JUnit 4's @Ignore, TestNG's @Test(enabled = false) — only inside @Test(…):
+// `boolean enabled = false;` is code, and counting it would fail a round that tests a feature flag —
+// assumptions (JUnit, AssertJ, Hamcrest), JUnit 5's Assumptions.abort, and throwing what the
+// frameworks report as skipped.
+const SKIP_MARKERS = new RegExp(
+  [
+    String.raw`@(?:[\w.]+\.)?(?:Disabled|Enabled)\w*`,
+    String.raw`@(?:[\w.]+\.)?Ignore\b`,
+    String.raw`@(?:[\w.]+\.)?Test\s*\([^)]*\benabled\s*=\s*false\b`,
+    String.raw`\bassum(?:e(?:True|False|That\w*|NotNull|NoException)|ingThat)\s*\(`,
+    String.raw`\bAssumptions\s*\.\s*abort\s*\(`,
+    String.raw`\bnew\s+(?:[\w.]+\.)?(?:SkipException|TestAbortedException|AssumptionViolatedException)\b`,
+  ].join("|"),
+  "g",
+);
+// abort() on its own is anybody's method; it is JUnit's only when statically imported from there.
+const ABORT_IMPORTED = /\bimport\s+static\s+org\.junit\.jupiter\.api\.Assumptions\.(?:abort|\*)\s*;/;
 
-const SKIP_MARKERS =
-  /@(?:Disabled|Enabled)\w*|@Ignore\b|\benabled\s*=\s*false\b|\bassum(?:e(?:True|False|That\w*|NotNull|NoException)|ingThat)\s*\(/g;
+const TEST_ANNOTATION = /@(?:[\w.]+\.)?(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b(?:\s*\((?:[^()]|\([^()]*\))*\))?/g;
+
+/**
+ * Pure: test methods that are declared and never run. JUnit 5 and TestNG pass over private and
+ * static test methods without a word, and Jupiter over a @Test that returns a value — the
+ * annotation is still there to count, the test is gone.
+ */
+export function unrunnableTests(code: string): number {
+  let n = 0;
+  for (const m of code.matchAll(TEST_ANNOTATION)) {
+    // Past the other annotations to the declaration: modifiers, return type, name.
+    const rest = code.slice(m.index! + m[0].length).replace(/^(?:\s*@[\w.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?)*/, "");
+    const decl = /^\s*((?:(?:public|protected|private|static|final|synchronized|abstract|default|strictfp)\s+)*)(?:<[^>{};]*>\s*)?([\w.$<>[\],?\s]+?)\s+[\w$]+\s*\(/.exec(rest);
+    if (!decl) continue; // on a class (TestNG), or not a method
+    if (/\b(?:private|static)\b/.test(decl[1])) n++;
+    else if (m[1] !== "TestFactory" && m[1] !== "TestTemplate" && decl[2].trim() !== "void") n++;
+  }
+  return n;
+}
 
 // Pure.
 export function testMetrics(src: string): TestMetrics {
-  const s = stripCommentsAndStrings(src);
+  // One pass as the lexer reads it: a "/*" inside a string ("**/*.java") used to swallow the code up
+  // to the next comment — every test in between gone, a false "shrunk" — and a trailing
+  // "// assertEquals(...)" used to count as an assertion.
+  const s = codeOnly(src);
   const count = (re: RegExp) => (s.match(re) ?? []).length;
   return {
-    tests: count(/@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b/g),
+    tests: count(/@(?:[\w.]+\.)?(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b/g),
     // JUnit / AssertJ assert*, Mockito verify*, BDDMockito should(), JUnit fail()
     assertions: count(/\b(?:assert\w*|verify\w*|should|fail)\s*\(/g),
-    // Each framework's way to not run a test — JUnit 5's @Disabled and its conditional
-    // @Disabled…/@Enabled… forms, JUnit 4's @Ignore, TestNG's enabled = false — and assumptions,
-    // which end a failing test as skipped: all of them turn a red build green.
-    disabled: count(SKIP_MARKERS),
+    disabled: count(SKIP_MARKERS) + (ABORT_IMPORTED.test(s) ? count(/(?<![.\w])abort\s*\(/g) : 0) + unrunnableTests(s),
   };
 }
 
