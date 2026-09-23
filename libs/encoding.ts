@@ -400,20 +400,27 @@ function ownedPrivately(p: string): boolean {
   }
 }
 
-/**
- * A directory for what the loop keeps between runs, this user's alone: the compiled transcoder,
- * the journal of views in progress. undefined when there is none to be had.
- */
-function cacheDir(...sub: string[]): string | undefined {
+// Where what the loop keeps between runs lives, this user's alone: the compiled transcoder, the
+// journal of views in progress.
+function cacheTop(): string {
   const base =
     process.env.LOCALAPPDATA ||
     (process.env.XDG_CACHE_HOME && path.isAbsolute(process.env.XDG_CACHE_HOME) ? process.env.XDG_CACHE_HOME : "") ||
     path.join(os.homedir(), ".cache");
-  const top = path.join(base, "testgen");
+  return path.join(base, "testgen");
+}
+
+/** A directory under the cache, created if asked and there is none; undefined when it is not ours alone. */
+function cacheDir(sub: string[], create = true): string | undefined {
+  const top = cacheTop();
   const dir = path.join(top, ...sub);
-  try {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  } catch {
+  if (create) {
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch {
+      return undefined;
+    }
+  } else if (!fs.existsSync(dir)) {
     return undefined;
   }
   for (let d = dir; ; d = path.dirname(d)) {
@@ -451,7 +458,7 @@ export function findJdk(): Jdk | undefined {
     return undefined;
   }
   const key = createHash("sha1").update(src).update(javac).digest("hex").slice(0, 12);
-  const cache = cacheDir();
+  const cache = cacheDir([]);
   const cached = cache ? path.join(cache, `transcode-${key}`) : undefined;
   let classDir: string | undefined;
   if (cached && fs.existsSync(path.join(cached, "Transcode.class")) && ownedPrivately(cached) && ownedPrivately(path.join(cached, "Transcode.class"))) {
@@ -755,18 +762,18 @@ const sha1 = (b: Buffer) => createHash("sha1").update(b).digest("hex");
 
 // The journal: what a view replaced, kept on disk while it is open, so a run killed without a chance
 // to put anything back (the OOM killer, a cancelled CI job) is undone by the next run on the repo.
-function journalDir(root: string): string | undefined {
+function journalDir(root: string, create: boolean): string | undefined {
   let real = root;
   try {
     real = fs.realpathSync.native(root);
   } catch {
     /* as given */
   }
-  return cacheDir("views", createHash("sha1").update(real).digest("hex").slice(0, 16));
+  return cacheDir(["views", createHash("sha1").update(real).digest("hex").slice(0, 16)], create);
 }
 
 function writeJournal(root: string, entries: Array<{ file: string; original: Buffer; view: Buffer }>): string | undefined {
-  const dir = journalDir(root);
+  const dir = journalDir(root, true);
   if (!dir) return undefined;
   try {
     const manifest = entries.map((e, i) => {
@@ -786,8 +793,12 @@ function writeJournal(root: string, entries: Array<{ file: string; original: Buf
  * each one only while it still is exactly that view. Returns the files put back.
  */
 export function recoverEncodingViews(root: string): string[] {
-  const dir = journalDir(root);
-  if (!dir || !fs.existsSync(path.join(dir, "manifest.json"))) return [];
+  const dir = journalDir(root, false);
+  if (!dir) return [];
+  if (!fs.existsSync(path.join(dir, "manifest.json"))) {
+    fs.rmSync(dir, { recursive: true, force: true }); // a journal cut short before its manifest
+    return [];
+  }
   const restored: string[] = [];
   try {
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8")) as Array<{ file: string; view: string; original: string }>;

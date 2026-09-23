@@ -3666,6 +3666,19 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     );
     check("recoverEncodingViews：日誌用過就刪（再跑一次什麼都不做）", recoverEncodingViews(tree).length === 0);
     restoreOpenViews();
+    // Every run looks for a journal; looking must not leave one directory per repo behind.
+    const savedLocal = process.env.LOCALAPPDATA;
+    const lookCache = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cache-"));
+    process.env.LOCALAPPDATA = lookCache;
+    const nothing = recoverEncodingViews(fs.mkdtempSync(path.join(os.tmpdir(), "tg-never-viewed-")));
+    if (savedLocal === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = savedLocal;
+    check(
+      "recoverEncodingViews：沒有日誌的 repo 只是查一下，不在快取裡留下空目錄",
+      nothing.length === 0 && !fs.existsSync(path.join(lookCache, "testgen", "views")),
+      JSON.stringify(fs.existsSync(lookCache) ? fs.readdirSync(lookCache, { recursive: true }) : []),
+    );
+    fs.rmSync(lookCache, { recursive: true, force: true });
 
     // A write that fails on one file (another user's file: its time cannot be set) does not leave
     // the rest in their view.
