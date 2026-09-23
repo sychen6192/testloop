@@ -13,8 +13,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, EXISTING_TEST, gitAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
-import { SCENARIOS } from "./itest-scenarios";
+import { ApiTurn, buildFixture, envKnobsInSource, EXISTING_TEST, gitAvailable, jdkAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
+import { FIXED_TEST as FIXED_TEST_TEXT, SCENARIOS } from "./itest-scenarios";
 import { planSpawn } from "../libs/shell";
 
 let passCount = 0;
@@ -146,6 +146,8 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
+      // What the model was sent — tool results included — for the checks to read.
+      fs.appendFileSync(path.join(root, ".itest", "api-requests.jsonl"), `${body.replace(/\n/g, " ")}\n`);
       const turn: ApiTurn = turns[i++] ?? { content: "沒有更多腳本回合了" };
       for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -265,6 +267,14 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     // Held by a live process — this one — exactly as a second testgen on the same repo would see.
     const lock = sc.lockHeld ? repoLockPath(root) : undefined;
     if (lock) fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, runDir: "/elsewhere" }));
+    // A PATH with node on it and nothing else: no java, no javac, wherever node is installed.
+    let noJdkEnv: Record<string, string> = {};
+    if (sc.noJdk) {
+      const bin = path.join(root, ".itest", "bin");
+      fs.mkdirSync(bin, { recursive: true });
+      fs.symlinkSync(process.execPath, path.join(bin, "node"));
+      noJdkEnv = { JAVA_HOME: "", PATH: bin };
+    }
     out = await runTsx(
       path.join(TESTGEN_ROOT, "loop.ts"),
       [targetDirOf(sc)],
@@ -277,6 +287,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
         ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
         // Scenarios opt into the bypass by naming the endpoint's own host:port.
         ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
+        ...noJdkEnv,
       }),
     );
     await api.close();
@@ -991,14 +1002,78 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}`);
     check("量到 MS950（來自 Maven 的平台編碼警告）", c.runRead("project-facts.json").includes("MS950"), c.runRead("project-facts.json"));
     const p1 = c.runRead("iter-1/prompt.md");
-    check("prompt 告知 MS950、只用 ASCII，並點名不能改的 ExistingTest.java", p1.includes("MS950") && p1.includes("只用 ASCII") && p1.includes("不能修改") && p1.includes("ExistingTest.java"), p1.slice(0, 2500));
-    check("第 1 輪：改壞的 MS950 檔已還原、該輪判 FAIL 不建置", c.runRead("iter-1/encoding-restored.txt").includes("ExistingTest.java"));
+    check(
+      "prompt 說明 \\uXXXX 是同一個字、不是亂碼，中文可以直接寫",
+      p1.includes("MS950") && p1.includes("不是亂碼") && p1.includes("可以直接寫") && !p1.includes("不能修改"),
+      p1.slice(0, 2500),
+    );
+    check(
+      "writer 讀到的既有測試是 \\uXXXX 形式，不是亂碼",
+      c.read(".itest/api-requests.jsonl").includes("\\\\u4e2d\\\\u6587") && !c.read(".itest/api-requests.jsonl").includes("\\ufffd"),
+    );
     const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"));
-    check("ExistingTest.java 仍是原本的 MS950 bytes", raw.includes(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5])) && !raw.includes(Buffer.from("補一個測試")), raw.toString("latin1").slice(-120));
+    const big5 = new TextDecoder("big5");
+    check("ExistingTest.java：writer 沒改的中文那行維持 MS950 原 bytes", raw.includes(Buffer.from([0x2f, 0x2f, 0x20, 0xa4, 0xa4, 0xa4, 0xe5])));
+    check(
+      "ExistingTest.java：writer 補的中文以 MS950 存（沒有殘留 \\uXXXX、沒有 UTF-8）",
+      big5.decode(raw).includes("// 補一個測試") && !raw.includes(Buffer.from("\\u")) && !raw.includes(Buffer.from("補一個測試")),
+      raw.toString("latin1").slice(-160),
+    );
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
+    check("CalcTest.java：writer 寫的中文以 MS950 存", big5.decode(calc).startsWith("// 準備資料\n") && !calc.includes(Buffer.from("準備資料")));
+    const requests = c.read(".itest/api-requests.jsonl").split("\n").filter(Boolean);
+    check(
+      "reviewer 讀到的也是 \\uXXXX 形式——包括 writer 剛補、已存成 MS950 的那行",
+      requests.some((r) => !r.includes('"write_file"') && r.includes("\\\\u88dc\\\\u4e00\\\\u500b\\\\u6e2c\\\\u8a66")),
+    );
+    check("review prompt 說明 \\uXXXX 是 pipeline 的跳脫", c.runRead("iter-1/review-prompt.md").includes("不要因此扣"));
+    check("建置 2 次：預檢 + 第 1 輪", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-encoding-no-jdk": (c) => {
+    if (process.platform === "win32") return;
+    check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}\n${c.stderr.slice(-400)}`);
+    const p1 = c.runRead("iter-1/prompt.md");
+    check(
+      "prompt：找不到 JDK → 只用 ASCII，並點名不能改的 ExistingTest.java",
+      p1.includes("MS950") && p1.includes("只用 ASCII") && p1.includes("不能修改") && p1.includes("ExistingTest.java"),
+      p1.slice(0, 2500),
+    );
+    check("第 1 輪：改壞的 MS950 檔已還原、該輪判 FAIL 不建置", c.runRead("iter-1/encoding-report.txt").includes("ExistingTest.java"));
+    const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"));
+    check("ExistingTest.java 仍是原本的 MS950 bytes", raw.includes(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5])) && !raw.includes(Buffer.from("補一個測試")));
     const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
     check("CalcTest.java 全是 ASCII，中文成了 \\uXXXX", [...calc].every((b) => b < 0x80) && calc.toString().includes("\\u6e96\\u5099"), calc.toString().slice(0, 120));
-    check("第 2 輪的 prompt 帶著還原報告", c.runRead("iter-2/prompt.md").includes("還原成原本的內容"));
+    check("第 2 輪的 prompt 帶著還原報告", c.runRead("iter-2/prompt.md").includes("已還原成原本的內容"));
     check("建置 2 次：預檢 + 第 2 輪（第 1 輪沒進建置）", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-encoding-replacement-char": (c) => {
+    check("最終成功", c.result.success === true, String(c.result.stopReason));
+    check("第 2 輪：writer 寫進 U+FFFD → 點名檔案、不進建置", c.runRead("iter-2/encoding-report.txt").includes("CalcTest.java") && c.runRead("iter-2/encoding-report.txt").includes("U+FFFD"));
+    const fb = c.runRead("iter-2/feedback.md");
+    check("餵回的報告連同第 1 輪還沒修的 gate 報告（不只剩編碼問題）", fb.includes("U+FFFD") && fb.includes("上一輪 gate 的失敗報告") && fb.includes("CalcTest"), fb.slice(0, 800));
+    check("建置 3 次：預檢 + 第 1 輪 + 第 3 輪", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-encoding-learned-from-build": (c) => {
+    check("最終成功", c.result.success === true, String(c.result.stopReason));
+    check("第 1 輪還不知道是 MS950", !c.runRead("iter-1/prompt.md").includes("MS950"));
+    check("第 2 輪：第 1 輪建置的 log 說了 MS950 → prompt 改用 MS950 的說明", c.runRead("iter-2/prompt.md").includes("MS950"), c.runRead("iter-2/prompt.md").slice(0, 400));
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
+    check("第 2 輪 writer 寫的中文以 MS950 存", new TextDecoder("big5").decode(calc).startsWith("// 兩數相加\n") && !calc.includes(Buffer.from("兩數相加")));
+  },
+
+  "loop-repair-ms950": (c) => {
+    check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}\n${c.stderr.slice(-400)}`);
+    const repair = c.result.repair as Record<string, unknown> | undefined;
+    check("修復成功（MS950 檔不再是「不能改」）", repair?.success === true, JSON.stringify(repair));
+    const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/BrokenTest.java"));
+    check(
+      "BrokenTest.java：中文那行維持原本的 MS950 bytes，其餘是修好的內容",
+      raw.subarray(0, 8).equals(Buffer.from([0x2f, 0x2f, 0x20, 0xa4, 0xa4, 0xa4, 0xe5, 0x0a])) && raw.subarray(8).toString("latin1") === FIXED_TEST_TEXT,
+      raw.toString("latin1").slice(0, 200),
+    );
   },
 
   "loop-batches-isolate-failure": (c) => {
@@ -1185,10 +1260,19 @@ async function main() {
   }
 
   const haveGit = gitAvailable();
+  const haveJdk = jdkAvailable();
   for (const sc of list) {
     console.log(`\n[${sc.name}] ${sc.desc}`);
     if (sc.git && !haveGit) {
       console.log("  [SKIP] 找不到 git——這個情境要一個真的 git repo 才測得到 .gitignore 的效果");
+      continue;
+    }
+    if (sc.jdk && !haveJdk) {
+      console.log("  [SKIP] 找不到 JDK——這個情境要真的 JDK 做編碼轉換");
+      continue;
+    }
+    if (sc.noJdk && process.platform === "win32") {
+      console.log("  [SKIP] Windows：「只有 node 的 PATH」這個情境只在 POSIX 上搭得出來");
       continue;
     }
     const ctx = await runScenario(sc);

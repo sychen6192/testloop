@@ -263,11 +263,16 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，
   就是編得過但字串常值成了亂碼（maven-compiler-plugin 3.13 + JDK 21 印出 unmappable character 後照樣
   BUILD SUCCESS），斷言中文訊息的測試因此永遠對不上；而 agent 的編輯工具以 UTF-8 讀寫，改一個 MS950 的
-  既有測試檔會把裡面的中文默默換成別的字。loop 會處理兩件事：
-  writer 留下的非 ASCII 字元轉成 `\uXXXX`（字串值不變、編得過），以 MS950 存且含中文的既有測試檔不讓
-  writer 改——被改到就照原 bytes 還原並判該輪失敗，writer 改在新的測試類別（`<類別>AdditionalTest.java`）
-  補測試。如果專案的原始碼其實是 UTF-8、只是 pom 沒設，在 pom 加上
-  `<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>` 才是根本解法。
+  既有測試檔會把裡面的中文默默換成別的字。所以每個 agent session 之前，loop 把測試原始碼裡的非 ASCII
+  字元改寫成 Java 的 `\uXXXX` 跳脫（javac 最先處理這種跳脫，編譯結果完全相同），writer 與 reviewer 讀到的
+  是純 ASCII、怎麼讀寫都不會壞；session 結束後，沒改的檔拿回原本的 bytes 與修改時間，改過的檔「沒改的行
+  維持原本的 bytes、writer 寫的行以 MS950 存」（MS950 放不下的字存成 `\uXXXX`）——轉換用 JDK 本身的
+  charset，跟 javac 讀檔的是同一套，所以 writer 可以照常補強既有的中文測試檔，git diff 也只有它改的行。
+  找不到 JDK（`JAVA_HOME` 與 PATH 上都沒有 `javac`）時退回保守做法：writer 只寫 ASCII，含非 ASCII 字元的
+  既有測試檔不讓它改（被改到就照原 bytes 還原並判該輪失敗）。writer 寫進 U+FFFD（`�`，某個工具用錯編碼
+  讀檔時就已遺失的字）時該輪不進建置、點名檔案。編碼的來源依序是 pom（或 `build.gradle` 的
+  `options.encoding`）、建置 log 裡 Maven 寫的平台編碼、JDK 的預設編碼。如果專案的原始碼其實是 UTF-8、
+  只是 pom 沒設，在 pom 加上 `<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>` 才是根本解法。
 
 - **doctor 說 agent 找不到。** 回工具 clone 目錄執行 `npm run setup`。
 - **中途中止，說「writer 修改了測試範圍以外的檔案」。** writer 動了 production code、

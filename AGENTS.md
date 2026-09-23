@@ -106,9 +106,11 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    `libs/teststack.ts` 從目標模組 surefire 報告裡的 `surefire.test.class.path` 量出測試相依（JUnit 4/5、
    Mockito 版本與能否用 MockitoExtension / mock static、AssertJ、Java 語言層級），模組還沒跑過測試時退回
    讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath；`libs/encoding.ts` 量出 javac 讀原始碼的
-   編碼（pom，退回 build log 裡 Maven 自己寫的平台編碼）。非 UTF-8 時另有確定性護欄：writer 前後比對
-   非 UTF-8 的測試檔，有變動一律照原 bytes 還原並判該輪 FAIL（UTF-8 編輯工具會把 MS950 的中文默默換掉），
-   writer 留下的非 ASCII 字元轉成 `\uXXXX`（否則依工具鏈不是編不過，就是字串常值編成亂碼、中文斷言永遠對不上）。
+   編碼（pom，退回 build log 裡 Maven 自己寫的平台編碼，再退回 JDK 預設編碼）。非 UTF-8 時另有確定性護欄：
+   每個 agent session 前把 `src/test/java` 的非 ASCII 字元改寫成 `\uXXXX` 的 ASCII 形式（UTF-8 編輯工具會把
+   MS950 的中文默默換掉），session 後沒改的檔照原 bytes 與時間放回，改過的檔沒改的行維持原 bytes、新寫的行
+   由 JDK（`libs/java/Transcode.java`，與 javac 同一套 charset）存成模組編碼；writer 寫進 U+FFFD 或解不開的檔
+   被改到，該輪 FAIL。找不到 JDK 時退回保守做法：含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`。
    測試類別可見性**沒有**放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
    但跨 package 的 class-symbol 套件沒有 `public` 就編不過。禁止在 standards 或 prompt 裡
    寫死任一邊。
@@ -177,7 +179,8 @@ libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
 libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
-libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 writer 輸出護欄（\uXXXX 跳脫、原編碼檔還原）
+libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）
+libs/java/Transcode.java  JDK 轉碼器（decode / encode / probe；Java 8 相容，執行時編譯並快取在系統暫存目錄）
 scripts/selftest.ts   純邏輯自測＋架構不變式 assert
 scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
 scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼

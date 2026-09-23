@@ -84,9 +84,17 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    surefire 在每次執行的報告裡記錄了測試 classpath，Maven 在每次建置的 log 裡寫了它用的平台編碼。
    所以量它、寫進 prompt；量不到的（模組還沒跑過測試時的 pom 推斷）明說是推斷。編碼另有一道
    確定性的護欄，因為 prompt 攔不住工具：agent 的編輯工具以 UTF-8 讀寫，改一個 MS950 既有測試檔會把
-   裡面的中文（包括字串常值）默默變成別的字——所以非 UTF-8 的檔案在 writer 前後比對、有變動一律照原
-   bytes 還原並判該輪失敗；writer 自己留下的非 ASCII 字元則轉成 `\uXXXX`（javac 先處理 Unicode 跳脫，
-   字串值不變）。
+   裡面的中文（包括字串常值）默默變成別的字。第一版的做法是把這些檔「鎖住」——被改到就還原、叫 writer 另建
+   `<Class>AdditionalTest.java`——但那跟「既有測試檔一律直接補強、嚴禁另建」衝突，修復迴圈也永遠修不了一個
+   MS950 的紅燈檔。現在改成**換一個工具讀寫都不會壞的形式**：每個 agent session 前，`src/test/java` 裡含
+   非 ASCII 字元的檔換成 ASCII 視圖（每個非 ASCII 字元寫成 javac 最先處理的 `\uXXXX`，語意完全相同）；
+   session 後，沒改的檔照原 bytes 與修改時間放回（建置看不到變化），改過的檔逐行比對視圖——沒改的行放回
+   原 bytes、改過與新寫的行把跳脫寫回字元，交給 JDK 以模組編碼存檔（放不下的字寫成 `\uXXXX`）。轉換用 JDK
+   而不是 Node 的 decoder：MS950 與 WHATWG 的 big5 有差異，javac 用的是 JDK 的 charset，用同一套才不會在
+   邊角字上錯位；而跑 Maven 的機器一定有 JDK。細節：`\` 前面有奇數個反斜線時不會被當成跳脫的開頭
+   （`C:\資料`），那個反斜線寫成 `\u005c`；寫回字元時只動非 ASCII 的跳脫（`\u0022`、`\u005c` 對 lexer 有
+   意義）；U+FFFD 不存（那是某個工具讀錯編碼時就遺失的字），該輪失敗並點名。reviewer 也透過同一個視圖讀檔。
+   找不到 JDK 時退回第一版的保守做法。
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表

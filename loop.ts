@@ -55,7 +55,15 @@ import {
 } from "./libs/batch";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
 import { describeTestStack, measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
-import { isUtf8Name, measureSourceEncoding, SourceEncoding } from "./libs/encoding";
+import {
+  describeSourceEncoding,
+  findJdk,
+  isUtf8Name,
+  measureSourceEncoding,
+  refineSourceEncoding,
+  restoreOpenViews,
+  SourceEncoding,
+} from "./libs/encoding";
 import { installShutdownHandlers, onShutdown } from "./libs/shell";
 import { acquireRepoLock } from "./libs/lock";
 import { PreExistingFailures } from "./prompts";
@@ -259,7 +267,7 @@ async function main() {
   let sourceEncoding: SourceEncoding | undefined;
   const measureStack = (buildLog = "", since?: number) => {
     testStack = mergeTestStack(testStack, measureTestStack(mod, REPO_ROOT, buildLog, since));
-    sourceEncoding = measureSourceEncoding(mod, REPO_ROOT, buildLog) ?? sourceEncoding;
+    sourceEncoding = refineSourceEncoding(sourceEncoding, measureSourceEncoding(mod, REPO_ROOT, buildLog));
     fs.writeFileSync(
       path.join(runDir, "project-facts.json"),
       JSON.stringify({ testStack: testStack ?? null, sourceEncoding: sourceEncoding ?? null }, null, 2),
@@ -268,12 +276,15 @@ async function main() {
   const logFacts = () => {
     log(`測試相依：${describeTestStack(testStack)}`);
     if (sourceEncoding && !isUtf8Name(sourceEncoding.name)) {
+      const jdk = findJdk();
       log(
-        `[WARN] 原始碼編碼：${sourceEncoding.name}（${sourceEncoding.source === "pom" ? "pom 設定" : "pom 沒設定，Maven 用平台編碼"}）` +
-          "——writer 留下的非 ASCII 字元會轉成 \\uXXXX，以這個編碼存、含中文的既有測試檔不讓 writer 修改",
+        `[WARN] 原始碼編碼：${describeSourceEncoding(sourceEncoding)}` +
+          (jdk
+            ? `——測試檔以 \\uXXXX 的 ASCII 形式交給 writer 與 reviewer，寫回時以 ${sourceEncoding.name} 存（轉碼用 ${jdk.java}）`
+            : "——找不到 JDK 來轉換編碼：writer 留下的非 ASCII 字元會轉成 \\uXXXX，含非 ASCII 字元的既有測試檔不讓 writer 修改"),
       );
     } else if (sourceEncoding) {
-      log(`原始碼編碼：${sourceEncoding.name}`);
+      log(`原始碼編碼：${describeSourceEncoding(sourceEncoding)}`);
     }
   };
   if (SKIP_BASELINE && ALLOW_DIRTY_BASELINE) {
@@ -869,6 +880,9 @@ function repairHint(stopReason: string): string {
 let crashRunDir: string | undefined;
 
 main().catch((e) => {
+  // A test tree left in its ASCII view (libs/encoding.ts) goes back first; the batch rollback after
+  // it compares against what the batch started with.
+  restoreOpenViews();
   if (crashRunDir && !fs.existsSync(path.join(crashRunDir, "summary.json"))) {
     try {
       fs.writeFileSync(

@@ -280,28 +280,52 @@ ${rows}
 `;
 }
 
+export type EncodingMode = "transcode" | "protect";
+
 /**
- * A module compiled from a non-UTF-8 encoding, told to the writer. The loop already escapes what
- * the writer leaves outside ASCII and restores the files it cannot edit (libs/encoding.ts); this
- * is so the writer does not spend its rounds meeting either.
+ * A module compiled from a non-UTF-8 encoding, told to the writer (libs/encoding.ts). With a JDK
+ * the test sources are shown as an ASCII view and written back in the module's encoding, so the
+ * writer can read and edit them like any other; this is so it does not mistake the escapes for
+ * mojibake. Without one, what holds characters outside ASCII cannot be written back faithfully:
+ * the writer writes ASCII and leaves those files alone.
  */
-export function renderSourceEncoding(enc: SourceEncoding | undefined, locked: string[] = []): string {
+export function renderSourceEncoding(enc: SourceEncoding | undefined, locked: string[] = [], mode: EncodingMode = "transcode"): string {
   if (!enc || isUtf8Name(enc.name)) return "";
-  const why = enc.source === "pom" ? "pom 設定的編碼" : "pom 沒有設定，Maven 用了平台編碼";
-  const lines = [
-    `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8：`,
-    "- 你寫的測試碼只用 ASCII：註解、@DisplayName 一律用英文；字串常值需要中文等非 ASCII 字元時寫成 \\uXXXX" +
-      "（pipeline 會把殘留的非 ASCII 字元自動轉成 \\uXXXX 讓它編得過，但英文註解比一串跳脫字元好讀）",
-  ];
-  if (locked.length) {
-    lines.push(
-      `- 以下既有測試檔以 ${enc.name} 存、含非 ASCII 字元。你的工具以 UTF-8 讀寫，修改它們會破壞裡面的字元（字串常值也是），` +
-        "所以**不能修改**——pipeline 會還原並判該輪失敗。要補測試時，在同一個 package 另建新的測試類別（例如 <ClassName>AdditionalTest.java）：",
-      ...locked.slice(0, 20).map((f) => `  - ${f}`),
-      ...(locked.length > 20 ? [`  …另 ${locked.length - 20} 個`] : []),
-    );
-  }
+  const why = enc.source === "pom" ? "專案設定的編碼" : enc.source === "platform" ? "pom 沒有設定，Maven 用了平台編碼" : "沒有設定，JDK 的預設編碼";
+  const lockedLines = (reason: string) =>
+    locked.length
+      ? [
+          `- 以下既有測試檔${reason}，所以**不能修改**——被改到會還原並判該輪失敗。要補測試時，在同一個 package 另建新的測試類別（例如 <ClassName>AdditionalTest.java）：`,
+          ...locked.slice(0, 20).map((f) => `  - ${f}`),
+          ...(locked.length > 20 ? [`  …另 ${locked.length - 20} 個`] : []),
+        ]
+      : [];
+  const lines =
+    mode === "transcode"
+      ? [
+          `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8。為了讓你的工具讀寫正確，pipeline 已把測試檔裡` +
+            "的非 ASCII 字元（中文註解、字串）改寫成 Java 的 \\uXXXX 跳脫——同一個字元的另一種寫法，編譯結果完全相同，不是亂碼：",
+          "- 讀到的 \\uXXXX 照常引用、原樣保留；不要把它們當成亂碼去「修正」，也不要自己換成別的字",
+          `- 你要寫的中文可以直接寫：結束後 pipeline 以 ${enc.name} 存檔（${enc.name} 放不下的字存成 \\uXXXX），你沒改到的行維持原本的內容`,
+          ...lockedLines(`不是有效的 ${enc.name}，pipeline 無法轉換`),
+        ]
+      : [
+          `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8，而這台機器找不到 JDK 來轉換編碼：`,
+          "- 你寫的測試碼只用 ASCII：註解、@DisplayName 一律用英文；字串常值需要中文等非 ASCII 字元時寫成 \\uXXXX" +
+            "（pipeline 會把殘留的非 ASCII 字元自動轉成 \\uXXXX 讓它編得過，但英文註解比一串跳脫字元好讀）",
+          ...lockedLines(`以 ${enc.name} 存、含非 ASCII 字元，你的工具以 UTF-8 讀寫會破壞裡面的字元（字串常值也是）`),
+        ];
   return `${lines.join("\n")}\n`;
+}
+
+/** The same, for the reviewer: what it reads is the view, not how the author wrote it. */
+export function renderReviewEncoding(enc: SourceEncoding | undefined, mode: EncodingMode | undefined): string {
+  if (!enc || isUtf8Name(enc.name) || !mode) return "";
+  return mode === "transcode"
+    ? `注意：本模組原始碼以 ${enc.name} 編譯。測試檔裡的 \\uXXXX 是 pipeline 為了讓你讀對非 ASCII 字元（中文註解、字串）` +
+        "而做的跳脫，不是作者的寫法——請當成對應的字元看待，不要因此扣可讀性的分數或列為問題。\n\n"
+    : `注意：本模組原始碼以 ${enc.name} 存檔，你的工具以 UTF-8 讀取，檔案裡的中文可能顯示成亂碼——那是讀取方式的問題，` +
+        "不是測試本身的問題，不要因此扣分或列為問題。\n\n";
 }
 
 export function renderPreExisting(pre: PreExistingFailures | undefined): string {
@@ -330,6 +354,7 @@ export interface GeneratePromptInput {
   sourceEncoding?: SourceEncoding;
   // Repo-relative test files the writer must not edit (see renderSourceEncoding).
   lockedFiles?: string[];
+  encodingMode?: EncodingMode;
 }
 
 export function testRootRel(mod: ModuleInfo): string {
@@ -356,7 +381,7 @@ export function buildGeneratePrompt(input: GeneratePromptInput): string {
 目標類別：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
-${renderExistingTests(input.existingTests, input.lockedFiles, input.sourceEncoding?.name)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
+${renderExistingTests(input.existingTests, input.lockedFiles, input.sourceEncoding?.name)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}
 必須嚴格遵守以下品質標準：
 <standards>
 ${input.standards}
@@ -385,6 +410,7 @@ export interface FixPromptInput {
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
   lockedFiles?: string[];
+  encodingMode?: EncodingMode;
 }
 
 export function buildFixPrompt(input: FixPromptInput): string {
@@ -395,7 +421,7 @@ export function buildFixPrompt(input: FixPromptInput): string {
 ${input.gateReport}
 </gate_report>
 
-${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
+${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}
 本次任務的目標類別（測試範圍以此為準）：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
@@ -425,6 +451,7 @@ export interface RepairPromptInput {
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
   lockedFiles?: string[];
+  encodingMode?: EncodingMode;
 }
 
 // The repair loop's writer prompt. Its definition of "fixed" is the one the guards enforce:
@@ -441,7 +468,7 @@ ${input.brokenFiles.map((f) => `- ${f}`).join("\n")}
 ${input.report}
 </build_report>
 
-${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
+${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}
 修復的定義：讓測試**正確地通過**，不是讓它消失。以下由 pipeline 以確定性方式檢查，違反即判 FAIL 或中止：
 - 只能修改 ${root} 下的測試檔與 ${testResourcesRel(input.mod)} 下的測試資源；不得修改 production code、pom.xml / build.gradle 或其他任何檔案
 - 既有測試檔的 @Test 方法數與斷言數不得減少、不得新增讓測試略過的寫法（@Disabled、@Ignore、enabled = false、assumeTrue 之類）
@@ -479,6 +506,8 @@ export interface ReviewPromptInput {
   targetClasses: string[];
   rubric: string;
   mod: ModuleInfo;
+  sourceEncoding?: SourceEncoding;
+  encodingMode?: EncodingMode;
 }
 
 export function buildReviewPrompt(input: ReviewPromptInput): string {
@@ -494,7 +523,7 @@ export function buildReviewPrompt(input: ReviewPromptInput): string {
 ${pairs}
 （若實際測試檔名不同，請自行以 glob/grep 在該模組 src/test/java 下找到對應檔案。）
 
-審查依據為以下評分 rubric（分數帶與 Java 範例皆以此為準）：
+${renderReviewEncoding(input.sourceEncoding, input.encodingMode)}審查依據為以下評分 rubric（分數帶與 Java 範例皆以此為準）：
 <rubric>
 ${input.rubric}
 </rubric>

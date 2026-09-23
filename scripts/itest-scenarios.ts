@@ -93,12 +93,14 @@ const withClasspath = (xml: string, cp: string) =>
   xml.replace("<properties>", `<properties><property name="surefire.test.class.path" value="${cp}"/>`);
 // ExistingTest as a zh-TW Windows repo keeps it: MS950 bytes, "// 中文" (中 = A4 A4, 文 = A4 E5).
 const EXISTING_TEST_MS950 = [
-  ...Buffer.from(EXISTING_TEST.replace("class ExistingTest {", "// ")),
+  ...Buffer.from(`${EXISTING_TEST.split("class ExistingTest {")[0]}// `),
   0xa4, 0xa4, 0xa4, 0xe5,
   ...Buffer.from("\nclass ExistingTest {" + EXISTING_TEST.split("class ExistingTest {")[1]),
 ];
 const PLATFORM_MS950 =
   "[WARNING] Using platform encoding (MS950 actually) to copy filtered resources, i.e. build is platform dependent!\n";
+// What an agent tool reads of that file: every non-ASCII character as its \uXXXX escape.
+const EXISTING_VIEW = EXISTING_TEST.replace("class ExistingTest {", "// \\u4e2d\\u6587\nclass ExistingTest {");
 const JACOCO_GREETER = { pkg: "com/x", file: "Greeter.java", line: [0, 4] as [number, number], branch: [0, 4] as [number, number] };
 const GREETER_GREEN = {
   exit: 0,
@@ -143,7 +145,7 @@ class BrokenTest {
 }
 `;
 
-const FIXED_TEST = `package com.x;
+export const FIXED_TEST = `package com.x;
 
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -156,6 +158,8 @@ class BrokenTest {
     }
 }
 `;
+// BrokenTest as a zh-TW Windows repo keeps it: MS950, with a Chinese comment on its first line.
+const BROKEN_MS950 = [...Buffer.from("// "), 0xa4, 0xa4, 0xa4, 0xe5, ...Buffer.from(`\n${BROKEN_TEST}`)];
 
 const verdict = (o: {
   blockers?: string[];
@@ -1410,8 +1414,30 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "loop-encoding-platform-ms950",
-    desc: "pom 沒設編碼、Maven 用平台編碼 MS950：writer 的中文轉成 \\uXXXX；它用 UTF-8 改壞的 MS950 既有測試檔照原 bytes 還原、該輪 FAIL",
+    desc: "pom 沒設編碼、Maven 用平台編碼 MS950：writer 與 reviewer 讀到 \\uXXXX 形式的既有測試；沒改的行維持 MS950 原 bytes，writer 寫的中文以 MS950 存",
     entry: "loop",
+    jdk: true,
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      { toolCalls: [{ name: "read_file", args: { path: EXISTING_PATH } }] },
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料\n${calcTest(1)}` } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: EXISTING_VIEW.replace(/}\n$/, "    // 補一個測試\n}\n") } },
+        ],
+      },
+      { content: "已建立 CalcTest.java，也補了 ExistingTest" },
+      // The reviewer reads the file the writer extended, through the same view.
+      { toolCalls: [{ name: "read_file", args: { path: EXISTING_PATH } }] },
+      { content: verdict({}) },
+    ],
+    mvn: [{ ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) }, GREEN_BUILD],
+  },
+  {
+    name: "loop-encoding-no-jdk",
+    desc: "MS950 模組、找不到 JDK：無法轉換，含中文的既有測試檔不讓 writer 改（被 UTF-8 工具改壞就照原 bytes 還原、該輪 FAIL），writer 的中文轉成 \\uXXXX",
+    entry: "loop",
+    noJdk: true,
     env: { UT_SKIP_REVIEW: "1" },
     extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
     api: [
@@ -1426,6 +1452,78 @@ export const SCENARIOS: Scenario[] = [
       { content: "改寫在 CalcTest.java" },
     ],
     mvn: [{ ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) }, GREEN_BUILD],
+  },
+  {
+    name: "loop-encoding-replacement-char",
+    desc: "writer 寫進 U+FFFD（某個工具用錯編碼讀檔時就遺失的字）→ 該輪不進建置、點名檔案，連同上一輪的 gate 報告餵回",
+    entry: "loop",
+    jdk: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: `// \uFFFD\uFFFD\n${calcTest(2)}` } }] },
+      { content: "已修正" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: `// 兩數相加\n${calcTest(3)}` } }] },
+      { content: "已修正" },
+    ],
+    mvn: [
+      { ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) },
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [
+          { suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add", message: "expected: <3> but was: <4>", line: 9 }]) },
+        ],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-encoding-learned-from-build",
+    desc: "跳過預檢、JDK 預設是 UTF-8：第 1 輪不知道模組其實以 MS950 編譯；第 1 輪建置的 log 說了，第 2 輪就改用 MS950 的處理",
+    entry: "loop",
+    jdk: true,
+    env: { UT_SKIP_REVIEW: "1", UT_SKIP_BASELINE: "1" },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: `// 兩數相加\n${calcTest(2)}` } }] },
+      { content: "已修正" },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: PLATFORM_MS950 + TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [
+          { suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add", message: "expected: <3> but was: <4>", line: 9 }]) },
+        ],
+      },
+      { ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) },
+    ],
+  },
+  {
+    name: "loop-repair-ms950",
+    desc: "預檢紅燈在一個 MS950、含中文的既有測試檔：修復 writer 讀到 \\uXXXX 形式照常修好，中文那行維持原本的 bytes",
+    entry: "loop",
+    jdk: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraBytes: { [BROKEN_PATH]: BROKEN_MS950 },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: BROKEN_PATH, content: `// \\u4e2d\\u6587\n${FIXED_TEST}` } }] },
+      { content: "已修好 BrokenTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      { exit: 1, out: PLATFORM_MS950 + COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
+      GREEN_BUILD,
+      GREEN_BUILD,
+    ],
   },
   // ── Folder targets run as batches ──────────────────────────────────────────
   {

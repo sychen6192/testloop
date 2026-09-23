@@ -137,6 +137,10 @@ export interface Scenario {
   runsInRepo?: boolean;
   /** entry=loop: another live testgen already holds this repo's lock. */
   lockHeld?: boolean;
+  /** Needs a JDK (the encoding transcoder); skipped where there is none. */
+  jdk?: boolean;
+  /** Runs with no JDK to be found: JAVA_HOME empty, PATH holding only node (POSIX). */
+  noJdk?: boolean;
   mvn: MvnStep[];
 }
 
@@ -661,6 +665,19 @@ export function buildFixture(root: string, sc: Scenario): void {
 export function gitAvailable(): boolean {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A JDK where the loop looks for one (JAVA_HOME, else PATH): javac and java both answer. */
+export function jdkAvailable(): boolean {
+  const home = process.env.JAVA_HOME;
+  const tool = (name: string) => (home ? path.join(home, "bin", name) : name);
+  try {
+    execFileSync(tool("javac"), ["-version"], { stdio: "ignore" });
+    execFileSync(tool("java"), ["-version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;

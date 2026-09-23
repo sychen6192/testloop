@@ -60,7 +60,15 @@ import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } f
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
 import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
-import { captureNonUtf8Sources, isUtf8Name, repairWriterEncoding, SourceEncoding } from "./libs/encoding";
+import {
+  closeEncodingView,
+  describeSourceEncoding,
+  EncodingView,
+  measureSourceEncoding,
+  openEncodingView,
+  refineSourceEncoding,
+  SourceEncoding,
+} from "./libs/encoding";
 
 export interface OrchestratorConfig {
   targetClasses: string[];
@@ -97,52 +105,63 @@ function refineTestStack(stack: TestStack | undefined, mod: ModuleInfo, buildLog
   return merged;
 }
 
-// Around each writer session in a module whose sources are not UTF-8 (libs/encoding.ts): the
-// non-UTF-8 test files are captured before the session — the writer is told they cannot be edited,
-// and any change to them is undone after — and what the writer left outside ASCII is escaped.
-interface EncodingGuard {
-  encoding: SourceEncoding;
-  originals: Map<string, Buffer>;
-  /** Repo-relative, for the prompt. */
-  locked: string[];
+// Around each agent session in a module whose sources are not UTF-8 (libs/encoding.ts): the test
+// sources are shown as their ASCII view, and afterwards written back in the module's encoding.
+
+const relToRepo = (p: string) => path.relative(REPO_ROOT, p).replace(/\\/g, "/");
+
+/** Repo-relative, for the prompt: the files the session must leave alone. */
+function protectedList(view: EncodingView | undefined): string[] {
+  return view ? [...view.protectedFiles.keys()].map(relToRepo).sort() : [];
 }
 
-function encodingGuardBefore(enc: SourceEncoding | undefined, testRoot: string): EncodingGuard | undefined {
-  if (!enc || isUtf8Name(enc.name)) return undefined;
-  const originals = captureNonUtf8Sources(testRoot);
-  const locked = [...originals.keys()].map((p) => path.relative(REPO_ROOT, p).replace(/\\/g, "/")).sort();
-  return { encoding: enc, originals, locked };
-}
+const listFiles = (files: string[]) =>
+  [...files.slice(0, 20).map((f) => `  - ${relToRepo(f)}`), ...(files.length > 20 ? [`  …另 ${files.length - 20} 個`] : [])].join("\n");
 
-/** A failure report when files had to be put back, null otherwise. */
-function encodingGuardAfter(
-  guard: EncodingGuard | undefined,
-  writableTree: string,
-  rawChanged: string[],
-  save: (name: string, content: string) => void,
-): string | null {
-  if (!guard) return null;
-  const fix = repairWriterEncoding(
-    rawChanged.map((r) => path.join(writableTree, r)),
-    guard.originals,
-  );
-  const rel = (p: string) => path.relative(REPO_ROOT, p).replace(/\\/g, "/");
-  if (fix.escaped.length) {
+/**
+ * Closes the view after a writer session. A failure report when something could not be written
+ * back safely — the round then fails before any build — null otherwise.
+ */
+function encodingViewAfter(view: EncodingView | undefined, save: (name: string, content: string) => void): string | null {
+  if (!view) return null;
+  const r = closeEncodingView(view);
+  const name = view.encoding.name;
+  if (r.converted.length) {
     log(
-      `[${guard.encoding.name}] 已把 ${fix.escaped.length} 個測試檔裡的非 ASCII 字元轉成 \\uXXXX` +
-        `（模組原始碼以 ${guard.encoding.name} 編譯，UTF-8 的中文不是編不過、就是編成亂碼）`,
+      view.mode === "transcode"
+        ? `[${name}] writer 改寫的 ${r.converted.length} 個測試檔已以 ${name} 存檔（沒改到的行維持原本的內容）`
+        : `[${name}] 找不到 JDK：writer 寫的 ${r.converted.length} 個測試檔裡的非 ASCII 字元已轉成 \\uXXXX`,
     );
-    save("encoding-escaped.txt", fix.escaped.map(rel).join("\n"));
+    save("encoding-converted.txt", r.converted.map(relToRepo).join("\n"));
   }
-  if (!fix.restored.length) return null;
-  const list = fix.restored.map((f) => `  - ${rel(f)}`).join("\n");
-  save("encoding-restored.txt", fix.restored.map(rel).join("\n"));
-  log(`[FAIL] writer 改了以 ${guard.encoding.name} 存的既有測試檔，已還原（${fix.restored.length} 檔）——本輪判 FAIL，不進建置`);
-  return (
-    `以下既有測試檔以 ${guard.encoding.name} 編碼、含非 ASCII 字元（多半是中文）。你的工具以 UTF-8 讀寫它們，` +
-    `會把那些字元（包括字串常值）破壞掉，所以 pipeline 已把它們還原成原本的內容，本輪判 FAIL：\n${list}\n` +
-    "這些檔案不能修改。要補測試時，在同一個 package 另建新的測試類別（例如 <ClassName>AdditionalTest.java），只用 ASCII 撰寫。"
-  );
+  const problems: string[] = [];
+  if (r.restored.length) {
+    problems.push(
+      (view.mode === "transcode"
+        ? `以下測試檔不是有效的 ${name}，pipeline 無法安全轉換，`
+        : `以下測試檔以 ${name} 存、含非 ASCII 字元，而這台機器找不到 JDK 來轉換編碼，`) +
+        `你的工具改它們會破壞裡面的字元，所以已還原成原本的內容。這些檔案不能修改；要補測試時，在同一個 package 另建新的測試類別：\n${listFiles(r.restored)}`,
+    );
+  }
+  if (r.replacement.length) {
+    problems.push(
+      `以下測試檔含有 U+FFFD（�）——那是某個工具用錯的編碼讀檔時就已經遺失的字元，存進測試裡永遠是錯的。` +
+        `請把它們換回實際的字（或它的 \\uXXXX）：\n${listFiles(r.replacement)}`,
+    );
+  }
+  if (r.failed.length) problems.push(`以下測試檔無法轉成 ${name}（既有的已還原，新的保留原樣）：\n${listFiles(r.failed)}`);
+  if (!problems.length) return null;
+  const report = problems.join("\n\n");
+  save("encoding-report.txt", report);
+  log(`[FAIL] writer 的輸出有無法以 ${name} 安全存檔的內容——本輪判 FAIL，不進建置`);
+  return report;
+}
+
+// Measured again after every build: the build log is what says which encoding Maven fell back to.
+function refineEncoding(prev: SourceEncoding | undefined, next: SourceEncoding | undefined): SourceEncoding | undefined {
+  const merged = refineSourceEncoding(prev, next);
+  if (merged && prev?.name !== merged.name) log(`原始碼編碼：${describeSourceEncoding(merged)}`);
+  return merged;
 }
 
 // One row per iteration: which gate the round reached and how it ended.
@@ -240,6 +259,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   let lastVerdict: ReviewVerdict | undefined;
   let lastCov = "（尚未執行覆蓋率檢查）";
   let testStack = cfg.testStack;
+  let sourceEncoding = cfg.sourceEncoding;
+  // The last gate's report. A round that fails on the encoding never reaches a gate, and what the
+  // gate said before still has to be fixed: it goes along with the encoding report.
+  let gateFeedback: string | null = null;
   const funnel: IterationRecord[] = [];
   let totalOutputTokens: number | undefined;
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -293,7 +316,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const record = (rec: Omit<IterationRecord, "iter">) => funnel.push({ iter, ...rec });
     // A failed round: bound the report, persist it, and stop if it is the same failure as last
     // round (see feedbackFingerprint). Returns the abort result, or null to go on.
-    const failRound = (report: string, stuckMsg: string): OrchestratorResult | null => {
+    const failRound = (report: string, stuckMsg: string, fromGate = true): OrchestratorResult | null => {
+      if (fromGate) gateFeedback = report;
       // Bounded here as well as at the source, so the invariant holds whichever gate wrote
       // the report: the writer never receives more than MAX_FEEDBACK_CHARS *of report*, plus
       // clampText's short truncation notice when it had to cut. The notice is deliberate —
@@ -311,7 +335,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 1: generate or fix
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
-    const encGuard = encodingGuardBefore(cfg.sourceEncoding, testRoot);
+    const encView = openEncodingView(sourceEncoding, testRoot);
     const prompt = feedback
       ? buildFixPrompt({
           gateReport: feedback,
@@ -321,8 +345,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           preExisting: cfg.preExisting,
           conventions: cfg.conventions,
           testStack,
-          sourceEncoding: cfg.sourceEncoding,
-          lockedFiles: encGuard?.locked,
+          sourceEncoding,
+          encodingMode: encView?.mode,
+          lockedFiles: protectedList(encView),
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
@@ -331,14 +356,19 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           existingTests: cfg.existingTests,
           conventions: cfg.conventions,
           testStack,
-          sourceEncoding: cfg.sourceEncoding,
-          lockedFiles: encGuard?.locked,
+          sourceEncoding,
+          encodingMode: encView?.mode,
+          lockedFiles: protectedList(encView),
         });
     save("prompt.md", prompt);
 
     const before = snapshotTree(writableTree);
     const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
+    // Read off the tree before the view closes: closing it gives the untouched files their
+    // original bytes back, which would read as changes of their own.
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    const encodingReport = encodingViewAfter(encView, save);
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
     }
@@ -354,7 +384,6 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       );
     }
 
-    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     const changed = writerChanges(rawChanged);
     changed.forEach((f) => everWritten.add(f));
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
@@ -381,10 +410,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Before the no-op check and the shrink guard: putting a file back can undo the round's only
     // change, and a restored file has its original counts again.
-    const encodingReport = encodingGuardAfter(encGuard, writableTree, rawChanged, save);
     if (encodingReport) {
-      record({ gate: "writer", outcome: "encoding-restored", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
-      const stop = failRound(encodingReport, "連續兩輪修改同一批不能改的編碼檔，判定迴圈卡住，提前結束。");
+      record({ gate: "writer", outcome: "encoding", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      const stop = failRound(
+        gateFeedback ? `${encodingReport}\n\n上一輪 gate 的失敗報告（仍待處理）：\n${gateFeedback}` : encodingReport,
+        "連續兩輪得到相同的編碼問題，判定迴圈卡住，提前結束。",
+        false,
+      );
       if (stop) return stop;
       log("→ 帶著編碼報告進入下一輪");
       continue;
@@ -440,6 +472,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     });
     save("build.log", build.raw ?? build.report);
     testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
+    sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, build.raw ?? ""));
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
       record({
@@ -482,10 +515,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       log("Step 4/4：依設定跳過 review gate");
     } else {
       log("Step 4/4：執行品質 review gate");
+      // The reviewer reads through the same view: raw MS950 through a UTF-8 tool is mojibake.
+      const reviewView = openEncodingView(sourceEncoding, testRoot);
       const reviewPrompt = buildReviewPrompt({
         targetClasses: cfg.targetClasses,
         rubric: cfg.rubric,
         mod: cfg.mod,
+        sourceEncoding,
+        encodingMode: reviewView?.mode,
       });
       save("review-prompt.md", reviewPrompt);
 
@@ -495,14 +532,18 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // which is exactly how one reported run burned four rounds and 52 minutes of model time.
       // So the retries land on the reviewer, and an exhausted retry budget ends the run naming
       // the reviewer rather than blaming the tests.
-      for (let attempt = 1; attempt <= 1 + REVIEW_MAX_RETRIES; attempt++) {
-        verdict = await runReviewGate(cfg.runner, reviewPrompt);
-        save(attempt === 1 ? "verdict.json" : `verdict-attempt-${attempt}.json`, JSON.stringify(verdict, stripRaw, 2));
-        if (verdict.raw) save(attempt === 1 ? "review-raw.txt" : `review-raw-${attempt}.txt`, verdict.raw);
-        if (!isUnparseable(verdict)) break;
-        log(
-          `[WARN] reviewer 輸出無法解析（${verdict.parseError}）——第 ${attempt}/${1 + REVIEW_MAX_RETRIES} 次嘗試`,
-        );
+      try {
+        for (let attempt = 1; attempt <= 1 + REVIEW_MAX_RETRIES; attempt++) {
+          verdict = await runReviewGate(cfg.runner, reviewPrompt);
+          save(attempt === 1 ? "verdict.json" : `verdict-attempt-${attempt}.json`, JSON.stringify(verdict, stripRaw, 2));
+          if (verdict.raw) save(attempt === 1 ? "review-raw.txt" : `review-raw-${attempt}.txt`, verdict.raw);
+          if (!isUnparseable(verdict)) break;
+          log(
+            `[WARN] reviewer 輸出無法解析（${verdict.parseError}）——第 ${attempt}/${1 + REVIEW_MAX_RETRIES} 次嘗試`,
+          );
+        }
+      } finally {
+        if (reviewView) closeEncodingView(reviewView);
       }
       lastVerdict = verdict;
       // A reviewer that cannot run at all is the environment, exactly like a writer that cannot:
@@ -692,6 +733,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const touched = new Set<string>();
   let current = cfg.baseline;
   let testStack = cfg.testStack;
+  let sourceEncoding = cfg.sourceEncoding;
   const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
   let prevFingerprint: string | null = null;
 
@@ -761,7 +803,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       fs.writeFileSync(path.join(dir, name), content);
     banner(`修復既有紅燈 第 ${round}/${REPAIR_MAX_ITER} 輪`);
 
-    const encGuard = encodingGuardBefore(cfg.sourceEncoding, testRootForEncoding);
+    const encView = openEncodingView(sourceEncoding, testRootForEncoding);
     const prompt = buildRepairPrompt({
       brokenFiles: brokenList(current),
       report,
@@ -769,14 +811,17 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       mod: cfg.mod,
       round,
       testStack,
-      sourceEncoding: cfg.sourceEncoding,
-      lockedFiles: encGuard?.locked,
+      sourceEncoding,
+      encodingMode: encView?.mode,
+      lockedFiles: protectedList(encView),
     });
     save("prompt.md", prompt);
 
     const before = snapshotTree(writableTree);
     const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    const encodingReport = encodingViewAfter(encView, save);
     save("writer-summary.md", writer.text || "（writer 未回傳文字）");
     log(`[writer 總結] ${tail(writer.text, 1500)}`);
     if (writer.status === "spawn-error") {
@@ -787,7 +832,6 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       );
     }
 
-    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     const changed = writerChanges(rawChanged);
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
@@ -802,13 +846,13 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         round,
       );
     }
-    const encodingReport = encodingGuardAfter(encGuard, writableTree, rawChanged, save);
     if (encodingReport) {
-      report = clampText(encodingReport, MAX_FEEDBACK_CHARS);
+      // The build did not run: its last report still stands, and goes along.
+      report = clampText(`${encodingReport}\n\n上一次建置的失敗報告（仍待處理）：\n${describe(current)}`, MAX_FEEDBACK_CHARS);
       save("feedback.md", report);
       const fingerprint = feedbackFingerprint(report);
       if (prevFingerprint === fingerprint) {
-        return giveUp("stuck", `連續兩輪修改同一批不能改的編碼檔，判定迴圈卡住。\n${report}`, round);
+        return giveUp("stuck", `連續兩輪得到相同的編碼問題，判定迴圈卡住。\n${report}`, round);
       }
       prevFingerprint = fingerprint;
       continue;
@@ -844,7 +888,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       save("test-shrink.txt", shrinkReport);
       if (!ALLOW_TEST_SHRINK) {
         log(`[FAIL] 修復輪刪減了既有測試（${shrunk.length} 檔）——本輪判 FAIL，不進建置`);
-        report = clampText(shrinkReport, MAX_FEEDBACK_CHARS);
+        report = clampText(`${shrinkReport}\n\n上一次建置的失敗報告（仍待處理）：\n${describe(current)}`, MAX_FEEDBACK_CHARS);
         save("feedback.md", report);
         const fingerprint = feedbackFingerprint(report);
         if (prevFingerprint === fingerprint) {
@@ -860,6 +904,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
     save("build.log", current.raw);
     testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
+    sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, current.raw));
     save("build-summary.md", current.summary);
     console.log(current.summary);
     // A build that never finished locates nothing; carried on, it became "unlocatable" next round.

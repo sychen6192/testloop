@@ -44,11 +44,17 @@
   測試永遠對不上，writer 從失敗報告抄回正確的中文、再以 UTF-8 寫回，又是亂碼，以 stuck 收場（以真的
   Maven 專案重現）。而 prompt 是中文，writer 寫中文註解、字串或 `@DisplayName` 是常態。pom 沒設 `project.build.sourceEncoding` 的專案在繁中 Windows、JDK 17 以前也是
   MS950。更糟的是 agent 的編輯工具以 UTF-8 讀寫：改一個 MS950 既有測試檔，會把裡面的中文（字串常值
-  也是）默默換成別的字，而檔案照樣編得過。現在 loop 量出 javac 實際用的編碼（pom 設定，退回 Maven
-  在每次建置 log 裡寫的平台編碼），不是 UTF-8 時：prompt 告知只用 ASCII 並點名不能改的檔；writer 留下
-  的非 ASCII 字元轉成 `\uXXXX`（javac 先處理 Unicode 跳脫，字串值不變——以真的 Maven 專案在
-  `sourceEncoding=MS950` 下跑完整的 loop 驗證：三輪都轉換、建置通過、`gates-passed`）；非 UTF-8 的測試檔在 writer 前後比對，有變動一律照原 bytes 還原並判該輪
-  失敗，writer 改在新的測試類別補測試。修復迴圈同樣適用。UTF-8 或量不到時完全不介入。
+  也是）默默換成別的字，而檔案照樣編得過。現在 loop 量出 javac 實際用的編碼（pom 或 `build.gradle` 的設定，
+  屬性間接設定也解得開；退回 Maven 在建置 log 裡寫的平台編碼——多模組時取目標模組那一段；再退回 JDK 預設
+  編碼），不是 UTF-8 時，每個 writer 與 reviewer session 前把 `src/test/java` 的非 ASCII 字元改寫成 `\uXXXX`
+  的 ASCII 形式（javac 最先處理這種跳脫，語意完全相同），session 後沒改的檔照原 bytes 與修改時間放回，改過的檔
+  沒改的行維持原 bytes、writer 寫的行由 JDK（與 javac 同一套 charset）存成 MS950。所以 writer 可以照常補強
+  既有的中文測試檔、修復迴圈也修得了 MS950 的紅燈檔，git diff 只有它改的行。以真的 Maven 專案驗證：
+  `sourceEncoding=MS950`、production code 丟出中文例外訊息，writer 讀既有測試（讀到 `\uXXXX`）、以 UTF-8
+  補一個斷言中文訊息的測試——轉存成 MS950 後真的 javac 編出來相等，`gates-passed`，diff 只有 12 行新增。
+  writer 寫進 U+FFFD（某個工具讀錯編碼時就遺失的字）時該輪不進建置、點名檔案，連同上一輪還沒修的 gate
+  報告一起餵回。找不到 JDK 時退回保守做法（含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`）。
+  UTF-8 或量不到時完全不介入。
 - **公司網路支援：proxy 與 TLS 攔截**（`libs/proxy.ts`、`libs/tls.ts`，作法參考姊妹專案
   prloop 的實戰版本）。Node 內建的 fetch **完全無視** `HTTP_PROXY` / `HTTPS_PROXY`——curl、
   git、mvn 都吃，它不吃——所以在只能經 proxy 出去的網路上，症狀是一個沒頭沒尾的
@@ -122,6 +128,8 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **修復迴圈被防掏空擋下的那一輪，下一輪 writer 看不到還有哪些紅燈。** 刪減報告取代了建置的失敗報告，
+  writer 補回被刪的測試之後，對原本要修的紅燈一無所知。現在兩份一起餵回。
 - **次數、上限這類設定給了小數時照單全收。** `UT_API_MAX_TOKENS=4096.5` 原封不動送到模型端點，被當成不合法
   的 `max_tokens` 拒絕；`UT_BATCH_SIZE=1.5` 則默默變成一批一個。現在 12 個整數設定給了小數就在啟動時 FATAL。
 - **幾個 run 同時碰到同一個過期的 repo 鎖時，偶爾有兩個都執行。** 接手時讀到的鎖若剛好不存在（上一個
