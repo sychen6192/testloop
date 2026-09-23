@@ -22,6 +22,8 @@ import {
   writerScopeSkip,
   testClassNames,
   stripAnsi,
+  codelessTypeReason,
+  splitForeignChanges,
 } from "../libs/utils";
 import {
   resolveAgentPath,
@@ -31,7 +33,7 @@ import {
   REVIEWER_RULES,
 } from "../libs/guard";
 import { parseJacocoReport, toRanges, missedLines, reportIsStale } from "../gates/coverage";
-import { parseVerdict, runReviewGate } from "../gates/review";
+import { parseVerdict, runReviewGate, jsonObjectCandidates } from "../gates/review";
 import {
   buildFixPrompt,
   buildGeneratePrompt,
@@ -59,11 +61,25 @@ import { loadRubric } from "../libs/rubric";
 import { isUnparseable, zeroToolCallVerdict, spawnErrorVerdict } from "../gates/review";
 import { ScoreThresholds } from "../config";
 import { AgentRunner } from "../libs/types";
-import { traceEvent, buildInvocation } from "../runners/opencode";
-import { ApiRunner } from "../runners/api";
+import { traceEvent, buildInvocation, OpencodeRunner } from "../runners/opencode";
+import {
+  ApiRunner,
+  classifyHttpFailure,
+  compactHistory,
+  looksLikeToolCallText,
+  completionFromSse,
+  normalizeToolName,
+  textOf,
+  unusableCompletion,
+  parseContextOverflow,
+  retryAfterMs,
+} from "../runners/api";
+import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
-import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree } from "../libs/shell";
-import { spawn } from "node:child_process";
+import { acquireRepoLock, repoLockFile } from "../libs/lock";
+import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
+import { classifyEnvFailures, readSurefireXml, isSurefireSummary, crashedTestClasses, unfinishedTestClasses } from "../gates/build";
+import { spawn, spawnSync } from "node:child_process";
 import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { bundleFrom, caSummary, load, sourcePaths } from "../libs/tls";
@@ -343,7 +359,7 @@ console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / 
   fs.mkdirSync(path.join(repo, ".opencode", "agent"), { recursive: true });
   fs.mkdirSync(path.join(globalDir, "agent"), { recursive: true });
   const writerFm =
-    "---\ntools:\n  write: true\n  edit: true\n  bash: false\n  webfetch: false\n---\nbody";
+    "---\ntools:\n  write: true\n  edit: true\n  bash: false\n  webfetch: false\n  task: false\n---\nbody";
   fs.writeFileSync(path.join(repo, ".opencode", "agent", "ut-writer.md"), writerFm);
   fs.writeFileSync(path.join(globalDir, "agent", "ut-writer.md"), writerFm);
   fs.writeFileSync(
@@ -364,10 +380,21 @@ console.log("\n[6] resolveAgentPath / contractViolations / skillDirCandidates / 
   const badWriter = path.join(tmp, "bad-writer.md");
   fs.writeFileSync(
     badWriter,
-    "---\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n---\n",
+    "---\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n  task: false\n---\n",
   );
   const errs = contractViolations(badWriter, WRITER_RULES);
   check("writer 拿到 bash → 違規", errs.length === 1 && errs[0].includes("bash"));
+  const taskOpen = path.join(tmp, "task-writer.md");
+  fs.writeFileSync(taskOpen, "---\ntools:\n  write: true\n  edit: true\n  bash: false\n  webfetch: false\n---\n");
+  const taskErrs = contractViolations(taskOpen, WRITER_RULES);
+  check(
+    "writer 沒有關掉 task → 違規（subagent 拿得到 bash，等於繞過 bash: false）",
+    taskErrs.length === 1 && taskErrs[0].includes("tools.task"),
+    JSON.stringify(taskErrs),
+  );
+  const reviewerTask = path.join(tmp, "task-reviewer.md");
+  fs.writeFileSync(reviewerTask, "---\ntools:\n  write: false\n  edit: false\n  bash: false\n  webfetch: false\n  task: true\n---\n");
+  check("reviewer 開著 task → 違規（subagent 可寫檔，不是唯讀）", contractViolations(reviewerTask, REVIEWER_RULES).some((e) => e.includes("tools.task")));
 
   const cands = skillDirCandidates("/repo", "/tool", undefined);
   check(
@@ -585,9 +612,16 @@ console.log("\n[10] planKill / killTree（逾時終止整棵程序樹）");
     const alive = (pid: number) => {
       try {
         process.kill(pid, 0);
-        return true;
       } catch {
         return false;
+      }
+      // A killed grandchild is re-parented to PID 1 and stays a zombie until PID 1 reaps it, and
+      // signal 0 still succeeds on a zombie. A container whose init reaps lazily (measured: 1-3s)
+      // made this report a dead process as alive. Linux only; elsewhere signal 0 has the last word.
+      try {
+        return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+      } catch {
+        return true;
       }
     };
     check("killTree 前置：孫程序確實活著", alive(grandchildPid), `pid ${grandchildPid}`);
@@ -609,6 +643,68 @@ console.log("\n[10] planKill / killTree（逾時終止整棵程序樹）");
       }
     })());
   }
+}
+
+// ---------------------------------------------------------------------------
+// 10b. The parent process must outlive its console and its terminal
+// ---------------------------------------------------------------------------
+console.log("\n[10b] 行程生命週期（管線關閉、終端斷線、殘留程序占住輸出、被 signal 終止）");
+if (process.platform !== "win32") {
+  const loader = new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
+  const logTs = new URL("../libs/log.ts", import.meta.url).href;
+  const shellTs = new URL("../libs/shell.ts", import.meta.url).href;
+  const runNode = (code: string, shellCmd: (node: string) => string) =>
+    new Promise<{ code: number | null; signal: string | null; err: string }>((res) => {
+      const node = `${JSON.stringify(process.execPath)} --import ${loader} --input-type=module -e ${JSON.stringify(code)}`;
+      const c = spawn("sh", ["-c", shellCmd(node)], { stdio: ["ignore", "ignore", "pipe"] });
+      let err = "";
+      c.stderr.setEncoding("utf8");
+      c.stderr.on("data", (d: string) => (err += d));
+      c.on("close", (code, signal) => res({ code, signal, err }));
+    });
+
+  // The reader of `| tee` goes away mid-run: the next log line must not kill the run. The node
+  // side reports through a file, since its stdout is the dead pipe.
+  const st = path.join(os.tmpdir(), `testgen-epipe-${process.pid}`);
+  await runNode(
+    `const { log } = await import(${JSON.stringify(logTs)});` +
+      `await new Promise(r => setTimeout(r, 300));` +
+      `for (let i = 0; i < 200; i++) log("x".repeat(200));` +
+      `await new Promise(r => setTimeout(r, 100));` +
+      `(await import("node:fs")).writeFileSync(${JSON.stringify(st)}, "survived");`,
+    (node) => `${node} | head -c 1 >/dev/null`,
+  );
+  check("log()：stdout 的讀取端消失（EPIPE）後 run 繼續，不以未捕捉例外結束", fs.existsSync(st) && fs.readFileSync(st, "utf8") === "survived");
+  fs.rmSync(st, { force: true });
+
+  // SIGHUP without a terminal on stdin (nohup / setsid / CI) is not a request to stop — node
+  // resets nohup's SIG_IGN, so this handler is the only thing that keeps such a run alive.
+  const hup = await runNode(
+    `const { installShutdownHandlers } = await import(${JSON.stringify(shellTs)});` +
+      `installShutdownHandlers();` +
+      `setTimeout(() => process.exit(0), 1500);` +
+      `setTimeout(() => process.kill(process.pid, "SIGHUP"), 200);`,
+    (node) => `${node} </dev/null`,
+  );
+  check("SIGHUP（stdin 不是終端機，nohup / CI）：run 不中斷", hup.code === 0 && hup.signal === null, JSON.stringify(hup));
+  const term = await runNode(
+    `const { installShutdownHandlers, onShutdown } = await import(${JSON.stringify(shellTs)});` +
+      `installShutdownHandlers();` +
+      `onShutdown((r) => process.stderr.write("hook:" + r));` +
+      `setTimeout(() => process.exit(0), 1500);` +
+      `setTimeout(() => process.kill(process.pid, "SIGTERM"), 200);`,
+    (node) => `${node} </dev/null`,
+  );
+  check("SIGTERM：以 143 結束，結束前跑 onShutdown（寫 summary 用）", term.code === 143 && term.err.includes("hook:SIGTERM"), JSON.stringify(term));
+
+  // A build that exits but leaves a process holding its stdout must not hold the gate forever.
+  if (spawnSync("sh", ["-c", "command -v setsid"]).status === 0) {
+    const t0 = Date.now();
+    const r = await shLive("sh", ["-c", "setsid sleep 20 & echo built; exit 0"], "[t]", os.tmpdir(), 0);
+    check("shLive：建置結束後有殘留程序占住輸出，數秒內仍會返回", r.code === 0 && r.out.includes("built") && Date.now() - t0 < 10_000, `${Date.now() - t0}ms code=${r.code}`);
+  }
+  const sig = await shLive("sh", ["-c", "kill -9 $$"], "[t]", os.tmpdir(), 0);
+  check("shLive：被 signal 終止時回報是哪個 signal（OOM killer 不是測試失敗）", sig.signal === "SIGKILL", JSON.stringify(sig));
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +759,7 @@ console.log("\n[11] 迴圈強化（writer 變更偵測 / 未覆蓋行 / fix prom
   const deceptive = path.join(tmp2, "agent.md");
   fs.writeFileSync(
     deceptive,
-    "---\ndescription: bash: false 只是描述\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n---\nbody",
+    "---\ndescription: bash: false 只是描述\ntools:\n  write: true\n  edit: true\n  bash: true\n  webfetch: false\n  task: false\n---\nbody",
   );
   const errs = contractViolations(deceptive, WRITER_RULES);
   check(
@@ -1641,6 +1737,310 @@ console.log("\n[18] api runner（api-tools 權限 + 假 transport 的 tool loop�
   const o8 = await new ApiRunner({ ...base, fetchImpl: denied }).runWriter("x");
   check("ApiRunner：401 不重試、判 spawn-error", o8.status === "spawn-error" && hits === 1, `hits=${hits}`);
 
+  // --- mid-run failures (reported: runs stopping half-way "for no reason") ------------------
+  // One runner per run, as loop.ts creates it. `script` answers each request in order; after
+  // the list runs out, every request gets the last entry.
+  const sequenced = (script: Array<number | Record<string, unknown>>) => {
+    let n = 0;
+    const f: typeof fetch = async () => {
+      const step = script[Math.min(n++, script.length - 1)];
+      if (typeof step === "number") return new Response('{"error":{"message":"overloaded"}}', { status: step });
+      return reply(step);
+    };
+    return { f, calls: () => n };
+  };
+  const ok = { role: "assistant", content: "done" };
+
+  const burst = sequenced([ok, 503, 503, 503, 503, ok]);
+  const rb = new ApiRunner({ ...base, fetchImpl: burst.f });
+  await rb.runWriter("round 1");
+  const burstOut = await rb.runWriter("round 2");
+  check(
+    "ApiRunner：端點回應過之後，session 開頭連續 4 次 503 → 重試到恢復，不是 spawn-error",
+    burstOut.status === "ok" && burstOut.text === "done" && burst.calls() === 6,
+    `${JSON.stringify(burstOut)} calls=${burst.calls()}`,
+  );
+
+  const never = sequenced([503]);
+  const neverOut = await new ApiRunner({ ...base, fetchImpl: never.f }).runWriter("x");
+  check(
+    "ApiRunner：端點從未回應過 → 快速試 3 次就判 spawn-error（網址或 proxy 設錯要秒報）",
+    neverOut.status === "spawn-error" && never.calls() === 3,
+    `${neverOut.status} calls=${never.calls()}`,
+  );
+
+  const outage = sequenced([ok, 503]);
+  const ro2 = new ApiRunner({ ...base, fetchImpl: outage.f, retryWindowMs: 0 });
+  await ro2.runWriter("round 1");
+  const outageOut = await ro2.runWriter("round 2");
+  check(
+    "ApiRunner：回應過之後持續失敗（超過重試窗）→ timeout 而非 spawn-error（不得中止整個 run 並叫人裝 opencode）",
+    outageOut.status === "timeout",
+    JSON.stringify(outageOut),
+  );
+  check("ApiRunner：UT_AGENT_RETRY_WINDOW_MS=0 → 回應過之後真的不重試（文件說 0 = 不重試）", outage.calls() === 2, `calls=${outage.calls()}`);
+  const longOutage = sequenced([ok, ...Array(25).fill(503), ok]);
+  const rLong = new ApiRunner({ ...base, fetchImpl: longOutage.f, retryWindowMs: 10 * 60 * 60 * 1000 });
+  await rLong.runWriter("round 1");
+  const longOut = await rLong.runWriter("round 2");
+  check(
+    "ApiRunner：重試窗設很長（10 小時）時不被寫死的次數上限提早結束（連續 25 次 503 後恢復）",
+    longOut.status === "ok" && longOutage.calls() === 27,
+    `${longOut.status} calls=${longOutage.calls()}`,
+  );
+
+  const revoked = sequenced([ok, 401]);
+  const rr = new ApiRunner({ ...base, fetchImpl: revoked.f });
+  await rr.runWriter("round 1");
+  check("ApiRunner：回應過之後遇到 401 → 仍是 spawn-error（金鑰是設定問題）", (await rr.runWriter("round 2")).status === "spawn-error");
+
+  const bodies: Body[] = [];
+  let overflowed = false;
+  const bigRead = "x".repeat(3000);
+  fs.writeFileSync(path.join(repo, "modA/src/main/java/com/x/Big.java"), bigRead);
+  const ctxFetch: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    bodies.push(b);
+    const n = b.messages.filter((m) => m.role === "tool").length;
+    if (n < 2) return reply({ role: "assistant", content: null, tool_calls: [call(`r${n}`, "read_file", { path: "modA/src/main/java/com/x/Big.java" })] });
+    if (!overflowed) {
+      overflowed = true;
+      return new Response(
+        JSON.stringify({ object: "error", message: "This model's maximum context length is 8000 tokens. However, you requested 9000 tokens (5000 in the messages, 4000 in the completion)." }),
+        { status: 400 },
+      );
+    }
+    return reply({ role: "assistant", content: "wrote it" });
+  };
+  const ctxOut = await new ApiRunner({ ...base, fetchImpl: ctxFetch, maxTokens: 4000 }).runWriter("x");
+  const retried = bodies[bodies.length - 1];
+  const toolMsgs = retried.messages.filter((m) => m.role === "tool");
+  check("ApiRunner：context 滿了 → 縮短對話後繼續，session 正常完成", ctxOut.status === "ok" && ctxOut.text === "wrote it", JSON.stringify(ctxOut));
+  check(
+    "ApiRunner：縮短的是較早的工具結果，最近一次的結果原封不動",
+    toolMsgs.length === 2 && String(toolMsgs[0].content).includes("已省略") && toolMsgs[1].content === bigRead,
+    JSON.stringify(toolMsgs.map((m) => String(m.content).slice(0, 40))),
+  );
+  check(
+    "ApiRunner：縮短後 tool_call_id 配對不變（伺服器會拒絕沒有對應呼叫的 tool 訊息）",
+    toolMsgs[0].tool_call_id === "r0" && toolMsgs[1].tool_call_id === "r1",
+  );
+  check("ApiRunner：縮短不動 system 與任務 prompt", retried.messages[0].role === "system" && retried.messages[1].content === "x");
+
+  const fitBodies: Body[] = [];
+  let fitOverflowed = false;
+  const fitFetch: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    fitBodies.push(b);
+    if (!fitOverflowed) {
+      fitOverflowed = true;
+      return new Response(
+        JSON.stringify({ message: "'max_tokens' is too large: 8192. This model's maximum context length is 16384 tokens and your request has 9000 input tokens (8192 > 16384 - 9000)." }),
+        { status: 400 },
+      );
+    }
+    return reply({ role: "assistant", content: "fits" });
+  };
+  const fitOut = await new ApiRunner({ ...base, fetchImpl: fitFetch, maxTokens: 8192 }).runReview("審查");
+  check(
+    "ApiRunner：沒有可省略的內容時，把 max_tokens 降到伺服器說得下的量（16384-9000-32）",
+    fitOut.status === "ok" && (fitBodies[1] as unknown as { max_tokens: number }).max_tokens === 16384 - 9000 - 32,
+    JSON.stringify({ status: fitOut.status, max: (fitBodies[1] as unknown as { max_tokens?: number })?.max_tokens }),
+  );
+
+  const hopeless: typeof fetch = async () =>
+    new Response(JSON.stringify({ message: "This model's maximum context length is 4096 tokens. However, your request has 9000 input tokens." }), { status: 400 });
+  const hopelessOut = await new ApiRunner({ ...base, fetchImpl: hopeless }).runWriter("x");
+  check(
+    "ApiRunner：prompt 本身就塞不下且無可省略 → 如實結束，不無限重送",
+    hopelessOut.status !== "ok",
+    JSON.stringify(hopelessOut),
+  );
+
+  // Headers arrive, the body never does: a dead connection mid-response. The deadline used to
+  // be cleared at the headers, so this waited forever with the heartbeat still ticking.
+  const stalled: typeof fetch = async (_u, init) => {
+    const signal = init?.signal as AbortSignal;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"choices":'));
+        signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+      },
+    });
+    return new Response(stream, { status: 200 });
+  };
+  const t0 = Date.now();
+  const stallOut = await new ApiRunner({ ...base, fetchImpl: stalled, timeoutMs: 400 }).runWriter("x");
+  check(
+    "ApiRunner：回應 body 卡住 → 在 session 期限內逾時結束，不會永遠掛著",
+    stallOut.status === "timeout" && Date.now() - t0 < 5000,
+    `${stallOut.status} after ${Date.now() - t0}ms`,
+  );
+
+  // max_tokens cut the write_file off mid-arguments: vLLM returns the fragment as text.
+  const cutBodies: Body[] = [];
+  let cutSent = 0;
+  const cutFetch: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    cutBodies.push(b);
+    if (cutSent++ === 0) {
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: "assistant", content: '<tool_call>\n{"name": "write_file", "arguments": {"path": "x", "content": "' + "z".repeat(5000) }, finish_reason: "length" }] }),
+        { status: 200 },
+      );
+    }
+    return reply({ role: "assistant", content: "寫好了" });
+  };
+  const cutOut = await new ApiRunner({ ...base, fetchImpl: cutFetch }).runWriter("x");
+  const nudge = cutBodies[1]?.messages[cutBodies[1].messages.length - 1];
+  check("ApiRunner：finish_reason=length 的回覆不是答案 → 告訴模型被截斷、session 繼續", cutOut.status === "ok" && cutOut.text === "寫好了", JSON.stringify(cutOut));
+  check("ApiRunner：截斷提示以 user 訊息送出並要求改小步驟", nudge?.role === "user" && String(nudge.content).includes("截斷") && String(nudge.content).includes("replace_in_file"));
+  check("ApiRunner：半截內容回送前先裁短（不把 context 花在碎片上）", String(cutBodies[1]?.messages[cutBodies[1].messages.length - 2]?.content).length < 2000);
+
+  const alwaysCut: typeof fetch = async () =>
+    new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "<tool_call>{" }, finish_reason: "length" }] }), { status: 200 });
+  const acOut = await new ApiRunner({ ...base, fetchImpl: alwaysCut }).runWriter("x");
+  check("ApiRunner：一直被截斷 → 有上限，且不報 ok（writer 什麼都沒寫）", acOut.status === "timeout", JSON.stringify(acOut));
+
+  // A gateway's 200 that carries no completion is a failed request, not an empty answer.
+  let gwHits = 0;
+  const gatewayFetch: typeof fetch = async () => {
+    gwHits++;
+    if (gwHits === 2) return new Response('{"error":{"message":"upstream request timeout","code":504}}', { status: 200 });
+    if (gwHits === 3) return new Response('{"choices":[]}', { status: 200 });
+    return reply({ role: "assistant", content: "after the outage" });
+  };
+  const rg = new ApiRunner({ ...base, fetchImpl: gatewayFetch });
+  await rg.runWriter("reach");
+  const gwOut = await rg.runWriter("x");
+  check(
+    "ApiRunner：200 但內容是閘道錯誤 / 空 choices → 重試，不是模型的空答案",
+    gwOut.status === "ok" && gwOut.text === "after the outage" && gwHits === 4,
+    `${JSON.stringify(gwOut)} hits=${gwHits}`,
+  );
+
+  const reasoningNew: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    if (!b.messages.some((m) => m.role === "tool")) {
+      return reply({ role: "assistant", content: null, tool_calls: [call("r1", "read_file", { path: "modA/src/main/java/com/x/Foo.java" })] });
+    }
+    return reply({ role: "assistant", content: [{ type: "text", text: "" }], reasoning: '{"scores":{"a":1}}' });
+  };
+  const rnOut = await new ApiRunner({ ...base, fetchImpl: reasoningNew }).runReview("審查");
+  check("ApiRunner：答案在 message.reasoning（新版 vLLM / Ollama 的欄位名）也讀得到", rnOut.status === "ok" && rnOut.text.includes('"scores"'), JSON.stringify(rnOut));
+
+  // What goes back must be acceptable to a strict server: an id on every call, JSON-object args.
+  const echoBodies: Body[] = [];
+  const badEcho: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    echoBodies.push(b);
+    if (echoBodies.length === 1) {
+      return reply({
+        role: "assistant",
+        content: "",
+        tool_calls: [{ type: "function", function: { name: "functions.write_file", arguments: '{"path": "modA/src/test/java/X.java", "content": "a "quoted" b"}' } }],
+      });
+    }
+    return reply({ role: "assistant", content: "ok" });
+  };
+  await new ApiRunner({ ...base, fetchImpl: badEcho }).runWriter("x");
+  const echoed = echoBodies[1].messages.find((m) => m.role === "assistant") as Record<string, any>;
+  const answered = echoBodies[1].messages.find((m) => m.role === "tool") as Record<string, any>;
+  check(
+    "ApiRunner：回送的 tool call 一定有 id、arguments 一定是合法 JSON（vLLM ≤0.11 會對整段對話回 400）",
+    typeof echoed.tool_calls[0].id === "string" && echoed.tool_calls[0].id.length > 0 && echoed.tool_calls[0].function.arguments === "{}",
+    JSON.stringify(echoed.tool_calls),
+  );
+  check("ApiRunner：tool 訊息的 tool_call_id 對得上回送的 id", answered.tool_call_id === echoed.tool_calls[0].id);
+  check("ApiRunner：模型沒逃脫的引號照樣回報為參數錯誤", String(answered.content).includes("不是合法 JSON"), String(answered.content));
+
+  const alwaysCutArgs: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: { role: "assistant", content: "", tool_calls: [{ id: "t", type: "function", function: { name: "write_file", arguments: '{"path":"a","content":"cut' } }] },
+            finish_reason: "length",
+          },
+        ],
+      }),
+      { status: 200 },
+    );
+  const acaOut = await new ApiRunner({ ...base, fetchImpl: alwaysCutArgs }).runWriter("x");
+  check("ApiRunner：tool call 參數一直被截斷 → 有上限（不會燒完 60 回合）", acaOut.status === "timeout" && (acaOut.toolCallCount ?? 0) <= 4, JSON.stringify(acaOut));
+
+  // A request that fails only after running longer than the whole window still gets retried.
+  let slowHits = 0;
+  const slowFail: typeof fetch = async () => {
+    slowHits++;
+    if (slowHits === 2) {
+      await new Promise((r) => setTimeout(r, 60));
+      return new Response("gateway timeout", { status: 504 });
+    }
+    return reply({ role: "assistant", content: "fine" });
+  };
+  const rsf = new ApiRunner({ ...base, fetchImpl: slowFail, retryWindowMs: 10 });
+  await rsf.runWriter("reach");
+  const sfOut = await rsf.runWriter("x");
+  check("ApiRunner：跑了比重試窗還久才 504 的請求照樣重試一次（窗從第一次失敗起算）", sfOut.status === "ok" && slowHits === 3, `${JSON.stringify(sfOut)} hits=${slowHits}`);
+
+  // Cut off now and then, recovering each time: not a run of failures.
+  let alt = 0;
+  const altCut: typeof fetch = async () => {
+    alt++;
+    if (alt > 8) return reply({ role: "assistant", content: "all written" });
+    if (alt % 2 === 1) {
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: "assistant", content: "", tool_calls: [{ id: `t${alt}`, type: "function", function: { name: "write_file", arguments: '{"path":"a","content":"cut' } }] }, finish_reason: "length" }] }),
+        { status: 200 },
+      );
+    }
+    return reply({ role: "assistant", content: null, tool_calls: [call(`w${alt}`, "write_file", { path: "modA/src/test/java/com/x/Alt.java", content: "class Alt {}" })] });
+  };
+  const altOut = await new ApiRunner({ ...base, fetchImpl: altCut }).runWriter("x");
+  check("ApiRunner：截斷與成功交替出現 → 不是「連續」截斷，session 照常完成", altOut.status === "ok" && altOut.text === "all written", JSON.stringify(altOut));
+
+  // The reviewer's cut-off answer is asked to be shorter, not split into writes it cannot make.
+  const revCutBodies: Body[] = [];
+  const revCut: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    revCutBodies.push(b);
+    if (revCutBodies.length === 1) return reply({ role: "assistant", content: null, tool_calls: [call("r", "read_file", { path: "modA/src/main/java/com/x/Foo.java" })] });
+    if (revCutBodies.length === 2) {
+      return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: '{"scores":{"a":1}} 以下補充說明' }, finish_reason: "length" }] }), { status: 200 });
+    }
+    return reply({ role: "assistant", content: '{"scores":{"a":1}}' });
+  };
+  await new ApiRunner({ ...base, fetchImpl: revCut }).runReview("審查");
+  const revNudge = String(revCutBodies[2]?.messages[revCutBodies[2].messages.length - 1]?.content ?? "");
+  check("ApiRunner：reviewer 的回覆被截斷 → 要它縮短，不叫它用它沒有的 write_file", revNudge.includes("截斷") && !revNudge.includes("write_file"), revNudge);
+
+  // The reviewer is never compacted: a verdict must rest on what it actually read.
+  const revCtxBodies: Body[] = [];
+  const revCtx: typeof fetch = async (_u, init) => {
+    const b = JSON.parse(String(init?.body)) as Body;
+    revCtxBodies.push(b);
+    const n = b.messages.filter((m) => m.role === "tool").length;
+    if (n < 2) return reply({ role: "assistant", content: null, tool_calls: [call(`rr${n}`, "read_file", { path: "modA/src/main/java/com/x/Big.java" })] });
+    return new Response(JSON.stringify({ message: "This model's maximum context length is 4000 tokens. However, your request has 9000 input tokens." }), { status: 400 });
+  };
+  const revCtxOut = await new ApiRunner({ ...base, fetchImpl: revCtx }).runReview("審查");
+  check(
+    "ApiRunner：reviewer 的 context 滿了不省略它讀過的檔案（判決不能建立在「已省略」上）→ 未完成",
+    revCtxOut.status === "timeout" && revCtxBodies.every((b) => b.messages.every((m) => !String(m.content ?? "").includes("已省略"))),
+    JSON.stringify(revCtxOut),
+  );
+
+  let retryAfterHits = 0;
+  const limited: typeof fetch = async () => {
+    retryAfterHits++;
+    if (retryAfterHits === 2) return new Response("slow down", { status: 429, headers: { "retry-after": "0" } });
+    return reply({ role: "assistant", content: "ok" });
+  };
+  const rl = new ApiRunner({ ...base, fetchImpl: limited });
+  await rl.runWriter("reach");
+  check("ApiRunner：429 帶 Retry-After → 照等後重試成功", (await rl.runWriter("x")).status === "ok" && retryAfterHits === 3, `hits=${retryAfterHits}`);
+
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
@@ -1889,6 +2289,554 @@ console.log("\n[22] 架構不變式（AGENTS.md 硬規則的可執行版本）")
   const undocumentedReadme = knobs.filter((k) => !readme.includes(k));
   check(`${knobs.length} 個 UT_* 全部寫進 .env.example`, undocumentedEnv.length === 0, undocumentedEnv.join(", "));
   check("UT_* 全部寫進 README", undocumentedReadme.length === 0, undocumentedReadme.join(", "));
+}
+
+// ---------------------------------------------------------------------------
+// 23. Mid-run interruptions: failure classification, context compaction, code-less targets
+// ---------------------------------------------------------------------------
+console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒有程式碼的目標）");
+{
+  const vllmOld = parseContextOverflow(
+    "This model's maximum context length is 32768 tokens. However, you requested 33000 tokens (24808 in the messages, 8192 in the completion).",
+  );
+  check("parseContextOverflow：vLLM（舊）", vllmOld.limit === 32768 && vllmOld.used === 24808, JSON.stringify(vllmOld));
+  const vllmNew = parseContextOverflow(
+    "'max_tokens' or 'max_completion_tokens' is too large: 8192. This model's maximum context length is 32768 tokens and your request has 25000 input tokens (8192 > 32768 - 25000).",
+  );
+  check("parseContextOverflow：vLLM（新）", vllmNew.limit === 32768 && vllmNew.used === 25000, JSON.stringify(vllmNew));
+  const openai = parseContextOverflow("This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens.");
+  check("parseContextOverflow：OpenAI", openai.limit === 8192 && openai.used === 9000, JSON.stringify(openai));
+  const tgi = parseContextOverflow("Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096. Given: 3000 `inputs` tokens and 2000 `max_new_tokens`");
+  check("parseContextOverflow：TGI", tgi.limit === 4096 && tgi.used === 3000, JSON.stringify(tgi));
+  const llama = parseContextOverflow('{"error":{"code":400,"message":"the request exceeds the available context size","type":"exceed_context_size_error","n_prompt_tokens":5000,"n_ctx":4096}}');
+  check("parseContextOverflow：llama.cpp", llama.limit === 4096 && llama.used === 5000, JSON.stringify(llama));
+
+  check("classifyHttpFailure：400 + context 字樣 → context", classifyHttpFailure(400, "maximum context length is 4096 tokens") === "context");
+  check("classifyHttpFailure：422 TGI → context", classifyHttpFailure(422, "`inputs` tokens + `max_new_tokens` must be <= 4096") === "context");
+  check("classifyHttpFailure：400 其他 → rejected（不重試）", classifyHttpFailure(400, "invalid tool schema") === "rejected");
+  check("classifyHttpFailure：401/403/404 → config", ["config", "config", "config"].join() === [401, 403, 404].map((c) => classifyHttpFailure(c, "")).join());
+  check(
+    "classifyHttpFailure：408/429/500/502/503/504 → transient",
+    [408, 429, 500, 502, 503, 504].every((c) => classifyHttpFailure(c, "") === "transient"),
+  );
+  check("retryAfterMs：秒數", retryAfterMs("7") === 7000);
+  check("retryAfterMs：HTTP 日期", retryAfterMs(new Date(1_000_000 + 5000).toUTCString(), 1_000_000) === 5000);
+  check("retryAfterMs：沒有 / 亂碼 → undefined", retryAfterMs(null) === undefined && retryAfterMs("soon") === undefined);
+
+  const specsAll = toolsFor(false);
+  check("looksLikeToolCallText：hermes 的 <tool_call> 標記", looksLikeToolCallText('<tool_call>\n{"name":"write_file"', specsAll));
+  check("looksLikeToolCallText：裸 JSON 呼叫已知工具", looksLikeToolCallText('{"name": "read_file", "arguments": {"path": "a"}}', specsAll));
+  check("looksLikeToolCallText：一般文字 / 判決 JSON 不算", !looksLikeToolCallText('已完成。{"scores":{"coverage":8},"blockers":[]}', specsAll));
+
+  check("unusableCompletion：{error} 是失敗的請求", unusableCompletion({ error: { message: "upstream request timeout" } })?.includes("upstream") === true);
+  check("unusableCompletion：空 choices / 沒有 message", unusableCompletion({ choices: [] }) !== null && unusableCompletion({ choices: [{}] }) !== null);
+  check("unusableCompletion：正常的 completion", unusableCompletion({ choices: [{ message: { content: "x" } }] }) === null);
+  const sse = completionFromSse(
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n' +
+      'data: {"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\\"pa"}}]}}]}\n\n' +
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\"a\\"}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n',
+  );
+  const sseMsg = sse?.choices?.[0].message;
+  check(
+    "completionFromSse：閘道強制串流時把 delta 拼回一則訊息（內容、tool call、finish_reason）",
+    sseMsg?.content === "Hello" && sseMsg.tool_calls?.[0].id === "c1" && sseMsg.tool_calls?.[0].function?.arguments === '{"path":"a"}' && sse?.choices?.[0].finish_reason === "tool_calls",
+    JSON.stringify(sse),
+  );
+  check("completionFromSse：一般 JSON 不是 SSE", completionFromSse('{"choices":[]}') === null);
+  check(
+    "completionFromSse：串流中的 error 事件 → 失敗的請求，不是空答案",
+    unusableCompletion(completionFromSse('data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"error":{"message":"upstream timeout"}}\n\n')) !== null,
+  );
+  check(
+    "completionFromSse：沒有 finish_reason 也沒有 [DONE] 就斷了 → 失敗的請求",
+    unusableCompletion(completionFromSse('data: {"choices":[{"delta":{"content":"half an ans"}}]}\n\n')) !== null,
+  );
+  check("textOf：陣列形式的 content", textOf([{ type: "text", text: "a" }, { type: "image_url" }, { type: "text", text: "b" }]) === "ab");
+  check("normalizeToolName：functions. 前綴與 <|…|> 尾巴", normalizeToolName("functions.write_file") === "write_file" && normalizeToolName("read_file<|call|>") === "read_file");
+
+  const VERDICT = '{"scores":{"effectiveness":9,"coverage":9,"independence":9,"readability":9,"fast_reliable":9,"mock_appropriateness":9},"blockers":[],"advisories":[]}';
+  const shapes: Array<[string, string]> = [
+    ["<think> 裡有程式碼的大括號", `<think>看 totalCents() { if (x) { return 1; } }</think>\n${VERDICT}`],
+    ["只有 </think>（Qwen3 的模板把 <think> 放在 prompt 裡）", `先想一下 { a: b } …</think>\n\n${VERDICT}`],
+    ["判決後面加了帶大括號的註解", `${VERDICT}\n\n註：可再補 { null, "  " } 的情境`],
+    ["字串內含大括號", VERDICT.replace('"advisories":[]', '"advisories":["考慮 {} 與 \\"}\\" 的情況"]')],
+  ];
+  for (const [label, text] of shapes) {
+    const v = parseVerdict(text);
+    check(`parseVerdict：${label} → 讀得到判決`, !v.parseError && v.passed, v.parseError ?? "");
+  }
+  check("parseVerdict：真的沒有判決 → 照樣 fail-closed", parseVerdict("<think>{ x }</think>我覺得不錯").parseError !== undefined);
+  const blocked = VERDICT.replace('"blockers":[]', '"blockers":["FooTest.save_ok：只有 assertNotNull"]');
+  check(
+    "parseVerdict：兩個內容不同的判決（草稿＋最終、每檔一個）→ fail-closed，不得挑一個而丟掉另一個的 blocker",
+    parseVerdict(`${blocked}\n${VERDICT}`).parseError !== undefined && parseVerdict(`[${blocked},${VERDICT}]`).parseError !== undefined,
+  );
+  check("parseVerdict：同一個判決重複貼兩次 → 不算歧義", !parseVerdict(`${VERDICT}\n再附一次：${VERDICT}`).parseError);
+  check(
+    "parseVerdict：判決前的說明裡有一個沒閉合的 {（`void save() {`）→ 照樣找到判決",
+    !parseVerdict(`測試方法 \`void save() {\` 什麼都沒斷言，但整體可接受。\n${VERDICT}`).parseError,
+  );
+  check(
+    "parseVerdict：判決包在另一個帶 blockers 的物件裡 → 不得單取內層而丟掉外層的 blocker",
+    parseVerdict(`{"blockers":["FooTest.save_ok：只有 assertNotNull"],"detail":${VERDICT}}`).passed === false,
+  );
+  check(
+    "parseVerdict：沒閉合的 { 之後有兩個不同判決 → 照樣 fail-closed",
+    parseVerdict(`\`void save() {\`\n${blocked}\n${VERDICT}`).parseError !== undefined,
+  );
+  check("jsonObjectCandidates：依序列出頂層物件", JSON.stringify(jsonObjectCandidates('a {"x":1} b {"y":{"z":2}}')) === JSON.stringify(['{"x":1}', '{"y":{"z":2}}']));
+
+  // compactHistory on a hand-built conversation
+  const big = "y".repeat(5000);
+  const msgs: Array<Record<string, unknown>> = [
+    { role: "system", content: big },
+    { role: "user", content: big },
+    { role: "assistant", content: "", tool_calls: [{ id: "a", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "p", content: big }) } }] },
+    { role: "tool", tool_call_id: "a", name: "write_file", content: "已寫入 p" },
+    { role: "assistant", content: "", tool_calls: [{ id: "b", type: "function", function: { name: "read_file", arguments: '{"path":"q"}' } }] },
+    { role: "tool", tool_call_id: "b", name: "read_file", content: big },
+    { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "read_file", arguments: '{"path":"r"}' } }] },
+    { role: "tool", tool_call_id: "c", name: "read_file", content: big },
+  ];
+  const done = new Set<Record<string, unknown>>();
+  const freed = compactHistory(msgs, done);
+  const writeArgs = JSON.parse(String((msgs[2].tool_calls as Array<{ function: { arguments: string } }>)[0].function.arguments));
+  check("compactHistory：較早的 read 結果被省略", String(msgs[5].content).includes("已省略") && freed > 9000, `freed=${freed}`);
+  check("compactHistory：較早 write_file 的檔案內容被省略、arguments 仍是合法 JSON 且保留 path", writeArgs.path === "p" && String(writeArgs.content).includes("已省略"));
+  check("compactHistory：最近一輪（剛要的結果）原封不動", msgs[7].content === big);
+  check("compactHistory：system 與任務 prompt 不動", msgs[0].content === big && msgs[1].content === big);
+  check("compactHistory：短的結果不值得省略", msgs[3].content === "已寫入 p");
+  check("compactHistory：同一則不重複計算（第二次回 0）", compactHistory(msgs, done) === 0);
+  const partial: Array<Record<string, unknown>> = [
+    msgs[0], msgs[1],
+    { role: "assistant", content: "", tool_calls: [] },
+    { role: "tool", tool_call_id: "x1", name: "read_file", content: big },
+    { role: "tool", tool_call_id: "x2", name: "read_file", content: big },
+    { role: "assistant", content: "", tool_calls: [] },
+  ];
+  compactHistory(partial, new Set(), 1000);
+  check("compactHistory：有目標量時只省略到夠用為止（由舊到新）", String(partial[3].content).includes("已省略") && partial[4].content === big);
+
+  // Code-less targets: verified against JaCoCo 0.8.12, which writes these self-closing.
+  check("codelessTypeReason：只有抽象方法的 interface", codelessTypeReason("package a;\n/** {x} */\npublic interface Port { int rate(String r); }") !== null);
+  check("codelessTypeReason：annotation", codelessTypeReason("package a;\npublic @interface Ann { String value() default \"{x}\"; }") === "annotation");
+  check(
+    "codelessTypeReason：Feign 式 interface（字串裡的 { 不算）",
+    codelessTypeReason('@FeignClient(name = "x")\npublic interface Api { @GetMapping("/u/{id}") User get(@PathVariable("id") long id); }') !== null,
+  );
+  check("codelessTypeReason：default method → 有程式碼", codelessTypeReason("public interface P { default int two() { return 2; } }") === null);
+  check("codelessTypeReason：interface 常數 → 保守視為可能有程式碼", codelessTypeReason("public interface P { java.util.List<String> L = java.util.List.of(); }") === null);
+  check("codelessTypeReason：class / enum / record → null", ["public class A {}", "public enum E { X }", "public record R(int x) {}"].every((c) => codelessTypeReason(c) === null));
+  check("codelessTypeReason：註解裡的 interface 字樣不算", codelessTypeReason("// this interface is old\npublic class A { void f() {} }") === null);
+
+  // JaCoCo writes code-less types self-closing. Both parser paths must read that as "nothing to
+  // cover", and the <class> fallback must not run on into the next class's counters.
+  const MIN = { line: 80, branch: 70 };
+  const selfClosing =
+    `<report><package name="com/x">` +
+    `<class name="com/x/Port" sourcefilename="Port.java"/>` +
+    `<class name="com/x/Foo" sourcefilename="Foo.java"><method name="a" desc="()V"><counter type="LINE" missed="9" covered="0"/></method>` +
+    `<counter type="LINE" missed="9" covered="0"/></class>` +
+    `<sourcefile name="Port.java"/>` +
+    `<sourcefile name="Foo.java"><counter type="LINE" missed="9" covered="0"/></sourcefile>` +
+    `</package></report>`;
+  const sc1 = parseJacocoReport(selfClosing, ["m/src/main/java/com/x/Port.java"], MIN);
+  check("parseJacocoReport：自我閉合的 <sourcefile/> → 無可執行程式碼，不擋 gate", sc1.passed && sc1.lines[0].includes("沒有可執行的程式碼"), sc1.lines.join(" | "));
+  const noSf = selfClosing.replace(/<sourcefile[\s\S]*?(?=<\/package>)/, "");
+  const sc2 = parseJacocoReport(noSf, ["m/src/main/java/com/x/Port.java"], MIN);
+  check(
+    "parseJacocoReport：<class .../> 退路不得讀到下一個類別的計數（Foo 的 0% 不是 Port 的）",
+    sc2.passed && !sc2.lines[0].includes("0.0%"),
+    sc2.lines.join(" | "),
+  );
+  const noDebug =
+    `<report><package name="com/x"><sourcefile name="Nd.java">` +
+    `<counter type="INSTRUCTION" missed="40" covered="0"/><counter type="METHOD" missed="2" covered="0"/>` +
+    `</sourcefile></package></report>`;
+  const nd = parseJacocoReport(noDebug, ["m/src/main/java/com/x/Nd.java"], MIN);
+  check("parseJacocoReport：沒有行號資訊（-g:none）的類別以 instruction 覆蓋率代替，0% 照樣 FAIL", !nd.passed && nd.lines[0].includes("0.0%"), nd.lines.join(" | "));
+  const sc3 = parseJacocoReport(selfClosing, ["m/src/main/java/com/x/Foo.java"], MIN);
+  check("parseJacocoReport：旁邊有 code-less 類別時，真的 0% 照樣 FAIL", !sc3.passed && sc3.lines[0].includes("0.0%"), sc3.lines.join(" | "));
+
+  const twoPkgs =
+    `<report><package name="com/a"><sourcefile name="Util.java"><counter type="LINE" missed="9" covered="1"/></sourcefile></package>` +
+    `<package name="com/b"><sourcefile name="Util.java"><counter type="LINE" missed="0" covered="10"/></sourcefile></package></report>`;
+  const np = parseJacocoReport(twoPkgs, ["mod/src/java/com/b/Util.java"], MIN, () => "com/b");
+  check("parseJacocoReport：非 src/main/java 佈局以 package 宣告定位，不拿別的 package 的同名檔", np.passed && np.lines[0].includes("100.0%"), np.lines.join(" | "));
+
+  // --- the repo changes under the snapshot walk ---------------------------------------------
+  const fsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-fsrace-"));
+  fs.mkdirSync(path.join(fsRoot, "out/classes/p1"), { recursive: true });
+  fs.writeFileSync(path.join(fsRoot, "out/classes/p1/A.class"), "x");
+  fs.writeFileSync(path.join(fsRoot, "keep.txt"), "k");
+  let vanished = false;
+  let snapOk = true;
+  try {
+    // An IDE deleting the directory between the parent's listing and this one: skipDir runs
+    // exactly in that window, so it can play the IDE.
+    snapshotTree(fsRoot, {
+      skipDir: (rel) => {
+        if (rel === "out/classes/p1") {
+          fs.rmSync(path.join(fsRoot, "out/classes/p1"), { recursive: true, force: true });
+          vanished = true;
+        }
+        return false;
+      },
+    });
+  } catch {
+    snapOk = false;
+  }
+  check("snapshotTree：走訪途中目錄被刪掉（IDE 重建輸出）→ 不崩潰", vanished && snapOk);
+  if (process.platform === "linux") {
+    fs.mkdirSync(Buffer.from(path.join(fsRoot, "docs/") + "\xb3\x57\xae\xe6", "latin1"), { recursive: true });
+    let big5Ok = true;
+    let snap: Record<string, string> = {};
+    try {
+      snap = snapshotTree(fsRoot);
+    } catch {
+      big5Ok = false;
+    }
+    check("snapshotTree：Big5 命名的目錄（Node 解碼後路徑不存在）→ 不崩潰，且結果穩定", big5Ok && JSON.stringify(snap) === JSON.stringify(snapshotTree(fsRoot)));
+    const fifo = path.join(fsRoot, "pipe.txt");
+    if (spawnSync("mkfifo", [fifo]).status === 0) {
+      const t0f = Date.now();
+      const r = execTool("read_file", { path: "pipe.txt" }, { repoRoot: fsRoot, maxResultChars: 1000 }, toolsFor(true));
+      check("api read_file：FIFO 不讀（readFileSync 會卡死整個 event loop，連逾時都不會觸發）", r.includes("不是一般檔案") && Date.now() - t0f < 1000, r);
+    }
+  }
+  const skipOwned = writerScopeSkip(fsRoot, fsRoot, [path.join(fsRoot, "testgen-runs")]);
+  check("writerScopeSkip：repo 內的 runs 目錄是 loop 自己的，不列入 writer 範圍檢查", skipOwned("testgen-runs", "testgen-runs") && !skipOwned("testgen-runs2", "testgen-runs2"));
+  check("writerScopeSkip：repo 外的 runs 目錄不影響判斷", !writerScopeSkip(fsRoot, fsRoot, ["/elsewhere/runs"])("elsewhere", "elsewhere"));
+  if (process.platform !== "win32") {
+    // The path typed to reach the module differs from the one the walk sees — on Windows and macOS
+    // by case (`shop` vs `Shop`), anywhere by a symlink. The writable tree must be the walked one.
+    fs.mkdirSync(path.join(fsRoot, "Shop", "src", "test"), { recursive: true });
+    fs.symlinkSync(path.join(fsRoot, "Shop"), path.join(fsRoot, "shop-link"));
+    const viaLink = writerScopeSkip(fsRoot, path.join(fsRoot, "shop-link"));
+    check("writerScopeSkip：模組以不同於磁碟上的路徑（大小寫／symlink）指定 → 可寫範圍仍對得上實際走訪到的目錄", viaLink("Shop/src/test", "test"));
+  }
+  fs.rmSync(fsRoot, { recursive: true, force: true });
+
+  // --- red builds the classifier used to call "unlocatable" -------------------------------------
+  const crashLog = [
+    "[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?",
+    "[ERROR] Crashed tests:",
+    "[ERROR] com.x.ExitTest",
+    "[ERROR] com.x.Other$Inner",
+    "[ERROR] -> [Help 1]",
+  ].join("\n");
+  check("crashedTestClasses：System.exit 讓 fork 結束時，從 Crashed tests 讀出類別", JSON.stringify(crashedTestClasses(crashLog)) === JSON.stringify(["com.x.ExitTest", "com.x.Other$Inner"]), JSON.stringify(crashedTestClasses(crashLog)));
+  const hangLog = "[INFO] Running com.x.A\n[INFO] Tests run: 1, Failures: 0 -- in com.x.A\n[INFO] Running com.x.Hang\n";
+  check("unfinishedTestClasses：逾時當下還沒跑完的測試類別", JSON.stringify(unfinishedTestClasses(hangLog)) === JSON.stringify(["com.x.Hang"]));
+  const javacNoise =
+    "[INFO] Running com.x.GeneratedSourceTest\ntarget/gen/Broken.java:3: error: ';' expected\n[INFO] Tests run: 1, Failures: 0";
+  check("extractCompileErrorFiles（maven）：測試自己印出的 javac 訊息不是編譯錯誤", extractCompileErrorFiles(javacNoise, "maven").length === 0);
+  check("extractCompileErrorFiles（gradle）：javac 形狀照樣認得", extractCompileErrorFiles(javacNoise, "gradle").length === 1);
+  check(
+    "extractCompileErrorFiles（maven on Windows）：`/C:/…` 的 URI 形狀還原成磁碟路徑（否則模組自己的測試被判範圍外、不進修復）",
+    JSON.stringify(extractCompileErrorFiles("[ERROR] /C:/Users/me/repo/src/test/java/com/x/FooTest.java:[3,8] cannot find symbol", "maven")) ===
+      JSON.stringify(["C:/Users/me/repo/src/test/java/com/x/FooTest.java"]),
+  );
+
+  // --- the foreign-change exemption must not reach build files or an ancestor's ignore rules ----
+  if (spawnSync("git", ["--version"]).status !== 0) {
+    console.log("  [SKIP] 找不到 git——splitForeignChanges 要一個真的 git repo 才測得到");
+  } else {
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+    const g = (cwd: string, ...a: string[]) => spawnSync("git", a, { cwd, env: gitEnv, stdio: "ignore" });
+    const gr = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-foreign-"));
+    g(gr, "init", "-q");
+    fs.writeFileSync(path.join(gr, ".gitignore"), "logs/\nlombok.config\nprojects/\n");
+    const own = splitForeignChanges(gr, ["logs/app.log", "lombok.config", "src/main/resources/local.yml", "README.md"]);
+    check(
+      "splitForeignChanges：git-ignored 的 logs/ 算別人的；被 ignore 的 lombok.config（建置會讀）與 src/ 底下照樣算",
+      JSON.stringify(own.foreign) === JSON.stringify(["logs/app.log"]),
+      JSON.stringify(own),
+    );
+    const nested = path.join(gr, "projects", "app");
+    fs.mkdirSync(nested, { recursive: true });
+    const inside = splitForeignChanges(nested, ["logs/app.log", "pom.xml", "notes.txt"]);
+    check(
+      "splitForeignChanges：repo 位在把它整個 ignore 掉的上層 repo 裡 → 一律不豁免",
+      inside.foreign.length === 0 && inside.kept.length === 3,
+      JSON.stringify(inside),
+    );
+    fs.writeFileSync(path.join(gr, ".gitignore"), "logs/\nlombok.config\nprojects/\nconfig/\napplication-local.yml\nout/\n*.mv.db\n");
+    const cfg = splitForeignChanges(gr, [
+      "svc/config/application.yml",
+      "application-local.yml",
+      "out/production/Calc.class",
+      "data/app.mv.db",
+      "logs/app.log",
+    ]);
+    check(
+      "splitForeignChanges：被 ignore 的 ./config/application.yml、./application-local.yml（Spring 從工作目錄載入）照樣算；只有輸出形狀的才豁免",
+      JSON.stringify(cfg.kept) === JSON.stringify(["svc/config/application.yml", "application-local.yml"]) && cfg.foreign.length === 3,
+      JSON.stringify(cfg),
+    );
+    const many = Array.from({ length: 20000 }, (_, i) => `logs/run-${i}.log`);
+    check("splitForeignChanges：兩萬個 ignored 檔（IDE 重建輸出）也判得出來（輸出超過 1MB）", splitForeignChanges(gr, many).foreign.length === 20000);
+    const noGit = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-nogit-"));
+    check("splitForeignChanges：不是 git repo → 一律不豁免", splitForeignChanges(noGit, ["logs/a.log"]).foreign.length === 0);
+    fs.rmSync(gr, { recursive: true, force: true });
+    fs.rmSync(noGit, { recursive: true, force: true });
+  }
+
+  // A timeout beyond setTimeout's range fires at once instead of never.
+  const tsxBin = path.join(TESTGEN_ROOT, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+  // config.ts as the entry point evaluates numEnv at load. planSpawn quotes the tsx.cmd shim for
+  // cmd.exe, as itest's runTsx does: a bare `shell: true` split a clone path containing a space.
+  const hugePlan = planSpawn(tsxBin, [path.join(TESTGEN_ROOT, "config.ts")]);
+  const huge = spawnSync(hugePlan.file, hugePlan.args, {
+    cwd: TESTGEN_ROOT,
+    env: { ...process.env, UT_AGENT_TIMEOUT_MS: "99999999999" },
+    encoding: "utf8",
+    windowsVerbatimArguments: hugePlan.windowsVerbatimArguments,
+  });
+  check(
+    "numEnv：UT_AGENT_TIMEOUT_MS 超過 setTimeout 上限 → 啟動就 FATAL（否則每個 agent 會立刻被殺）",
+    huge.status === 1 && /UT_AGENT_TIMEOUT_MS/.test(huge.stderr),
+    `status=${huge.status} ${huge.stderr.slice(0, 200)}`,
+  );
+
+  // --- the repo lock under a race: several runs finding the same stale lock at once -----------
+  if (process.platform !== "win32") {
+    const lockRepo = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-lockrace-"));
+    const lockFile = repoLockFile(fs.realpathSync.native(lockRepo));
+    const dead = spawnSync(process.execPath, ["-e", "0"]);
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: dead.pid, runDir: "an earlier run that crashed" }));
+    const go = path.join(lockRepo, "go");
+    const child = path.join(lockRepo, "child.ts");
+    fs.writeFileSync(
+      child,
+      `import * as fs from "node:fs";
+import { acquireRepoLock } from ${JSON.stringify(path.join(TESTGEN_ROOT, "libs", "lock.ts"))};
+console.log("READY");
+while (!fs.existsSync(${JSON.stringify(go)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+const busy = acquireRepoLock(${JSON.stringify(lockRepo)}, "run-" + process.pid);
+console.log(busy ? "BUSY" : "GOT");
+setTimeout(() => process.exit(0), 1500);
+`,
+    );
+    const kids = Array.from({ length: 8 }, () => spawn(tsxBin, [child], { cwd: TESTGEN_ROOT }));
+    const outs = kids.map((k) => {
+      let o = "";
+      k.stdout?.on("data", (d) => (o += d));
+      return { get: () => o, done: new Promise((r) => k.on("exit", r)) };
+    });
+    const deadline = Date.now() + 60_000;
+    while (outs.some((o) => !o.get().includes("READY")) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    fs.writeFileSync(go, "");
+    await Promise.all(outs.map((o) => o.done));
+    const got = outs.filter((o) => o.get().includes("GOT")).length;
+    const busy = outs.filter((o) => o.get().includes("BUSY")).length;
+    check(
+      "repo 鎖：8 個 run 同時發現同一個過期的鎖 → 只有一個接手，其餘都看到它在執行（不得兩個都跑）",
+      got === 1 && busy === 7,
+      `GOT=${got} BUSY=${busy}`,
+    );
+    check("repo 鎖：接手用的暫時鎖沒有殘留", !fs.existsSync(`${lockFile}.takeover`));
+    // The pid is alive but belongs to something else now; the run that held it finished.
+    const stranger = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"]);
+    const finishedRun = path.join(lockRepo, "old-run");
+    fs.mkdirSync(finishedRun);
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: stranger.pid, runDir: finishedRun }));
+    check("repo 鎖：持有者 pid 還活著但 artifacts 還沒有 summary.json → 視為執行中", acquireRepoLock(lockRepo, "new")?.pid === stranger.pid);
+    fs.writeFileSync(path.join(finishedRun, "summary.json"), "{}");
+    check("repo 鎖：持有者的 run 已寫出 summary.json（pid 被別的程序重用）→ 接手，不得永遠擋住", acquireRepoLock(lockRepo, "new") === undefined);
+    stranger.kill("SIGKILL");
+    fs.rmSync(lockRepo, { recursive: true, force: true });
+    fs.rmSync(lockFile, { force: true });
+  }
+
+  // --- build output that outgrows memory ------------------------------------------------------
+  // Scripts go in files, not `node -e`: on Windows shLive runs through cmd.exe, which would
+  // re-parse the quotes in an inline script (and split an execPath containing spaces).
+  const node = process.platform === "win32" ? "node" : process.execPath;
+  const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-sh-"));
+  const script = (name: string, body: string) => {
+    const f = path.join(scriptDir, name);
+    fs.writeFileSync(f, body);
+    // shLive runs through cmd.exe on Windows, which splits an unquoted %TEMP% like
+    // C:\Users\Jane Doe\AppData\Local\Temp at the space.
+    return process.platform === "win32" && /\s/.test(f) ? `"${f}"` : f;
+  };
+  const noisy = await shLive(
+    node,
+    [
+      script(
+        "noisy.js",
+        'console.log("[ERROR] /r/src/test/java/A.java:[3,1] cannot find symbol");const l="x".repeat(99)+"\\n";for(let i=0;i<30000;i++)process.stdout.write(l);console.log("[INFO] Tests run: 7, Failures: 0");',
+      ),
+    ],
+    "[t]",
+    os.tmpdir(),
+    0,
+    200_000,
+  );
+  check(
+    "shLive：輸出超過上限 → 不崩潰、只保留尾端（上限內）",
+    noisy.code === 0 && noisy.out.length < 200_000 + 5_000,
+    `code=${noisy.code} len=${noisy.out.length}`,
+  );
+  check("shLive：被丟掉的前段裡的 [ERROR] 行保留下來", noisy.out.includes("A.java:[3,1] cannot find symbol"));
+  check("shLive：尾端的 Tests run 還在、且標明有截斷", noisy.out.includes("Tests run: 7") && noisy.out.includes("已丟棄"));
+  const t1 = Date.now();
+  const oneLine = await shLive(node, [script("oneline.js", 'process.stdout.write("y".repeat(30*1024*1024))')], "[t]", os.tmpdir(), 0, 64 * 1024 * 1024);
+  fs.rmSync(scriptDir, { recursive: true, force: true });
+  check(
+    "shLive：30MB 沒有換行的輸出在線性時間內處理完（舊版逐 chunk 重切整段，O(n²)）",
+    oneLine.out.length === 30 * 1024 * 1024 && Date.now() - t1 < 15_000,
+    `len=${oneLine.out.length} ${Date.now() - t1}ms`,
+  );
+  check("assembleCapture：沒有截斷時原樣回傳", assembleCapture("abc", 0, ["x"], 10) === "abc");
+
+  // --- surefire reports that are not what they seem ---------------------------------------------
+  const soap = parseSurefireXml(
+    `<testsuite name="com.x.S" tests="2" failures="1" errors="0">` +
+      `<testcase name="parsesFault" classname="com.x.S"><system-out><![CDATA[<soap:Body><error code="1"/><failure/></soap:Body>]]></system-out></testcase>` +
+      `<testcase name="fails" classname="com.x.S"><failure message="boom" type="AssertionError">at com.x.S.fails(S.java:3)</failure></testcase>` +
+      `</testsuite>`,
+  );
+  check(
+    "parseSurefireXml：通過的測試印出 <error> 字樣不算失敗",
+    JSON.stringify(soap?.cases.map((c) => c.name)) === JSON.stringify(["fails"]),
+    JSON.stringify(soap?.cases.map((c) => c.name)),
+  );
+  const xmlDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-xml-"));
+  const bigXml = path.join(xmlDir, "TEST-com.x.Big.xml");
+  const noise = "line <error/> 中文\n".repeat(2_400_000);
+  fs.writeFileSync(
+    bigXml,
+    `<testsuite name="com.x.Big" tests="2" failures="1" errors="0">` +
+      `<testcase name="loud" classname="com.x.Big"><system-out><![CDATA[${noise}]]></system-out><system-err/></testcase>` +
+      `<testcase name="b" classname="com.x.Big"><failure message="expected: 3" type="AssertionError">x\nCaused by: com.zaxxer.hikari.pool.HikariPool$PoolInitializationException</failure></testcase>` +
+      `</testsuite>`,
+  );
+  const bigSuite = parseSurefireXml(readSurefireXml(bigXml));
+  check(
+    "readSurefireXml：超過直讀上限的報告分段讀、跳過測試輸出，失敗案例與 cause 都還在",
+    fs.statSync(bigXml).size > 32 * 1024 * 1024 && bigSuite?.cases.length === 1 && bigSuite.cases[0].name === "b" && /HikariPool/.test(bigSuite.cases[0].trace ?? ""),
+    JSON.stringify(bigSuite?.cases.map((c) => c.name)),
+  );
+  fs.rmSync(xmlDir, { recursive: true, force: true });
+  check("isSurefireSummary：<class>.txt 是摘要", isSurefireSummary("com.x.FooTest.txt"));
+  check("isSurefireSummary：<class>-output.txt 是測試輸出，不讀", !isSurefireSummary("com.x.FooTest-output.txt"));
+
+  // --- environment failures are read from the failing tests, not the whole log ------------------
+  const springWarn =
+    "WARN o.s.c.a.AnnotationConfigApplicationContext : Exception encountered during context initialization - " +
+    "cancelling refresh attempt: org.springframework.beans.factory.UnsatisfiedDependencyException: x";
+  const assertionSuite = { suite: "com.x.T", tests: 1, failures: 1, errors: 0, cases: [{ kind: "failure" as const, name: "t", message: "expected: 2 but was: 3", frame: "", trace: "org.opentest4j.AssertionFailedError" }] };
+  check("classifyEnvFailures：失敗是普通斷言、Spring WARN 只出現在 log → 不是環境問題", classifyEnvFailures(springWarn, [assertionSuite]).length === 0);
+  const ctxSuite = { ...assertionSuite, cases: [{ kind: "error" as const, name: "t", message: "Failed to load ApplicationContext", frame: "", trace: "Caused by: com.zaxxer.hikari.pool.HikariPool$PoolInitializationException" }] };
+  check("classifyEnvFailures：失敗本身是 context 起不來 → 環境問題", classifyEnvFailures("", [ctxSuite]).length >= 2);
+  check("classifyEnvFailures：沒有 XML 可讀時退回掃 log", classifyEnvFailures("Failed to load ApplicationContext", []).length === 1);
+
+  // --- opencode: the exit code is part of the answer --------------------------------------------
+  if (process.platform !== "win32") {
+    const ocDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-oc-"));
+    const planFile = path.join(ocDir, "plan.json");
+    const fakeOc = path.join(ocDir, "opencode");
+    // Replays one behaviour per invocation: ok / fail (provider error, exit 1) / null (a bare
+    // `null` line on stdout, then ok) / hold (a grandchild keeps stdout open, then ok).
+    fs.writeFileSync(
+      fakeOc,
+      `#!${process.execPath}
+const fs = require("fs");
+const st = JSON.parse(fs.readFileSync(${JSON.stringify(planFile)}, "utf8"));
+const step = st.plan[Math.min(st.n, st.plan.length - 1)];
+st.n++;
+fs.writeFileSync(${JSON.stringify(planFile)}, JSON.stringify(st));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const ev = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+  if (step === "fail" || step === "workfail") {
+    if (step === "workfail") {
+      ev({ type: "tool_use", part: { type: "tool", tool: "write", callID: "w1", state: { status: "completed", input: {} } } });
+      ev({ type: "text", part: { type: "text", text: "wrote a file" } });
+    }
+    ev({ type: "error", error: { name: "APIError", data: { message: "provider 503" } } });
+    process.exit(1);
+  }
+  if (step === "null") process.stdout.write("null\\n");
+  ev({ type: "text", part: { type: "text", text: "done " + st.n } });
+  process.exit(0);
+});
+`,
+    );
+    fs.chmodSync(fakeOc, 0o755);
+    const plan = (p: string[]) => fs.writeFileSync(planFile, JSON.stringify({ n: 0, plan: p }));
+    const oc = (o: Record<string, unknown> = {}) => new OpencodeRunner({ bin: fakeOc, retryDelayMs: 0, timeoutMs: 20_000, ...o });
+
+    plan(["fail"]);
+    check("OpencodeRunner：第一個 session 就異常結束 → spawn-error（設定問題，秒報）", (await oc().runWriter("x")).status === "spawn-error");
+    plan(["ok", "fail", "fail", "ok"]);
+    const rOc = oc();
+    await rOc.runWriter("round 1");
+    const again = await rOc.runWriter("round 2");
+    check("OpencodeRunner：成功過之後 opencode 因 provider 錯誤結束 → 重新執行直到成功", again.status === "ok" && again.text.includes("done 4"), JSON.stringify(again));
+    plan(["ok", "fail"]);
+    const rOc2 = oc({ retryWindowMs: 0 });
+    await rOc2.runWriter("round 1");
+    const gaveUp = await rOc2.runWriter("round 2");
+    check("OpencodeRunner：重試窗用完 → timeout，不得報 ok（舊版把 exit=1 當成完成）", gaveUp.status === "timeout", JSON.stringify(gaveUp));
+    plan(["ok", "fail", "ok"]);
+    const rOc0 = oc({ retryWindowMs: 0 });
+    await rOc0.runWriter("round 1");
+    check("OpencodeRunner：UT_AGENT_RETRY_WINDOW_MS=0 → 不重新執行", (await rOc0.runWriter("round 2")).status === "timeout");
+    plan(["ok", ...Array(8).fill("fail"), "ok"]);
+    const rOcLong = oc({ retryWindowMs: 10 * 60 * 60 * 1000 });
+    await rOcLong.runWriter("round 1");
+    check("OpencodeRunner：重試窗設很長時不被寫死的 6 次上限提早結束（連續 8 次失敗後恢復）", (await rOcLong.runWriter("round 2")).status === "ok");
+    plan(["ok", "fail"]);
+    const rOc3 = oc();
+    await rOc3.runWriter("writer works");
+    check("OpencodeRunner：reviewer 第一次就異常結束 → spawn-error（writer 成功不代表 reviewer 的模型設對了）", (await rOc3.runReview("r")).status === "spawn-error");
+    plan(["workfail", "ok"]);
+    const wf = await oc().runWriter("x");
+    check(
+      "OpencodeRunner：第一個 session 做了事（寫檔、輸出文字）才因 provider 錯誤結束 → 不是設定錯誤，重跑",
+      wf.status === "ok" && wf.text.includes("done 2"),
+      JSON.stringify(wf),
+    );
+    plan(["null"]);
+    const nul = await oc().runWriter("x");
+    check("OpencodeRunner：stdout 出現一行 null 不會讓整個程序崩潰", nul.status === "ok" && nul.text.includes("done"), JSON.stringify(nul));
+    fs.rmSync(ocDir, { recursive: true, force: true });
+
+    // killTree after the leader exited: a grandchild holding stdout kept the build gate's
+    // timeout from ending anything, so the gate waited for the grandchild instead.
+    const t0k = Date.now();
+    const held = await shLive("sh", ["-c", "sleep 30 & echo started; exit 1"], "[t]", os.tmpdir(), 1000);
+    check("shLive：外層已結束、孫程序抓著 stdout → 逾時仍能在期限內收掉", held.timedOut === true && Date.now() - t0k < 8000, `${Date.now() - t0k}ms timedOut=${held.timedOut}`);
+  }
+
+  // --- a reviewer that did not finish is the reviewer's problem, not the writer's --------------
+  const unfinished = await runReviewGate(
+    { runWriter: async () => ({ text: "", status: "ok" }), runReview: async () => ({ text: "", status: "timeout", toolCallCount: 0 }) },
+    "p",
+  );
+  check("runReviewGate：reviewer 沒跑完且 0 次工具呼叫 → 視為解析不出（重試 reviewer），不是餵給 writer 的 blocker", isUnparseable(unfinished) && unfinished.blockers.length === 0, JSON.stringify(unfinished));
+  const lateVerdict = await runReviewGate(
+    {
+      runWriter: async () => ({ text: "", status: "ok" }),
+      runReview: async () => ({
+        text: '{"scores":{"effectiveness":9,"coverage":9,"independence":9,"readability":9,"fast_reliable":9,"mock_appropriateness":9},"blockers":[],"advisories":[]}',
+        status: "timeout",
+        toolCallCount: 3,
+      }),
+    },
+    "p",
+  );
+  check(
+    "runReviewGate：沒跑完的 session 即使留下完整判決也不採用（可能是讀到工具結果之前寫的）→ 重試 reviewer",
+    lateVerdict.passed === false && isUnparseable(lateVerdict),
+    JSON.stringify(lateVerdict),
+  );
+
+  check("runnerCannotRunHint：api runner 不叫人去裝 opencode", !runnerCannotRunHint("api").includes("opencode") && runnerCannotRunHint("api").includes("[FAIL]"));
+  check("runnerCannotRunHint：opencode runner 維持原本的指引", runnerCannotRunHint("opencode").includes("UT_OPENCODE_BIN"));
 }
 
 // ---------------------------------------------------------------------------

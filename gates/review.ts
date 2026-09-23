@@ -27,6 +27,81 @@ export function computeWeighted(scores: ReviewScores): { weighted: number; grade
   return { weighted, grade };
 }
 
+/**
+ * Pure: every balanced top-level {...} in the reviewer's text, in order.
+ *
+ * The verdict used to be the span from the first "{" to the last "}". Reasoning models served
+ * without a reasoning parser (Qwen3, QwQ, R1 distills) put their thinking in content — prose
+ * about Java code, full of braces — and a reviewer may show a draft before the final object or
+ * add a note after it. Every one of those parsed as garbage, identically on each retry at
+ * temperature 0, and the run ended as reviewer-unparseable although a valid verdict was there.
+ * The thinking is dropped (Qwen3's template opens <think> in the prompt, so only the closing tag
+ * may appear), and braces inside JSON strings do not count.
+ */
+export function jsonObjectCandidates(raw: string): string[] {
+  const text = replyText(raw);
+  return objectSpans(text).map(([a, b]) => text.slice(a, b));
+}
+
+/** The reply with thinking and code fences removed — what both scans below look at. */
+function replyText(raw: string): string {
+  let text = raw.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const closeAt = text.lastIndexOf("</think>");
+  if (closeAt >= 0) text = text.slice(closeAt + "</think>".length);
+  return text.replace(/```json|```/g, "");
+}
+
+/** Pure: [start, end) of the balanced top-level {...} in `text` from `from` on, in order. */
+function objectSpans(text: string, from = 0, max = Infinity): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = from; i < text.length && out.length < max; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"' && depth > 0) inStr = true;
+    else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}" && depth > 0 && --depth === 0) out.push([start, i + 1]);
+  }
+  return out;
+}
+
+/**
+ * Pure: every object carrying `scores` that parses from some "{" outside all balanced top-level
+ * objects (bounded). That region is only non-empty past an unclosed "{" in the prose. A "{"
+ * inside a balanced object is never a starting point: a verdict nested in a wrapper that also
+ * carries blockers would otherwise be taken on its own and pass with the wrapper's blockers
+ * dropped.
+ */
+function scoredObjectsFromAnyBrace(raw: string): unknown[] {
+  const text = replyText(raw);
+  const spans = objectSpans(text);
+  const inside = (i: number) => spans.some(([a, b]) => i > a && i < b);
+  const out: unknown[] = [];
+  let tries = 0;
+  for (let i = text.indexOf("{"); i >= 0 && tries < 2000; i = text.indexOf("{", i + 1), tries++) {
+    if (inside(i)) continue;
+    const [first] = objectSpans(text, i, 1).map(([a, b]) => text.slice(a, b));
+    if (!first || !first.includes('"scores"')) continue;
+    try {
+      const v: unknown = JSON.parse(first);
+      if (v && typeof v === "object" && "scores" in (v as object)) out.push(v);
+    } catch {
+      /* not this one */
+    }
+  }
+  return out;
+}
+
 export function parseVerdict(
   raw: string,
   thresholds: ScoreThresholds = SCORE_THRESHOLDS,
@@ -44,17 +119,32 @@ export function parseVerdict(
     raw,
   });
 
-  const cleaned = raw.replace(/```json|```/g, "");
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) return failed("找不到 JSON 物件");
-
-  let obj: unknown;
-  try {
-    obj = JSON.parse(cleaned.slice(start, end + 1));
-  } catch (e) {
-    return failed(`JSON.parse 失敗：${e instanceof Error ? e.message : String(e)}`);
+  const candidates = jsonObjectCandidates(raw);
+  // The verdict is the one object that parses and carries `scores`. Two that differ — a draft and
+  // a final answer, one verdict per test file, an array of them — are ambiguous, and picking
+  // either could drop a blocker the other one raised: fail closed, and the reviewer is retried.
+  // Without any scored object, the last one that parses stands in, and the field checks below
+  // say what is missing.
+  const parsed: unknown[] = [];
+  let lastErr = "";
+  for (const c of candidates) {
+    try {
+      parsed.push(JSON.parse(c));
+    } catch (e) {
+      lastErr ||= e instanceof Error ? e.message : String(e);
+    }
   }
+  let scored = parsed.filter((v) => v && typeof v === "object" && "scores" in (v as object));
+  // One unbalanced "{" in the prose before the verdict ("`void save() {` asserts nothing") keeps
+  // the scan above at depth > 0 for the rest of the text, and the verdict is never seen — the same
+  // way on every retry. Try from each "{" instead, before giving up.
+  if (!scored.length) scored = scoredObjectsFromAnyBrace(raw);
+  if (!candidates.length && !scored.length) return failed("找不到 JSON 物件");
+  if (new Set(scored.map((v) => JSON.stringify(v))).size > 1) {
+    return failed(`回覆裡有 ${scored.length} 個內容不同的判決物件，無法判定哪一個才是最終判決`);
+  }
+  const obj: unknown = scored[0] ?? parsed[parsed.length - 1];
+  if (obj === undefined) return failed(`JSON.parse 失敗：${lastErr}`);
   const o = obj as Record<string, unknown>;
   const rawScores = (o.scores ?? {}) as Record<string, unknown>;
 
@@ -143,6 +233,25 @@ export async function runReviewGate(
 ): Promise<ReviewVerdict> {
   const out = await runner.runReview(prompt);
   if (out.status === "spawn-error") return spawnErrorVerdict();
+  if (out.status !== "ok") {
+    // The session did not finish: its deadline, requests that kept failing, a context it could
+    // not shrink, an opencode that exited on a provider error. Whatever text it left is from a
+    // turn that was still working — possibly a verdict written before the model had read the
+    // results of the calls in that same turn — so no verdict is taken from it, however complete
+    // it looks. And it is not a reviewer that "answered without reading" either: that blocker is
+    // fed to the writer, which cannot make a reviewer finish, and runs used to end as writer-no-op
+    // with every hard gate green. Marked unparseable, it is retried at the reviewer
+    // (UT_REVIEW_MAX_RETRIES) and, if it never finishes, ends the run naming the reviewer.
+    return {
+      passed: false,
+      scores: {},
+      blockers: [],
+      advisories: [],
+      belowThreshold: [],
+      parseError: `reviewer session 未完成（status=${out.status}），沒有採用任何判決`,
+      raw: out.text,
+    };
+  }
   if (REVIEWER_MUST_READ && out.toolCallCount === 0) return zeroToolCallVerdict(out.text);
   return parseVerdict(out.text);
 }

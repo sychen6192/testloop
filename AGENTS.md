@@ -37,7 +37,11 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    原始輸出。writer 能自跑測試 = 能自述通過 = gate 被架空。同一個原則的另一面：writer 的
    可寫範圍只有目標模組的 `src/test/`，orchestrator 每輪在 writer 前後對整個 repo（扣除該
    `src/test`、建置輸出與 dot-dirs）拍快照，production code、`pom.xml` 或其他模組有任何變動
-   即中止（stopReason=scope-violation），變更留在磁碟交人檢視。prompt 裡的「嚴禁修改
+   即中止（stopReason=scope-violation），變更留在磁碟交人檢視。例外只有兩種，都不是 writer 寫的：
+   loop 自己的 runs 目錄（`UT_RUNS_DIR` 在 repo 內時），以及別的程序寫的**輸出**——被 git ignore、
+   不在任何 `src/` 底下、不是建置檔、而且形狀是輸出（`logs/`、`out/`、`bin/`、`tmp/`、`*.log`、
+   本機 DB 檔等；`libs/utils.ts` 的 `splitForeignChanges`），只印 WARN。刻意用 allowlist：被 ignore
+   不等於測試不讀，Spring Boot 會從模組根載入 `./config/application.yml`。prompt 裡的「嚴禁修改
    production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
    gate 的結果都失去意義。第三面是**防掏空**：build gate 分不出「修好失敗的測試」和「刪掉
    失敗的測試」，兩者都是綠燈，所以 `libs/testmetrics.ts` 在第一輪前量下每個既有測試檔的
@@ -76,14 +80,21 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    修復要證明的只有「模組綠了、而且沒有東西被拿掉」。預檢會先分類紅燈**修不修得動**，
    修不動的一律不進修復迴圈、直接中止並點名，有三種：(a) 不在 `<目標模組>/src/test` 內
    ——多模組時上游模組的測試、production code、`pom.xml` 都在範圍外，writer 沒有寫入權；
-   (b) `gates/build.ts` 的 `detectEnvFailures` 認出的環境/設定紅燈——Spring context 起不來、
-   連線池初始化失敗、設定解密失敗。這種檔案**就在可寫範圍內**，所以 (a) 擋不住它，但改測試碼
+   (b) `gates/build.ts` 的 `classifyEnvFailures` 認出的環境/設定紅燈——Spring context 起不來、
+   連線池初始化失敗、設定解密失敗；有 surefire XML 時只看**失敗測試自己的**訊息與 cause 鏈（通過的
+   測試也會印同樣的 WARN），沒有才退回掃 log。這種檔案**就在可寫範圍內**，所以 (a) 擋不住它，但改測試碼
    永遠不會讓它變綠，而重量級整合測試的模組每輪建置要 8–15 分鐘，燒滿輪數就是一小時；
    偵測刻意寫窄——誤判會拒絕修一個本來修得動的東西；(c) 建置紅但定位不到任何檔案
-   （`unlocatable-failure`），writer 拿到的是空清單，沒有目標可打。進了迴圈之後還有
+   （`unlocatable-failure`），writer 拿到的是空清單，沒有目標可打。預檢建置**沒跑完**（逾時、被
+   signal 終止——多半是 OOM）不屬於任何一種：它什麼都沒定位到，以 `baseline-aborted` 直接中止並
+   說明，修復輪的建置沒跑完同樣以 `build-aborted` 結束。進了迴圈之後還有
    **紅燈數早停**：連續 `UT_REPAIR_NO_PROGRESS_ROUNDS` 輪紅燈數沒下降就停——`stuck` 比對的是
    feedback fingerprint，要求兩輪報告完全相同，而「修好 A 又弄壞 B」每輪報告都不一樣卻毫無
-   進展，只有數量看得出來）與
+   進展，只有數量看得出來。唯一不算「沒下降」的是**揭露**：上一輪有編譯錯誤（只有它藏得住別的
+   紅燈）、這輪修好了一些，而新冒出的紅燈都在這輪沒改過、也沒引用這輪改過的類別的檔案裡（改了
+   測試資源則一律不算揭露）。writer 沒改任何檔案而紅燈只有測試失敗時，先重跑一次建置確認，轉綠
+   即以 `flaky-baseline` 照常開始並點名那些測試。修復以 `scope-violation`、`runner-spawn-error`、
+   `build-aborted` 結束時，`UT_ALLOW_DIRTY_BASELINE` 也不放行——它只放行「修不好的既有紅燈」）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
@@ -144,15 +155,16 @@ runners/…             factory＋三個 AgentRunner 實作（opencode / api / q
 runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
-libs/shell.ts         shLive（子行程逐行轉印）
+libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾
 libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 逾時覆寫
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
-libs/utils.ts         純函式（含 skillDirCandidates / runsDirFor / findExistingTests / clampText）
+libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防掏空 guard 的量尺）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
+libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
 scripts/selftest.ts   純邏輯自測＋架構不變式 assert
 scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
 scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼

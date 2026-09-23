@@ -7,5 +7,14 @@ TSX="$TOOL_DIR/node_modules/.bin/tsx"
 case "${1:-}" in
   doctor) shift; exec "$TSX" "$TOOL_DIR/scripts/doctor.ts" "$@" ;;
   setup)  shift; exec "$TSX" "$TOOL_DIR/scripts/setup.ts" "$@" ;;
-  *)      exec "$TSX" "$TOOL_DIR/loop.ts" "$@" ;;
+  # The loop runs as ONE node process with tsx as an in-process loader, not under the tsx CLI:
+  # the CLI is a second node process that forwards only SIGINT/SIGTERM, so on a terminal hangup
+  # it died by itself and the shell reported exit 129 for a run that was still going. Resolved
+  # through tsx's public export; if that ever fails, the CLI still works. `--import` needs Node
+  # 20.6+ (engines allows 20.0), and once exec'd there is no falling back: probe it first.
+  *)      LOADER="$(node -p 'require("url").pathToFileURL(require.resolve("tsx", { paths: [process.argv[1]] })).href' "$TOOL_DIR" 2>/dev/null || true)"
+          if [ -n "$LOADER" ] && node --import "$LOADER" -e 0 >/dev/null 2>&1; then
+            exec node --import "$LOADER" "$TOOL_DIR/loop.ts" "$@"
+          fi
+          exec "$TSX" "$TOOL_DIR/loop.ts" "$@" ;;
 esac

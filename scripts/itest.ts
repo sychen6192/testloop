@@ -13,7 +13,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
+import { ApiTurn, buildFixture, envKnobsInSource, gitAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
 import { SCENARIOS } from "./itest-scenarios";
 import { planSpawn } from "../libs/shell";
 
@@ -45,7 +45,9 @@ const BASE_ENV: Record<string, string> = {
   UT_API_MAX_TOKENS: "0",
   UT_API_MAX_TOOL_RESULT_CHARS: "20000",
   UT_API_MAX_TURNS: "8",
+  UT_AGENT_RETRY_WINDOW_MS: "180000",
   UT_BUILD_TIMEOUT_MS: "60000",
+  UT_MAX_BUILD_OUTPUT_CHARS: "67108864",
   UT_CA_CERTS: "",
   UT_HTTPS_PROXY: "",
   UT_HTTP_PROXY: "",
@@ -85,10 +87,16 @@ const BASE_ENV: Record<string, string> = {
   UT_WRITER_TEMPERATURE: "0.2",
 };
 
+// The standard proxy variables are the fallback behind every UT_ proxy knob (config.ts envAny),
+// so an empty UT_NO_PROXY does not blank a NO_PROXY the shell exports — and on a corporate
+// machine, the one place the proxy scenarios matter most, the shell always exports one. With
+// 127.0.0.1 in it, the fixture proxy never saw a connection and the scenario failed there.
+const PROXY_ENV = /^(?:https?_proxy|no_proxy|all_proxy)$/i;
+
 function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (!k.startsWith("UT_")) env[k] = v;
+    if (!k.startsWith("UT_") && !PROXY_ENV.test(k)) env[k] = v;
   }
   return { ...env, ...BASE_ENV, ...extra };
 }
@@ -131,13 +139,22 @@ function runTsx(script: string, args: string[], cwd: string, env: NodeJS.Process
 // the seam for testing loop.ts itself. The server replays scripted turns; the runner's tool
 // loop, its write-scope enforcement and its token accounting are all the real ones.
 
-function startFakeApi(turns: ApiTurn[]): Promise<{ url: string; close: () => Promise<void> }> {
+function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; close: () => Promise<void> }> {
   let i = 0;
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       const turn: ApiTurn = turns[i++] ?? { content: "沒有更多腳本回合了" };
+      for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
+        fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+        fs.writeFileSync(path.join(root, rel), content);
+      }
+      if (turn.status) {
+        res.writeHead(turn.status, { "content-type": "application/json" });
+        res.end(turn.body ?? JSON.stringify({ error: { message: "scripted failure" } }));
+        return;
+      }
       const message: Record<string, unknown> = { content: turn.content ?? "" };
       if (turn.toolCalls?.length) {
         message.tool_calls = turn.toolCalls.map((t, n) => ({
@@ -147,7 +164,12 @@ function startFakeApi(turns: ApiTurn[]): Promise<{ url: string; close: () => Pro
         }));
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ choices: [{ message }], usage: { completion_tokens: 11 } }));
+      res.end(
+        JSON.stringify({
+          choices: [{ message, ...(turn.finishReason ? { finish_reason: turn.finishReason } : {}) }],
+          usage: { completion_tokens: 11 },
+        }),
+      );
     });
   });
   return new Promise((resolve) => {
@@ -234,11 +256,14 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
   let proxySeen: string[] | undefined;
 
   if (sc.entry === "loop") {
-    const api = await startFakeApi(sc.api ?? []);
+    const api = await startFakeApi(sc.api ?? [], root);
     const proxy = sc.proxy ? await startProxy() : undefined;
     proxySeen = proxy?.seen;
     const apiHost = new URL(api.url).host;
-    const runsBase = path.join(root, ".itest", "runs");
+    const runsBase = path.join(root, sc.runsInRepo ? "testgen-runs" : path.join(".itest", "runs"));
+    // Held by a live process — this one — exactly as a second testgen on the same repo would see.
+    const lock = sc.lockHeld ? repoLockPath(root) : undefined;
+    if (lock) fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, runDir: "/elsewhere" }));
     out = await runTsx(
       path.join(TESTGEN_ROOT, "loop.ts"),
       [targetDirOf(sc)],
@@ -255,6 +280,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     );
     await api.close();
     await proxy?.close();
+    if (lock) fs.rmSync(lock, { force: true });
     // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; exactly one run per scenario.
     const repoRuns = path.join(runsBase, path.basename(root));
     const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
@@ -776,6 +802,174 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("訊息給的是環境方向，不是叫人去修測試", c.stderr.includes("環境/設定"), c.stderr.slice(-400));
   },
 
+  "loop-api-503-mid-run": (c) => {
+    check("exit code 0——幾秒的 503 不是中止整個 run 的理由", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("不是 runner-spawn-error", c.result.stopReason !== "runner-spawn-error", String(c.result.stopReason));
+    check("重試看得見（log 有 N 秒後重試）", /秒後重試/.test(c.stdout), c.stdout.slice(-800));
+    check("第 2 輪的測試確實寫入", c.read("src/test/java/com/x/CalcTest.java").includes("variant xxxxxxxxx"));
+    check("預檢 + 兩輪 gate 共 3 次建置", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-api-outage-not-spawn-error": (c) => {
+    check("不是 runner-spawn-error——端點這個 run 已經回應過", c.result.stopReason !== "runner-spawn-error", String(c.result.stopReason));
+    check("判為 writer-no-op", c.result.stopReason === "writer-no-op", String(c.result.stopReason));
+    const fb = String(c.result.finalFeedback);
+    check("訊息說明 writer session 沒有正常完成", fb.includes("status=timeout"), fb);
+    check("訊息不再把人指去 permission / opencode", !fb.includes("permission") && !fb.includes("opencode"), fb);
+    check("實際的 HTTP 錯誤印在 log 裡", c.stdout.includes("HTTP 503"), c.stdout.slice(-800));
+  },
+
+  "loop-api-context-overflow": (c) => {
+    check("exit code 0——context 滿了要縮短對話，不是結束 session", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("log 說明 context 已滿並縮短後重送", /context 已滿/.test(c.stdout), c.stdout.slice(-800));
+    check("測試確實產生（writer 沒有在讀完檔之後被砍掉）", c.exists("src/test/java/com/x/CalcTest.java"));
+    check("只花一輪", c.result.iterations === 1, String(c.result.iterations));
+  },
+
+  "review-spawn-error-aborts": (c) => {
+    check("判為 runner-spawn-error", c.result.stopReason === "runner-spawn-error", String(c.result.stopReason));
+    check("第 1 輪就停，不把它當 blocker 餵給 writer", c.result.iterations === 1, String(c.result.iterations));
+    check("只建置一次", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+    check("funnel 記為 review/spawn-error", gates(c).join(",") === "review/spawn-error", gates(c).join(","));
+    check("訊息點名 reviewer", String(c.result.finalFeedback).includes("reviewer"), String(c.result.finalFeedback));
+  },
+
+  "loop-api-truncated-write": (c) => {
+    check("exit code 0——被 max_tokens 截斷的 write_file 不是 writer 的最終答案", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("第 1 輪就寫出測試", c.result.iterations === 1 && c.exists("src/test/java/com/x/CalcTest.java"), String(c.result.iterations));
+    check("log 說明截斷並要求改小步驟", /被截斷/.test(c.stdout), c.stdout.slice(-800));
+  },
+
+  "loop-api-gateway-200-error": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("測試確實產生（writer 沒有把閘道錯誤當成完成）", c.exists("src/test/java/com/x/CalcTest.java"));
+    check("log 點名閘道錯誤並重試", /upstream request timeout/.test(c.stdout) && /秒後重試/.test(c.stdout), c.stdout.slice(-800));
+  },
+
+  "loop-review-think-verdict": (c) => {
+    check("exit code 0——<think> 裡的大括號不能讓判決解析失敗", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功且只試一次", c.result.success === true && !c.runExists("iter-1/verdict-attempt-2.json"), JSON.stringify(c.result.stopReason));
+  },
+
+  "loop-interface-in-target": (c) => {
+    check("exit code 0——interface 沒有程式碼可覆蓋，不能卡住 coverage gate", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    const params = JSON.parse(c.runRead("params.json") || "{}");
+    const skipped = JSON.stringify(params.skippedCodeless ?? []);
+    check("params.json 記錄略過的 interface", skipped.includes("CalcPort.java"), skipped);
+    // listJavaClasses keeps the platform separator: backslashes on Windows.
+    const targets = ((params.targetClasses ?? []) as string[]).map((p) => p.replace(/\\/g, "/"));
+    check("目標只剩實作類別", JSON.stringify(targets) === JSON.stringify(["src/main/java/com/x/Calc.java"]), JSON.stringify(params.targetClasses));
+    check("log 說明為什麼略過", /略過 1 個沒有可執行程式碼的型別/.test(c.stdout), c.stdout.slice(0, 1500));
+  },
+
+  "loop-baseline-env-false-positive": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("不是 dirty-baseline:env-failure", c.result.stopReason !== "dirty-baseline:env-failure", String(c.result.stopReason));
+    const repair = c.result.repair as Record<string, unknown> | undefined;
+    check("進了修復迴圈且修好", repair?.success === true, JSON.stringify(repair));
+    check("預檢摘要沒有把它列為環境問題", !c.runRead("baseline.md").includes("環境/設定問題"), c.runRead("baseline.md"));
+  },
+
+  "scope-foreign-ignored-change": (c) => {
+    check("最終成功——git-ignored 的 logs/ 變動不是 writer 越界", c.result.success === true, String(c.result.stopReason));
+    check("log 說明有哪些檔案被當成別的程序的變動", c.stdout.includes("logs/app.log") && /git-ignored/.test(c.stdout), c.stdout.slice(-1200));
+  },
+
+  "scope-ignored-under-src-still-blocked": (c) => {
+    check("src/ 底下的檔案即使被 ignore 也照樣擋", c.result.stopReason === "scope-violation", String(c.result.stopReason));
+    check("違規清單點名那個設定檔", c.runRead("iter-1/scope-violations.txt").includes("src/main/resources/application-local.yml"));
+  },
+
+  "loop-runs-dir-inside-repo": (c) => {
+    check("exit code 0——loop 自己寫的 artifacts 不是 writer 越界", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("artifacts 確實落在 repo 內", fs.existsSync(path.join(c.root, "testgen-runs")));
+  },
+
+  "loop-repo-lock-held": (c) => {
+    check("同一個 repo 已有 testgen 在跑 → 直接拒絕", c.code === 1, `code=${c.code}`);
+    check("訊息說明原因與解法", /已有另一個 testgen 在執行/.test(c.stderr) && /worktree/.test(c.stderr), c.stderr.slice(-600));
+    check("一次都沒建置", c.mvnCalls === 0, `mvnCalls=${c.mvnCalls}`);
+    check("被拒絕的 run 不留下 artifacts 目錄", !fs.existsSync(path.join(c.root, ".itest", "runs")), c.runDir);
+  },
+
+  "review-unfinished-retried": (c) => {
+    check("最終成功", c.result.success === true, String(c.result.stopReason));
+    check("只花一輪 writer（沒跑完的 reviewer 不算 writer 的帳）", c.result.iterations === 1, String(c.result.iterations));
+    check("reviewer 重試的紀錄留在 artifacts", c.runExists("iter-1/verdict-attempt-2.json"));
+  },
+
+  "loop-baseline-killed": (c) => {
+    if (process.platform === "win32") return; // no SIGKILL to deliver
+    check("中止（exit 1）", c.code === 1, `code=${c.code}`);
+    check("stopReason = baseline-aborted", c.result.stopReason === "baseline-aborted", String(c.result.stopReason));
+    check("訊息說明建置被 signal 終止", /SIGKILL/.test(c.stderr) && /沒有跑完/.test(c.stderr), c.stderr.slice(-600));
+    check("沒有進修復迴圈、也不猜 Lombok", !c.runExists("repair-1/prompt.md") && !/Lombok/.test(c.stderr));
+  },
+
+  "repair-resource-fix": (c) => {
+    check("修復成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("改過的資源檔列進清單", JSON.stringify(c.result.changedFiles) === JSON.stringify(["resources/expected-total.txt"]), JSON.stringify(c.result.changedFiles));
+  },
+
+  "repair-revealed-errors": (c) => {
+    check("修復成功（揭露出的紅燈不算沒進展）", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("兩輪修好", c.result.rounds === 2, String(c.result.rounds));
+  },
+
+  "repair-thrash-still-stops": (c) => {
+    check("判為 repair-no-progress", c.result.stopReason === "repair-no-progress", String(c.result.stopReason));
+    check("第 1 輪就停", c.result.rounds === 1, String(c.result.rounds));
+  },
+
+  "repair-thrash-via-helper": (c) => {
+    check("stopReason = repair-no-progress", c.result.stopReason === "repair-no-progress", String(c.result.stopReason));
+    check("第 1 輪就判定（B 用到這輪改過的 helper，不算揭露）", c.result.rounds === 1, String(c.result.rounds));
+  },
+
+  "repair-test-failure-swap": (c) => {
+    check("stopReason = repair-no-progress", c.result.stopReason === "repair-no-progress", String(c.result.stopReason));
+    check("第 1 輪就判定", c.result.rounds === 1, String(c.result.rounds));
+  },
+
+  "repair-flaky-baseline": (c) => {
+    check("不中止：重跑確認紅燈不穩定", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("stopReason = flaky-baseline", c.result.stopReason === "flaky-baseline", String(c.result.stopReason));
+    check("點名不穩定的測試", String(c.result.report).includes("com.x.ExistingTest"), String(c.result.report));
+    check("建置 2 次：預檢 + 確認重跑", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "repair-crashed-fork": (c) => {
+    check("修復成功（Crashed tests 定位到類別）", c.result.success === true, JSON.stringify(c.result.stopReason));
+    check("不是 unlocatable-failure", c.result.stopReason !== "unlocatable-failure", String(c.result.stopReason));
+  },
+
+  "loop-dirty-repair-broke-green": (c) => {
+    check("不是成功——修復 writer 弄壞的測試沒有被放行", c.result.success !== true && c.code !== 0, `code=${c.code} ${String(c.result.stopReason)}`);
+    const tol = JSON.stringify(c.result.toleratedFailures ?? []);
+    check("容忍集合只有 writer 介入前就失敗的", tol.includes("old_behaviour") && !tol.includes("ExistingTest"), tol);
+    check("點名那是本輪之前沒有的新失敗", /新失敗：com\.x\.ExistingTest/.test(c.stdout), c.stdout.slice(-800));
+  },
+
+  "loop-dirty-repair-scope-violation": (c) => {
+    check("中止（exit code ≠ 0）", c.code !== 0, `code=${c.code}`);
+    check("stopReason = repair-failed:scope-violation", c.result.stopReason === "repair-failed:scope-violation", String(c.result.stopReason));
+    check("沒有帶著被改過的 production code 進入產生階段", !c.runExists("iter-1/prompt.md"));
+    check("只跑了預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+    check("變更留在磁碟交人檢視", c.read("src/main/java/com/x/Calc.java").includes("a + b + 0"));
+  },
+
+  "scoped-dtest-keeps-writer-files": (c) => {
+    const second = c.argv[1] ?? [];
+    const dtest = second.find((a) => a.startsWith("-Dtest=")) ?? "";
+    check("第 2 輪的 -Dtest 仍含 writer 第 1 輪寫的 CalcBehaviourTest", dtest.includes("CalcBehaviourTest"), dtest);
+    check("最終成功", c.result.success === true, String(c.result.stopReason));
+  },
+
   "loop-repair-then-generate": (c) => {
     check("exit code 0", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
     check("summary.json 判定成功", c.result.success === true, JSON.stringify(c.result.stopReason));
@@ -807,8 +1001,13 @@ async function main() {
     process.exit(1);
   }
 
+  const haveGit = gitAvailable();
   for (const sc of list) {
     console.log(`\n[${sc.name}] ${sc.desc}`);
+    if (sc.git && !haveGit) {
+      console.log("  [SKIP] 找不到 git——這個情境要一個真的 git repo 才測得到 .gitignore 的效果");
+      continue;
+    }
     const ctx = await runScenario(sc);
     if (ctx.result.crashed) {
       check(`${sc.name} 執行未崩潰`, false, String(ctx.result.crashed).slice(0, 800));

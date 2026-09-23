@@ -4,7 +4,37 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logVerbose } from "./log";
+import { isatty } from "node:tty";
+import { log, logVerbose } from "./log";
+import { stripAnsi } from "./utils";
+import { MAX_BUILD_OUTPUT_CHARS } from "../config";
+
+// Build output grows with the module and with whatever its tests print, not with anything the
+// gates need. Kept whole, one chatty test — a @SpringBootTest module logging at DEBUG, or a
+// writer-generated test that prints in a loop — pushed the capture past V8's ~512M-character
+// string limit, and `buf += chunk` threw inside the stream handler: RangeError, uncaught, the
+// whole tool gone mid-build with no summary. So the capture is bounded: the tail (maven's
+// Results block and BUILD FAILURE are at the end) plus every line the parsers read wherever it
+// appeared — [ERROR] lines with javac's continuation lines, "Tests run:", gradle's
+// "X.java:12: error:". What falls out of the window is announced, never silently missing.
+const MAX_LINE_CHARS = 8192;
+// After the build process exits, how long its stdout/stderr may stay open before we stop
+// waiting. 'close' waits for every holder of the inherited pipes, and a process the build left
+// behind (a daemon started with setsid, a test that inheritIO()s a server) holds them for as
+// long as it lives: the build was over, the gate waited forever, and the build timeout could
+// not end it because the process holding the pipe is not in the build's process group.
+const SH_EXIT_DRAIN_MS = 3_000;
+const MAX_KEPT_CHARS = 8 * 1024 * 1024;
+const KEY_LINE = /^\[ERROR\]|Tests run: \d|\.java:\d+:\s*error:/;
+
+/** Pure: the text shLive hands back once `dropped` leading characters fell out of the window. */
+export function assembleCapture(tail: string, dropped: number, lostKeyLines: string[], max: number): string {
+  if (dropped <= 0) return tail;
+  return (
+    `…（輸出共 ${dropped + tail.length} 字元，超過上限 ${max}；前段 ${dropped} 字元已丟棄，` +
+    `其中的錯誤行與測試統計行保留如下）\n${lostKeyLines.join("\n")}\n…（以下為輸出尾端）\n${tail}`
+  );
+}
 
 export function shLive(
   cmd: string,
@@ -12,7 +42,8 @@ export function shLive(
   linePrefix: string,
   cwd: string,
   timeoutMs = 0,
-): Promise<{ code: number; out: string; timedOut?: boolean }> {
+  maxChars = MAX_BUILD_OUTPUT_CHARS,
+): Promise<{ code: number; out: string; timedOut?: boolean; signal?: NodeJS.Signals }> {
   return new Promise((resolve) => {
     logVerbose(`> 執行：${cmd} ${args.join(" ")}（cwd=${cwd}）`);
     const child = spawn(cmd, args, {
@@ -26,34 +57,119 @@ export function shLive(
     const timer = timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          logVerbose(`${linePrefix} 逾時 ${timeoutMs}ms，終止程序樹`);
+          log(`${linePrefix} [WARN] 逾時 ${timeoutMs}ms，終止程序樹`);
           killTree(child, "SIGKILL");
         }, timeoutMs)
       : undefined;
 
-    let buf = "";
+    // parts/size: the capture window. seen: every character ever received, which is what a key
+    // line's position is measured in, so it can be told apart from what the tail still holds.
+    let parts: string[] = [];
+    let size = 0;
+    let seen = 0;
+    let dropped = 0;
+    const keyLines: Array<{ at: number; line: string }> = [];
+    let keptChars = 0;
+    let warned = false;
+    const trim = () => {
+      const all = parts.join("");
+      const cut = all.length - maxChars;
+      dropped += cut;
+      parts = [all.slice(cut)];
+      size = maxChars;
+      if (!warned) {
+        warned = true;
+        log(`${linePrefix} [WARN] 建置輸出超過 ${maxChars} 字元，只保留尾端與錯誤行（多半是測試大量輸出 log）`);
+      }
+    };
     const pipe = (stream: NodeJS.ReadableStream) => {
       let pending = "";
+      let inError = false;
       stream.setEncoding("utf8");
       stream.on("data", (chunk: string) => {
-        buf += chunk;
-        pending += chunk;
-        const lines = pending.split("\n");
-        pending = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line.trim()) logVerbose(`${linePrefix} ${line}`);
+        // Nothing in here may throw: an exception in a stream handler is uncaught and ends the
+        // process — which is exactly how the unbounded version took the whole run down.
+        try {
+          const at = seen;
+          seen += chunk.length;
+          parts.push(chunk);
+          size += chunk.length;
+          if (size > 2 * maxChars) trim(); // amortized: one join per maxChars of output
+          // Only the new chunk is searched for a newline. Re-splitting the accumulated partial
+          // line on every chunk was quadratic: 80MB printed without newlines took 87s of CPU,
+          // blocking the event loop (and, through back-pressure, maven) the whole time.
+          const nl = chunk.lastIndexOf("\n");
+          if (nl < 0) {
+            if (pending.length < MAX_LINE_CHARS) pending += chunk.slice(0, MAX_LINE_CHARS - pending.length);
+            return;
+          }
+          const lines = (pending + chunk.slice(0, nl)).split("\n");
+          pending = chunk.slice(nl + 1, nl + 1 + MAX_LINE_CHARS);
+          for (const raw of lines) {
+            const line = raw.length > MAX_LINE_CHARS ? raw.slice(0, MAX_LINE_CHARS) : raw;
+            const plain = stripAnsi(line);
+            const isError = /^\[ERROR\]/.test(plain);
+            const continuation = inError && /^\s+\S/.test(plain) && !/^\s*\[\w+\]/.test(plain);
+            inError = isError || continuation;
+            if ((isError || continuation || KEY_LINE.test(plain)) && keptChars < MAX_KEPT_CHARS) {
+              keyLines.push({ at, line: plain });
+              keptChars += plain.length;
+            }
+            if (line.trim()) logVerbose(`${linePrefix} ${line}`);
+          }
+        } catch (e) {
+          logVerbose(`${linePrefix} [WARN] 讀取輸出時發生錯誤，略過這段：${e instanceof Error ? e.message : String(e)}`);
         }
       });
     };
     pipe(child.stdout);
     pipe(child.stderr);
 
-    child.on("close", (code) => {
+    const collect = (): string => {
+      try {
+        return collectOrThrow();
+      } catch (e) {
+        return `（建置輸出無法組回：${e instanceof Error ? e.message : String(e)}）`;
+      }
+    };
+    const collectOrThrow = (): string => {
+      let tail = parts.join("");
+      if (tail.length > maxChars) {
+        dropped += tail.length - maxChars;
+        tail = tail.slice(-maxChars);
+      }
+      return assembleCapture(
+        tail,
+        dropped,
+        keyLines.filter((k) => k.at < dropped).map((k) => k.line),
+        maxChars,
+      );
+    };
+    let done = false;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    // A signal is reported as such: a build killed by the OOM killer is not an exit-1 build,
+    // and read as one it was classified as a red baseline nobody could locate.
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (done) return;
+      done = true;
       if (timer) clearTimeout(timer);
-      resolve({ code: code ?? 1, out: buf, timedOut });
+      if (drainTimer) clearTimeout(drainTimer);
+      resolve({ code: code ?? 1, out: collect(), timedOut, ...(signal && !timedOut ? { signal } : {}) });
+    };
+    child.on("exit", (code, signal) => {
+      drainTimer = setTimeout(() => {
+        logVerbose(`${linePrefix} 程序已結束但輸出管線仍被其他程序占用，不再等待`);
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(code, signal);
+      }, SH_EXIT_DRAIN_MS);
     });
+    child.on("close", (code, signal) => finish(code, signal));
     child.on("error", (err) => {
+      if (done) return;
+      done = true;
       if (timer) clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       logVerbose(`指令啟動失敗：${err.message}`);
       resolve({ code: 1, out: String(err) });
     });
@@ -201,7 +317,15 @@ export const DETACH_CHILDREN = process.platform !== "win32";
 /** Kills `child` and everything it spawned. Never throws — the caller is already on a sad path. */
 export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
   const pid = child.pid;
-  if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  if (pid === undefined) return;
+  // POSIX: the leader having exited says nothing about the rest of its group. A grandchild that
+  // inherited stdout (a server a plugin started, a forked JVM) keeps the group and the pipe
+  // alive, and shLive waits on the pipe — so returning here made UT_BUILD_TIMEOUT_MS unable to
+  // end the build at all. A group id is not reused while any member lives, and ESRCH covers an
+  // empty group. Windows: taskkill /T walks the tree from a live parent, so there an exited
+  // child really is the end of it.
+  const leaderGone = child.exitCode !== null || child.signalCode !== null;
+  if (leaderGone && process.platform === "win32") return;
   const plan = planKill(pid, signal);
 
   if (plan.via === "taskkill") {
@@ -224,7 +348,7 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
   } catch (err) {
     // ESRCH just means the group is already gone. Anything else (e.g. the child was not
     // detached after all) is worth a direct-child fallback rather than a silent no-op.
-    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH" && !leaderGone) {
       try {
         child.kill(signal);
       } catch {
@@ -242,25 +366,62 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
 const liveChildren = new Set<ChildProcess>();
 let shutdownHooked = false;
 
+const shutdownHooks: Array<(reason: string) => void> = [];
+
+/** Runs synchronously on the way out after SIGINT / SIGTERM (and SIGHUP on a terminal). */
+export function onShutdown(fn: (reason: string) => void): void {
+  shutdownHooks.push(fn);
+}
+
+function killAll(): void {
+  for (const c of liveChildren) killTree(c, "SIGKILL");
+  liveChildren.clear();
+}
+
+function shutdown(reason: string, code: number): never {
+  killAll();
+  for (const fn of shutdownHooks.splice(0)) {
+    try {
+      fn(reason);
+    } catch {
+      /* already leaving */
+    }
+  }
+  process.exit(code);
+}
+
+// Sampled at load, not in the handler: once a terminal has hung up, isatty() on it fails (the
+// kernel swaps in hung-up file operations), and an interactive run would look detached.
+const STARTED_ON_TERMINAL = process.platform !== "win32" && isatty(0);
+
+/**
+ * The process-wide signal handlers, installed once — by loop.ts at startup and again (a no-op)
+ * by the first spawn, so they are in place before any child exists.
+ *
+ * SIGHUP needs its own rule. Node resets an inherited SIG_IGN to the default at startup, so
+ * `nohup testgen … &` did NOT survive a dropped SSH session the way other programs do: the run
+ * died with the terminal mid-build, printed nothing, wrote no summary, and the detached mvn
+ * tree ran on as orphans. Without a terminal on stdin (nohup, setsid, cron, CI) a hangup is not
+ * a request to stop, so it is ignored; on an interactive terminal it is a clean shutdown.
+ */
+export function installShutdownHandlers(): void {
+  if (shutdownHooked) return;
+  shutdownHooked = true;
+  // 'exit' handlers must be synchronous; process.kill is, so the POSIX path is safe here.
+  process.on("exit", killAll);
+  process.on("SIGINT", () => shutdown("SIGINT", 130));
+  process.on("SIGTERM", () => shutdown("SIGTERM", 143));
+  process.on("SIGHUP", () => {
+    if (STARTED_ON_TERMINAL || process.platform === "win32") shutdown("SIGHUP", 129);
+    log("[WARN] 收到 SIGHUP（終端已斷線），但 stdin 不是終端機（nohup / setsid / CI），繼續執行");
+  });
+}
+
 /** Registers `child` so an interrupted run still takes its process tree down with it. */
 export function trackForShutdown(child: ChildProcess): void {
   liveChildren.add(child);
   child.once("exit", () => liveChildren.delete(child));
-  if (shutdownHooked) return;
-  shutdownHooked = true;
-
-  const killAll = () => {
-    for (const c of liveChildren) killTree(c, "SIGKILL");
-    liveChildren.clear();
-  };
-  // 'exit' handlers must be synchronous; process.kill is, so the POSIX path is safe here.
-  process.on("exit", killAll);
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-      killAll();
-      process.exit(sig === "SIGINT" ? 130 : 143);
-    });
-  }
+  installShutdownHandlers();
 }
 
 /** Turns a spawn errno into its actual cause, rather than guessing one cause for all of them. */

@@ -5,7 +5,7 @@
 // is method-level and badly undercounts).
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MIN_LINE_COV, MIN_BRANCH_COV, STRICT_COV } from "../config";
+import { MIN_LINE_COV, MIN_BRANCH_COV, STRICT_COV, REPO_ROOT } from "../config";
 import { log } from "../libs/log";
 import { GateResult, ModuleInfo } from "../libs/types";
 
@@ -47,11 +47,41 @@ function lastCounterPct(block: string, type: string): number | null {
   return (covered / Math.max(1, missed + covered)) * 100;
 }
 
+// One <sourcefile> or <class> element whose `attrName` attribute is `value`.
+// undefined = no such element; body null = the element is self-closing.
+//
+// JaCoCo writes a type with no executable code — an interface with only abstract methods, an
+// annotation, a constants holder whose private constructor it filters — as a self-closing element
+// with no counters: `<sourcefile name="TaxRateProvider.java"/>`. A pattern that insists on
+// `<sourcefile name="X">…</sourcefile>` reports such a type as missing, and the gate then fails on a
+// class that has nothing to cover — every round, identically, until stuck. The <class> fallback was
+// worse: `<class …sourcefilename="X"/>` followed by `[\s\S]*?</class>` ran on into the NEXT class and
+// read that class's counters as this one's.
+function findElement(
+  xml: string,
+  tag: "sourcefile" | "class",
+  attrName: string,
+  value: string,
+): { body: string | null } | undefined {
+  const re = new RegExp(`<${tag}\\b([^>]*?)(\\/>|>([\\s\\S]*?)<\\/${tag}>)`, "g");
+  const want = `${attrName}="${value}"`;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml))) {
+    if (!new RegExp(`(?:^|\\s)${escRe(want)}`).test(m[1])) continue;
+    return { body: m[2] === "/>" ? null : (m[3] ?? "") };
+  }
+  return undefined;
+}
+
 // Pure: parse JaCoCo XML, check each class against thresholds.
 export function parseJacocoReport(
   xml: string,
   targetClasses: string[],
   min: { line: number; branch: number } = { line: MIN_LINE_COV, branch: MIN_BRANCH_COV },
+  // The package of a class whose path does not say it (a source root other than
+  // src/main/java). Without one the whole report is searched, and the first same-named file in
+  // any package wins — another package's Util.java answering for this one.
+  pkgOf: (cls: string) => string | undefined = () => undefined,
 ): { passed: boolean; lines: string[] } {
   const lines: string[] = [];
   let allPass = true;
@@ -60,32 +90,41 @@ export function parseJacocoReport(
     const simple = path.basename(cls);
 
     // Narrow to the right <package> block by source path (avoid same-name collisions).
-    const pkgMatch = cls.replace(/\\/g, "/").match(/src\/main\/java\/(.+)\/[^/]+\.java$/);
+    const pkg = cls.replace(/\\/g, "/").match(/src\/main\/java\/(.+)\/[^/]+\.java$/)?.[1] ?? pkgOf(cls);
     let scope = xml;
-    if (pkgMatch) {
-      const pkgRe = new RegExp(`<package name="${escRe(pkgMatch[1])}">[\\s\\S]*?</package>`);
+    if (pkg !== undefined) {
+      const pkgRe = new RegExp(`<package name="${escRe(pkg)}">[\\s\\S]*?</package>`);
       const pm = xml.match(pkgRe);
       if (pm) scope = pm[0];
     }
 
     // 1) file-level <sourcefile> aggregate (includes inner classes, most accurate)
-    const sfRe = new RegExp(`<sourcefile name="${escRe(simple)}">[\\s\\S]*?</sourcefile>`);
-    let block = scope.match(sfRe)?.[0];
     // 2) fallback: class block — take the LAST counter (class-level aggregate)
-    if (!block) {
-      const clsRe = new RegExp(
-        `<class[^>]*sourcefilename="${escRe(simple)}"[\\s\\S]*?</class>`,
-      );
-      block = scope.match(clsRe)?.[0];
-    }
-    if (!block) {
+    const el =
+      findElement(scope, "sourcefile", "name", simple) ??
+      findElement(scope, "class", "sourcefilename", simple);
+    if (!el) {
       lines.push(`- ${simple}: 在 JaCoCo 報告中找不到（可能完全沒被測試觸及）`);
       allPass = false;
       continue;
     }
+    const block = el.body ?? "";
 
-    const line = lastCounterPct(block, "LINE");
+    // A class compiled without line debug info (-g:none, <debug>false</debug>) has instructions
+    // but no LINE counter; its instruction coverage stands in for line coverage rather than the
+    // class being waved through as code-less.
+    const instr = lastCounterPct(block, "INSTRUCTION");
+    const line = lastCounterPct(block, "LINE") ?? instr;
     const branch = lastCounterPct(block, "BRANCH");
+    if (line === null && branch === null) {
+      // JaCoCo analyzed the class and found nothing to execute. There is nothing a test could
+      // cover, so there is nothing for this gate to hold the writer to.
+      lines.push(
+        `- ${simple}: 沒有可執行的程式碼（JaCoCo 無任何計數器，例如只有抽象方法的 interface、` +
+          `annotation、常數類別），不列入覆蓋率門檻`,
+      );
+      continue;
+    }
     const lineOk = line === null || line >= min.line;
     const branchOk = branch === null || branch >= min.branch;
     if (!lineOk || !branchOk) allPass = false;
@@ -147,6 +186,14 @@ export function checkCoverage(
   }
   log(`解析覆蓋率報告：${xmlPath}`);
   const xml = fs.readFileSync(xmlPath, "utf8");
-  const { passed, lines } = parseJacocoReport(xml, targetClasses);
+  const pkgOf = (cls: string): string | undefined => {
+    try {
+      const src = fs.readFileSync(path.resolve(REPO_ROOT, cls), "utf8");
+      return /^\s*package\s+([\w.]+)\s*;/m.exec(src)?.[1].replace(/\./g, "/");
+    } catch {
+      return undefined;
+    }
+  };
+  const { passed, lines } = parseJacocoReport(xml, targetClasses, undefined, pkgOf);
   return { passed, report: `覆蓋率檢查（${xmlPath}）：\n${lines.join("\n")}` };
 }

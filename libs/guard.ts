@@ -13,6 +13,9 @@ export const WRITER_RULES: readonly ContractRule[] = [
   ["edit", "true"],
   ["bash", "false"], // verification stays in the loop
   ["webfetch", "false"],
+  // task hands a subagent the default toolset — bash included — so leaving it on undoes every
+  // other line here, invisibly: the runner only sees `[tool] task [completed]`.
+  ["task", "false"],
 ];
 
 export const REVIEWER_RULES: readonly ContractRule[] = [
@@ -20,6 +23,7 @@ export const REVIEWER_RULES: readonly ContractRule[] = [
   ["edit", "false"],
   ["bash", "false"], // reviewer is fully read-only
   ["webfetch", "false"],
+  ["task", "false"], // a subagent is not read-only; see WRITER_RULES
 ];
 
 // Both guard sites (startup assert + doctor) check the same two agents.

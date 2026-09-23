@@ -10,9 +10,12 @@ tools:
   write: false
   edit: false
   bash: false
+  task: false
   webfetch: false
 permission:
   edit: deny
+  task: deny
+  external_directory: deny
   bash: deny
   webfetch: deny
   skill:

@@ -4,6 +4,7 @@
 // Test reports are read from the *module's* target/build, not the repo root.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import {
   REPO_ROOT,
   MAVEN_EXTRA_ARGS,
@@ -45,6 +46,9 @@ export interface BaselineResult {
   failingTests: string[];
   summary: string;
   raw: string;
+  // The build never reached a verdict (timed out, or killed by a signal). Not a red module:
+  // there is nothing to repair, and the repair loop must not be entered on it.
+  aborted?: string;
 }
 
 /** The writer's only writable path, repo-relative, for messages. */
@@ -137,6 +141,8 @@ export interface SurefireCase {
   message: string;
   // First stack frame in the project's own code. Framework frames locate nothing.
   frame: string;
+  // The failure's stack trace with its cause chain (bounded), for classifying *why* it failed.
+  trace?: string;
 }
 
 export interface SurefireSuite {
@@ -199,8 +205,11 @@ export function parseSurefireXml(xml: string): SurefireSuite | null {
   while ((m = caseRe.exec(xml))) {
     const body = m[2];
     if (!body) continue; // self-closing: the test passed
-    // <skipped/>, <system-out> and <rerunFailure> are not this round's failures.
-    const fail = /<(failure|error)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/.exec(body);
+    // <skipped/>, <system-out> and <rerunFailure> are not this round's failures. The test's own
+    // output is dropped before looking: surefire keeps a passing test's stdout in the XML, and a
+    // logged SOAP fault or XML payload containing "<error" made that test read as failed.
+    const scan = body.replace(/<(system-out|system-err)\b[^>]*>[\s\S]*?<\/\1>/g, "");
+    const fail = /<(failure|error)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/.exec(scan);
     if (!fail) continue;
     const method = attr(m[1], "name");
     const className = attr(m[1], "classname");
@@ -216,6 +225,7 @@ export function parseSurefireXml(xml: string): SurefireSuite | null {
       name: nested ? `${nested}.${method}` : method,
       message: message.replace(/\s+/g, " ").trim(),
       frame: firstProjectFrame(stack),
+      trace: stack.length > 20_000 ? stack.slice(0, 20_000) : stack,
     });
   }
   return { suite, tests: num("tests"), failures: num("failures"), errors: num("errors"), cases };
@@ -278,7 +288,7 @@ export function subtractTolerated(
   const current = failingTestIds(suites);
   const allowed = new Set(tolerate);
   const unexpected = current.filter((id) => !allowed.has(id));
-  const compileErrors = extractCompileErrorFiles(raw);
+  const compileErrors = extractCompileErrorFiles(raw, "maven");
   if (compileErrors.length) {
     return { pass: false, current, unexpected, reason: "編譯失敗，沒有任何測試跑過，無從比對" };
   }
@@ -360,15 +370,76 @@ function freshFiles(dir: string, prefix: string, suffix: string, since: number):
     .sort();
 }
 
+// A TEST-*.xml can be enormous — surefire keeps every test's stdout in it — and one past V8's
+// ~512M-character string limit cannot be read with readFileSync at all. It used to be swallowed
+// silently (the failing suite vanished from the report); now anything big is read in chunks with
+// the <system-out>/<system-err> bodies skipped, which is everything but a few KB of it.
+const XML_DIRECT_READ_BYTES = 32 * 1024 * 1024;
+
+/** Reads a surefire XML report without its captured test output. */
+export function readSurefireXml(file: string): string {
+  if (fs.statSync(file).size <= XML_DIRECT_READ_BYTES) return fs.readFileSync(file, "utf8");
+  const fd = fs.openSync(file, "r");
+  try {
+    const buf = Buffer.alloc(4 * 1024 * 1024);
+    const decoder = new StringDecoder("utf8");
+    const out: string[] = [];
+    let carry = "";
+    let skipping: string | null = null; // the closing tag we are skipping to
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      let text = carry + (n > 0 ? decoder.write(buf.subarray(0, n)) : decoder.end());
+      carry = "";
+      for (;;) {
+        if (skipping) {
+          const end = text.indexOf(skipping);
+          if (end < 0) {
+            carry = text.slice(-skipping.length); // a closing tag may straddle chunks
+            text = "";
+            break;
+          }
+          out.push(skipping);
+          text = text.slice(end + skipping.length);
+          skipping = null;
+          continue;
+        }
+        // The first opening tag that has a body; a self-closing <system-out/> has nothing to skip.
+        const open = /<(system-out|system-err)(?:\s[^>]*)?(?<!\/)>/.exec(text);
+        if (open) {
+          out.push(text.slice(0, open.index + open[0].length));
+          skipping = `</${open[1]}>`;
+          text = text.slice(open.index + open[0].length);
+          continue;
+        }
+        // Hold back a possible partial opening tag at the end of the chunk.
+        const lt = text.lastIndexOf("<");
+        const keep = lt >= 0 && text.length - lt < 64 ? lt : text.length;
+        out.push(text.slice(0, keep));
+        carry = text.slice(keep);
+        break;
+      }
+      if (n <= 0) {
+        if (!skipping) out.push(carry);
+        break;
+      }
+    }
+    return out.join("");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function failingSuites(moduleRoot: string, since: number): SurefireSuite[] {
   const out: SurefireSuite[] = [];
   for (const dir of surefireDirs(moduleRoot)) {
     for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
       let suite: SurefireSuite | null = null;
       try {
-        suite = parseSurefireXml(fs.readFileSync(path.join(dir, f), "utf8"));
-      } catch {
-        /* unreadable, or truncated by a crashed JVM — the .txt fallback still applies */
+        suite = parseSurefireXml(readSurefireXml(path.join(dir, f)));
+      } catch (e) {
+        // Truncated by a crashed JVM, or unreadable — the .txt fallback still applies, but a
+        // failing suite that disappears from the report must at least leave a trace in the log.
+        log(`[WARN] 無法解析 surefire 報告 ${f}：${e instanceof Error ? e.message : String(e)}`);
       }
       if (suite && suite.failures + suite.errors > 0) out.push({ ...suite, dir });
     }
@@ -376,10 +447,31 @@ function failingSuites(moduleRoot: string, since: number): SurefireSuite[] {
   return out;
 }
 
+// Surefire's per-class summaries are "<class>.txt", about a kilobyte each. The same directory
+// also holds "<class>-output.txt" — the test's whole stdout under redirectTestOutputToFile — which
+// the ".txt" suffix matched too: reading a 600MB one to regex a summary line crashed the run with
+// ERR_STRING_TOO_LONG. Only summaries are read, and nothing large is read at all.
+const SUMMARY_TXT_MAX_BYTES = 4 * 1024 * 1024;
+
+function readSummary(file: string): string | null {
+  try {
+    if (fs.statSync(file).size > SUMMARY_TXT_MAX_BYTES) return null;
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Pure: is this surefire-reports file a per-class summary (as opposed to captured output)? */
+export const isSurefireSummary = (f: string) => f.endsWith(".txt") && !/-output\.txt$|-jvmRun\d*\.txt$/.test(f);
+
 function failingReports(surefireDir: string, since: number): string[] {
-  return freshFiles(surefireDir, "", ".txt", since).filter((f) =>
-    surefireHasFailure(fs.readFileSync(path.join(surefireDir, f), "utf8")),
-  );
+  return freshFiles(surefireDir, "", ".txt", since)
+    .filter(isSurefireSummary)
+    .filter((f) => {
+      const txt = readSummary(path.join(surefireDir, f));
+      return txt !== null && surefireHasFailure(txt);
+    });
 }
 
 function collectSurefireFailures(moduleRoot: string, since: number): string {
@@ -400,7 +492,7 @@ function collectSurefireFailures(moduleRoot: string, since: number): string {
   }
   let failures = "";
   for (const { dir, file } of failing.slice(0, MAX_FAILURE_BLOCKS)) {
-    const txt = fs.readFileSync(path.join(dir, file), "utf8");
+    const txt = readSummary(path.join(dir, file)) ?? "";
     failures += `\n----- ${file} -----\n${tail(txt, 1500)}`;
   }
   if (failing.length > MAX_FAILURE_BLOCKS) {
@@ -462,20 +554,76 @@ export function detectEnvFailures(raw: string): string[] {
   return ENV_FAILURE_SIGNATURES.filter((s) => s.re.test(text)).map((s) => s.why);
 }
 
+/**
+ * Pure: environment reasons, read from the failing tests themselves when surefire said which
+ * failed and why; the whole build log only when it did not.
+ *
+ * The build log carries every test's console output, passing tests included, and healthy Spring
+ * modules log these very signatures all the time — Spring warns "Exception encountered during
+ * context initialization … UnsatisfiedDependencyException" on every failed refresh, which is what
+ * an ApplicationContextRunner `hasFailed()` test is there to provoke. Scanned whole, one such
+ * passing test turned a red baseline that was an ordinary assertion bug into an "environment"
+ * abort before round 1, and the repair loop that would have fixed it never ran.
+ */
+export function classifyEnvFailures(raw: string, suites: SurefireSuite[]): string[] {
+  if (suites.length === 0) return detectEnvFailures(raw);
+  const evidence = suites
+    .flatMap((s) => s.cases.map((c) => `${c.message}\n${c.trace ?? ""}`))
+    .join("\n");
+  return detectEnvFailures(evidence);
+}
+
 // Pure: the distinct .java files the compiler reported errors in. Two shapes cover both
 // build tools — Maven prefixes and bracket-wraps the position, javac (gradle) does not:
 //   [ERROR] /abs/path/FooTest.java:[12,34] cannot find symbol
 //   /abs/path/FooTest.java:12: error: cannot find symbol
 // Order is first-seen, so the report reads in the order the compiler produced it.
-export function extractCompileErrorFiles(raw: string): string[] {
+// For maven only the compiler plugin's own shape counts: the bare javac shape also matches a
+// diagnostic a *passing* test printed (a test that compiles a template in-process), which made a
+// green file under target/ an out-of-scope compile error and aborted the run.
+export function extractCompileErrorFiles(raw: string, tool: BuildTool | "any" = "any"): string[] {
   const seen = new Set<string>();
   const text = stripAnsi(raw);
-  const patterns = [/^\[ERROR\]\s+(.+?\.java):\[\d+,\d+\]/gm, /^(.+?\.java):\d+:\s*error:/gm];
+  const patterns =
+    tool === "maven"
+      ? [/^\[ERROR\]\s+(.+?\.java):\[\d+,\d+\]/gm]
+      : [/^\[ERROR\]\s+(.+?\.java):\[\d+,\d+\]/gm, /^(.+?\.java):\d+:\s*error:/gm];
   for (const re of patterns) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text))) seen.add(m[1].trim().replace(/\\/g, "/"));
+    // On Windows the maven compiler plugin prints the file as a URI path, `/C:/repo/...`. Read
+    // as-is it is "absolute" and resolves to `C:\C:\repo\...`, so a compile error in the
+    // module's own src/test was classed out of scope and the run stopped before repair.
+    while ((m = re.exec(text))) seen.add(m[1].trim().replace(/\\/g, "/").replace(/^\/([A-Za-z]:\/)/, "$1"));
   }
   return [...seen];
+}
+
+/**
+ * Pure: test classes whose forked JVM died (System.exit, a crash) — surefire lists them under
+ * "Crashed tests:" and writes no report for them. Unread, a module whose only red is a test
+ * calling System.exit was "unlocatable" and the repair loop gave up before round 1, although
+ * surefire had named the class and the writer could fix it.
+ */
+export function crashedTestClasses(raw: string): string[] {
+  const out: string[] = [];
+  const lines = stripAnsi(raw).split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\[ERROR\]\s+Crashed tests:\s*$/.test(lines[i])) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const m = /^\[ERROR\]\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*$/.exec(lines[j]);
+      if (!m) break;
+      if (!out.includes(m[1])) out.push(m[1]);
+    }
+  }
+  return out;
+}
+
+/** Pure: test classes surefire started and never finished — where a timed-out build was stuck. */
+export function unfinishedTestClasses(raw: string): string[] {
+  const text = stripAnsi(raw);
+  const started = [...text.matchAll(/^\[INFO\] Running ([\w.$]+)\s*$/gm)].map((m) => m[1]);
+  const done = new Set([...text.matchAll(/ -- in ([\w.$]+)\s*$/gm)].map((m) => m[1]));
+  return [...new Set(started.filter((c) => !done.has(c)))];
 }
 
 // Test classes this build ran and failed. Same source preference as the failure detail:
@@ -511,7 +659,22 @@ export async function runBaseline(
       ? "修復驗證：重新建置，確認既有紅燈是否清除"
       : "預檢：在 writer 介入前先建置一次，取得既有紅燈基準",
   );
-  const r = await runBuildAndTests(tool, mod, { allowZeroTests: true });
+  const { gate: r, aborted } = await runBuild(tool, mod, { allowZeroTests: true });
+
+  if (aborted) {
+    return {
+      clean: false,
+      compileErrorFiles: [],
+      failingTestClasses: [],
+      outOfScope: [],
+      envFailures: [],
+      failureDetail: "",
+      failingTests: [],
+      summary: `${tag}：建置沒有跑完——${aborted}`,
+      raw: r.raw ?? "",
+      aborted,
+    };
+  }
 
   if (r.passed) {
     return {
@@ -528,13 +691,15 @@ export async function runBaseline(
   }
 
   const raw = r.raw ?? "";
-  const compileErrorFiles = extractCompileErrorFiles(raw);
+  const compileErrorFiles = extractCompileErrorFiles(raw, tool);
   const suites = tool === "maven" ? failingSuites(mod.moduleRoot, startedAt) : [];
   const failingTestClasses = suites.length
     ? suites.map((s) => s.suite)
     : tool === "maven"
       ? collectFailingTestClasses(mod.moduleRoot, startedAt)
       : [];
+  const crashed = tool === "maven" ? crashedTestClasses(raw) : [];
+  for (const c of crashed) if (!failingTestClasses.includes(c)) failingTestClasses.push(c);
 
   // What the writer is allowed to change. Everything red outside it is a human's job: the
   // repair loop would spend its whole budget discovering it cannot write there.
@@ -568,6 +733,9 @@ export async function runBaseline(
     lines.push(`測試失敗的類別（${failingTestClasses.length}）：`);
     failingTestClasses.forEach((c) => lines.push(`  - ${c}`));
   }
+  if (crashed.length) {
+    lines.push(`fork 的 JVM 中途結束（System.exit 或 crash，surefire 沒有留下報告）的測試類別：${crashed.join("、")}`);
+  }
   if (!compileErrorFiles.length && !failingTestClasses.length) {
     lines.push("（無法從輸出定位到具體檔案，錯誤節錄如下）");
     lines.push(summarizeBuildErrors(raw, 2000));
@@ -584,7 +752,7 @@ export async function runBaseline(
     tool === "maven"
       ? collectSurefireFailures(mod.moduleRoot, startedAt)
       : collectGradleFailures(mod.moduleRoot);
-  const envFailures = detectEnvFailures(raw);
+  const envFailures = classifyEnvFailures(raw, suites);
   if (envFailures.length) {
     lines.push(`環境/設定問題（改測試碼修不好）：`);
     envFailures.forEach((w) => lines.push(`  - ${w}`));
@@ -641,6 +809,8 @@ function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string 
   );
 }
 
+type BuildOptions = { allowZeroTests?: boolean; onlyTests?: string[]; tolerate?: string[] };
+
 export async function runBuildAndTests(
   tool: BuildTool,
   mod: ModuleInfo,
@@ -648,12 +818,25 @@ export async function runBuildAndTests(
   // whole module's test sources still have to compile — so this narrows execution, not scope.
   // tolerate: the baseline's failing identities. Set only by loop.ts under
   // UT_ALLOW_DIRTY_BASELINE; absent means the gate keeps its "module is green" requirement.
-  opts: { allowZeroTests?: boolean; onlyTests?: string[]; tolerate?: string[] } = {},
+  opts: BuildOptions = {},
 ): Promise<GateResult> {
+  return (await runBuild(tool, mod, opts)).gate;
+}
+
+// The build plus whether it reached a verdict at all. `aborted` is set when it did not — timed
+// out, or killed by a signal (the OOM killer's SIGKILL is the usual one). The gate report says so
+// either way; runBaseline needs the distinction, because an aborted baseline has no failures to
+// locate and was classified as a red module nobody could name, ending in a repair loop that
+// gave up with advice about Lombok.
+async function runBuild(
+  tool: BuildTool,
+  mod: ModuleInfo,
+  opts: BuildOptions,
+): Promise<{ gate: GateResult; aborted?: string }> {
   const isWin = process.platform === "win32";
   // Taken before the build so stale reports from an earlier round can be told apart.
   const startedAt = Date.now();
-  let r: { code: number; out: string; timedOut?: boolean };
+  let r: { code: number; out: string; timedOut?: boolean; signal?: NodeJS.Signals };
 
   if (tool === "maven") {
     const wrapper = isWin ? "mvnw.cmd" : "mvnw";
@@ -703,20 +886,31 @@ export async function runBuildAndTests(
   r.out = stripAnsi(r.out);
 
   if (r.timedOut) {
+    const hung = tool === "maven" ? unfinishedTestClasses(r.out) : [];
+    const stuckIn = hung.length ? `；逾時當下仍在執行的測試類別：${hung.join("、")}` : "";
     return {
-      passed: false,
-      report:
-        `建置/測試逾時（${BUILD_TIMEOUT_MS}ms），已終止程序樹。` +
-        `常見原因：依賴解析卡住、測試含真實網路 I/O。可調整 UT_BUILD_TIMEOUT_MS。`,
-      raw: r.out,
+      gate: {
+        passed: false,
+        report:
+          `建置/測試逾時（${BUILD_TIMEOUT_MS}ms），已終止程序樹${stuckIn}。` +
+          `常見原因：依賴解析卡住、測試含真實網路 I/O 或無限等待。可調整 UT_BUILD_TIMEOUT_MS。`,
+        raw: r.out,
+      },
+      aborted: `建置/測試逾時（UT_BUILD_TIMEOUT_MS=${BUILD_TIMEOUT_MS}ms），已終止程序樹${stuckIn}`,
     };
+  }
+  if (r.signal) {
+    const why =
+      `建置程序被 ${r.signal} 終止，沒有跑完——這不是編譯或測試失敗。` +
+      (r.signal === "SIGKILL" ? "常見原因：記憶體不足被 OOM killer 收掉（dmesg 可查）。" : "");
+    return { gate: { passed: false, report: why, raw: r.out }, aborted: why };
   }
 
   if (r.code === 0) {
     const zeroReport =
       ALLOW_ZERO_TESTS || opts.allowZeroTests ? null : detectZeroTests(tool, mod, r.out);
-    if (zeroReport) return { passed: false, report: zeroReport, raw: r.out };
-    return { passed: true, report: "編譯與測試全數通過。", raw: r.out };
+    if (zeroReport) return { gate: { passed: false, report: zeroReport, raw: r.out } };
+    return { gate: { passed: true, report: "編譯與測試全數通過。", raw: r.out } };
   }
 
   // Dirty-baseline subtraction: the gate's promise weakens from "the module is green" to
@@ -727,12 +921,14 @@ export async function runBuildAndTests(
     const v = subtractTolerated(r.out, failingSuites(mod.moduleRoot, startedAt), opts.tolerate);
     if (v.pass) {
       return {
-        passed: true,
-        report:
-          `編譯通過。${v.current.length} 個失敗全部是 writer 介入前就存在的，` +
-          `依 UT_ALLOW_DIRTY_BASELINE 放行：\n` +
-          v.current.map((id) => `  - ${id}`).join("\n"),
-        raw: r.out,
+        gate: {
+          passed: true,
+          report:
+            `編譯通過。${v.current.length} 個失敗全部是 writer 介入前就存在的，` +
+            `依 UT_ALLOW_DIRTY_BASELINE 放行：\n` +
+            v.current.map((id) => `  - ${id}`).join("\n"),
+          raw: r.out,
+        },
       };
     }
     log(`[dirty-baseline] 不予扣除：${v.reason}`);
@@ -753,9 +949,11 @@ export async function runBuildAndTests(
       : collectGradleFailures(mod.moduleRoot);
 
   return {
-    passed: false,
-    report:
-      `編譯或測試失敗（exit=${r.code}）。${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
-    raw: r.out,
+    gate: {
+      passed: false,
+      report:
+        `編譯或測試失敗（exit=${r.code}）。${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
+      raw: r.out,
+    },
   };
 }

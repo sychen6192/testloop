@@ -32,7 +32,7 @@ import {
 } from "./config";
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
-import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw } from "./libs/utils";
+import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw, codelessTypeReason } from "./libs/utils";
 import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
@@ -40,9 +40,14 @@ import { getToolVersion } from "./libs/version";
 import { detectBuildTool, runBaseline, writableRel } from "./gates/build";
 import { createRunner } from "./runners/runner";
 import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
+import { installShutdownHandlers, onShutdown } from "./libs/shell";
+import { acquireRepoLock } from "./libs/lock";
 import { PreExistingFailures } from "./prompts";
 
 async function main() {
+  // Before anything can be interrupted: the SIGHUP rule in particular has to be in place before
+  // a terminal can hang up on a run that is still in its baseline build.
+  installShutdownHandlers();
   banner("write-java-ut pipeline 啟動");
   const toolVersion = getToolVersion();
   log(`工具版本：${toolVersion}`);
@@ -64,8 +69,20 @@ async function main() {
 
   const mod = findModuleInfo(absTarget, REPO_ROOT);
   const buildTool = detectBuildTool(mod.moduleRoot);
-  const targetClasses = listJavaClasses(absTarget, REPO_ROOT);
-  if (targetClasses.length === 0) die(`目標沒有 .java 檔：${absTarget}`);
+  const javaFiles = listJavaClasses(absTarget, REPO_ROOT);
+  if (javaFiles.length === 0) die(`目標沒有 .java 檔：${absTarget}`);
+  // Types that compile to no executable code are not targets: no test can cover them, so the
+  // coverage gate has nothing to hold the writer to and a reviewer has nothing to review.
+  const codeless = javaFiles
+    .map((cls) => ({ cls, why: codelessTypeReason(fs.readFileSync(path.join(REPO_ROOT, cls), "utf8")) }))
+    .filter((c): c is { cls: string; why: string } => c.why !== null);
+  const targetClasses = javaFiles.filter((cls) => !codeless.some((c) => c.cls === cls));
+  if (targetClasses.length === 0) {
+    die(
+      `目標底下只有沒有可執行程式碼的型別（${codeless.map((c) => `${path.basename(c.cls)}：${c.why}`).join("、")}），` +
+        "沒有東西可以寫單元測試。請改指定實作類別（例如 FooServiceImpl.java）或其所在資料夾。",
+    );
+  }
 
   if (!fs.existsSync(STANDARDS_PATH)) die(`找不到品質標準檔：${STANDARDS_PATH}`);
   const standards = fs.readFileSync(STANDARDS_PATH, "utf8");
@@ -78,6 +95,10 @@ async function main() {
   log(`建置工具：${buildTool}`);
   log(`目標類別 ${targetClasses.length} 個：`);
   targetClasses.forEach((c) => log(`  - ${c}`));
+  if (codeless.length) {
+    log(`略過 ${codeless.length} 個沒有可執行程式碼的型別（不產生測試、不列入覆蓋率門檻）：`);
+    codeless.forEach((c) => log(`  - ${c.cls}（${c.why}）`));
+  }
 
   // Existing tests, resolved deterministically rather than left to the writer to discover.
   const existingTests = targetClasses.map((cls) => ({
@@ -123,7 +144,25 @@ async function main() {
 
   const runId = new Date().toISOString().replace(/[:.]/g, "-");
   const runDir = path.join(RUNS_DIR, runId);
+  // Locked before the directory exists: a run refused for sharing the repo leaves nothing behind.
+  const busy = acquireRepoLock(REPO_ROOT, runDir);
+  if (busy) {
+    die(
+      `同一個 repo（${REPO_ROOT}）已有另一個 testgen 在執行（pid ${busy.pid}，artifacts：${busy.runDir}）。\n` +
+        "同一個 repo 併行會互相觸發 scope-violation（對方 writer 寫的檔案落在本次範圍外），-am 建置也會共用上游模組的 target/。\n" +
+        `請等它結束，或改在另一個 clone / git worktree 執行。確定沒有在跑卻看到這個訊息，刪除 ${busy.lock} 即可。`,
+    );
+  }
   fs.mkdirSync(runDir, { recursive: true });
+  crashRunDir = runDir;
+  // Ctrl-C, SIGTERM, a hangup on an interactive terminal: the run still leaves a summary that
+  // says it was interrupted, rather than a directory that looks like a run still going.
+  onShutdown((reason) => {
+    const p = path.join(runDir, "summary.json");
+    if (!fs.existsSync(p)) {
+      fs.writeFileSync(p, JSON.stringify({ success: false, stopReason: `interrupted:${reason}` }, null, 2));
+    }
+  });
 
   // The target repo's HEAD, so a run record says what code the tests were written against.
   let targetGitSha = "no-git";
@@ -148,6 +187,7 @@ async function main() {
         module: mod.moduleRel || "(root)",
         buildTool,
         targetClasses,
+        skippedCodeless: codeless,
         targetGitSha,
         thresholds: { MIN_LINE_COV, MIN_BRANCH_COV, scores: SCORE_THRESHOLDS },
         runner: RUNNER_KIND,
@@ -206,6 +246,17 @@ async function main() {
     fs.writeFileSync(path.join(runDir, "baseline.md"), baseline.summary);
     fs.writeFileSync(path.join(runDir, "baseline.log"), baseline.raw);
     console.log(baseline.summary);
+    if (baseline.aborted) {
+      fs.writeFileSync(
+        path.join(runDir, "summary.json"),
+        JSON.stringify({ success: false, stopReason: "baseline-aborted", error: baseline.aborted }, null, 2),
+      );
+      die(
+        `預檢建置沒有跑完：${baseline.aborted}\n` +
+          "這不是既有紅燈，修復迴圈幫不上忙。建置每次都要跑這麼久時請調高 UT_BUILD_TIMEOUT_MS；" +
+          `被 signal 終止多半是記憶體不足。詳見 ${path.join(runDir, "baseline.log")}`,
+      );
+    }
 
     let clean = baseline.clean;
     // Repairing is only possible where the writer may write. A red common/ in a reactor, or a
@@ -245,19 +296,42 @@ async function main() {
       );
       if (repair.success) {
         clean = true;
-        log(
-          `[OK] 既有紅燈已修復（${repair.rounds} 輪，變更 ${repair.changedFiles.length} 個測試檔）` +
-            "——這些是 writer 對別人測試的改動，commit 前請檢視 diff：",
-        );
-        repair.changedFiles.forEach((f) => log(`  - ${f}`));
+        if (repair.stopReason === "flaky-baseline") {
+          log(`[WARN] ${repair.report}——不是穩定的紅燈，照常開始產生測試；這些測試本身需要人檢視`);
+        } else {
+          log(
+            `[OK] 既有紅燈已修復（${repair.rounds} 輪，變更 ${repair.changedFiles.length} 個測試檔）` +
+              "——這些是 writer 對別人測試的改動，commit 前請檢視 diff：",
+          );
+          repair.changedFiles.forEach((f) => log(`  - ${f}`));
+        }
       } else {
         log(`[FAIL] 修復未能讓模組回到綠燈（${repair.stopReason}，${repair.rounds} 輪）`);
       }
     }
 
+    // Some ways repair ends are not "could not make it green" and must not be pushed through by
+    // UT_ALLOW_DIRTY_BASELINE: a scope violation leaves production code the writer changed on disk
+    // (every later snapshot starts from the changed tree, so nothing would flag it again, and the
+    // run could end gates-passed on it); a runner that cannot run or a build that does not finish
+    // will not do better in the main loop.
+    if (!clean && repair && ["scope-violation", "runner-spawn-error", "build-aborted"].includes(repair.stopReason)) {
+      fs.writeFileSync(
+        path.join(runDir, "summary.json"),
+        JSON.stringify({ success: false, stopReason: `repair-failed:${repair.stopReason}`, repair }, null, 2),
+      );
+      die(`修復迴圈以 ${repair.stopReason} 結束，不論 UT_ALLOW_DIRTY_BASELINE 都不能繼續：\n${repair.report}\n詳見 ${runDir}`);
+    }
     if (!clean) {
+      // What the writer is told to leave alone: still red after repair AND red before it. A class
+      // the repair writer turned red was not pre-existing — telling the writer not to touch it
+      // while the gate (which tolerates only the baseline) demands it be fixed was a contradiction
+      // that ended in stuck.
       preExisting = repair
-        ? repair.remaining
+        ? {
+            compileErrorFiles: repair.remaining.compileErrorFiles.filter((f) => baseline.compileErrorFiles.includes(f)),
+            failingTestClasses: repair.remaining.failingTestClasses.filter((c) => baseline.failingTestClasses.includes(c)),
+          }
         : {
             compileErrorFiles: baseline.compileErrorFiles,
             failingTestClasses: baseline.failingTestClasses,
@@ -298,19 +372,21 @@ async function main() {
         die(
           (repair
             ? `修復 ${repair.rounds} 輪後模組仍無法通過建置（${repair.stopReason}）。仍然紅燈的：\n${still}\n` +
-              "常見原因：根因在 production code 或建置設定（例如 pom.xml 的 Lombok annotation processor），" +
-              "writer 無權修改。請人工修好後重跑，或：\n"
+              `${repairHint(repair.stopReason)}請人工修好後重跑，或：\n`
             : baseline.envFailures.length
               ? "模組在本工具介入前就無法通過建置，而紅燈來自環境/設定，不是測試碼——" +
                 "檔案就算在 writer 可寫範圍內，改測試碼也不會讓它變綠：\n" +
                 `${baseline.envFailures.map((w) => `  - ${w}`).join("\n")}\n` +
                 "重量級整合測試（@SpringBootTest）的模組最常見。請先讓該環境起得來，或：\n"
             : baseline.outOfScope.length
-              ? `模組在本工具介入前就無法通過建置，而紅燈全部落在 writer 的可寫範圍` +
+              ? `模組在本工具介入前就無法通過建置，而其中 ${baseline.outOfScope.length} 項紅燈落在 writer 的可寫範圍` +
                 `（${writableRel(mod)}）之外——它沒有權限修改這些檔案，所以沒有進入修復迴圈：\n` +
                 `${outOfScopeList}\n` +
-                `多模組常見原因：build gate 跑的是 \`mvn -pl ${mod.moduleRel || "."} -am test\`，` +
-                "上游模組的測試原始碼也要編得過、也會被執行。請先人工修好上面這些，或：\n"
+                (mod.multiModule
+                  ? `多模組常見原因：build gate 跑的是 \`mvn -pl ${mod.moduleRel} -am test\`，` +
+                    "上游模組的測試原始碼也要編得過、也會被執行。"
+                  : "") +
+                "請先人工修好上面這些，或：\n"
               : "模組在本工具介入前就無法通過建置，而 UT_REPAIR_BASELINE=0 關閉了自動修復。請先修好：\n" +
                 `${still}\n或：\n`) +
             "  UT_ALLOW_DIRTY_BASELINE=1  照樣執行（已知紅燈會標記為 pre-existing 並要求 writer 不要碰）\n" +
@@ -321,6 +397,9 @@ async function main() {
       log("[WARN] UT_ALLOW_DIRTY_BASELINE=1：帶著既有紅燈繼續，已知失敗會標記為 pre-existing");
       // The gate now compares instead of requiring: these identities may keep failing, anything
       // else that fails is the writer's doing and still turns the round red.
+      // Only what failed before any writer ran. After a failed repair, something failing now that
+      // did not fail then is the repair writer's doing — tolerating it would let a test it broke
+      // ride through every later gate. A failing method it merely renamed fails closed, by design.
       tolerate = baseline.failingTests;
       if (tolerate.length) {
         log(`[dirty-baseline] build gate 將容忍以下 ${tolerate.length} 個既有失敗：`);
@@ -387,4 +466,43 @@ async function main() {
   process.exit(result.success ? 0 : 2);
 }
 
-main().catch((e) => die(String(e?.stack ?? e)));
+// Why repair gave up decides what the operator should look at. The one hint used for all of them
+// — production code or Lombok in pom.xml — was wrong for most: a writer that could not finish, a
+// build that did not, a repair that went round in circles.
+function repairHint(stopReason: string): string {
+  switch (stopReason) {
+    case "build-aborted":
+      return "修復後的建置沒有跑完（逾時或被 signal 終止），見上方訊息。";
+    case "writer-no-op":
+      return "writer 沒有改任何檔案——它可能判斷這些紅燈不是測試碼能修的，或 session 沒有正常完成（見上方 [WARN]）。";
+    case "unlocatable-failure":
+      return "建置失敗但定位不到任何測試檔或測試類別，請直接看建置 log。";
+    case "repair-no-progress":
+    case "stuck":
+    case "repair-max-iterations":
+      return "writer 修了幾輪都沒讓紅燈減少——根因常在 production code 或建置設定（例如 pom.xml 的 Lombok annotation processor），writer 無權修改。";
+    case "scope-violation":
+      return "writer 動了測試範圍以外的檔案，見上方清單。";
+    default:
+      return "";
+  }
+}
+
+// Set once the artifacts dir exists. A crash anywhere after that — baseline, repair, a round —
+// must still leave a summary, or the directory looks exactly like a run that is still going.
+// Only orchestrate() used to be covered; a crash in the repair loop left no summary at all.
+let crashRunDir: string | undefined;
+
+main().catch((e) => {
+  if (crashRunDir && !fs.existsSync(path.join(crashRunDir, "summary.json"))) {
+    try {
+      fs.writeFileSync(
+        path.join(crashRunDir, "summary.json"),
+        JSON.stringify({ success: false, stopReason: "crash", error: String(e?.stack ?? e) }, null, 2),
+      );
+    } catch {
+      /* best effort: the FATAL line below still says what happened */
+    }
+  }
+  die(String(e?.stack ?? e));
+});

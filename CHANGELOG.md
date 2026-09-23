@@ -80,6 +80,226 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **跑到一半「莫名其妙中斷」：實測重現出五個成因，全部修掉。** 以真的 Maven 專案（JUnit 5 +
+  Mockito + JaCoCo）加一個行為像模型的假 OpenAI 端點，完整跑 `loop.ts`，把真實環境會遇到的狀況
+  逐一注入。五個都能讓 run 在第 N 輪突然停下，而且停下時的訊息都指向錯的地方：
+  - **幾秒鐘的 503 就結束整個 run，還叫你去裝 opencode。** api runner 把「任何一個 writer session
+    的第一個請求失敗」都當成 spawn-error，orchestrator 見到 spawn-error 就判定是環境壞了、立即中止，
+    訊息是「writer 程序未能啟動…請確認 opencode CLI 可用」——即使你用的是 api runner、上一輪才剛
+    成功。實測：第 2 輪開頭連續 3 次 503（模型伺服器重啟、閘道過載的典型樣子，前後 3 秒）→
+    `stop=runner-spawn-error`。重試原本只有 3 次、間隔 1 秒與 2 秒。現在分兩段：端點**這個 run
+    從未回應過**時照舊快速試 3 次就判定設定錯誤（網址、proxy 設錯要秒報）；**回應過之後**，連線錯誤、
+    408/425/429/5xx、以及不是 JSON 的 2xx 會以指數退避持續重試到 `UT_AGENT_RETRY_WINDOW_MS`（預設
+    3 分鐘，**從這一波第一次失敗起算**，不是從 session 開始；`0` = 不重試），以 `Retry-After` 為最短等待，每次重試都印一行
+    `[WARN] … N 秒後重試`，不再靜默。401/403/404
+    仍然立即判 spawn-error——金鑰與模型名稱是設定問題。重試窗用盡時回報的是 `timeout`（session
+    沒完成）而不是 spawn-error，runner-spawn-error 的訊息也依 runner 改寫，不再對 api runner 使用者提
+    opencode。重試次數的上限由重試窗推得，設長的窗（例如撐過 15 分鐘的 vLLM 重啟）不會被寫死的次數提早結束。
+  - **context 滿了，writer 讀完檔就空手結束。** api runner 把每次讀檔的結果都留在對話裡；本地模型
+    （vLLM 的 `max_model_len`、32k 很常見）在 prompt + `max_tokens` 超過上限時回 HTTP 400，舊版把它
+    當成請求失敗直接結束 session——writer 讀完檔、還沒開始寫——下一輪就以 `writer-no-op` 中止，
+    訊息還說「常見原因：permission 被擋」。現在認得各家伺服器的 context 超限訊息（vLLM 新舊兩版、
+    OpenAI、TGI、llama.cpp、SGLang、LM Studio），先把**較早**的工具結果與已落地的 write_file 內容
+    換成一行說明（模型需要可以重讀；最近一輪的結果、system 與任務 prompt、tool_call_id 配對一律不動），
+    沒有可省的才把 `max_tokens` 降到伺服器說得下的量；兩者都不行才結束，並說明要調哪個旋鈕。
+    唯讀的 reviewer session 不做前一步——被換掉的是它讀過的程式碼，拿省略過的內容評分等於沒讀；它只降
+    `max_tokens`，不夠就以 reviewer 未完成收場、由 review gate 重試。
+  - **寫大測試檔超過 `max_tokens`，writer 被當成「完成」。** 一次 write_file 整個測試類別，輸出被
+    `max_tokens` 截斷時，vLLM 把半截的 tool call 當**文字**回傳、`tool_calls` 為空、
+    `finish_reason=length`；舊版把它當 writer 的最終答案，log 印 `[OK] [writer] 完成`，檔案一個字都
+    沒寫，下一輪 `writer-no-op` 中止。現在截斷（或伺服器沒解析出來、以文字送出的工具呼叫）會以
+    user 訊息告訴模型發生了什麼、要它拆成 write_file + replace_in_file 的小步驟（reviewer 則是要它直接
+    輸出較短的 JSON 判決），**連續**最多 3 次；
+    tool call 的 arguments 被截成壞 JSON 時，錯誤訊息也會說明是截斷。
+  - **回應 body 卡住就永遠掛著。** 請求逾時的計時器在收到 header 時就被清掉，之後讀 body 沒有任何
+    期限（undici 的 `bodyTimeout` 先前為了修 300 秒問題已關閉）；連線在回應途中斷掉而沒有 RST
+    （VPN 重連、筆電休眠、NAT 逾時）時，run 會一直印「仍在進行中」直到天荒地老。現在 session 期限
+    涵蓋整個 body。實測 `UT_AGENT_TIMEOUT_MS=20000`：舊版 60 秒以上仍在等，新版 20 秒逾時後繼續。
+  - **目標資料夾裡有 interface，coverage gate 永遠過不了。** service 套件的常態是
+    `FooService`（interface）加 `FooServiceImpl`。只有抽象方法的 interface 沒有任何可執行的
+    bytecode，JaCoCo 把它寫成自我閉合的 `<sourcefile name="FooService.java"/>`，而 gate 的正則只認
+    `<sourcefile …>…</sourcefile>`，於是回報「在 JaCoCo 報告中找不到」、每輪一模一樣，第 3 輪判
+    `stuck` 中止。`<class>` 的退路更糟：自我閉合的 `<class …/>` 會一路配對到**下一個**類別的
+    `</class>`，把別人的覆蓋率算成自己的。現在兩條路徑都正確處理自我閉合元素（無計數器 = 沒有
+    可執行的程式碼，不列入門檻；以 `-g:none` 編譯、沒有 LINE 計數器的類別改用 INSTRUCTION 計數）；loop 啟動時也會以保守的原始碼判斷略過只有抽象方法的 interface
+    與 annotation（列在 log 與 `params.json` 的 `skippedCodeless`），不再要 writer 替它們寫測試、
+    也不讓 reviewer 為了缺測試擋關。目標只有這類型別時直接說明並中止。
+  每一項都有對應的整合情境（`loop-api-503-mid-run`、`loop-api-outage-not-spawn-error`、
+  `loop-api-context-overflow`、`loop-api-truncated-write`、`loop-interface-in-target`），並確認在修改前
+  的程式碼上會紅。api runner 的重試、context 縮短與截斷處理改動了 `runners/` 對模型端的呼叫方式（AGENTS.md 高風險項，已取得使用者確認）。
+- **建置輸出太大，整個工具中途崩潰。** build gate 把 maven 的全部輸出串成一個字串，超過 V8 的字串
+  上限（約 5.4 億字元）時 `buf += chunk` 在 stream handler 裡丟出 `RangeError: Invalid string length`
+  ——uncaught，整個程序直接結束，沒有 summary.json。surefire 預設把測試的 stdout 轉到 maven 主控台，
+  所以一個 DEBUG log 的 `@SpringBootTest` 模組、或 writer 寫出會迴圈印 log 的測試就會撞到。實測 600MB
+  輸出：舊版崩潰，新版 exit 0（失敗的斷言照樣被找出來餵回）。現在只在記憶體保留尾端
+  （`UT_MAX_BUILD_OUTPUT_CHARS`，預設 64M 字元、上限 2 億）加上被丟棄前段裡的 `[ERROR]` 行、javac 接續行與
+  `Tests run:` 行，並明說丟了多少；同一處的斷行也從每個 chunk 重切整段（O(n²)，80MB 無換行輸出要
+  87 秒 CPU、期間 event loop 全卡）改為只看新 chunk。
+- **`redirectTestOutputToFile` 的專案，大量測試輸出讓報告解析崩潰。** 讀 surefire `.txt` 摘要時
+  `-output.txt`（測試的整份 stdout）也被當摘要讀，600MB 的檔案直接 `ERR_STRING_TOO_LONG`。現在只讀
+  真正的摘要、有大小上限；過大的 `TEST-*.xml` 改為分段讀並跳過 `<system-out>`，失敗案例照樣讀得到
+  （先前是靜默消失）。
+- **預檢把普通的斷言失敗誤判成「環境問題」而中止。** 環境失敗（Spring context 起不來、連線池、解密）
+  的偵測原本掃**整份建置 log**——包含**通過的**測試的輸出；Spring 每次 refresh 失敗都會印的 WARN
+  （`ApplicationContextRunner` 的 `hasFailed()` 測試就是故意觸發它）讓一個本來修得動的紅燈在第 1 輪前
+  就被判成環境問題、修復迴圈根本沒跑。現在有 surefire XML 時只看**失敗測試自己的**訊息與 cause 鏈，
+  沒有 XML 才退回掃 log（`loop-baseline-env-false-positive`）。
+- **通過的測試被報成失敗。** surefire XML 會保留通過測試的 stdout，裡面若印了含 `<error` / `<failure`
+  的 XML/SOAP，那個測試就被當成失敗餵給 writer、也進了 dirty-baseline 的容忍集合。現在先去掉
+  `<system-out>` / `<system-err>` 再判斷。
+- **repo 裡有目錄在跑到一半消失、讀不到、或是 Big5 檔名，整個 run 以 FATAL 結束。** writer 範圍快照
+  每輪兩次走訪整個 repo，任何一個目錄 `readdirSync` 失敗就丟例外：IDE／dev server 重建輸出時刪掉的
+  目錄（ENOENT）、docker volume 掛出來的 `pgdata`（EACCES）、Big5 命名的目錄（Node 解碼後路徑不存在）、
+  超過 PATH_MAX 的深度。現在消失的目錄當作不存在、讀不到的記錄其狀態（之後才變成讀不到的一樣算變動），
+  防掏空量尺與慣例掃描同樣處理；在 baseline 或修復迴圈中崩潰時也一定寫出 summary.json。
+- **別的程序在 repo 裡寫檔，被當成 writer 越界而中止。** writer 執行期間 repo 內任何檔案有變動都算
+  writer 的：執行中的應用程式寫 `logs/app.log`、IDE 自己建置到 `out/`，都會在某個隨機的輪次以
+  `scope-violation` 結束 run，還叫你「git diff 檢視並還原」——但 diff 什麼都沒有。現在**被 git ignore、
+  不在任何 `src/` 底下、不是建置檔、而且形狀是輸出**（`logs/`、`out/`、`bin/`、`tmp/`、`*.log`、本機 DB
+  檔等——刻意用 allowlist：Spring Boot 會從模組根載入被 ignore 的 `./config/application.yml`）的檔案視為
+  別的程序的變動，只印 `[WARN]` 清單不中止；tracked 檔案、
+  `src/` 底下的一切（被 ignore 的 `application-local.yml` 一樣是測試會載入的設定）、`pom.xml` /
+  `*.gradle` / `lombok.config` 等建置檔、不是 git repo、以及 repo 本身被上層 repo 整個 ignore 掉的情況，
+  guard 強度不變（`scope-foreign-ignored-change`、`scope-ignored-under-src-still-blocked`）。這放寬了
+  AGENTS.md 機制 1 的範圍 assert（AGENTS.md 高風險項，已取得使用者確認）。違規清單改為最多列 20 筆。
+- **同一個 repo 同時跑兩個 testgen，兩邊都在第 1 輪中止。** 各自把對方 writer 寫的測試檔當成自己越界，
+  叫你還原對方的成果。現在每個 repo 同時只允許一個 run，第二個啟動即以清楚的訊息拒絕
+  （鎖檔在系統暫存目錄、不在 repo 內；持有者已結束的鎖會自動接手，別的使用者的程序持有的鎖視為仍在執行）。
+  幾個 run 同時發現同一個過期的鎖時只有一個接手（接手在另一個互斥鎖下進行，實測舊寫法 8 個裡有 2–3 個
+  同時跑起來）；持有者的 pid 被別的程序重用（Windows 很快就重用，常給系統服務）時，由鎖檔的擁有者與
+  持有者 run 的 `summary.json` 判斷它其實已經結束，不會從此擋住每一個 run。
+- **`UT_RUNS_DIR` 設在 repo 內（或工具 clone 在 repo 內）時，每個 run 第 1 輪就 scope-violation。**
+  loop 自己寫的 `writer-summary.md` 被當成 writer 越界。現在 runs 目錄不列入範圍檢查。
+- **（Windows / macOS）指定目標時的大小寫與磁碟上不同，writer 寫的測試在第 1 輪就被判越界。** 範圍快照
+  走訪到的是磁碟上的名稱（`modA/src/test`），可寫範圍卻是從使用者輸入的路徑算的（`moda/src/test`）；
+  不分大小寫的檔案系統上兩者指向同一處，比對卻不相等，於是 writer 在自己的範圍內寫的檔案全被當成越界。
+  runs 目錄、以及經 symlink 指定的模組同理。現在兩端都取磁碟上的實際路徑再比對。
+- **（Windows）模組自己的測試有編譯錯誤，預檢判定「不在可寫範圍內」、不進修復就中止。** Windows 上
+  maven-compiler-plugin 印出的是 URI 形狀的路徑 `/C:/repo/src/test/...`，照字面解析會變成
+  `C:\C:\repo\...`，落在範圍外。現在還原成磁碟路徑。
+- **api runner 的 read_file 讀到 FIFO 會讓整個程序永遠卡住**（readFileSync 卡住 event loop，連逾時與
+  心跳都不會觸發）；search 遇到一個讀不到的檔案整個搜尋就變成錯誤。現在只讀一般檔案、有大小上限，
+  search 跳過讀不到的檔案。
+- **（opencode runner）opencode 因 provider 故障結束，被當成「完成」。** opencode 對 429/5xx 會自己重試
+  約 75 秒，放棄時印一個 `type:error` 事件後 **exit 1**；runner 原本丟掉 exit code，只要不是逾時就是
+  `[OK] 完成`——writer 什麼都沒寫，下一輪 `writer-no-op` 中止，訊息還猜 permission。實測真的 opencode
+  1.18.32：舊版 94 秒後 exit 2；新版印出 `opencode 異常結束（exit=1）：fake 503——15 秒後重新執行`，
+  重跑後三輪全過、exit 0。語意與 api runner 一致：**同一個 agent 這個 run 從沒完成過 session、這一次也
+  什麼都沒做**（沒有工具呼叫、沒有輸出）時照舊判 spawn-error（模型名稱、provider 認證設錯要秒報，writer
+  與 reviewer 分開算，因為兩者可以是不同模型）；做過事之後在 `UT_AGENT_RETRY_WINDOW_MS` 內重新執行（從第一次
+  失敗起算），用完才回報 session 未完成。這改動了 `runners/` 的 CLI 呼叫方式（AGENTS.md 高風險項，已取得使用者確認）。
+- **reviewer 沒跑完，被算成「沒讀檔就給判決」並餵給 writer。** reviewer 在第一次工具呼叫前就被逾時或
+  provider 故障打斷時，`toolCallCount` 是 0，落進 fail-closed 的「0 次工具呼叫」判定——那是給「答得出來
+  但沒讀檔」的 reviewer 用的 blocker，會餵給 writer；writer 無從讓 reviewer 跑完，於是 hard gate 全綠的
+  run 以 `writer-no-op` 收場。現在 reviewer session 沒正常完成時一律視為解析不出、在 reviewer 端重試
+  （`UT_REVIEW_MAX_RETRIES`），用完以 `reviewer-unparseable` 點名 reviewer（`review-unfinished-retried`）。
+  沒跑完的 session 留下的文字**即使看起來是完整判決也不採用**——那可能是模型在同一回合讀到工具結果之前
+  寫的草稿。這改動了 review gate 的判定流程（AGENTS.md 高風險項，已取得使用者確認）。
+- **（opencode runner）讀一次 repo 外的檔案就結束整個 session。** opencode 的 `external_directory` 預設是
+  `ask`，`opencode run` 非互動時自動拒絕，而**拒絕會結束 session**：模型讀 `~/.m2` 裡依賴的原始碼、或
+  stack trace 上的絕對路徑，writer 就空手結束、下一輪 `writer-no-op`。兩個 agent 改為 `deny`——模型拿到
+  工具錯誤後繼續。實測真的 opencode：舊版 36 秒 exit 2，新版三輪全過。agent `.md` 權限變更（AGENTS.md 高風險項，已取得使用者確認）。
+- **（opencode runner）writer 改 `pom.xml` 加依賴，整個 run 以 scope-violation 中止。** writer 的 `edit`
+  原本對所有路徑 `allow`，只靠事後快照攔截並中止；api runner 則是在工具層拒絕、session 繼續。現在
+  opencode 也在權限層只允許 `src/test/**`，其餘 `deny`（快照 guard 照舊是 assert）。實測真的 opencode：
+  pom.xml 的 edit 被拒、模型繼續寫測試、三輪全過、pom.xml 未變。agent `.md` 權限變更（AGENTS.md 高風險項，已取得使用者確認）。
+- **writer 與「唯讀」reviewer 都拿得到 opencode 的 `task` 工具。** `task` 開出的 subagent 拿的是預設工具組
+  ——**含 bash 與寫檔**——實測 reviewer 經由它跑了 shell 指令，runner 只看得到 `[tool] task [completed]`；
+  subagent 的 bash 還以 detached 方式執行，逾時的整樹終止收不到它。這直接違反 AGENTS.md 硬規則 2、3
+  與「禁止 Task tool delegation」，而 startup guard 照樣報通過。兩個 agent 改為 `tools.task: false` +
+  `permission.task: deny`，guard 新增 `task: false` 契約。**升級後請重跑 `npm run setup`**，自訂的
+  repo 層 agent 也要補上 `task: false`，否則啟動時 guard 會 FATAL（訊息會點名）。agent 權限與 guard
+  契約變更（AGENTS.md 高風險項，已取得使用者確認）。
+- **build gate 逾時收不掉抓著 stdout 的孫程序，一直掛著。** `killTree` 在直接子程序已結束時就不做事，
+  但 POSIX 上整個 process group 可能還在（外掛或測試啟動的背景 server），`shLive` 等的是 pipe 關閉，
+  於是 `UT_BUILD_TIMEOUT_MS` 到了也結束不了。現在 POSIX 一律對 group 送訊號；opencode session 結束時也把
+  殘留的子孫收掉，避免它在 gate 判完之後還在改測試檔（opencode 部分屬 `runners/` 呼叫方式變更，
+  AGENTS.md 高風險項，已取得使用者確認）。
+- **`nohup testgen … &` 之後登出或 SSH 斷線，run 在建置中途無聲無息地死掉。** Node 啟動時會把繼承來的
+  「忽略 SIGHUP」重設回預設，所以 `nohup` 對它無效：終端一斷，log 停在某一行 `[mvn]`、沒有 FATAL、沒有
+  summary.json，detached 的 mvn / surefire 還成了孤兒繼續寫 `target/`——重量級模組每輪 8–15 分鐘，丟到
+  背景再登出是最自然的用法，也最像「跑到一半莫名其妙中斷」。現在 stdin 不是終端機（nohup、setsid、
+  cron、CI）時 SIGHUP 只印 `[WARN]` 並繼續執行；互動式終端斷線則與 Ctrl-C 一樣收掉整棵程序樹、寫出
+  summary.json 後結束（exit 129）。實測：pty 裡 `nohup bin/testgen … &` 後斷線，舊版當場死掉並留下 3 個
+  孤兒，新版 3 分 40 秒後 `gates-passed`。`bin/testgen` 也改成單一 node 程序（tsx 以 `--import` 載入）
+  ——tsx CLI 會多一個只轉送 SIGINT/SIGTERM 的父程序，斷線時它自己先死，shell 回報 129 而 run 其實還在跑。
+  `--import` 要 Node 20.6 以上（`engines` 允許 20.0），所以先試一次，不支援時照舊走 tsx CLI。
+- **`testgen … | tee log` 的 tee 結束、或終端斷線後，下一行 log 讓整個 run 崩潰。** stdout 的讀取端消失時
+  Node 以 `EPIPE` / `EIO` 的 error 事件回報，沒有 listener 就是未捕捉例外——而且發生在**下一行 log**，
+  可能是幾分鐘後，看起來完全隨機。現在 console 失效時照常執行（紀錄本來就在 `runs/`）。
+- **預檢建置逾時或被 OOM killer 收掉，被說成「定位不到的紅燈」再猜 Lombok。** 被 signal 終止的建置原本
+  看起來跟 exit 1 一樣，逾時的預檢也沒有任何測試失敗可定位，於是進修復迴圈、立刻以
+  `unlocatable-failure` 放棄，訊息卻說「根因在 production code 或 pom.xml 的 Lombok」。現在預檢／修復
+  驗證的建置沒跑完時直接說明（`建置程序被 SIGKILL 終止，沒有跑完——常見原因：記憶體不足`、或逾時與
+  `UT_BUILD_TIMEOUT_MS`），stopReason 為 `baseline-aborted` / `build-aborted`（`loop-baseline-killed`）。
+- **建置結束後，被它啟動的背景程序抓著 stdout，build gate 永遠等下去。** 等的是 pipe 關閉，而 setsid 過的
+  程序不在建置的 process group 裡，逾時也收不到。現在建置程序結束 3 秒後不再等待 pipe。
+- **Ctrl-C / SIGTERM 中斷時也寫出 summary.json**（`interrupted:SIGINT` 等），不再留下一個看起來還在跑的
+  artifacts 目錄；程序樹的收尾照舊。
+- **opencode 的 stdout 出現一行 `null` 就讓整個程序崩潰**（`JSON.parse("null")` 成功、接著讀 `.part`）；
+  長 JSONL 行的切行也改為線性。
+- **（api runner）閘道回 HTTP 200 包著錯誤，writer 被當成「完成」。** LiteLLM、one-api、OpenRouter 這類閘道
+  把上游逾時／過載包成 **200 + `{"error": …}`** 或空的 `choices`；舊版照樣當 completion 讀，得到一則空訊息，
+  再拿**前幾回合說過的話**當最終答案回報 `[OK]`——writer 什麼都沒寫，下一輪 `writer-no-op`；首輪時甚至以
+  `gates-passed` 收場而**一個測試都沒產生**。現在這種回應是失敗的請求，與 5xx 一樣重試並點名閘道的錯誤
+  訊息（`loop-api-gateway-200-error`）。閘道強制串流（即使請求 `stream: false`）時也把 SSE 拼回一則訊息；
+  串流裡的 `error` 事件、或沒有 `finish_reason` 也沒有 `[DONE]` 就斷掉的串流，同樣是失敗的請求，不會把
+  半截的回覆當成答案。
+- **reviewer 的判決前面有 `<think>` 或草稿，連續三次解析失敗而中止。** 判決原本取「第一個 `{` 到最後一個
+  `}`」；沒開 reasoning parser 的推理模型（Qwen3、QwQ、R1 蒸餾版）把思考過程放在 content 裡，談的是 Java
+  程式碼、滿是大括號；判決後加一段帶大括號的註解也一樣。temperature 0 的重試每次輸出相同，於是
+  `reviewer-unparseable`。現在先去掉 `<think>…</think>`（Qwen3 模板只留下 `</think>` 也處理），逐一找出
+  平衡的頂層物件（字串內的大括號不算），取帶 `scores` 的那一個。**有兩個內容不同的判決物件**（草稿加
+  最終版、每個測試檔一個、一個陣列）時照樣 fail-closed、重試 reviewer——挑其中一個可能丟掉另一個提出的
+  blocker。只改擷取，判定不變（`loop-review-think-verdict`）。`gates/review.ts` 變更（AGENTS.md 高風險項，已取得使用者確認）。
+- **（api runner）一個格式不對的 tool call 讓後面每個請求都被拒。** 模型送出的 tool call 原樣回送給伺服器；
+  arguments 不是合法 JSON（Java 原始碼放在 JSON 字串裡很容易漏逃脫引號，或被 `max_tokens` 截斷）、或沒有
+  `id` 時，vLLM 0.11 以前會對**這段對話之後的每一個請求**回 400，writer 空手結束。現在回送前補上 `id`、
+  `type`，壞掉的 arguments 以 `{}` 回送（錯誤照樣告訴模型），`functions.write_file` 這類工具名稱也正規化。
+  參數**持續**被截斷時最多提示 3 次就結束並點名 `UT_API_MAX_TOKENS`，不再燒完 60 回合。
+- **（api runner）答案放在 `message.reasoning` 的模型被當成「沒說話」。** 新版 vLLM、Ollama、OpenRouter 用的
+  欄位名是 `reasoning`（`reasoning_content` 是舊名）；陣列形式的 `content` 也一併讀取。
+- **修復迴圈把「修好了」「還在修」「修不動」分錯，在第一輪之前或中途就中止。** 以真的 Maven 專案逐一重現：
+  - **只改 `src/test/resources` 的修復被當成 writer 什麼都沒改。** writer 的可寫範圍是整個 `src/test`，
+    「有沒有改東西」卻只看 `src/test/java`，修正測試資料檔的一輪以 `writer-no-op` 中止（產生階段也一樣）。
+    writer 的 prompt 與 agent 定義原本也只說 `src/test/java`，照做的模型根本不會去改測試資料檔；現在三者
+    一致寫明 `src/test/resources` 的測試資源也在範圍內。
+  - **呼叫 `System.exit` 的既有測試「定位不到」。** fork 的 JVM 中途結束時 surefire 不寫報告，只在 log 列出
+    `Crashed tests:`；現在讀這段，照樣進修復迴圈。
+  - **通過的測試印出 javac 形狀的訊息，被當成範圍外的編譯錯誤中止。** maven 只認編譯外掛自己的
+    `[ERROR] X.java:[l,c]` 格式。
+  - **紅燈數判斷把「揭露」當成「沒進展」。** 修好編譯錯誤後才看得到流程錯誤、整個模組編得過才看得到測試
+    失敗；數量沒降就被算一次沒進展，連兩次就在離綠燈一輪時中止。現在「上一輪有編譯錯誤（只有它藏得住別的
+    紅燈）、這輪有東西修好、新冒出的紅燈都在這輪沒改過、也沒引用這輪改過的類別的檔案裡」算進展；修好 A
+    卻在同一輪改過的 B、或經由同一輪改過的共用 helper 弄壞 B、或改了測試資源，照樣算沒進展；上一輪只有
+    測試失敗時換一個測試失敗也不算（`repair-revealed-errors` / `repair-thrash-still-stops` /
+    `repair-thrash-via-helper` / `repair-test-failure-swap`）。
+  - **flaky 測試讓預檢紅燈、writer 正確地沒改任何東西，run 以 writer-no-op 中止。** 只有測試失敗、writer
+    又沒改檔時，先重跑一次建置確認；重跑變綠就判定為 flaky、點名那些測試後照常開始產生。
+  - **`UT_ALLOW_DIRTY_BASELINE` 在修復失敗後，把修復 writer 弄紅的類別也列為「既有、請勿碰」。** gate 只容忍
+    writer 介入前就失敗的測試（這點不變，是刻意的 fail-closed），prompt 卻叫 writer 別碰那個類別，兩邊矛盾、
+    以 stuck 收場。現在「既有」只列修復前就紅、修復後仍紅的（`loop-dirty-repair-broke-green`）。
+  - **`UT_ALLOW_DIRTY_BASELINE` 讓修復輪改過 production code 的 run 照樣跑到 `gates-passed`。** 修復迴圈以
+    `scope-violation` 結束時，這個旋鈕原本照樣「帶著紅燈續跑」——之後每個 gate 量的都是被改過的程式碼。
+    現在修復以 `scope-violation`、`runner-spawn-error`、`build-aborted` 結束時不論旋鈕一律中止
+    （`loop-dirty-repair-scope-violation`）；它只放行「修不好的既有紅燈」。
+  - **`UT_TEST_SCOPE=generated` 的 `-Dtest` 只看這一輪改了什麼。** 第 2 輪只修 helper 時，writer 第 1 輪寫
+    的測試類別不在 `-Dtest` 裡，跑了 0 個測試，還被叫去「建立 `<Class>Test.java`」；現在用整個 run 寫過的檔。
+  - 修復失敗的 FATAL 不再一律猜 Lombok，改依實際的 stopReason 說明；單一模組不再提 `mvn -pl`；範圍外
+    清單不再說「全部」落在範圍外；建置逾時時點名當下還在跑的測試類別，逾時訊息也不再只在 verbose 才看得到。
+- **reviewer 根本跑不起來時立即中止。** 先前 reviewer 的 spawn-error 被包成 blocker 餵給 writer——
+  writer 改測試碼不可能讓 reviewer 起得來，於是多燒一輪 writer 加一次建置，拿到一模一樣的 blocker，
+  以 `stuck` 收場。現在與 writer 的 spawn-error 同樣處理（`review-spawn-error-aborts`）。已取得使用者確認。
+- **`writer-no-op` 的訊息不再一律猜 permission。** writer session 沒有正常完成（逾時、請求持續失敗、
+  context 無法再縮短、回覆一直被截斷）時，訊息改為說明 session 沒完成並指向 runner 的 `[WARN]` 行。
+- **逾時設得超大反而立刻逾時。** `UT_AGENT_TIMEOUT_MS` / `UT_BUILD_TIMEOUT_MS` 超過 setTimeout 的上限
+  （約 24.8 天）時，Node 會把它改成 1 毫秒——想設成「永不逾時」的人，每個 agent 與每次建置都會一啟動
+  就被殺。現在啟動時直接 FATAL 並點名變數。
+- **itest 在有 `NO_PROXY` 的機器上會紅。** `BASE_ENV` 釘住了 `UT_NO_PROXY=""`，但空的 UT_ 值會退回讀
+  shell 的 `NO_PROXY`——公司電腦幾乎一定有設，且含 `127.0.0.1`——於是 `loop-through-proxy` 的假 proxy
+  一次連線都收不到。整合自測現在一併清掉標準 proxy 變數。需要 git 的情境在沒有 git 時標示 `[SKIP]` 而非
+  整個 itest 崩潰，fixture 的 commit 也不受開發者全域的簽章設定與 hook 影響；Windows 上的路徑分隔、
+  含空白的路徑也不再讓自測誤報。
 - **reviewer 解析失敗不再拿 writer 的輪數去換。** 實地回報：reviewer 跑了 193 秒、38 次工具
   呼叫，最後回一個**空訊息**；`parseVerdict` 依 fail-closed 判 REJECT（這部分是對的），但那句
   「Reviewer 輸出無法解析，請重新輸出符合 schema 的單一 JSON 物件」被包成 blocker **餵給

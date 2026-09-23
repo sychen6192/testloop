@@ -183,7 +183,13 @@ export function execTool(
         const abs = resolveInside(ctx.repoRoot, rel);
         if (!abs) return `錯誤：路徑不在 repo 內：${rel}`;
         if (!fs.existsSync(abs)) return `錯誤：檔案不存在：${rel}`;
-        if (fs.statSync(abs).isDirectory()) return `錯誤：${rel} 是目錄，請用 list_files`;
+        const st = fs.statSync(abs);
+        if (st.isDirectory()) return `錯誤：${rel} 是目錄，請用 list_files`;
+        // A FIFO, socket or device blocks readFileSync — and with it the event loop, so neither
+        // the agent timeout nor the heartbeat ever fires again. A huge file blocks it for as long
+        // as it takes to fail.
+        if (!st.isFile()) return `錯誤：${rel} 不是一般檔案，無法讀取`;
+        if (st.size > MAX_SCAN_BYTES * 8) return `錯誤：${rel} 過大（${st.size} bytes），請用 search 定位後再讀相關段落`;
         return clip(fs.readFileSync(abs, "utf8"), ctx.maxResultChars);
       }
       case "list_files": {
@@ -231,7 +237,12 @@ export function execTool(
             return;
           }
           if (st.size > MAX_SCAN_BYTES) return;
-          const lines = fs.readFileSync(f, "utf8").split("\n");
+          let lines: string[];
+          try {
+            lines = fs.readFileSync(f, "utf8").split("\n");
+          } catch {
+            return; // one unreadable file must not turn the whole search into an error
+          }
           for (let i = 0; i < lines.length; i++) {
             if (!re.test(lines[i])) continue;
             if (matches.length >= MAX_SEARCH_MATCHES) {

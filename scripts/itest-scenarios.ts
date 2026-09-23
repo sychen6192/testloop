@@ -34,6 +34,7 @@ const CALC_TEST_PATH = `${TEST_DIR}/CalcTest.java`;
 const EXISTING_PATH = `${TEST_DIR}/ExistingTest.java`;
 const BROKEN_PATH = `${TEST_DIR}/BrokenTest.java`;
 const PROD_PATH = "src/main/java/com/x/Calc.java";
+const SUPPORT_PATH = "src/test/java/com/x/Support.java";
 
 // Distinct by length, so "the writer changed something" is detectable regardless of mtime
 // resolution. Rounds that must not no-op use a fresh variant each time.
@@ -93,6 +94,19 @@ const GREEN_BUILD = {
 };
 
 const LEGACY = "com.x.LegacyTest";
+const LEGACY_PATH = `${TEST_DIR}/LegacyTest.java`;
+const LEGACY_FIXED = `package com.x;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class LegacyTest {
+    @Test
+    void old_behaviour() {
+        assertEquals(3, new Calc().add(1, 2));
+    }
+}
+`;
 const LEGACY_CASE = { nested: "", method: "old_behaviour", message: "已知失敗", line: 21 };
 /** The module arrives with one test already failing, and it keeps failing every round. */
 const LEGACY_RED = () => ({
@@ -113,6 +127,33 @@ export const SCENARIOS: Scenario[] = [
         write: {
           [CALC_TEST_PATH]: CALC_TEST,
           [PROD_PATH]: CALC_JAVA.replace("return a + b;", "return a + b + 0;"),
+        },
+      },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "scope-foreign-ignored-change",
+    desc: "writer 執行期間，repo 裡執行中的應用程式寫了 logs/app.log（git-ignored）→ 不是 writer 越界，run 照常",
+    entry: "orchestrate",
+    git: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { ".gitignore": "logs/\nsrc/main/resources/application-local.yml\n" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST, "logs/app.log": "INFO Started Application\n" } }],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "scope-ignored-under-src-still-blocked",
+    desc: "被 .gitignore 的 src/main/resources 設定檔也是測試會載入的設定 → 照樣判 scope-violation",
+    entry: "orchestrate",
+    git: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { ".gitignore": "logs/\nsrc/main/resources/application-local.yml\n" },
+    writer: [
+      {
+        write: {
+          [CALC_TEST_PATH]: CALC_TEST,
+          "src/main/resources/application-local.yml": "feature.enabled: true\n",
         },
       },
     ],
@@ -389,6 +430,42 @@ export const SCENARIOS: Scenario[] = [
     mvn: [GREEN_BUILD],
   },
   {
+    name: "review-spawn-error-aborts",
+    desc: "reviewer 根本跑不起來 → 立即中止；那是環境問題，餵給 writer 當 blocker 只會多燒一輪",
+    entry: "orchestrate",
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }],
+    review: [{ text: "", status: "spawn-error" }],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "scoped-dtest-keeps-writer-files",
+    desc: "UT_TEST_SCOPE=generated：第 2 輪只改 helper，-Dtest 也要包含 writer 第 1 輪寫的測試類別（否則 0 個測試、被叫去另建檔）",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    writer: [
+      {
+        write: {
+          "src/test/java/com/x/CalcBehaviourTest.java": CALC_TEST.replace("class CalcTest", "class CalcBehaviourTest"),
+          "src/test/java/com/x/CalcFixtures.java": "package com.x;\n\nclass CalcFixtures { static int two() { return 3; } }\n",
+        },
+      },
+      { write: { "src/test/java/com/x/CalcFixtures.java": "package com.x;\n\nclass CalcFixtures { static int two() { return 2; } }\n" } },
+    ],
+    mvn: [
+      { exit: 1, out: TEST_FAILURE("com.x.CalcBehaviourTest"), cleanSurefire: true },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "review-unfinished-retried",
+    desc: "reviewer 還沒讀檔就被逾時／provider 故障打斷 → 在 reviewer 端重試，不得變成「0 次工具呼叫」的 blocker 餵給 writer",
+    entry: "orchestrate",
+    env: { UT_REVIEW_MAX_RETRIES: "2" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }],
+    review: [{ text: "", status: "timeout", toolCallCount: 0 }, { text: verdict({}), toolCallCount: 3 }],
+    mvn: [GREEN_BUILD],
+  },
+  {
     name: "review-zero-tool-calls",
     desc: "reviewer 沒讀任何檔就給滿分 → fail-closed 判 REJECT",
     entry: "orchestrate",
@@ -659,6 +736,130 @@ export const SCENARIOS: Scenario[] = [
       { exit: 1, out: COMPILE_FAILURE_2(`{{root}}/${BROKEN_PATH}`, `{{root}}/src/test/java/com/x/Broken2Test.java`, "LOG"), cleanSurefire: true },
     ],
   },
+  // ── 修復迴圈的誤判（實地：跑到一半就中止） ─────────────────────────────────
+  {
+    name: "repair-resource-fix",
+    desc: "修復只需要改 src/test/resources 的測試資料 → 那是 writer 的可寫範圍，不得判成 writer-no-op",
+    entry: "repair",
+    writer: [{ write: { "src/test/resources/expected-total.txt": "1050\n" } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "reads_fixture", message: "expected: <1050> but was: <1049>", line: 9 }]) }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "repair-revealed-errors",
+    desc: "修好編譯錯誤後才冒出（沒被碰過的檔案的）測試失敗 → 那是進展，不得以 repair-no-progress 中止",
+    entry: "repair",
+    env: { UT_REPAIR_NO_PROGRESS_ROUNDS: "1" },
+    extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
+    writer: [
+      { write: { [BROKEN_PATH]: FIXED_TEST } },
+      { write: { [EXISTING_PATH]: `${EXISTING_TEST}// fixed the assertion\n` } },
+    ],
+    mvn: [
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "old", message: "expected: <1> but was: <2>", line: 7 }]) }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "repair-thrash-still-stops",
+    desc: "修好 A 卻在同一輪改過的 B 弄出新紅燈 → 那不是「揭露」，照樣算沒進展",
+    entry: "repair",
+    env: { UT_REPAIR_NO_PROGRESS_ROUNDS: "1" },
+    extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
+    writer: [{ write: { [BROKEN_PATH]: FIXED_TEST, [EXISTING_PATH]: `${EXISTING_TEST}// broke it\n` } }],
+    mvn: [
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${EXISTING_PATH}`), cleanSurefire: true },
+    ],
+  },
+  {
+    name: "repair-thrash-via-helper",
+    desc: "每輪經由同一個共用 helper 修好 A、弄壞沒碰過的 B（B 用到那個 helper）→ 不是「揭露」，照樣算沒進展",
+    entry: "repair",
+    env: { UT_REPAIR_NO_PROGRESS_ROUNDS: "1", UT_REPAIR_MAX_ITER: "4" },
+    extraFiles: {
+      [BROKEN_PATH]: BROKEN_TEST,
+      [EXISTING_PATH]: EXISTING_TEST.replace("new Calc().add(1, 2)", "Support.calc().add(1, 2)"),
+      [SUPPORT_PATH]: "package com.x;\n\nclass Support {\n    static Calc calc() { return new Calc(); }\n}\n",
+    },
+    writer: [0, 1, 2, 3].map((k) => ({
+      write: {
+        [BROKEN_PATH]: FIXED_TEST,
+        [SUPPORT_PATH]: `package com.x;\n\nclass Support {\n    // attempt ${k}\n    static Calc calc${k % 2 ? "" : "2"}() { return new Calc(); }\n}\n`,
+      },
+    })),
+    mvn: [0, 1, 2, 3, 4].map((k) => ({
+      exit: 1,
+      out: COMPILE_FAILURE(`{{root}}/${k % 2 ? EXISTING_PATH : BROKEN_PATH}`),
+      cleanSurefire: true,
+    })),
+  },
+  {
+    name: "repair-test-failure-swap",
+    desc: "上一輪只有測試失敗（沒有東西被編譯錯誤擋住）→ 換成另一個測試失敗不是「揭露」，照樣算沒進展",
+    entry: "repair",
+    env: { UT_REPAIR_NO_PROGRESS_ROUNDS: "1", UT_REPAIR_MAX_ITER: "3" },
+    // OtherTest names nothing the writer edits: only the kind of the previous red decides.
+    extraFiles: { "src/test/java/com/x/OtherTest.java": EXISTING_TEST.replace("class ExistingTest", "class OtherTest") },
+    writer: [0, 1, 2].map((k) => ({ write: { [EXISTING_PATH]: `${EXISTING_TEST}// attempt ${k}\n` } })),
+    mvn: [0, 1, 2, 3].map((k) => {
+      const cls = k % 2 ? "com.x.OtherTest" : "com.x.ExistingTest";
+      return {
+        exit: 1,
+        out: TEST_FAILURE(cls),
+        cleanSurefire: true,
+        surefireXml: [{ suite: cls, body: SUREFIRE_XML(cls, 2, [{ nested: "", method: "shared_state", message: "expected: <1> but was: <2>", line: 7 }]) }],
+      };
+    }),
+  },
+  {
+    name: "repair-flaky-baseline",
+    desc: "預檢的紅燈是 flaky 測試：writer 正確地什麼都沒改 → 重跑一次確認後照常開始，不得以 writer-no-op 中止",
+    entry: "repair",
+    writer: [{ write: {} }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "timing", message: "timeout", line: 7 }]) }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "repair-crashed-fork",
+    desc: "既有測試呼叫 System.exit，surefire 只在 log 列出 Crashed tests、沒有報告 → 照樣定位到類別並修復",
+    entry: "repair",
+    writer: [{ write: { [EXISTING_PATH]: `${EXISTING_TEST}// no System.exit any more\n` } }],
+    mvn: [
+      {
+        exit: 1,
+        out: [
+          "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+          "[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?",
+          "[ERROR] Crashed tests:",
+          "[ERROR] com.x.ExistingTest",
+          "[INFO] BUILD FAILURE",
+        ].join("\n"),
+        cleanSurefire: true,
+      },
+      GREEN_BUILD,
+    ],
+  },
   {
     name: "repair-max-iterations",
     desc: "UT_REPAIR_MAX_ITER 用完仍紅 → repair-max-iterations，不無限重試",
@@ -837,6 +1038,234 @@ export const SCENARIOS: Scenario[] = [
           },
         ],
       },
+    ],
+  },
+  // ── api runner 的中途失敗（實地回報：跑到一半莫名其妙中斷） ──────────────
+  {
+    name: "loop-api-503-mid-run",
+    desc: "第 2 輪 writer 一開始就遇到連續 503（模型伺服器重啟、閘道過載）→ 重試後繼續，run 不得中止",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      // Three in a row: exactly what the old three-attempt budget could not absorb, at the
+      // start of a session — which the old code reported as spawn-error and ended the run on.
+      { status: 503, body: '{"error":{"message":"overloaded"}}' },
+      { status: 503, body: '{"error":{"message":"overloaded"}}' },
+      { status: 503, body: '{"error":{"message":"overloaded"}}' },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(9) } }] },
+      { content: "已修正 CalcTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-api-outage-not-spawn-error",
+    desc: "端點回應過之後持續失敗 → 如實說 writer session 沒完成，不得判成 spawn-error 叫人去裝 opencode",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_AGENT_RETRY_WINDOW_MS: "0" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      // Persistent: a window of 0 still allows the one retry every failure gets.
+      ...[0, 1, 2].map(() => ({ status: 503, body: '{"error":{"message":"overloaded"}}' })),
+    ],
+    mvn: [
+      GREEN_BUILD,
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+      },
+    ],
+  },
+  {
+    name: "loop-api-context-overflow",
+    desc: "writer 讀了幾個檔之後 context 滿了（vLLM 回 400）→ 縮短對話後繼續寫，不得在讀完檔之後空手結束",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "read_file", args: { path: PROD_PATH } }] },
+      { toolCalls: [{ name: "read_file", args: { path: PROD_PATH } }] },
+      {
+        status: 400,
+        body: JSON.stringify({
+          object: "error",
+          message:
+            "This model's maximum context length is 32768 tokens. However, you requested 33100 tokens " +
+            "(24908 in the messages, 8192 in the completion). Please reduce the length of the messages or completion.",
+          type: "BadRequestError",
+          code: 400,
+        }),
+      },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-api-truncated-write",
+    desc: "writer 一次寫整個測試類別、超過 max_tokens → vLLM 把半截的呼叫當文字回傳；不得當成 writer 已完成",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      {
+        content: `<tool_call>\n{"name": "write_file", "arguments": {"path": "${CALC_TEST_PATH}", "content": "package com.x;\\n\\nimport org.junit`,
+        finishReason: "length",
+      },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-api-gateway-200-error",
+    desc: "閘道（LiteLLM / one-api）把上游逾時包成 HTTP 200 + {error} → 是失敗的請求要重試，不是模型的空答案",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "read_file", args: { path: PROD_PATH } }] },
+      { status: 200, body: '{"error":{"message":"upstream request timeout","code":504}}' },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-review-think-verdict",
+    desc: "reviewer 是推理模型、沒開 reasoning parser：判決前面有一段含大括號的 <think> → 照樣讀得到判決",
+    entry: "loop",
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "read_file", args: { path: CALC_TEST_PATH } }] },
+      { content: `<think>看一下 add_twoInts_returnsSum() { assertEquals(3, calc.add(1, 2)); } 的斷言……</think>\n${verdict({})}` },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-interface-in-target",
+    desc: "目標資料夾裡有 interface（service 套件的常態）→ 略過它，不得讓 coverage gate 永遠過不了",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: {
+      "src/main/java/com/x/CalcPort.java":
+        "package com.x;\n\n/** Port for {@code Calc}. */\npublic interface CalcPort {\n    int add(int a, int b);\n}\n",
+    },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    // JACOCO_GREEN lists Calc.java only, as a report without the interface would.
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-baseline-env-false-positive",
+    desc: "預檢紅燈是普通的斷言失敗，只是另一個「通過」的測試印了 Spring 的 WARN → 照樣進修復迴圈，不得判成環境問題",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: LEGACY_PATH, content: LEGACY_FIXED } }] },
+      { content: "已修好 LegacyTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      {
+        ...LEGACY_RED(),
+        // What Spring logs on every failed refresh — here from a passing ApplicationContextRunner
+        // test that provokes one on purpose. It is in the build log; it is not why the build is red.
+        out:
+          "[INFO] Running com.x.AutoConfigTest\n" +
+          "WARN 4242 --- [main] o.s.c.a.AnnotationConfigApplicationContext : Exception encountered during context " +
+          "initialization - cancelling refresh attempt: org.springframework.beans.factory.UnsatisfiedDependencyException: " +
+          "Error creating bean with name 'client'\n" +
+          "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in com.x.AutoConfigTest\n" +
+          TEST_FAILURE(LEGACY),
+      },
+      GREEN_BUILD,
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-runs-dir-inside-repo",
+    desc: "UT_RUNS_DIR 放在 repo 內（或工具 clone 在 repo 內）→ loop 自己的 writer-summary.md 不得觸發 scope-violation",
+    entry: "loop",
+    runsInRepo: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-repo-lock-held",
+    desc: "同一個 repo 已有另一個 testgen 在跑 → 啟動即拒絕，而不是兩邊跑到一半互判 scope-violation",
+    entry: "loop",
+    lockHeld: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-baseline-killed",
+    desc: "預檢建置被 OOM killer 收掉（SIGKILL）→ 說清楚建置沒跑完，不得當成「定位不到的紅燈」進修復迴圈再猜 Lombok",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [{ exit: 1, out: "[INFO] Running com.x.HeavyTest", cleanSurefire: true, killed: true }],
+  },
+  {
+    name: "loop-dirty-repair-scope-violation",
+    desc: "修復輪 writer 改了 production code（scope-violation），就算 UT_ALLOW_DIRTY_BASELINE=1 也不得繼續跑到綠",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1" },
+    extraFiles: { [BROKEN_PATH]: BROKEN_TEST },
+    // The endpoint edits Calc.java itself while serving the repair turn — what an opencode writer
+    // with edit reaching src/main would do; the api runner's write_file cannot.
+    api: [
+      {
+        toolCalls: [{ name: "write_file", args: { path: BROKEN_PATH, content: FIXED_TEST } }],
+        sideWrite: { [PROD_PATH]: CALC_JAVA.replace("return a + b;", "return a + b + 0;") },
+      },
+      { content: "修好了" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [{ exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true }, GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-dirty-repair-broke-green",
+    desc: "修復失敗後帶著紅燈續跑：修復 writer 弄壞的、原本綠的測試不得被當成既有失敗容忍",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_MAX_ITER: "1", UT_MAX_ITER: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// the repair writer changed an expectation\n` } }] },
+      { content: "試著修了" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(),
+      ...[0, 1].map((k) => ({
+        ...LEGACY_RED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          { suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne", message: "expected: <5> but was: <6>", line: 9 }]) },
+        ],
+        ...(k === 1 ? { jacoco: JACOCO_GREEN } : {}),
+      })),
     ],
   },
   {
