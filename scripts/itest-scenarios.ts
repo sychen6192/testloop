@@ -100,6 +100,31 @@ const EXISTING_TEST_MS950 = [
 const PLATFORM_MS950 =
   "[WARNING] Using platform encoding (MS950 actually) to copy filtered resources, i.e. build is platform dependent!\n";
 const JACOCO_GREETER = { pkg: "com/x", file: "Greeter.java", line: [0, 4] as [number, number], branch: [0, 4] as [number, number] };
+const GREETER_GREEN = {
+  exit: 0,
+  out: BUILD_SUCCESS(4),
+  cleanSurefire: true,
+  surefire: [{ cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") }],
+  jacoco: JACOCO_GREETER,
+};
+const MOCK_MAKER = "src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker";
+// surefire's JVM dying under the tests (the OOM killer, a System.exit) belongs to the module,
+// whichever class the batch was for: the same report but for that class's name and the numbers.
+const FORK_CRASH = (cls: string) =>
+  [
+    "[INFO] Scanning for projects...",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+    `[INFO] Running ${cls}`,
+    "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project fixture:",
+    "[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?",
+    "[ERROR] Command was /bin/sh -c cd {{root}} && java -Xmx64m -jar {{root}}/target/surefire/surefirebooter-{{elapsed}}.jar {{time}}-jvmRun1",
+    "[ERROR] Process Exit Code: 137",
+    "[ERROR] Crashed tests:",
+    `[ERROR] ${cls}`,
+    "[INFO] BUILD FAILURE",
+    "[INFO] Total time:  {{elapsed}} s",
+    "[INFO] Finished at: {{time}}",
+  ].join("\n");
 
 // Distinct by length, so "the writer changed something" is detectable regardless of mtime
 // resolution. Rounds that must not no-op use a fresh variant each time.
@@ -1512,6 +1537,130 @@ export const SCENARIOS: Scenario[] = [
       { content: "已建立 CalcTest.java" },
     ],
     mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-outputs-removed",
+    desc: "撤回失敗批次時一併清掉它留在 target/test-classes 的編譯產物與資源——否則 surefire 在下一批照樣跑那支失敗的測試、MockMaker 開關照樣生效",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: {
+      [GREETER_PATH]: GREETER_JAVA,
+      // Outputs from before the run: not the batch's, and staying.
+      "target/test-classes/com/x/ExistingTest.class": "compiled before the run",
+    },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: MOCK_MAKER, content: "mock-maker-inline\n" } },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [
+          { suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add", message: "expected: <3> but was: <4>", line: 9 }]) },
+        ],
+        writeFiles: {
+          "target/test-classes/com/x/CalcTest.class": "compiled",
+          "target/test-classes/com/x/CalcTest$Nested.class": "compiled",
+          "target/test-classes/mockito-extensions/org.mockito.plugins.MockMaker": "mock-maker-inline\n",
+        },
+      },
+      // surefire runs every test class it finds in test-classes.
+      { ...GREETER_GREEN, failIfExists: "target/test-classes/com/x/CalcTest.class", failOut: TEST_FAILURE("com.x.CalcTest") },
+    ],
+  },
+  {
+    name: "loop-batches-interrupted",
+    desc: "第 2 批建置到一半按 Ctrl-C → 這批沒通過任何 gate 的測試比照失敗批次撤回，summary 寫明哪批完成、哪批中斷、哪些沒跑",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD, { exit: 0, interrupt: true }],
+  },
+  {
+    name: "loop-batches-repeated-build-failure",
+    desc: "連續兩批的建置以同樣的原因失敗（surefire 的 JVM 當掉，只差類別名稱與數字）→ 問題在批次之外，停下而不是每一批都燒完輪數",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      { exit: 1, out: FORK_CRASH("com.x.CalcTest"), cleanSurefire: true },
+      { exit: 1, out: FORK_CRASH("com.x.GreeterTest"), cleanSurefire: true },
+    ],
+  },
+  {
+    name: "loop-batches-distinct-failures-continue",
+    desc: "連續兩批的建置各自失敗、原因不同（各自測試碼的編譯錯誤）→ 不是同一個外部問題，照常跑第 3 批",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+      { content: "Zeta 不需要新的測試" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`, "total"), cleanSurefire: true },
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${GREETER_TEST_PATH}`, "greeting"), cleanSurefire: true },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-batches-coverage-failures-continue",
+    desc: "連續兩批都卡在覆蓋率、報告去掉類別名稱與數字後一模一樣 → 覆蓋率是各自類別的事，不當成外部問題，照常跑第 3 批",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+      { content: "Zeta 不需要新的測試" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      { ...GREEN_BUILD, jacoco: JACOCO_RED },
+      { ...GREETER_GREEN, jacoco: { ...JACOCO_RED, file: "Greeter.java" } },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-batches-rollback-failed",
+    desc: "失敗批次有檔案放不回去（這裡用一個放了 named pipe 的目錄佔住原位）→ src/test 已不是批次開始前的樣子，停下並點名，不在上面跑下一批",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, { exit: 1, out: TEST_FAILURE("com.x.CalcTest"), cleanSurefire: true, pipeDirAt: EXISTING_PATH }],
   },
   {
     name: "loop-repair-then-generate",

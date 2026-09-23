@@ -223,13 +223,23 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 
 - **一批沒過不會拖垮其他批。** 沒通過的批次會撤回它對 `src/test` 的所有變更——新增的檔移走、改過的檔
   還原成原本的內容——嘗試的版本依 repo 相對路徑保留在 `runs/<repo>/<ts>/batch-NN-<類別>/rejected/`，
-  清單在同目錄的 `rollback.md`。下一批因此從一個還編得過的模組開始，`src/test` 最後只留下通過所有 gate
-  的測試。
+  清單在同目錄的 `rollback.md`。它留在建置輸出（`target/test-classes`）的東西也一併清掉：編譯與資源複製
+  只會新增、不會刪除，撤回的測試編出來的 `.class` 還在的話，surefire 在下一批照樣會跑它，複製過去的
+  `mockito-extensions` 開關也照樣生效。下一批因此從一個還編得過的模組開始，`src/test` 最後只留下通過所有
+  gate 的測試。
+- **中途按 Ctrl-C（或 crash）**：正在跑的那一批比照失敗批次撤回——它的測試還沒通過任何 gate。
+  `summary.json` 的 `inProgress` 是被中斷的那一批，`notRun` 是還沒輪到的類別。
 - **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
-  變更原樣保留給你檢視），或連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束——後面的批次
-  也會遇到同樣的事，summary 會列出沒執行的類別。
-- **結果**：`summary.json` 的 `batches` 逐批列出結果與 artifacts 目錄，`notRun` 是沒執行的類別；
-  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`，中途被中斷也看得到進度。
+  變更原樣保留給你檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的
+  建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差，例如 surefire 的 JVM 當掉——問題在模組、
+  相依或環境，不在這兩個類別；覆蓋率與 review 的失敗是各類別自己的事，不算），或撤回時有檔案放不回去
+  （多半是防毒軟體或 IDE 鎖住了檔案）——後面的批次也會遇到同樣的事，summary 會列出沒執行的類別。
+- **結果**：`summary.json` 的 `batches` 逐批列出結果、每輪卡在哪個 gate（`funnel`）與 artifacts 目錄，
+  `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
+  檔案）。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
+  原因是 `runner-spawn-error`、`scope-violation`、`writer-no-op`、`reviewer-unparseable`、
+  `repeated-build-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
+  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
   驗收。建置很慢的模組建議搭配 `UT_TEST_SCOPE=generated`，或把 `UT_BATCH_SIZE` 調大一些來分攤。
 - 只有一個類別（或 `UT_BATCH_SIZE` 不小於類別數）時就是單一一批，行為與 artifacts 版面都和以前一樣：

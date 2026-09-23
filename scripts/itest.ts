@@ -1067,6 +1067,90 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("production 的變更留在磁碟交人檢視", c.read("src/main/java/com/x/Calc.java").includes("a + b + 0"));
     check("後面的批次不跑", JSON.stringify(c.result.notRun ?? []).includes("Greeter.java"));
     check("只有預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+    check("summary 的 attention 點名沒還原的範圍外變更", JSON.stringify(c.result.attention ?? []).includes("範圍以外"), JSON.stringify(c.result.attention));
+  },
+
+  "loop-batches-outputs-removed": (c) => {
+    check("exit code 2（第 1 批沒過）", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    const b = (c.result.batches ?? []) as Array<Record<string, any>>;
+    check(
+      "第 2 批沒被第 1 批留下的 CalcTest.class 拖垮：通過",
+      b.length === 2 && b[0].success === false && b[1].success === true,
+      JSON.stringify(b.map((x) => [x.stopReason, x.success])),
+    );
+    check(
+      "撤回時清掉這批留在 target/test-classes 的類別（含 nested）與複製過去的 MockMaker",
+      !c.exists("target/test-classes/com/x/CalcTest.class") &&
+        !c.exists("target/test-classes/com/x/CalcTest$Nested.class") &&
+        !c.exists("target/test-classes/mockito-extensions/org.mockito.plugins.MockMaker"),
+    );
+    check("run 之前就在的輸出留著", c.exists("target/test-classes/com/x/ExistingTest.class"));
+    check("src/test 的 MockMaker 開關一併撤回", !c.exists("src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker"));
+    check(
+      "撤回紀錄寫明清掉的輸出數",
+      b[0]?.rolledBack?.outputsRemoved === 3 && c.runRead("batch-1-Calc/rollback.md").includes("建置輸出"),
+      JSON.stringify(b[0]?.rolledBack),
+    );
+  },
+
+  "loop-batches-interrupted": (c) => {
+    if (process.platform === "win32") return; // the fake build signals the loop by its pid
+    check("exit code 130（SIGINT）", c.code === 130, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("stopReason = interrupted:SIGINT", c.result.stopReason === "interrupted:SIGINT", String(c.result.stopReason));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("完成的第 1 批留在紀錄裡", b.length === 1 && b[0].success === true, JSON.stringify(b.map((x) => [x.stopReason, x.success])));
+    const ip = c.result.inProgress as Record<string, any> | undefined;
+    check(
+      "中斷的是第 2 批，它的 GreeterTest.java 比照失敗批次撤回",
+      ip?.batch === 2 && JSON.stringify(ip?.rolledBack?.created ?? []).includes("GreeterTest.java"),
+      JSON.stringify(ip),
+    );
+    check("src/test 只留通過 gate 的測試", c.exists("src/test/java/com/x/CalcTest.java") && !c.exists("src/test/java/com/x/GreeterTest.java"));
+    check("中斷那批的嘗試保留在 rejected/", c.runExists("batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java"));
+    check("沒跑的 Zeta 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"), JSON.stringify(c.result.notRun));
+  },
+
+  "loop-batches-repeated-build-failure": (c) => {
+    check("exit code 2", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check(
+      "stopReason = stopped:repeated-build-failure",
+      c.result.stopReason === "stopped:repeated-build-failure",
+      String(c.result.stopReason),
+    );
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "跑了兩批、都失敗，第 3 批沒跑",
+      b.length === 2 && b.every((x) => x.success === false) && JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"),
+      JSON.stringify(b.map((x) => [x.stopReason, x.success])),
+    );
+    check("建置 3 次：預檢 + 兩批", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    check("停止的原因寫進 summary", String(c.result.stopMessage ?? "").includes("同樣的原因"), String(c.result.stopMessage));
+  },
+
+  "loop-batches-distinct-failures-continue": (c) => {
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("三批都跑了", b.length === 3, JSON.stringify(b.map((x) => [x.stopReason, x.success])));
+    check("stopReason = some-batches-failed（不是 stopped:）", c.result.stopReason === "some-batches-failed", String(c.result.stopReason));
+  },
+
+  "loop-batches-coverage-failures-continue": (c) => {
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("三批都跑了", b.length === 3, JSON.stringify(b.map((x) => [x.stopReason, x.success])));
+    check("stopReason = some-batches-failed", c.result.stopReason === "some-batches-failed", String(c.result.stopReason));
+  },
+
+  "loop-batches-rollback-failed": (c) => {
+    if (process.platform === "win32") return; // no named pipes
+    check("exit code 2", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("stopReason = stopped:rollback-failed", c.result.stopReason === "stopped:rollback-failed", String(c.result.stopReason));
+    const attention = JSON.stringify(c.result.attention ?? []);
+    check("summary 的 attention 點名放不回去的 ExistingTest.java", attention.includes("ExistingTest.java"), attention);
+    check(
+      "第 2 批沒有在不完整的樹上跑",
+      c.mvnCalls === 2 && JSON.stringify(c.result.notRun ?? []).includes("Greeter.java"),
+      `mvnCalls=${c.mvnCalls} notRun=${JSON.stringify(c.result.notRun)}`,
+    );
+    check("其餘照樣撤回：CalcTest.java 已移出", !c.exists("src/test/java/com/x/CalcTest.java"));
   },
 
   "loop-repair-then-generate": (c) => {

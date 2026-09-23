@@ -1,5 +1,5 @@
 // Batching support for folder targets: splitting the target classes, and putting a failed
-// batch's test tree back the way it was.
+// batch's test tree back the way it was — its build outputs included.
 //
 // A folder target used to go to one writer session and one reviewer session as a whole. With
 // more than a few classes that session outgrew the model's context or the agent timeout, and one
@@ -7,6 +7,7 @@
 // maker-checker loop per batch; these helpers are the parts of that which are not control flow.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { BuildTool } from "./types";
 
 /** Pure: consecutive groups of at most `size` items, in order. */
 export function chunk<T>(items: T[], size: number): T[][] {
@@ -56,38 +57,64 @@ function walkFiles(root: string, onFile: (rel: string, abs: string) => void, onD
 
 const fingerprint = (st: fs.Stats) => `${st.size}:${st.mtimeMs}`;
 
-/** The contents of every regular file under `root` — a batch's starting point. */
-export function captureTree(root: string): TreeCapture {
+const SOURCE = /\.(?:java|kt|groovy)$/;
+
+/**
+ * The contents of every regular file under `root` — a batch's starting point. `limits` is for the
+ * selftest, which cannot write a quarter of a gigabyte to reach the real bound.
+ */
+export function captureTree(root: string, limits = { file: MAX_FILE_BYTES, total: MAX_TOTAL_BYTES }): TreeCapture {
   const files = new Map<string, Buffer | null>();
   const fingerprints = new Map<string, string>();
   const dirs = new Set<string>();
-  let total = 0;
+  const found: Array<{ rel: string; abs: string; st: fs.Stats }> = [];
   walkFiles(
     root,
     (rel, abs) => {
-      let st: fs.Stats;
       try {
-        st = fs.statSync(abs);
+        found.push({ rel, abs, st: fs.statSync(abs) });
       } catch {
-        return;
-      }
-      if (st.size > MAX_FILE_BYTES || total + st.size > MAX_TOTAL_BYTES) {
-        files.set(rel, null);
-        fingerprints.set(rel, fingerprint(st));
-        return;
-      }
-      try {
-        const buf = fs.readFileSync(abs);
-        total += buf.length;
-        files.set(rel, buf);
-      } catch {
-        files.set(rel, null);
-        fingerprints.set(rel, fingerprint(st));
+        /* gone meanwhile */
       }
     },
     (rel) => dirs.add(rel),
   );
+  // Sources first, then smallest first: the total bound is for fixtures, and a test source kept
+  // out by fixtures read before it — it is what a batch changes most — could not be put back.
+  found.sort((a, b) => Number(SOURCE.test(b.rel)) - Number(SOURCE.test(a.rel)) || a.st.size - b.st.size);
+  let total = 0;
+  for (const { rel, abs, st } of found) {
+    if (st.size > limits.file || total + st.size > limits.total) {
+      files.set(rel, null);
+      fingerprints.set(rel, fingerprint(st));
+      continue;
+    }
+    try {
+      const buf = fs.readFileSync(abs);
+      total += buf.length;
+      files.set(rel, buf);
+    } catch {
+      files.set(rel, null);
+      fingerprints.set(rel, fingerprint(st));
+    }
+  }
   return { root, files, fingerprints, dirs };
+}
+
+// On Windows an antivirus scan or an IDE indexer holds a file for a moment (EBUSY, EPERM): retried
+// briefly before it counts as a file that could not be put back.
+const TRANSIENT = new Set(["EBUSY", "EPERM", "EACCES", "ENOTEMPTY"]);
+
+function retrying(op: () => void): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      op();
+      return;
+    } catch (e) {
+      if (attempt >= 4 || !TRANSIENT.has((e as NodeJS.ErrnoException).code ?? "")) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100 * attempt);
+    }
+  }
 }
 
 export interface RollbackReport {
@@ -99,20 +126,37 @@ export interface RollbackReport {
   undeleted: string[];
   /** Changed files whose original was too large to keep: left as the batch left them. */
   unrestorable: string[];
+  /** Files that could not be put back, with why: the tree is not as it was captured. */
+  failed: string[];
+  /** Files whose attempted version could not be kept in the rejected directory (put back anyway). */
+  notKept: string[];
 }
 
 /**
  * Puts the tree under `capture.root` back to the captured state and keeps what the batch wrote:
  * every file it created or changed is copied to `rejectedDir` under `rejectedPrefix/<relative
  * path>` first, so an attempt that did not pass is still there to read, and to copy back by hand.
- * Compared by content, not mtime: a file rewritten with identical bytes was not changed.
+ * Compared by content, not mtime: a file rewritten with identical bytes was not changed. A file
+ * that cannot be put back is reported, not thrown: the rest of the tree still is.
  */
 export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejectedPrefix = ""): RollbackReport {
-  const report: RollbackReport = { created: [], restored: [], undeleted: [], unrestorable: [] };
+  const report: RollbackReport = { created: [], restored: [], undeleted: [], unrestorable: [], failed: [], notKept: [] };
   const keep = (rel: string, abs: string) => {
-    const dest = path.join(rejectedDir, rejectedPrefix, rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(abs, dest);
+    try {
+      const dest = path.join(rejectedDir, rejectedPrefix, rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(abs, dest);
+    } catch {
+      report.notKept.push(rel);
+    }
+  };
+  const putBack = (rel: string, list: string[], op: () => void) => {
+    try {
+      retrying(op);
+      list.push(rel);
+    } catch (e) {
+      report.failed.push(`${rel}（${(e as NodeJS.ErrnoException).code ?? (e as Error).message}）`);
+    }
   };
   const seen = new Set<string>();
   const createdDirs: string[] = [];
@@ -122,8 +166,7 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
       seen.add(rel);
       if (!capture.files.has(rel)) {
         keep(rel, abs);
-        fs.rmSync(abs, { force: true });
-        report.created.push(rel);
+        putBack(rel, report.created, () => fs.rmSync(abs, { force: true }));
         return;
       }
       const original = capture.files.get(rel);
@@ -144,13 +187,13 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
       let now: Buffer;
       try {
         now = fs.readFileSync(abs);
-      } catch {
+      } catch (e) {
+        report.failed.push(`${rel}（${(e as NodeJS.ErrnoException).code ?? (e as Error).message}）`);
         return;
       }
       if (!now.equals(original)) {
         keep(rel, abs);
-        fs.writeFileSync(abs, original);
-        report.restored.push(rel);
+        putBack(rel, report.restored, () => fs.writeFileSync(abs, original));
       }
     },
     (rel) => {
@@ -164,9 +207,20 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
       report.unrestorable.push(rel);
       continue;
     }
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, original);
-    report.undeleted.push(rel);
+    putBack(rel, report.undeleted, () => {
+      // Whatever the batch left in its place goes first: a directory (now emptied of the files
+      // it created), a link, a pipe — which a write would block on.
+      let st: fs.Stats | undefined;
+      try {
+        st = fs.lstatSync(abs);
+      } catch {
+        st = undefined;
+      }
+      if (st?.isDirectory()) fs.rmdirSync(abs);
+      else if (st) fs.rmSync(abs, { force: true });
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, original);
+    });
   }
   // Directories the batch created and that are now empty; deepest first.
   for (const rel of createdDirs.sort((a, b) => b.length - a.length)) {
@@ -178,4 +232,83 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
   }
   for (const list of Object.values(report)) list.sort();
   return report;
+}
+
+// ─── Build outputs ───────────────────────────────────────────────────────────
+
+/** Where the build puts compiled tests and copied test resources. */
+export function testOutputDirs(moduleRoot: string, tool: BuildTool): string[] {
+  return tool === "maven"
+    ? [path.join(moduleRoot, "target", "test-classes")]
+    : ["classes/java/test", "classes/kotlin/test", "classes/groovy/test", "resources/test"].map((d) =>
+        path.join(moduleRoot, "build", ...d.split("/")),
+      );
+}
+
+export interface OutputCapture {
+  dirs: Array<{ dir: string; files: Set<string> }>;
+}
+
+/** Which output files exist — a batch's starting point, for its build outputs. */
+export function captureOutputs(dirs: string[]): OutputCapture {
+  return {
+    dirs: dirs.map((dir) => {
+      const files = new Set<string>();
+      walkFiles(dir, (rel) => files.add(rel));
+      return { dir, files };
+    }),
+  };
+}
+
+/**
+ * After a rollback, what the batch's builds left behind. Test compilation and the resource copy
+ * add and overwrite but never delete: the class of a test the rollback set aside stayed in
+ * test-classes, and surefire runs the test classes it finds there — the failing test went on
+ * failing every later batch's build — and a resource it added (a mockito-extensions switch)
+ * went on changing their mock maker. Removed: every output file that did not exist when the batch
+ * started, and the outputs of the sources the rollback put back, which the next build rebuilds
+ * from them. `touched` is relative to the test tree (java/…, resources/…). Returns what was removed.
+ */
+export function removeBatchOutputs(capture: OutputCapture, touched: string[]): string[] {
+  const stems: string[] = [];
+  const resources = new Set<string>();
+  for (const rel of touched) {
+    const src = /^(?:java|kotlin|groovy)\/(.+)\.(?:java|kt|groovy)$/.exec(rel);
+    if (src) stems.push(src[1]);
+    else if (rel.startsWith("resources/")) resources.add(rel.slice("resources/".length));
+  }
+  // <pkg>/<Name>.java compiles to <pkg>/<Name>.class and its nested and anonymous <pkg>/<Name>$….class.
+  const compiledFrom = (rel: string) =>
+    rel.endsWith(".class") && stems.some((s) => rel === `${s}.class` || rel.startsWith(`${s}$`));
+  const removed: string[] = [];
+  for (const { dir, files } of capture.dirs) {
+    walkFiles(dir, (rel, abs) => {
+      if (files.has(rel) && !compiledFrom(rel) && !resources.has(rel)) return;
+      try {
+        retrying(() => fs.rmSync(abs, { force: true }));
+        removed.push(abs);
+      } catch {
+        /* held open: the next build overwrites a stale output, and a new one it cannot is reported by its gate */
+      }
+    });
+  }
+  return removed.sort();
+}
+
+// ─── Across batches ──────────────────────────────────────────────────────────
+
+/**
+ * Pure: what is left of a failed batch's last gate report once what is specific to it is taken out
+ * — its class names, and every number (lines, counts, times). Two batches for different classes
+ * whose build failed with the same remainder failed on something neither of them wrote: the
+ * module, a dependency, the environment. "" when there is no report.
+ */
+export function batchFailureFingerprint(report: string | undefined, targetClasses: string[]): string {
+  if (!report) return "";
+  const names = targetClasses
+    .map((c) => c.replace(/\\/g, "/").split("/").pop()!.replace(SOURCE, ""))
+    .sort((a, b) => b.length - a.length);
+  let s = report;
+  for (const n of names) if (n) s = s.split(n).join("<target>");
+  return s.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 }

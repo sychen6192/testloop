@@ -40,8 +40,19 @@ import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
 import { detectBuildTool, runBaseline, writableRel } from "./gates/build";
 import { createRunner } from "./runners/runner";
-import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
-import { captureTree, chunk, rollbackTree, RollbackReport } from "./libs/batch";
+import { IterationRecord, orchestrate, repairBaseline, RepairResult } from "./orchestrator";
+import {
+  batchFailureFingerprint,
+  captureOutputs,
+  captureTree,
+  chunk,
+  OutputCapture,
+  removeBatchOutputs,
+  rollbackTree,
+  RollbackReport,
+  testOutputDirs,
+  TreeCapture,
+} from "./libs/batch";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
 import { describeTestStack, measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
 import { isUtf8Name, measureSourceEncoding, SourceEncoding } from "./libs/encoding";
@@ -167,7 +178,7 @@ async function main() {
     if (!fs.existsSync(p)) {
       fs.writeFileSync(
         p,
-        JSON.stringify({ success: false, stopReason: `interrupted:${reason}`, batches: batchProgress }, stripRaw, 2),
+        JSON.stringify({ success: false, stopReason: `interrupted:${reason}`, ...batchShutdownState() }, stripRaw, 2),
       );
     }
   });
@@ -546,15 +557,26 @@ interface BatchRecord {
   success: boolean;
   stopReason: string;
   iterations: number;
+  /** Each round's gate and outcome: where the batch's rounds went. */
+  funnel: IterationRecord[];
   totalOutputTokens?: number;
   coverageReport?: string;
   finalFeedback?: string;
   finalVerdict?: ReviewVerdict;
-  rolledBack?: RollbackReport & { rejectedDir: string };
+  rolledBack?: SetAside;
 }
 
-// Read by the interrupt and crash handlers, so a run cut short still says which batches finished.
-let batchProgress: BatchRecord[] | undefined;
+type SetAside = RollbackReport & { rejectedDir: string; outputsRemoved: number };
+
+// The batch run as the interrupt and crash handlers see it: which batches finished, and the one in
+// flight — whose tests never passed the gates, so it is set aside like a failed batch.
+interface BatchRun {
+  batches: string[][];
+  records: BatchRecord[];
+  treeRel: string;
+  inFlight?: { index: number; dir: string; start: TreeCapture; outputs: OutputCapture };
+}
+let batchRun: BatchRun | undefined;
 
 // Stop reasons that belong to the environment rather than the batch: the next batch would meet them
 // too. A scope violation also leaves files outside src/test changed on disk for a human to look at,
@@ -580,15 +602,19 @@ interface BatchRunInput {
   sourceEncoding?: SourceEncoding;
 }
 
+const lastGate = (funnel: IterationRecord[]) => funnel[funnel.length - 1]?.gate;
+
 async function runBatches(o: BatchRunInput): Promise<number> {
-  const records: BatchRecord[] = [];
-  batchProgress = records;
   const total = o.batches.reduce((n, b) => n + b.length, 0);
   const width = String(o.batches.length).length;
   const testTree = path.join(o.mod.moduleRoot, "src", "test");
   const treeRel = path.relative(REPO_ROOT, testTree).replace(/\\/g, "/");
+  const run: BatchRun = { batches: o.batches, records: [], treeRel };
+  batchRun = run;
+  const records = run.records;
   let stopped: { reason: string; message: string } | undefined;
   let stack = o.testStack;
+  let prevFailure = "";
   banner(`分批執行：${total} 個目標類別分成 ${o.batches.length} 批（UT_BATCH_SIZE=${BATCH_SIZE}）`);
 
   for (let i = 0; i < o.batches.length; i++) {
@@ -602,6 +628,8 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     // Earlier batches' builds leave a surefire classpath behind even when the baseline had none.
     stack = mergeTestStack(stack, measureTestStack(o.mod, REPO_ROOT));
     const start = captureTree(testTree);
+    const outputs = captureOutputs(testOutputDirs(o.mod.moduleRoot, o.buildTool));
+    run.inFlight = { index: i, dir, start, outputs };
     const r = await orchestrate({
       targetClasses: batch,
       buildTool: o.buildTool,
@@ -625,6 +653,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       success: r.success,
       stopReason: r.stopReason,
       iterations: r.iterations,
+      funnel: r.funnel,
       totalOutputTokens: r.totalOutputTokens,
       coverageReport: r.coverageReport,
       finalFeedback: r.finalFeedback,
@@ -632,22 +661,8 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     };
     // A scope violation is left exactly as it is: the changes outside src/test are the reason the
     // run stops, and the test files beside them are part of what a human has to look at.
-    if (!r.success && r.stopReason !== "scope-violation") {
-      const rejectedDir = path.join(dir, "rejected");
-      const rb = rollbackTree(start, rejectedDir, treeRel);
-      const touched = rb.created.length + rb.restored.length + rb.undeleted.length + rb.unrestorable.length;
-      if (touched) {
-        rec.rolledBack = { ...rb, rejectedDir };
-        fs.writeFileSync(path.join(dir, "rollback.md"), renderRollback(rb, rejectedDir, treeRel));
-        log(
-          `這批的測試變更已移出 ${treeRel}（新增 ${rb.created.length}、還原 ${rb.restored.length + rb.undeleted.length} 個檔），` +
-            `嘗試的版本保留在 ${rejectedDir}`,
-        );
-        if (rb.unrestorable.length) {
-          log(`[WARN] 以下檔案過大、沒有備份，維持這批留下的狀態：${rb.unrestorable.join("、")}`);
-        }
-      }
-    }
+    if (!r.success && r.stopReason !== "scope-violation") rec.rolledBack = setAside(dir, start, outputs, treeRel);
+    run.inFlight = undefined;
     records.push(rec);
     fs.writeFileSync(path.join(o.runDir, "batches.json"), JSON.stringify(records, stripRaw, 2));
     log(
@@ -656,6 +671,14 @@ async function runBatches(o: BatchRunInput): Promise<number> {
         : `[FAIL] 第 ${i + 1}/${o.batches.length} 批未通過（${r.stopReason}，${r.iterations} 輪）`,
     );
 
+    if (rec.rolledBack?.failed.length) {
+      stopped = {
+        reason: "rollback-failed",
+        message:
+          "這批有檔案無法還原（常見原因是防毒軟體或 IDE 鎖住了檔案）——src/test 已不是這批開始前的狀態，後面的批次會建在它上面",
+      };
+      break;
+    }
     if (RUN_STOPS.has(r.stopReason)) {
       stopped = {
         reason: r.stopReason,
@@ -674,12 +697,35 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       };
       break;
     }
+    // A build that fails the same way for two different classes — once each batch's own names and
+    // numbers are taken out — fails on something neither wrote: the module, a dependency, the
+    // environment. Every later batch would spend its rounds and builds on it too.
+    const failure = !r.success && lastGate(r.funnel) === "build" ? batchFailureFingerprint(r.lastReport, batch) : "";
+    if (failure && failure === prevFailure) {
+      stopped = {
+        reason: "repeated-build-failure",
+        message:
+          "連續兩批的建置以同樣的原因失敗（去掉各自的類別名稱與數字後一字不差）——問題在這兩批之外（模組、相依或環境），後面的批次也會一樣",
+      };
+      break;
+    }
+    prevFailure = failure;
   }
 
   const passed = records.filter((r) => r.success).length;
   const notRun = o.batches.slice(records.length).flat();
   const success = passed === o.batches.length;
-  const stopReason = success ? "gates-passed" : stopped ? `stopped:${stopped.reason}` : "some-batches-failed";
+  // "stopped:" means classes were left untried; a stop on the last batch left nothing behind it.
+  const stopReason = success ? "gates-passed" : stopped && notRun.length ? `stopped:${stopped.reason}` : "some-batches-failed";
+  // Changes the run left in place, which a human has to look at before anything else.
+  const attention = [
+    ...records
+      .filter((r) => r.stopReason === "scope-violation")
+      .map((r) => `第 ${r.batch} 批的 writer 改了測試範圍以外的檔案，變更未還原（清單在 ${r.dir}）`),
+    ...records
+      .filter((r) => r.rolledBack?.failed.length)
+      .map((r) => `第 ${r.batch} 批有檔案無法還原：${r.rolledBack!.failed.join("、")}`),
+  ];
   const tokens = records.reduce<number | undefined>(
     (n, r) => (r.totalOutputTokens === undefined ? n : (n ?? 0) + r.totalOutputTokens),
     undefined,
@@ -700,6 +746,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     log(`未執行的 ${notRun.length} 個類別（${stopped?.message ?? "提前停止"}）：`);
     notRun.forEach((c) => log(`  - ${c}`));
   }
+  attention.forEach((a) => log(`[WARN] 需要人工處理：${a}`));
   if (tokens !== undefined) log(`writer output tokens 合計：${tokens}`);
   const failed = records.filter((r) => !r.success);
   if (failed.length) {
@@ -711,6 +758,8 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       {
         success,
         stopReason,
+        ...(stopped ? { stopMessage: stopped.message } : {}),
+        ...(attention.length ? { attention } : {}),
         batchSize: BATCH_SIZE,
         batches: records,
         notRun,
@@ -726,7 +775,53 @@ async function runBatches(o: BatchRunInput): Promise<number> {
   return success ? 0 : 2;
 }
 
-function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string): string {
+/**
+ * A failed batch's changes to the test tree, undone: the tree put back as captured, the attempt kept
+ * under <batch>/rejected, and the build outputs it left behind removed (libs/batch.ts). undefined
+ * when the batch changed nothing.
+ */
+function setAside(dir: string, start: TreeCapture, outputs: OutputCapture, treeRel: string): SetAside | undefined {
+  const rejectedDir = path.join(dir, "rejected");
+  const rb = rollbackTree(start, rejectedDir, treeRel);
+  const putBack = [...rb.created, ...rb.restored, ...rb.undeleted];
+  const removed = putBack.length ? removeBatchOutputs(outputs, putBack) : [];
+  if (!putBack.length && !rb.unrestorable.length && !rb.failed.length) return undefined;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "rollback.md"), renderRollback(rb, rejectedDir, treeRel, removed.length));
+  log(
+    `這批的測試變更已移出 ${treeRel}（新增 ${rb.created.length}、還原 ${rb.restored.length + rb.undeleted.length} 個檔` +
+      (removed.length ? `，清掉它留在建置輸出的 ${removed.length} 個檔` : "") +
+      `），嘗試的版本保留在 ${rejectedDir}`,
+  );
+  if (rb.unrestorable.length) log(`[WARN] 以下檔案過大、沒有備份，維持這批留下的狀態：${rb.unrestorable.join("、")}`);
+  if (rb.notKept.length) log(`[WARN] 以下檔案的嘗試版本沒能保留（已照樣還原）：${rb.notKept.join("、")}`);
+  if (rb.failed.length) log(`[FAIL] 以下檔案無法還原：${rb.failed.join("、")}`);
+  return { ...rb, rejectedDir, outputsRemoved: removed.length };
+}
+
+// The interrupt and crash paths: the batch that was cut short is set aside like a failed one — its
+// tests never passed the gates — and the summary says which batches finished, which one was cut
+// short, and which never ran.
+function batchShutdownState(): Record<string, unknown> {
+  const run = batchRun;
+  if (!run) return {};
+  const f = run.inFlight;
+  run.inFlight = undefined;
+  let inProgress: Record<string, unknown> | undefined;
+  if (f) {
+    let rolledBack: unknown;
+    try {
+      rolledBack = setAside(f.dir, f.start, f.outputs, run.treeRel) ?? null;
+    } catch (e) {
+      rolledBack = { error: String(e) };
+    }
+    inProgress = { batch: f.index + 1, targetClasses: run.batches[f.index], dir: f.dir, rolledBack };
+  }
+  const started = run.records.length + (f ? 1 : 0);
+  return { batches: run.records, ...(inProgress ? { inProgress } : {}), notRun: run.batches.slice(started).flat() };
+}
+
+function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string, outputsRemoved: number): string {
   const list = (title: string, files: string[]) =>
     files.length ? [`${title}：`, ...files.map((f) => `  - ${treeRel}/${f}`)] : [];
   return [
@@ -738,6 +833,11 @@ function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string
     ...list("這批修改過、已還原為原本內容的檔案", rb.restored),
     ...list("這批刪掉、已放回的檔案", rb.undeleted),
     ...list("過大沒有備份、維持這批留下狀態的檔案", rb.unrestorable),
+    ...list("嘗試版本沒能保留（已照樣還原）的檔案", rb.notKept),
+    ...list("無法還原的檔案（run 因此停止）", rb.failed),
+    ...(outputsRemoved
+      ? ["", `另清掉這批留在建置輸出（test-classes）的 ${outputsRemoved} 個檔——下一次建置會從還原後的原始碼重新產生。`]
+      : []),
   ].join("\n");
 }
 
@@ -774,7 +874,7 @@ main().catch((e) => {
       fs.writeFileSync(
         path.join(crashRunDir, "summary.json"),
         JSON.stringify(
-          { success: false, stopReason: "crash", error: String(e?.stack ?? e), batches: batchProgress },
+          { success: false, stopReason: "crash", error: String(e?.stack ?? e), ...batchShutdownState() },
           stripRaw,
           2,
         ),

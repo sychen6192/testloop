@@ -24,7 +24,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 - **`loop.ts`** — entry point：參數驗證、模組偵測、rubric 載入、startup guard、版本戳記、
   既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它對
-  `src/test` 的變更（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
+  `src/test` 的變更與它留在 `target/test-classes` 的輸出，被中斷時正在跑的那批也一樣（`libs/batch.ts`；
+  rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
@@ -174,7 +175,7 @@ libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter a
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
-libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更（captureTree / rollbackTree）
+libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
 libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 writer 輸出護欄（\uXXXX 跳脫、原編碼檔還原）
 scripts/selftest.ts   純邏輯自測＋架構不變式 assert

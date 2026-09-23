@@ -37,7 +37,7 @@ export function envKnobsInSource(): string[] {
     const re =
       f === "config.ts"
         ? /\bUT_[A-Z0-9_]+/g
-        : /process\.env\.(UT_[A-Z0-9_]+)|process\.env\["(UT_[A-Z0-9_]+)"\]|numEnv\("(UT_[A-Z0-9_]+)"/g;
+        : /process\.env\.(UT_[A-Z0-9_]+)|process\.env\["(UT_[A-Z0-9_]+)"\]|(?:num|int)Env\("(UT_[A-Z0-9_]+)"/g;
     for (const m of src.matchAll(re)) {
       found.add(m[1] ?? m[2] ?? m[3] ?? m[0]);
     }
@@ -69,6 +69,17 @@ export interface MvnStep {
   jacocoAgeMs?: number;
   /** The build is killed by SIGKILL after printing its output (POSIX): the OOM killer. */
   killed?: boolean;
+  /** Files the build writes, repo-relative: compiled test classes, copied test resources. */
+  writeFiles?: Record<string, string>;
+  /** Repo-relative: when this exists, the build prints `failOut` and exits 1 instead — surefire
+   *  running a test class it found in test-classes. */
+  failIfExists?: string;
+  failOut?: string;
+  /** Sends SIGINT to the process that ran the build (the loop), then waits to be killed: Ctrl-C. */
+  interrupt?: boolean;
+  /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
+   *  a rollback cannot put a file back at, whatever its privileges. */
+  pipeDirAt?: string;
 }
 
 export interface JacocoSpec {
@@ -279,6 +290,27 @@ const vary = (s) => String(s)
   .replace(/{{root}}/g, root)
   .replace(/{{time}}/g, new Date(1767225600000 + n * 1013).toISOString())
   .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3));
+
+if (step.failIfExists && fs.existsSync(path.join(root, step.failIfExists))) {
+  process.stdout.write(vary(step.failOut || "") + "\\n");
+  process.exit(1);
+}
+for (const [rel, content] of Object.entries(step.writeFiles || {})) {
+  const p = path.join(root, rel);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content);
+}
+if (step.pipeDirAt && process.platform !== "win32") {
+  const p = path.join(root, step.pipeDirAt);
+  fs.rmSync(p, { recursive: true, force: true });
+  fs.mkdirSync(p, { recursive: true });
+  require("child_process").execFileSync("mkfifo", [path.join(p, "pipe")]);
+}
+if (step.interrupt) {
+  process.kill(process.ppid, "SIGINT");
+  setTimeout(() => process.exit(0), 60000);
+  return;
+}
 
 const sfDir = (mod) => path.join(root, mod || ".", "target", "surefire-reports");
 if (step.cleanSurefire) {

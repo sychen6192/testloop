@@ -51,28 +51,39 @@ export function numEnv(name: string, def: number, min = 0, max = Infinity): numb
   return n;
 }
 
+// A count: a fraction is a typo, not a setting — UT_API_MAX_TOKENS=4096.5 reached the endpoint as a
+// max_tokens it rejected, and UT_BATCH_SIZE=1.5 quietly ran batches of one.
+export function intEnv(name: string, def: number, min = 0, max = Infinity): number {
+  const n = numEnv(name, def, min, max);
+  if (!Number.isInteger(n)) {
+    console.error(`FATAL: ${name}=${process.env[name]} 必須是整數`);
+    process.exit(1);
+  }
+  return n;
+}
+
 // setTimeout's ceiling. A longer delay is not "wait longer": Node clamps it to 1ms and fires at
 // once, so an operator who sets a huge UT_AGENT_TIMEOUT_MS to mean "never time out" would have
 // every agent and every build killed the moment it starts. ~24.8 days is already "never".
 export const MAX_TIMER_MS = 2_147_483_647;
 
-export const MAX_ITER = numEnv("UT_MAX_ITER", 5, 1);
+export const MAX_ITER = intEnv("UT_MAX_ITER", 5, 1);
 // Target classes per batch when the target is a folder. Each batch is a full maker-checker loop
 // of its own — fresh writer and reviewer sessions, its own MAX_ITER rounds — and a batch that
 // fails is set aside without ending the run. One class per batch is what a writer session can
 // reliably finish; a whole package in one session outgrew the model's context and the agent
 // timeout, and one class that would not go green ended the run for every other class.
-export const BATCH_SIZE = numEnv("UT_BATCH_SIZE", 1, 1);
+export const BATCH_SIZE = intEnv("UT_BATCH_SIZE", 1, 1);
 // Upper bound on the failure report fed back to the writer each round. A build log grows with
 // the module, not with the writer's mistake — an unbounded report crowds the model's context
 // out with maven boilerplate and leaves no room to actually fix anything.
-export const MAX_FEEDBACK_CHARS = numEnv("UT_MAX_FEEDBACK_CHARS", 12000, 500);
+export const MAX_FEEDBACK_CHARS = intEnv("UT_MAX_FEEDBACK_CHARS", 12000, 500);
 // Per-round caps on surefire failure detail: how many failing test classes get quoted, and
 // how much of each. Without these, one broken module produces a report longer than the tests.
-export const MAX_FAILURE_BLOCKS = numEnv("UT_MAX_FAILURE_BLOCKS", 5, 1);
+export const MAX_FAILURE_BLOCKS = intEnv("UT_MAX_FAILURE_BLOCKS", 5, 1);
 // Failing test cases quoted per class. One @Nested test class can fail 50 cases at once, and
 // quoting all of them would spend the whole feedback budget on one mistake repeated 50 times.
-export const MAX_FAILURE_CASES = numEnv("UT_MAX_FAILURE_CASES", 10, 1);
+export const MAX_FAILURE_CASES = intEnv("UT_MAX_FAILURE_CASES", 10, 1);
 export const MIN_LINE_COV = numEnv("UT_MIN_LINE_COV", 80);
 export const MIN_BRANCH_COV = numEnv("UT_MIN_BRANCH_COV", 70);
 // 1 = fail the coverage gate when no JaCoCo report is found (default: skip leniently).
@@ -89,13 +100,13 @@ export const ALLOW_DIRTY_BASELINE = process.env.UT_ALLOW_DIRTY_BASELINE === "1";
 // (scope- and shrink-guarded) until the same build command is green, and only then does test
 // generation start. 0 = abort on a red baseline instead, as before.
 export const REPAIR_BASELINE = process.env.UT_REPAIR_BASELINE !== "0";
-export const REPAIR_MAX_ITER = numEnv("UT_REPAIR_MAX_ITER", 5, 1);
+export const REPAIR_MAX_ITER = intEnv("UT_REPAIR_MAX_ITER", 5, 1);
 // Consecutive repair rounds whose red count did not go down before the loop gives up. The
 // stuck check needs two *identical* reports; a writer that fixes one file and breaks another
 // keeps producing fresh text forever, so only the count catches it. On a module whose existing
 // tests are @SpringBootTest a wasted round is 8-15 minutes, which is what makes this worth
 // its own cut-off rather than leaving it to REPAIR_MAX_ITER.
-export const REPAIR_NO_PROGRESS_ROUNDS = numEnv("UT_REPAIR_NO_PROGRESS_ROUNDS", 2, 1);
+export const REPAIR_NO_PROGRESS_ROUNDS = intEnv("UT_REPAIR_NO_PROGRESS_ROUNDS", 2, 1);
 // Which tests the build gate runs each round. "module" (default) runs the whole module and its
 // upstream modules, exactly as before. "generated" narrows surefire to the target classes' own
 // tests during iterations and does one full module run before declaring success — the module
@@ -112,7 +123,7 @@ export const REVIEWER_MUST_READ = process.env.UT_REVIEWER_MUST_READ !== "0";
 // Extra reviewer attempts when its output cannot be parsed into a verdict. A parse failure is
 // the reviewer malfunctioning, not the tests being bad — the writer cannot fix it by rewriting
 // them, so the retries happen here rather than costing writer rounds. 0 disables them.
-export const REVIEW_MAX_RETRIES = numEnv("UT_REVIEW_MAX_RETRIES", 2, 0);
+export const REVIEW_MAX_RETRIES = intEnv("UT_REVIEW_MAX_RETRIES", 2, 0);
 export const SKIP_REVIEW = process.env.UT_SKIP_REVIEW === "1";
 export const QUIET = process.env.UT_QUIET === "1";
 // 1 = skip the agent frontmatter permission guard (not recommended).
@@ -141,12 +152,12 @@ export const API_BASE_URL = (process.env.UT_API_BASE_URL ?? process.env.OPENAI_B
 export const API_KEY = process.env.UT_API_KEY ?? process.env.OPENAI_API_KEY ?? "";
 // Assistant turns per session before the run is cut off — the loop's own bound, since the
 // model has none.
-export const API_MAX_TURNS = numEnv("UT_API_MAX_TURNS", 60, 1);
+export const API_MAX_TURNS = intEnv("UT_API_MAX_TURNS", 60, 1);
 // Passed as max_tokens when > 0; 0 = server default (some local servers default too low to
 // write a full test class).
-export const API_MAX_TOKENS = numEnv("UT_API_MAX_TOKENS", 8192);
+export const API_MAX_TOKENS = intEnv("UT_API_MAX_TOKENS", 8192);
 // Tool results are clipped to this many characters so one read cannot fill the context.
-export const API_MAX_TOOL_RESULT_CHARS = numEnv("UT_API_MAX_TOOL_RESULT_CHARS", 24000, 500);
+export const API_MAX_TOOL_RESULT_CHARS = intEnv("UT_API_MAX_TOOL_RESULT_CHARS", 24000, 500);
 export const WRITER_TEMPERATURE = numEnv("UT_WRITER_TEMPERATURE", 0.2);
 // How long a transient model-side failure is retried before the session is reported as not
 // finished. api runner: network errors, 429 and 5xx on one request, once the endpoint has answered
@@ -168,7 +179,7 @@ export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 10
 // whole tool at V8's ~512M-character string limit when a test logged heavily.
 // At most 200M: the window is trimmed once it reaches twice this, and that join must stay under
 // V8's ~536M-character limit.
-export const MAX_BUILD_OUTPUT_CHARS = numEnv("UT_MAX_BUILD_OUTPUT_CHARS", 64 * 1024 * 1024, 100_000, 200 * 1024 * 1024);
+export const MAX_BUILD_OUTPUT_CHARS = intEnv("UT_MAX_BUILD_OUTPUT_CHARS", 64 * 1024 * 1024, 100_000, 200 * 1024 * 1024);
 export const OPENCODE_BIN = process.env.UT_OPENCODE_BIN ?? "opencode";
 
 // --- Corporate network: proxy and TLS interception ---------------------------

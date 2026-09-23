@@ -13,10 +13,14 @@
   （README 因此建議一次只做一個類別），而且只要一個類別修不綠，整個 run 就停下、其他類別一起卡在半路。
   現在依路徑排序、每批一個類別，各自跑完整的 writer → gate 迴圈（新的 session、自己的輪數、自己的
   `batch-NN-<類別>/` artifacts）。沒通過的批次撤回它對 `src/test` 的所有變更——新增的移走、改過的還原、
-  刪掉的放回——嘗試的版本保留在該批的 `rejected/`（清單在 `rollback.md`），所以下一批從一個編得過的
-  模組開始，`src/test` 最後只留下通過所有 gate 的測試。agent 無法執行、writer 改了範圍外的檔案（不撤回、
-  原樣交給人檢視）、或連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束時提前停止，
-  summary 列出沒執行的類別。每批跑完就更新 `batches.json`。只有一批時行為、artifacts 版面與以前完全相同。
+  刪掉的放回——嘗試的版本保留在該批的 `rejected/`（清單在 `rollback.md`），連同它留在 `target/test-classes`
+  的編譯產物與資源（不清的話 surefire 在下一批照樣跑那支撤回的失敗測試、`mockito-extensions` 開關照樣生效），
+  所以下一批從一個編得過的模組開始，`src/test` 最後只留下通過所有 gate 的測試。被 Ctrl-C 或 crash 中斷時，
+  正在跑的那一批比照撤回，summary 寫明 `inProgress` 與 `notRun`。agent 無法執行、writer 改了範圍外的檔案
+  （不撤回、原樣交給人檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的建置
+  以同樣的原因失敗（去掉類別名稱與數字後逐字相同）、或撤回時有檔案放不回去時提前停止，summary 列出沒執行的
+  類別與需要人工處理的東西（`attention`）。每批跑完就更新 `batches.json`。只有一批時行為、artifacts 版面與
+  以前完全相同。
 - **量測目標模組的測試相依，當成事實寫進 prompt。** standards 寫死 JUnit 5 + `MockitoExtension` + AssertJ，
   prompt 的第一行也寫死「（JUnit 5）」；在只有 JUnit 4 的模組（Spring Boot 2.2 以前）每個 JUnit 5 import
   都編不過，沒有 `mockito-junit-jupiter` 就沒有 `MockitoExtension`，沒有 inline mock maker 的 `mockStatic`
@@ -118,13 +122,16 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **次數、上限這類設定給了小數時照單全收。** `UT_API_MAX_TOKENS=4096.5` 原封不動送到模型端點，被當成不合法
+  的 `max_tokens` 拒絕；`UT_BATCH_SIZE=1.5` 則默默變成一批一個。現在 12 個整數設定給了小數就在啟動時 FATAL。
 - **幾個 run 同時碰到同一個過期的 repo 鎖時，偶爾有兩個都執行。** 接手時讀到的鎖若剛好不存在（上一個
   接手者刪掉舊鎖、還沒建好新鎖的瞬間），會被當成「空的過期鎖」，接手區段隨後把別的 run 剛寫好的鎖刪掉——
   兩個 run 都以為自己持有這個 repo，互相把對方的輸出判成 scope-violation。8 個 run 同時搶的壓測約每 8 次
   出現一次（selftest 也偶爾紅）。現在讀不到的鎖直接重新建立，剛建立、還沒寫入內容的鎖等它寫完，空了好幾秒
   的才當成當機留下的；修正後 80 次壓測（8 與 16 個 run）沒有一次兩個都執行。
 - **目標類別的順序在不同機器上不一樣。** 資料夾裡的類別依檔案系統的 readdir 順序列出（ext4 是雜湊順序），
-  prompt 裡的順序、分批的順序都因此不可重現。現在依路徑排序。
+  prompt 裡的順序、分批的順序都因此不可重現。現在依路徑排序，並一律以 `/` 比較——`\` 排在大寫字母之後、
+  `/` 排在之前，用原生分隔符排序的話同一個資料夾在 Windows 與 Linux 會分出不同的批次。
 - **跑到一半「莫名其妙中斷」：實測重現出五個成因，全部修掉。** 以真的 Maven 專案（JUnit 5 +
   Mockito + JaCoCo）加一個行為像模型的假 OpenAI 端點，完整跑 `loop.ts`，把真實環境會遇到的狀況
   逐一注入。五個都能讓 run 在第 N 輪突然停下，而且停下時的訊息都指向錯的地方：

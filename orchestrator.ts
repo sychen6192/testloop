@@ -167,6 +167,8 @@ export interface OrchestratorResult {
   funnel: IterationRecord[];
   totalOutputTokens?: number;
   finalFeedback?: string;
+  /** The last failed round's gate report as the writer got it, without the stop's own explanation. */
+  lastReport?: string;
   finalVerdict?: ReviewVerdict;
 }
 
@@ -279,6 +281,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     funnel,
     totalOutputTokens,
     finalFeedback,
+    lastReport: feedback ?? undefined,
     finalVerdict: lastVerdict,
   });
 

@@ -29,7 +29,17 @@ export function listJavaClasses(target: string, repoRoot: string): string[] {
   walk(target);
   // readdir order is the file system's (hash order on ext4): sorted, the batches and the order in
   // the prompt are the same on every machine and every run.
-  return out.sort();
+  return out.sort(portablePathOrder);
+}
+
+/**
+ * Pure: path order that is the same on every platform — compared with "/" separators, since "\"
+ * sorts after digits and capitals where "/" sorts before them, and Windows batched differently.
+ */
+export function portablePathOrder(a: string, b: string): number {
+  const x = a.replace(/\\/g, "/");
+  const y = b.replace(/\\/g, "/");
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 function hasBuildFile(dir: string): boolean {

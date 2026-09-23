@@ -24,6 +24,7 @@ import {
   stripAnsi,
   codelessTypeReason,
   splitForeignChanges,
+  portablePathOrder,
 } from "../libs/utils";
 import {
   resolveAgentPath,
@@ -80,7 +81,7 @@ import {
 import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { acquireRepoLock, repoLockFile } from "../libs/lock";
-import { captureTree, chunk, rollbackTree } from "../libs/batch";
+import { batchFailureFingerprint, captureOutputs, captureTree, chunk, removeBatchOutputs, rollbackTree, testOutputDirs } from "../libs/batch";
 import { captureNonUtf8Sources, escapeNonAscii, isUtf8Name, repairWriterEncoding, sourceEncodingFrom } from "../libs/encoding";
 import { canMockStatic, classpathFromSurefireXml, javaReleaseFromLog, measureTestStack, mergeTestStack, pomFactsFromChain, stackFromClasspath, stackFromPom } from "../libs/teststack";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
@@ -2616,6 +2617,21 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
     huge.status === 1 && /UT_AGENT_TIMEOUT_MS/.test(huge.stderr),
     `status=${huge.status} ${huge.stderr.slice(0, 200)}`,
   );
+  // A count with a fraction is a typo: it would reach the model endpoint as a max_tokens it rejects.
+  const loadConfig = (env: Record<string, string>) =>
+    spawnSync(hugePlan.file, hugePlan.args, {
+      cwd: TESTGEN_ROOT,
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+      windowsVerbatimArguments: hugePlan.windowsVerbatimArguments,
+    });
+  const fractional = loadConfig({ UT_API_MAX_TOKENS: "4096.5" });
+  check(
+    "intEnv：次數、上限這類整數設定給了小數 → 啟動就 FATAL",
+    fractional.status === 1 && /UT_API_MAX_TOKENS/.test(fractional.stderr) && /整數/.test(fractional.stderr),
+    `status=${fractional.status} ${fractional.stderr.slice(0, 200)}`,
+  );
+  check("intEnv：整數照常接受", loadConfig({ UT_BATCH_SIZE: "3" }).status === 0);
 
   // --- the repo lock under a race: several runs finding the same stale lock at once -----------
   if (process.platform !== "win32") {
@@ -2901,6 +2917,11 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
   check("chunk：依序切成最多 n 個一組", JSON.stringify(chunk([1, 2, 3, 4, 5], 2)) === "[[1,2],[3,4],[5]]");
   check("chunk：size < 1 視為 1", chunk([1, 2], 0).length === 2);
   check("chunk：空陣列 → 沒有批次", chunk([], 3).length === 0);
+  check(
+    "portablePathOrder：Windows 的 \\ 路徑排得跟 / 一樣（分批的順序不因平台而異）",
+    JSON.stringify(["x\\aB.java", "x\\a\\B.java"].sort(portablePathOrder)) === JSON.stringify(["x\\a\\B.java", "x\\aB.java"]) &&
+      JSON.stringify(["x/aB.java", "x/a/B.java"].sort(portablePathOrder)) === JSON.stringify(["x/a/B.java", "x/aB.java"]),
+  );
 
   const tree = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-batch-"));
   const put = (rel: string, content: string | Buffer) => {
@@ -2950,11 +2971,142 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
   const again = rollbackTree(captureTree(tree), rejected);
   check(
     "rollbackTree：什麼都沒變 → 什麼都不做",
-    again.created.length + again.restored.length + again.undeleted.length + again.unrestorable.length === 0,
+    again.created.length + again.restored.length + again.undeleted.length + again.unrestorable.length + again.failed.length === 0,
     JSON.stringify(again),
   );
-  fs.rmSync(tree, { recursive: true, force: true });
-  fs.rmSync(rejected, { recursive: true, force: true });
+
+  // Sources are kept before fixtures: under the total bound, a test source is what must come back.
+  const small = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-batch-"));
+  fs.mkdirSync(path.join(small, "java"), { recursive: true });
+  fs.mkdirSync(path.join(small, "resources"), { recursive: true });
+  fs.writeFileSync(path.join(small, "resources", "a.bin"), Buffer.alloc(500));
+  fs.writeFileSync(path.join(small, "resources", "b.bin"), Buffer.alloc(500));
+  fs.writeFileSync(path.join(small, "java", "ATest.java"), "x".repeat(600));
+  const bounded = captureTree(small, { file: 1000, total: 1500 });
+  check(
+    "captureTree：總量上限先留給測試原始碼，fixture 排在後面（不會因為先讀到大 fixture 而還原不了 .java）",
+    Buffer.isBuffer(bounded.files.get("java/ATest.java")) && [...bounded.files.values()].filter((v) => v === null).length === 1,
+    JSON.stringify([...bounded.files.entries()].map(([k, v]) => [k, v === null ? null : v.length])),
+  );
+  fs.rmSync(small, { recursive: true, force: true });
+
+  // What the batch left in a deleted file's place is cleared first; what cannot be is reported, and
+  // the rest of the tree is still put back.
+  const odd = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-batch-"));
+  const oddPut = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(odd, rel)), { recursive: true });
+    fs.writeFileSync(path.join(odd, rel), content);
+  };
+  oddPut("java/com/x/ATest.java", "class ATest {}\n");
+  oddPut("java/com/x/BTest.java", "class BTest {}\n");
+  const oddCap = captureTree(odd);
+  // ATest.java became a directory holding a file the batch created: emptied, removed, restored.
+  fs.rmSync(path.join(odd, "java/com/x/ATest.java"));
+  oddPut("java/com/x/ATest.java/Inner.java", "class Inner {}\n");
+  oddPut("java/com/x/NewTest.java", "class NewTest {}\n");
+  const oddRejected = path.join(odd, "..", `${path.basename(odd)}-rejected`);
+  const oddRb = rollbackTree(oddCap, oddRejected);
+  check(
+    "rollbackTree：刪掉的檔案原位被換成目錄 → 清空、移除後照樣放回",
+    oddRb.failed.length === 0 && fs.readFileSync(path.join(odd, "java/com/x/ATest.java"), "utf8") === "class ATest {}\n",
+    JSON.stringify(oddRb),
+  );
+  if (process.platform !== "win32") {
+    // A directory that cannot be emptied (a named pipe is not a file the walk removes) stands for
+    // any path the rollback cannot put a file back at — a lock, a permission — whatever the uid.
+    fs.rmSync(path.join(odd, "java/com/x/BTest.java"));
+    fs.mkdirSync(path.join(odd, "java/com/x/BTest.java"));
+    spawnSync("mkfifo", [path.join(odd, "java/com/x/BTest.java/pipe")]);
+    oddPut("java/com/x/Other.java", "class Other {}\n");
+    const stuckTwo = rollbackTree(oddCap, oddRejected);
+    check(
+      "rollbackTree：放不回去的檔案回報在 failed（不丟例外），其餘照樣撤回",
+      stuckTwo.failed.length === 1 &&
+        stuckTwo.failed[0].startsWith("java/com/x/BTest.java") &&
+        stuckTwo.created.includes("java/com/x/Other.java") &&
+        !fs.existsSync(path.join(odd, "java/com/x/Other.java")),
+      JSON.stringify(stuckTwo),
+    );
+  }
+  // The rejected directory cannot be written: the attempt is not kept, the tree is still restored.
+  const blocked = path.join(odd, "..", `${path.basename(odd)}-blocked`);
+  fs.writeFileSync(blocked, "a file where a directory should be");
+  oddPut("java/com/x/Late.java", "class Late {}\n");
+  const unkept2 = rollbackTree(oddCap, blocked);
+  check(
+    "rollbackTree：嘗試版本存不進 rejected 目錄 → 記在 notKept，樹照樣還原",
+    unkept2.notKept.includes("java/com/x/Late.java") && !fs.existsSync(path.join(odd, "java/com/x/Late.java")),
+    JSON.stringify(unkept2),
+  );
+  fs.rmSync(odd, { recursive: true, force: true });
+  fs.rmSync(oddRejected, { recursive: true, force: true });
+  fs.rmSync(blocked, { force: true });
+
+  // Build outputs: what the batch's builds added goes, and so do the outputs of what it put back.
+  check(
+    "testOutputDirs：Maven 是 target/test-classes；Gradle 是 build/classes/*/test 與 build/resources/test",
+    testOutputDirs("/m", "maven").length === 1 &&
+      testOutputDirs("/m", "maven")[0] === path.join("/m", "target", "test-classes") &&
+      testOutputDirs("/m", "gradle").includes(path.join("/m", "build", "resources", "test")) &&
+      testOutputDirs("/m", "gradle").includes(path.join("/m", "build", "classes", "java", "test")),
+  );
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-out-"));
+  const outPut = (rel: string) => {
+    fs.mkdirSync(path.dirname(path.join(outDir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(outDir, rel), "x");
+  };
+  outPut("com/x/ExistingTest.class");
+  outPut("com/x/ExistingTest$1.class");
+  outPut("com/x/Restored.class");
+  outPut("com/x/Restored$Inner.class");
+  outPut("com/x/RestoredHelper.class");
+  outPut("app.yml");
+  const outCap = captureOutputs([outDir, path.join(outDir, "missing")]);
+  outPut("com/x/NewTest.class");
+  outPut("com/x/NewTest$Nested.class");
+  outPut("mockito-extensions/org.mockito.plugins.MockMaker");
+  const removed = removeBatchOutputs(outCap, ["java/com/x/NewTest.java", "java/com/x/Restored.java", "resources/app.yml"]).map((f) =>
+    path.relative(outDir, f).replace(/\\/g, "/"),
+  );
+  check(
+    "removeBatchOutputs：清掉這批新增的輸出，以及還原的原始碼與資源的舊輸出（下次建置重產）",
+    JSON.stringify(removed) ===
+      JSON.stringify([
+        "app.yml",
+        "com/x/NewTest$Nested.class",
+        "com/x/NewTest.class",
+        "com/x/Restored$Inner.class",
+        "com/x/Restored.class",
+        "mockito-extensions/org.mockito.plugins.MockMaker",
+      ]),
+    JSON.stringify(removed),
+  );
+  check(
+    "removeBatchOutputs：其他既有輸出不動（RestoredHelper 不是 Restored 的 nested class）",
+    fs.existsSync(path.join(outDir, "com/x/ExistingTest.class")) &&
+      fs.existsSync(path.join(outDir, "com/x/ExistingTest$1.class")) &&
+      fs.existsSync(path.join(outDir, "com/x/RestoredHelper.class")),
+  );
+  fs.rmSync(outDir, { recursive: true, force: true });
+
+  // Across batches: the same build failure for two classes, but for their names and numbers.
+  const crash = (cls: string, t: string) =>
+    `[ERROR] The forked VM terminated without properly saying goodbye.\n[ERROR] Command was java -jar surefirebooter${t}.jar\n[ERROR] Crashed tests:\n[ERROR] com.x.${cls}Test`;
+  check(
+    "batchFailureFingerprint：去掉各批自己的類別名稱與數字後一樣 → 同一個外部問題",
+    batchFailureFingerprint(crash("Calc", "20260101"), ["src/main/java/com/x/Calc.java"]) ===
+      batchFailureFingerprint(crash("Greeter", "20260102"), ["src/main/java/com/x/Greeter.java"]),
+  );
+  check(
+    "batchFailureFingerprint：各自的編譯錯誤（不同的符號）→ 不一樣",
+    batchFailureFingerprint("[ERROR] CalcTest.java:[9,9] cannot find symbol: variable total", ["src/main/java/com/x/Calc.java"]) !==
+      batchFailureFingerprint("[ERROR] GreeterTest.java:[9,9] cannot find symbol: variable greeting", ["src/main/java/com/x/Greeter.java"]),
+  );
+  check("batchFailureFingerprint：沒有報告 → 空（不當成相同）", batchFailureFingerprint(undefined, ["A.java"]) === "");
+  check(
+    "batchFailureFingerprint：Windows 路徑的類別名稱照樣拿掉",
+    batchFailureFingerprint("x CalcTest y", ["src\\main\\java\\Calc.java"]) === "x <target>Test y",
+  );
 }
 
 // ---------------------------------------------------------------------------
