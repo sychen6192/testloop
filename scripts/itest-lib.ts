@@ -163,6 +163,9 @@ export interface ApiTurn {
   sideWrite?: Record<string, string>;
   /** Ctrl-C while the agent session is running: SIGINT to the run holding the repo's lock. */
   interrupt?: boolean;
+  /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file while
+   *  this turn is served: whatever the run writes there next fails — a crash mid-round. */
+  breakRunDir?: boolean;
 }
 
 // ─── Fixture contents ────────────────────────────────────────────────────────

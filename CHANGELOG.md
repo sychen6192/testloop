@@ -16,9 +16,10 @@
   刪掉的放回——嘗試的版本保留在該批的 `rejected/`（清單在 `rollback.md`），連同它留在 `target/test-classes`
   的編譯產物與資源（不清的話 surefire 在下一批照樣跑那支撤回的失敗測試、`mockito-extensions` 開關照樣生效），
   所以下一批從一個編得過的模組開始，`src/test` 最後只留下通過所有 gate 的測試。被 Ctrl-C 或 crash 中斷時，
-  正在跑的那一批比照撤回，summary 寫明 `inProgress` 與 `notRun`。agent 無法執行、writer 改了範圍外的檔案
-  （不撤回、原樣交給人檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的建置
-  以同樣的原因失敗（去掉類別名稱與數字後逐字相同）、或撤回時有檔案放不回去時提前停止，summary 列出沒執行的
+  正在跑的那一批比照撤回（writer 的 session 還沒結束也一樣：它已經寫的檔算它的），summary 寫明 `inProgress`
+  與 `notRun`。agent 無法執行、writer 改了範圍外的檔案（不撤回、原樣交給人檢視）、連續兩批以同一個
+  `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的建置以同樣的原因失敗（去掉類別名稱與數字後逐字相同）
+  或同樣的環境/設定問題失敗（Spring context 起不來、連線池初始化失敗）、或撤回時有檔案放不回去時提前停止，summary 列出沒執行的
   類別與需要人工處理的東西（`attention`）。每批跑完就更新 `batches.json`。只有一批時行為、artifacts 版面與
   以前完全相同。
 - **量測目標模組的測試相依，當成事實寫進 prompt。** standards 寫死 JUnit 5 + `MockitoExtension` + AssertJ，
@@ -58,7 +59,8 @@
   時**不拿 JDK 預設編碼猜**——建置沒印平台編碼表示有設定（多半在 repo 外的 parent；Spring Boot parent 設 UTF-8），
   而繁中 Windows 的 JDK 17 預設 MS950，猜下去會把 UTF-8 模組當成 MS950——改看原始碼本身：不是 UTF-8 才保守處理。
   沒有可用的 JDK 時退回保守做法（含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`；writer 自己寫的檔不在此列）。
-  Ctrl-C 或 crash 時視圖照常關閉；被 SIGKILL 的由下一次執行從使用者快取目錄裡的復原日誌放回。轉碼器編譯後快取
+  Ctrl-C 或 crash 時視圖照常關閉；被 SIGKILL 的由下一次執行從使用者快取目錄裡的復原日誌放回（日誌刪不掉——Windows 上
+  被鎖住——時照樣收尾，下一次再清）。轉碼器編譯後快取
   在使用者自己的目錄並檢查擁有者（共用 /tmp 裡預先放好的 class 就是以執行者身分跑的程式碼），回應加上標記
   （`-Xlog` 之類印在 stdout 的東西不會被當成回應），「裝不裝得下」以 encode 再 decode 比對（Shift_JIS 把 ¥ 存成
   0x5C、javac 讀回來是反斜線）。UTF-8 或量不到時完全不介入。
@@ -145,35 +147,51 @@
   FATAL，或對沒有下限的設定靜靜變成 0），現在視同沒設、用預設值。
 - **分批撤回只動 writer 改過的檔，也不再把各批自己的失敗當成外部問題。** 撤回原本把整個 `src/test` 還原成
   批次開始時的樣子：執行期間你在 IDE 裡改的測試、測試在建置時寫進 `src/test` 的檔，會一起被搬進 `rejected/`。
-  現在只撤回 writer 在它的 session 裡改過的檔（中斷時也一樣），其他的原樣留著，列在 `rollback.md` 與 summary
+  現在只撤回 writer 在它的 session 裡改過的檔——session 被打斷（Ctrl-C、crash、途中的請求失敗，例如 token 過期的
+  401）時，它已經寫的也算——其他的原樣留著，列在 `rollback.md` 與 summary
   的 `attention`。「連續兩批的建置以同樣的原因失敗 → 停止」只看沒提到該批自己類別的失敗——兩個 writer 的
   測試以同樣的方式失敗（同一種斷言、各自的 `System.exit` 讓 fork 當掉）是兩批各自的事，停下會讓後面的類別
-  白白沒跑；比對前另外拿掉十六進位的 id（物件 hash、request id），否則同一個外部失敗每次都不一樣、永遠停不下來。
-  撤回時，原本是檔案、被換成好幾層目錄的位置照樣放得回去；輸出目錄在批次開始時還不存在（全新 clone 的第一批）
-  時，只清撤回的原始碼的輸出，不把其他測試的 `.class` 全部刪掉。不在 promise 鏈上的例外也走 crash 收尾（先結束
-  子行程、再撤回那一批、寫 summary），太大沒有備份的檔與中斷時的撤回結果也進 `attention`。
+  白白沒跑；比對前另外拿掉十六進位的 id 與 UUID（物件 hash、request id），否則同一個外部失敗每次都不一樣、永遠停不下來。
+  報告點名各批自己類別的環境/設定問題（Spring context 起不來）則比對問題的種類，連續兩批相同就停
+  （`stopped:repeated-env-failure`）——否則每一批都要燒完輪數。
+  撤回時，原本是檔案、被換成好幾層目錄的位置照樣放得回去；輸出目錄在批次開始時還不存在（模組原本沒有測試）時，
+  裡面的都是這批的建置產生的，全部清掉——同一個檔裡的第二個頂層類別編出的 `.class` 對不到原始碼檔名，只清撤回
+  的原始碼對應的輸出會把它留下，surefire 照樣執行它。不在 promise 鏈上的例外也走 crash 收尾（先結束子行程——
+  Windows 上等 `taskkill` 做完——再撤回那一批、寫 summary；每一步各自擋下例外，收尾時再出錯不會讓撤回或 summary
+  不見），太大沒有備份的檔與中斷時的撤回結果也進 `attention`。
 - **防掏空的計數不再誤判，也不再漏掉讓測試不執行的寫法。** 計數前清掉註解與字串的方式改成照 lexer 的順序
   一次掃過（`libs/javasrc.ts`）：舊的做法先刪區塊註解、再刪字串，字串裡的 `"**/*.java"` 會一路吃到下一個
   註解，中間的測試全數消失——writer 只是加了一段 Javadoc，就會被判「刪減了既有測試」；行尾註解
   `// assertEquals(...)` 也會被算成斷言。TestNG 的 `enabled = false` 只在 `@Test(…)` 裡算，測試裡的
   `boolean enabled = false;` 不再被當成略過標記。另外補上原本數不到的略過方式：`Assumptions.abort()`、
   丟 `SkipException` / `TestAbortedException` / `AssumptionViolatedException`，以及 JUnit 5 一聲不響跳過的
-  private / static / 有回傳值的 `@Test` 方法——`@Test` 還在、測試已經不會執行。全限定名的
-  `@org.junit.jupiter.api.Test` 也照樣算。
+  private / static / 有回傳值的 `@Test` 方法——`@Test` 還在、測試已經不會執行。把失敗的類別改成 abstract 的也擋：
+  `@Test` 與斷言一個不少，測試卻不會再自己執行，所以另數「會自己執行的 `@Test`」。全限定名的
+  `@org.junit.jupiter.api.Test` 也照樣算。writer 在既有測試上方插入一個沒關上的 `/**` 或 text block 時，只有
+  那個開頭被當成註解——以前一路清到檔尾，後面的測試全部「被刪」；編不過的是那個開頭，交給建置報錯。
 - **沒被執行的測試不再算過關。** 以真的 Maven 實測：surefire 2.22.2、classpath 上只有 `junit-jupiter-api`
   （沒有 engine）的模組，writer 寫的 JUnit 5 測試編得過、一個都沒執行，BUILD SUCCESS；既有的 JUnit 4 測試
   剛好覆蓋滿目標類別，coverage gate 也過——一個沒執行過的測試以 gates-passed 收場。反過來，修復迴圈的
   writer 把失敗的測試改寫成不會被執行的框架，`@Test` 與斷言一個不少，防掏空量尺看不出來，模組卻綠了。
-  現在綠燈的建置必須真的執行了：writer 新寫的測試類別、它改過且介入前有執行的類別，以及跑完整模組時
-  writer 介入前有執行的每一個類別（讓其他測試不被探索到的測試資源也擋得到）——以這次建置的 surefire
-  報告（TestNG 的單一 `TEST-TestSuite.xml`、`@Nested` 的 `$內部類別` 報告、reportNameSuffix 都認得）或 log
-  的 `Running` 行為準；writer 新寫的類別測試全部 skipped 也不算。沒執行時該輪 FAIL，回饋點名類別與它的寫法、
-  這次實際執行了哪些類別各是什麼框架、類名是否符合 surefire 的 includes、是否類別層級停用。看不出來時
-  （報告關了、寫到別處、以 `@DisplayName` 命名）只印 WARN、不判。修復迴圈同樣套用。
+  現在綠燈的建置必須真的執行了：writer 新寫的測試類別、它改過且介入前有執行的類別、它加了測試的既有類別
+  （介入前就沒執行也算——加進一個不會被執行的類別的測試等於沒寫），以及跑完整模組時 writer 介入前有執行的
+  每一個類別（讓其他測試不被探索到的測試資源也擋得到；分批時包括前面批次寫好的測試）——以這次建置的 surefire
+  報告（TestNG 的單一 `TEST-TestSuite.xml`、JUnit 4 suite 裡的成員、`@Nested` 的 `$內部類別` 報告、
+  reportNameSuffix、類別層級 `@DisplayName` 命名的報告都認得）或 log 的 `Running` 行（只算本模組的類別）為準；
+  writer 新寫的類別測試全部 skipped 也不算，沒有測試方法的類別改成 abstract 則不要求。沒執行時該輪 FAIL，
+  回饋點名類別與它的寫法、這次實際執行了哪些類別各是什麼框架、類名是否符合 surefire 的 includes（`*Tests` 要
+  2.20 以後）、是否類別層級停用。完全看不出來時（報告關了、寫到別處、對不到任何類別）只印 WARN、不判。修復
+  迴圈同樣套用，writer 沒改檔案時的 flaky 確認重跑也是——紅燈的建置不檢查誰沒跑，一輪裡把失敗的測試改成
+  不執行、同時另一個測試 flaky 紅燈，重跑轉綠就會被當成 flaky 放行。`UT_TEST_SCOPE=generated` 的 `-Dtest`
+  改帶 `Name,Name$*`（surefire 3.0.0-M5 以前的 `-Dtest=Name` 不跑只有 `@Nested` 測試的類別），最終驗收失敗在
+  「沒被執行」時回饋照實說，不再說「打壞了既有測試」。
 - **測試相依不再把「classpath 上有 JUnit 5」當成「JUnit 5 會被執行」。** surefire 3.0.0-M4 起才會替只有
   API 的模組補 engine，而補上的 engine 不記在 `surefire.test.class.path`——兩種情況的 classpath 一模一樣
-  （實測 3.2.5 與 2.22.2）。現在另從建置 log 讀 surefire 版本、從 pom 讀 plugin 自己的相依（2.19–2.21 時代的
-  provider 設定），JUnit 5 不會被執行時告訴 writer 用 JUnit 4，並說明原因。pom 來源不再宣稱「只有 JUnit 4、
+  （實測 3.2.5 與 2.22.2）。現在以建置 log 為準：surefire 說了用哪個 provider（`Using auto detected/configured
+  provider …`）就照它——設定成 junit47 provider 的 3.2.5 不執行 JUnit 5（實測）；沒說時看 log 裡的 surefire
+  版本（2.x 上 classpath 有 TestNG 時 TestNG provider 優先），以及 pom 裡 plugin 自己的相依（要有 2.19–2.21 時代的
+  `junit-platform-surefire-provider`；只放 engine 的 2.22.2 實測不執行）。JUnit 5 不會被執行時告訴 writer 用
+  JUnit 4（或 TestNG），並說明原因。pom 來源不再宣稱「只有 JUnit 4、
   沒有 JUnit 5」——宣告了 junit:junit 不代表沒有間接帶進來的 JUnit 5；只有 Spring Boot 版本推斷、且沒有其他
   repo 外的 parent 時例外。沒有既有測試可看時改用 pom 宣告的框架（以前預設 JUnit 5）。classpath 上看不到
   inline mock maker 時說「看不到」並建議避開，不再斷言「不能」（開關檔也可能在相依的 jar 裡）。
@@ -542,6 +560,9 @@
   - **與 `UT_SKIP_BASELINE=1` 互斥**，並用直接中止——靜默退回全綠要求會讓操作者以為扣除生效了。
   - 失敗時 gate 的報告會**點名哪些是本輪新造成的**，與既有失敗分開陳述；容忍了哪些失敗寫進
     `summary.json` 的 `toleratedFailures`，這個綠燈才可被審計。
+  - **目標模組沒被建置時不放行。** 預檢的紅燈在上游模組時 Maven 停在上游，目標模組在 reactor summary 裡是
+    SKIPPED——每一輪都會停在同一個地方，writer 的測試從來不會被編譯或執行。以前 build gate 把它當成「沒有變糟」
+    放行，後面的 gate 什麼都拿不到，每一輪卡在找不到覆蓋率報告；現在預檢時就中止並說明，gate 端也不扣除。
   - 預設行為完全不變：沒設這個旗標時，gate 維持原本的 fail-closed 全綠要求。
 - **單元測試不連資料庫，嵌入式的也不行**，且既有測試違反時**就地改寫、不得刪除**。
   standards 先前只有一句籠統的「禁止真實網路 / DB / 檔案系統 I/O（一律以 mock 或

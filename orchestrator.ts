@@ -39,6 +39,7 @@ import {
   expectedTestPath,
   feedbackFingerprint,
   snapshotTree,
+  TreeSnapshot,
   stripRaw,
   testClassNames,
   writerScopeSkip,
@@ -55,8 +56,8 @@ import {
   PreExistingFailures,
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
-import { collectTestMetrics, findShrunk, MetricsSnapshot } from "./libs/testmetrics";
-import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult, ExpectedTest, expectedTestOf } from "./gates/build";
+import { collectTestMetrics, findShrunk, MetricsSnapshot, testMetrics } from "./libs/testmetrics";
+import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult, ExpectedTest, expectedTestOf, NOT_RUN_HEADER, ranTestClasses } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
 import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
@@ -96,18 +97,44 @@ export interface OrchestratorConfig {
   // The test classes the module's build ran before any writer: from the baseline, or from the
   // repair that made it green. What a green round must still run; see testsThatMustRun.
   ranAtBaseline?: string[];
-  // Filled as the run goes with every path the writer changed, relative to src/test: what a batch
-  // that does not pass has to undo — and nothing else, even when it is interrupted halfway.
-  writtenTo?: Set<string>;
+  // What the writer changed, for a batch that does not pass: see WriterTrace.
+  trace?: WriterTrace;
+}
+
+/**
+ * What a batch runner needs to undo exactly its writer's work — and nothing else: every path under
+ * src/test the writer changed (relative to src/test), recorded the moment each session ends; and,
+ * while a session runs, the tree as it was when the session started. A session cut short — Ctrl-C,
+ * a crash, a request that failed after the first files were written — never reaches the recording,
+ * and its files used to be left in place as somebody else's.
+ */
+export interface WriterTrace {
+  written: Set<string>;
+  inSession?: { root: string; before: TreeSnapshot };
+}
+
+/** The writer's changes so far, those of a session still open (or cut short) included. */
+export function writerChangesSoFar(trace: WriterTrace): Set<string> {
+  if (trace.inSession) {
+    for (const p of diffSnapshots(trace.inSession.before, snapshotTree(trace.inSession.root))) trace.written.add(p);
+  }
+  return trace.written;
 }
 
 /**
  * The test classes a green build must have run (gates/build.ts checkTestsRan): each one the writer
- * created, and each one it changed that ran before it started. When the build runs the whole
- * module, also every class that ran before the writer started, touched or not: a round that gets
- * its green by making other tests stop running — a framework switch, a discovery filter among the
- * test resources — is seen there, whatever it edited. A class that ran before is required only
- * while its source is there: a stale compiled class ran too, and the next compile may drop it.
+ * created; each one it changed that ran before it started; and each one it added tests to, even if
+ * that class never ran — tests added to a JUnit 5 class in a module whose build runs only JUnit 4
+ * are no tests at all. When the build runs the whole module, also every class that ran before the
+ * writer started, touched or not: a round that gets its green by making other tests stop running —
+ * a framework switch, a discovery filter among the test resources — is seen there, whatever it
+ * edited.
+ *
+ * Required only while the source is still a runnable test class: a stale compiled class ran too
+ * and the next compile may drop it, and a class with no test methods that failed "No runnable
+ * methods" is rightly fixed by making it abstract. Making a class with tests abstract is not a way
+ * around this: its tests no longer count as ones that run on their own (TestMetrics.runnable in
+ * libs/testmetrics.ts), and the shrink guard sees the drop.
  */
 function testsThatMustRun(
   testRoot: string,
@@ -118,22 +145,33 @@ function testsThatMustRun(
 ): ExpectedTest[] {
   const before = new Set(ranBefore ?? []);
   const out = new Map<string, ExpectedTest>();
+  const writtenFiles = new Set<string>();
+  const read = (file: string) => {
+    try {
+      return fs.readFileSync(file, "latin1");
+    } catch {
+      return undefined; // deleted
+    }
+  };
   for (const rel of written) {
     if (!rel.endsWith(".java") || rel.startsWith("resources/")) continue;
     const file = path.join(testRoot, rel);
-    let src: string;
-    try {
-      src = fs.readFileSync(file, "latin1");
-    } catch {
-      continue; // deleted
-    }
-    const t = expectedTestOf(src, file, rel in preexisting ? "changed" : "created");
-    if (t && (t.origin === "created" || before.has(t.fqcn))) out.set(t.fqcn, t);
+    writtenFiles.add(path.resolve(file));
+    const src = read(file);
+    const had = preexisting[rel];
+    const t = src === undefined ? undefined : expectedTestOf(src, file, had ? "changed" : "created");
+    if (!t) continue;
+    if (!had) out.set(t.fqcn, t);
+    else if (before.has(t.fqcn)) out.set(t.fqcn, t);
+    else if (testMetrics(src!).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
   }
   if (wholeModule) {
     for (const fqcn of before) {
       const file = path.join(testRoot, ...fqcn.split(".")) + ".java";
-      if (!out.has(fqcn) && fs.existsSync(file)) out.set(fqcn, { file, fqcn, disabled: false, origin: "untouched" });
+      if (out.has(fqcn) || writtenFiles.has(path.resolve(file))) continue; // the writer's: judged above
+      const src = read(file);
+      const t = src === undefined ? undefined : expectedTestOf(src, file, "untouched");
+      if (t) out.set(fqcn, t);
     }
   }
   return [...out.values()];
@@ -247,6 +285,8 @@ export interface OrchestratorResult {
   /** The last failed round's gate report as the writer got it, without the stop's own explanation. */
   lastReport?: string;
   finalVerdict?: ReviewVerdict;
+  /** On success: the test classes the module's last whole-module build ran — for later batches to keep running. */
+  ranTests?: string[];
 }
 
 // What "the agent could not run" means depends on the runner, and so does the fix. Telling an api
@@ -318,6 +358,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   let lastCov = "（尚未執行覆蓋率檢查）";
   let testStack = cfg.testStack;
   let sourceEncoding = cfg.sourceEncoding;
+  // What the last whole-module green build ran; see OrchestratorResult.ranTests.
+  let ranTests: string[] | undefined;
   // The last gate's report. A round that fails on the encoding never reaches a gate, and what the
   // gate said before still has to be fixed: it goes along with the encoding report.
   let gateFeedback: string | null = null;
@@ -395,6 +437,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
     // Taken before the view opens and after it closes: what the round changed, net of the view.
     const before = snapshotTree(writableTree);
+    if (cfg.trace) cfg.trace.inSession = { root: writableTree, before };
     const protectedBefore = snapshotProtected();
     const encView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
     const targetSources = targetSourceViews(sourceEncoding, cfg.targetClasses);
@@ -429,6 +472,12 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const writer = await cfg.runner.runWriter(prompt);
     const encodingReport = encodingViewAfter(encView, save);
     const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    // Recorded before anything that can end the round: a session that failed after writing (an
+    // expired token on its tenth request) wrote what it wrote.
+    if (cfg.trace) {
+      rawChanged.forEach((f) => cfg.trace!.written.add(f));
+      cfg.trace.inSession = undefined;
+    }
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
     }
@@ -446,7 +495,6 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     const changed = writerChanges(rawChanged);
     changed.forEach((f) => everWritten.add(f));
-    rawChanged.forEach((f) => cfg.writtenTo?.add(f.replace(/\\/g, "/")));
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
@@ -534,6 +582,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       ranBefore: cfg.ranAtBaseline,
     });
     save("build.log", build.raw ?? build.report);
+    if (build.passed && !scoped) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, buildStartedAt, build.raw ?? "");
     testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
     sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, build.raw ?? ""));
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
@@ -653,14 +702,16 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // skipping it would trade the promise away for the same saving.
       if (scoped) {
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
+        const verifyStartedAt = Date.now();
         const full = await runBuildAndTests(cfg.buildTool, cfg.mod, {
           tolerate: cfg.tolerate,
           mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
           ranBefore: cfg.ranAtBaseline,
         });
         save("final-verify.log", full.raw ?? full.report);
+        if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verifyStartedAt, full.raw ?? "");
         if (!full.passed) {
-          log("[FAIL] 最終驗收：模組其他測試被打壞");
+          log("[FAIL] 最終驗收：完整模組重跑沒有通過");
           record({
             gate: "build",
             outcome: "final-verify-fail",
@@ -668,8 +719,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
             writerOutputTokens: writer.outputTokens,
           });
           const stop = failRound(
-            "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——" +
-              `新測試打壞了既有測試，請修正。\n${full.report}`,
+            (full.report.startsWith(NOT_RUN_HEADER)
+              ? "目標類別的測試本身全部通過，但以完整模組範圍重跑時，有該執行的測試沒有被執行，請修正。\n"
+              : "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——新測試打壞了既有測試，請修正。\n") +
+              full.report,
             "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
           );
           if (stop) return stop;
@@ -694,6 +747,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         funnel,
         totalOutputTokens,
         finalVerdict: verdict,
+        ranTests,
       };
     }
 
@@ -935,9 +989,19 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       // build tells the two apart before the run is ended over a failure that is not there. (A
       // real LLM facing a flaky test is more likely to "fix" it with a retry or a looser assertion,
       // which the shrink guard and the reviewer see; this covers the writer that declined.)
-      if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0) {
+      // Only test failures can be flaky: "did not run" (current.notRun) does not change on a rebuild.
+      // And the rebuild is judged like any repair build, must-run check included: a red build is
+      // not checked for tests that stopped running, so a round that switched the failing test off
+      // while another test failed flakily looked like a flaky red, and turned green here.
+      if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0 && !current.notRun) {
         log("writer 沒有改任何檔案——重跑一次建置，確認紅燈是否穩定重現（flaky 測試會在這裡消失）");
-        const recheck = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+        const recheck = await runBaseline(
+          cfg.buildTool,
+          cfg.mod,
+          "repair",
+          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+          ranBefore,
+        );
         save("recheck-build.log", recheck.raw);
         if (recheck.clean) {
           log(`[WARN] 預檢的紅燈重跑後消失，判定為不穩定的測試（flaky）：${current.failingTestClasses.join("、")}——這些測試需要人檢視`);
@@ -951,6 +1015,13 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
             ranTests: recheck.ranTests,
           };
         }
+        // The rebuild is the module as it now stands, and may say something the writer never saw.
+        if (!recheck.aborted) current = recheck;
+        return giveUp(
+          "writer-no-op",
+          `${noOpReason(writer.status, testRootRel(cfg.mod), true)}\n重跑一次建置確認的結果：\n${recheck.summary}`,
+          round,
+        );
       }
       return giveUp("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), true), round);
     }

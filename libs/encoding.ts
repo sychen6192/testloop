@@ -735,8 +735,20 @@ function restoreView(v: EncodingView): void {
       /* best effort on the way out */
     }
   }
-  if (v.journal) fs.rmSync(v.journal, { recursive: true, force: true });
+  removeJournal(v.journal);
   openViews.delete(v);
+}
+
+// A journal that cannot be removed (an antivirus holding it) is harmless: the next run's recovery
+// finds every file already back and removes it then. Throwing here, on the way out of a crash, ended
+// the process before its summary was written.
+function removeJournal(dir: string | undefined): void {
+  if (!dir) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* see above */
+  }
 }
 
 function javaFiles(root: string): string[] {
@@ -796,7 +808,7 @@ export function recoverEncodingViews(root: string): string[] {
   const dir = journalDir(root, false);
   if (!dir) return [];
   if (!fs.existsSync(path.join(dir, "manifest.json"))) {
-    fs.rmSync(dir, { recursive: true, force: true }); // a journal cut short before its manifest
+    removeJournal(dir); // a journal cut short before its manifest
     return [];
   }
   const restored: string[] = [];
@@ -1065,7 +1077,7 @@ export function closeEncodingView(view: EncodingView, opts: { timeoutMs?: number
       write(job, Buffer.concat(out.flatMap((b, k) => (k === 0 ? [b] : [Buffer.from([0x0a]), b]))));
     });
   }
-  if (view.journal) fs.rmSync(view.journal, { recursive: true, force: true });
+  removeJournal(view.journal);
   openViews.delete(view);
   for (const list of Object.values(result)) list.sort();
   return result;

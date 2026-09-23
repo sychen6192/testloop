@@ -799,7 +799,7 @@ export async function runBaseline(
 
 /** The test classes a build ran in the module: its fresh reports, and surefire's log lines. */
 export function ranTestClasses(tool: BuildTool, mod: ModuleInfo, since: number, out: string): string[] {
-  const check = checkTestsRan(tool, mod, since, out, []);
+  const check = checkTestsRan(tool, mod, since, out, [], [], true);
   return check ? [...new Set(check.reported)].sort() : [];
 }
 
@@ -823,12 +823,15 @@ export interface ExpectedTest {
   framework?: TestFramework;
   /** Disabled as a whole: @Disabled / @Ignore on the class, or TestNG's @Test(enabled = false). */
   disabled: boolean;
+  /** The class's own @DisplayName: what surefire's phrased reporters name it by instead of its FQCN. */
+  displayName?: string;
   /**
    * "created": the writer's new class — one whose every test was skipped is not run either.
-   * "changed": a class the writer edited that ran before it did. "untouched": a class that ran
-   * before the writer, and that nothing the writer did may stop running.
+   * "changed": a class the writer edited that ran before it did. "grown": one it added tests to
+   * that did not run before either. "untouched": a class that ran before the writer, and that
+   * nothing the writer did may stop running.
    */
-  origin: "created" | "changed" | "untouched";
+  origin: "created" | "changed" | "grown" | "untouched";
 }
 
 /** Pure: the framework a test source is written for — by the @Test it uses, then by any import. */
@@ -858,13 +861,33 @@ export function expectedTestOf(src: string, file: string, origin: ExpectedTest["
   const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(code)?.[1];
   // The class's own annotations: after the statement before it (the last import) and before it.
   const head = code.slice(0, decl.index + 1);
-  const own = head.slice(Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1);
+  const ownStart = Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1;
+  const own = head.slice(ownStart);
   const disabled = /@(?:[\w.]+\.)?(?:Disabled|Ignore)\b|@(?:[\w.]+\.)?Test\s*\([^)]*\benabled\s*=\s*false/.test(own);
-  return { file, fqcn: pkg ? `${pkg}.${name}` : name, framework: testFrameworkOf(code), disabled, origin };
+  // Its text is a string literal, which codeOnly blanked: read at the same place in the source.
+  const shown = /@(?:[\w.]+\.)?DisplayName\s*\(\s*"((?:[^"\\\n]|\\.)*)"\s*\)/.exec(src.slice(ownStart, decl.index + 1))?.[1];
+  return {
+    file,
+    fqcn: pkg ? `${pkg}.${name}` : name,
+    framework: testFrameworkOf(code),
+    disabled,
+    ...(shown ? { displayName: shown.replace(/\\(["\\])/g, "$1") } : {}),
+    origin,
+  };
 }
 
-/** Pure: the simple names surefire's default includes run — Test*, *Test, *Tests, *TestCase. */
-export const includedByDefault = (fqcn: string) => /^Test|Test$|Tests$|TestCase$/.test(fqcn.split(".").pop() ?? "");
+/**
+ * Pure: the simple names surefire's default includes run — Test*, *Test, *TestCase, and *Tests
+ * from 2.20 (2.12.4, what Maven 3.8 binds when the pom names no version, does not run CalcTests).
+ * An unknown version is taken as a recent one.
+ */
+export function includedByDefault(fqcn: string, surefireVersion?: string): boolean {
+  const simple = fqcn.split(".").pop() ?? "";
+  if (/^Test|Test$|TestCase$/.test(simple)) return true;
+  if (!/Tests$/.test(simple)) return false;
+  const m = /^(\d+)\.(\d+)/.exec(surefireVersion ?? "");
+  return !m || Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 20);
+}
 
 export interface RanCheck {
   /** Every class the build reported running (outer class names), in the module or its log. */
@@ -877,12 +900,19 @@ export interface RanCheck {
   ran: Array<{ fqcn: string; framework?: TestFramework }>;
   /** When this build ran nothing else: the classes that ran before the writer, the same way. */
   ranBefore: Array<{ fqcn: string; framework?: TestFramework }>;
+  /** The surefire version the build log shows, for what its default includes are. */
+  surefireVersion?: string;
 }
 
 // A class ran when something names it: its own report (TEST-<fqcn>.xml, <fqcn>.txt, with a
 // reportNameSuffix or for a @Nested class after it), a suite report's test cases (TestNG writes one
 // TEST-TestSuite.xml for everything), or surefire's "Running <fqcn>" line.
 const names = (fqcn: string, name: string) => name === fqcn || name.startsWith(`${fqcn}$`) || name.startsWith(`${fqcn}-`);
+// A display name as reported: surefire writes a file name in the platform's encoding, so a
+// non-ASCII @DisplayName arrives as "?"s — and a source in MS950 read as UTF-8 does not decode. Runs
+// of anything not ASCII (or "?") compare as one "?": loose, and only ever turns "not run" into "ran".
+const skeleton = (s: string) => s.replace(/(?:[^\x00-\x7f]|\?)+/g, "?").trim();
+const shownAs = (t: ExpectedTest, name: string) => !!t.displayName && skeleton(name) === skeleton(t.displayName);
 
 /** Pure: the classes a surefire console log says it ran. */
 export function classesRunInLog(out: string): string[] {
@@ -940,6 +970,8 @@ export function checkTestsRan(
   // Classes known to have run before the writer: which frameworks run here, when this build
   // (scoped to the writer's classes) ran nothing else to tell by.
   ranBefore: string[] = [],
+  // Also every class a report names inside it, not only by its file name: a JUnit 4 suite's members.
+  members = false,
 ): RanCheck | undefined {
   const dir = tool === "maven" ? surefireDirOf(mod.moduleRoot) : path.join(mod.moduleRoot, "build", "test-results", "test");
   let entries: string[] = [];
@@ -997,8 +1029,9 @@ export function checkTestsRan(
       if (!none) return undefined;
     }
   }
-  let notRun = expected.filter((t) => !seen.some((n) => names(t.fqcn, n)));
-  if (notRun.length && reports.length) notRun = notRun.filter((t) => !scanInside().some((n) => names(t.fqcn, n)));
+  const ranAs = (t: ExpectedTest, n: string) => names(t.fqcn, n) || shownAs(t, n);
+  let notRun = expected.filter((t) => !seen.some((n) => ranAs(t, n)));
+  if (notRun.length && reports.length) notRun = notRun.filter((t) => !scanInside().some((n) => ranAs(t, n)));
   // A class listed by name only (it ran before the writer): what its source says, for the report.
   notRun = notRun.map((t) => {
     if (t.framework) return t;
@@ -1017,8 +1050,12 @@ export function checkTestsRan(
     const { tests, skipped } = skippedCounts(dir, files);
     if (tests > 0 && skipped >= tests) allSkipped.push({ test: t, tests });
   }
-  // What ran, and in which framework — read only when something did not run.
+  // What ran, and in which framework — read only when something did not run. A suite report names
+  // its classes inside: TestNG's one TEST-TestSuite.xml, a JUnit 4 suite's members.
   const outer = new Set(seen.map((n) => n.replace(/[$-].*$/, "")));
+  if (members || reports.some((f) => f.endsWith(".xml") && !isClass(f.slice("TEST-".length, -".xml".length)))) {
+    for (const n of scanInside()) if (isClass(n)) outer.add(n.replace(/[$-].*$/, ""));
+  }
   // The classes that did not run are no evidence of what runs — before the writer, their source
   // may have been another framework.
   const frameworksOf = (classes: Iterable<string>) => {
@@ -1038,7 +1075,14 @@ export function checkTestsRan(
   };
   const reporting = notRun.length > 0 || allSkipped.length > 0;
   const ran = reporting ? frameworksOf(outer) : [];
-  return { reported: [...outer], notRun, allSkipped, ran, ranBefore: reporting && !ran.length ? frameworksOf(ranBefore) : [] };
+  return {
+    reported: [...outer],
+    notRun,
+    allSkipped,
+    ran,
+    ranBefore: reporting && !ran.length ? frameworksOf(ranBefore) : [],
+    surefireVersion: surefireVersionOf(out),
+  };
 }
 
 const HOW_TO_WRITE: Record<TestFramework, string> = {
@@ -1049,6 +1093,14 @@ const HOW_TO_WRITE: Record<TestFramework, string> = {
 
 const MAX_NOT_RUN_LISTED = 20;
 
+/** How a not-run report starts: a caller that frames it (the final verification) can tell it apart. */
+export const NOT_RUN_HEADER = "編譯與測試都通過，但";
+
+/** Pure: the surefire version in a build log ("--- surefire:3.2.5:test", "maven-surefire-plugin:2.22.2:test"). */
+export function surefireVersionOf(out: string): string | undefined {
+  return /--- (?:maven-)?surefire(?:-plugin)?:([^:\s]+):test\b/.exec(out)?.[1];
+}
+
 /** Pure: the failure report for tests the build did not run; null when every one of them ran. */
 export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null {
   if (!check.notRun.length && !check.allSkipped.length) return null;
@@ -1056,6 +1108,7 @@ export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null 
   const WHAT: Record<ExpectedTest["origin"], string> = {
     created: "你新寫的測試類別，這次建置沒有執行它",
     changed: "你改過的測試類別，改之前有被執行，這次沒有",
+    grown: "你在這個既有類別裡加了測試，但這個模組的建置沒有執行它（writer 介入前也沒有）——加在這裡的測試不會被執行",
     untouched: "既有的測試類別，writer 介入前有被執行，這次沒有——你的變更讓它不再被執行（例如測試資源裡的設定、共用的基底類別）",
   };
   const listed = [
@@ -1063,7 +1116,7 @@ export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null 
     ...check.allSkipped.map(({ test, tests }) => `  - ${test.fqcn}：你新寫的測試類別，${tests} 個測試全部被略過（skipped）`),
   ];
   const lines = [
-    `編譯與測試都通過，但有 ${listed.length} 個該執行的測試類別沒有真的被執行——沒被執行的測試不算數，本輪判 FAIL：`,
+    `${NOT_RUN_HEADER}有 ${listed.length} 個該執行的測試類別沒有真的被執行——沒被執行的測試不算數，本輪判 FAIL：`,
     ...listed.slice(0, MAX_NOT_RUN_LISTED),
     ...(listed.length > MAX_NOT_RUN_LISTED ? [`  …另 ${listed.length - MAX_NOT_RUN_LISTED} 個`] : []),
   ];
@@ -1093,8 +1146,11 @@ export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null 
           `改用 ${HOW_TO_WRITE[runs[0]]}寫`,
       );
     }
-    if (tool === "maven" && !includedByDefault(t.fqcn)) {
-      causes.push("類名不符 surefire 預設的 includes（Test*、*Test、*Tests、*TestCase）——改成以 Test 結尾的名字（模組若在 pom 自訂了 includes，以 pom 為準）");
+    if (tool === "maven" && !includedByDefault(t.fqcn, check.surefireVersion)) {
+      causes.push(
+        `類名不符 surefire${check.surefireVersion ? ` ${check.surefireVersion}` : ""} 預設的 includes（Test*、*Test、*TestCase；*Tests 要 2.20 以後）` +
+          "——改成以 Test 結尾的名字（模組若在 pom 自訂了 includes，以 pom 為準）",
+      );
     }
     if (t.disabled) causes.push("類別層級被停用（@Disabled / @Ignore / @Test(enabled = false)）——拿掉它");
     if (!causes.length && t.origin === "untouched") unexplained.push(t.fqcn);
@@ -1119,6 +1175,24 @@ export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null 
     );
   }
   return lines.join("\n");
+}
+
+/**
+ * Pure: the reactor's last module was never built — SKIPPED in the reactor summary. With
+ * `-pl <module> -am` the target module is built last, after everything it depends on, so this is
+ * the target module left out because an upstream one failed first.
+ */
+export function targetModuleSkipped(out: string): boolean {
+  const at = out.lastIndexOf("Reactor Summary");
+  if (at < 0) return false;
+  let last: string | undefined;
+  for (const line of out.slice(at).split(/\r?\n/).slice(1)) {
+    // A module's line has dot leaders ("web ........ SKIPPED"); "BUILD FAILURE" after the block does not.
+    const m = /\.{2,}\s*(SUCCESS|FAILURE|SKIPPED)\b(?:\s*\[[^\]]*\])?\s*$/.exec(line);
+    if (m && /\[INFO\]/.test(line)) last = m[1];
+    else if (last && /-{8,}|BUILD (?:SUCCESS|FAILURE)/.test(line)) break;
+  }
+  return last === "SKIPPED";
 }
 
 // Pure: last "Tests run: N" in the maven stream = the Results-block aggregate.
@@ -1222,7 +1296,7 @@ async function runBuild(
       // applied to the upstream modules, where those classes do not exist, and surefire
       // would fail the reactor for finding nothing to run.
       ...(opts.onlyTests?.length
-        ? [`-Dtest=${opts.onlyTests.join(",")}`, "-Dsurefire.failIfNoSpecifiedTests=false"]
+        ? [`-Dtest=${opts.onlyTests.flatMap((n) => [n, `${n}$*`]).join(",")}`, "-Dsurefire.failIfNoSpecifiedTests=false"]
         : []),
       "test",
       ...MAVEN_EXTRA_ARGS,
@@ -1294,7 +1368,14 @@ async function runBuild(
   let broke = "";
   if (opts.tolerate?.length && tool === "maven") {
     const v = subtractTolerated(r.out, failingSuites(mod.moduleRoot, startedAt), opts.tolerate);
-    if (v.pass) {
+    // Failures that were there before are all there is — but the reactor stopped at them, before
+    // the target module: nothing the writer wrote was compiled, let alone run.
+    const skipped = targetModuleSkipped(r.out);
+    if (skipped) {
+      log("[dirty-baseline] 不予扣除：上游模組失敗，reactor 在目標模組之前就停了");
+      broke = "\n上游模組的失敗讓 Maven 停在上游，目標模組沒有被建置——writer 的測試沒有被編譯、也沒有被執行，這不能算通過。\n";
+    }
+    if (v.pass && !skipped) {
       const unrun = notRun();
       if (unrun) return unrun;
       return {

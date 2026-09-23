@@ -281,8 +281,7 @@ export function testOutputDirs(moduleRoot: string, tool: BuildTool): string[] {
 }
 
 export interface OutputCapture {
-  /** `existed`: the directory was there when the batch started, so "not in `files`" means the batch's. */
-  dirs: Array<{ dir: string; files: Set<string>; existed: boolean }>;
+  dirs: Array<{ dir: string; files: Set<string> }>;
 }
 
 /** Which output files exist — a batch's starting point, for its build outputs. */
@@ -291,7 +290,7 @@ export function captureOutputs(dirs: string[]): OutputCapture {
     dirs: dirs.map((dir) => {
       const files = new Set<string>();
       walkFiles(dir, (rel) => files.add(rel));
-      return { dir, files, existed: fs.existsSync(dir) };
+      return { dir, files };
     }),
   };
 }
@@ -317,12 +316,13 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
   const compiledFrom = (rel: string) =>
     rel.endsWith(".class") && stems.some((s) => rel === `${s}.class` || rel.startsWith(`${s}$`));
   const removed: string[] = [];
-  for (const { dir, files, existed } of capture.dirs) {
+  // A directory that did not exist when the batch started (a module with no tests before it) is
+  // all the batch's, every file in it: its builds may have compiled other tests' classes there too,
+  // and they are rebuilt, but a class named after nothing that is left — a second top-level class
+  // in a test the rollback took out — would otherwise stay and be run by surefire.
+  for (const { dir, files } of capture.dirs) {
     walkFiles(dir, (rel, abs) => {
-      // A directory the batch's first build created holds every test's output, not only its own:
-      // there only the outputs of what it put back go.
-      const batchs = existed ? !files.has(rel) : false;
-      if (!batchs && !compiledFrom(rel) && !resources.has(rel)) return;
+      if (files.has(rel) && !compiledFrom(rel) && !resources.has(rel)) return;
       try {
         retrying(() => fs.rmSync(abs, { force: true }));
         removed.push(abs);
@@ -338,18 +338,24 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
 
 /**
  * Pure: what is left of a failed batch's last gate report once what is specific to it is taken out
- * — its class names, and every number (lines, counts, times). Two batches for different classes
- * whose build failed with the same remainder failed on something neither of them wrote: the
- * module, a dependency, the environment. "" when there is no report.
+ * — its classes, where they appear as code, and every number (lines, counts, times) and generated
+ * id. Two batches for different classes whose build failed with the same remainder failed on
+ * something neither of them wrote: the module, a dependency, the environment. "" when there is no
+ * report. A remainder that still says "<target>" names the batch's own classes: its own failure.
  */
 export function batchFailureFingerprint(report: string | undefined, targetClasses: string[]): string {
   if (!report) return "";
   const names = targetClasses
     .map((c) => c.replace(/\\/g, "/").split("/").pop()!.replace(SOURCE, ""))
+    .filter((n) => /^[A-Za-z_$][\w$]*$/.test(n))
     .sort((a, b) => b.length - a.length);
   let s = report;
-  for (const n of names) if (n) s = s.split(n).join("<target>");
-  // Object hashes, dump-file stamps, ids: different on every run of the same failure.
+  // As code only — CalcTest, Calc.java, com.x.Calc$1, Calc.add( — not as a word in the prose of
+  // an error message: a class named Help is in every "[Help 1]", one named Could in "Could not".
+  for (const n of names) s = s.replace(new RegExp(`(?<![\\w$])${n.replace(/\$/g, "\\$")}(?=[A-Z$.(:\\[])`, "g"), "<target>");
+  // Generated ids: UUIDs (whose 4-digit groups the rule after them would miss), object hashes,
+  // dump-file stamps — different on every run of the same failure.
+  s = s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<uuid>");
   s = s.replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{6,}\b/gi, "<hex>");
   return s.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 }

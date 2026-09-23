@@ -143,7 +143,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_REPAIR_BASELINE` | 1 | 0 = 預檢發現既有紅燈時直接中止，不進修復迴圈 |
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
 | `UT_REPAIR_NO_PROGRESS_ROUNDS` | 2 | 連續幾輪紅燈數沒下降就停。stuck 需要兩輪報告完全相同，「修好 A 又弄壞 B」的報告每輪都不一樣卻毫無進展，只有數量抓得到。例外是**揭露**：上一輪有編譯錯誤、這輪修好了一些，而新紅燈都在沒改過、也沒引用這輪改過的類別的檔案裡（改了測試資源則不算），算進展 |
-| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行。既有紅燈會標記為 pre-existing 寫進 prompt，**且 build gate 改為「失敗集合不得超出預檢基準」**——既有失敗可以續紅，writer 新弄壞的照樣擋。與 `UT_SKIP_BASELINE` 互斥（沒有基準就沒有可扣除的集合，會直接中止）。預設中止 |
+| `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行。既有紅燈會標記為 pre-existing 寫進 prompt，**且 build gate 改為「失敗集合不得超出預檢基準」**——既有失敗可以續紅，writer 新弄壞的照樣擋。與 `UT_SKIP_BASELINE` 互斥（沒有基準就沒有可扣除的集合，會直接中止）。紅燈在上游模組、Maven 停在上游而目標模組根本沒被建置時不放行（writer 的測試永遠不會被編譯）。預設中止 |
 | `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled / @Ignore / `@Test(enabled = false)` / assumeTrue / abort / SkipException、或把 @Test 改成 private / static 之類的略過）時只警告。預設該輪 FAIL 餵回 |
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
@@ -192,7 +192,7 @@ testgen <package 路徑>                  # 端對端執行
 UT_TEST_SCOPE=generated testgen <package 路徑>
 ```
 
-開啟後：**迭代期間** surefire 只跑目標類別的測試（`-Dtest=<那幾個>`），**所有 gate 通過之後、
+開啟後：**迭代期間** surefire 只跑目標類別的測試（`-Dtest=<那幾個>` 連同它們的 `@Nested` 巢狀類別），**所有 gate 通過之後、
 宣告成功之前**，再以完整模組範圍重跑一次驗收。「新測試有沒有打壞既有測試」這個保證沒有被拿掉，
 只是從每輪一次改成整個 run 一次。
 
@@ -211,7 +211,8 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
 - **只限縮執行，不限縮編譯。** 整個模組的測試原始碼還是要編得過，所以既有的編譯錯誤照樣擋你——
   那是修復迴圈的工作。
 - **最終驗收失敗會餵回 writer**，報告明說「目標類別的測試本身通過，但打壞了既有測試」，附上失敗的
-  類別與斷言，然後進下一輪。
+  類別與斷言，然後進下一輪；既有測試因為 writer 的變更不再被執行（例如它加的測試資源）也一樣，報告改說
+  哪些該執行的沒有被執行。
 - **覆蓋率反而更準**：限縮後 JaCoCo 只記錄目標測試造成的覆蓋，不會被別的測試順帶碰到而灌水。
 - Maven only。Gradle 會顯示警告並退回 `module`。
 
@@ -228,18 +229,21 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   只會新增、不會刪除，撤回的測試編出來的 `.class` 還在的話，surefire 在下一批照樣會跑它，複製過去的
   `mockito-extensions` 開關也照樣生效。下一批因此從一個還編得過的模組開始，`src/test` 最後只留下通過所有
   gate 的測試。
-- **中途按 Ctrl-C（或 crash）**：正在跑的那一批比照失敗批次撤回——它的測試還沒通過任何 gate。
+- **中途按 Ctrl-C（或 crash）**：正在跑的那一批比照失敗批次撤回——它的測試還沒通過任何 gate。writer 的
+  session 還沒結束就被打斷（或 session 途中的請求失敗，例如 token 過期）時，它已經寫的檔一樣算它的、一樣撤回。
   `summary.json` 的 `inProgress` 是被中斷的那一批，`notRun` 是還沒輪到的類別。
 - **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
   變更原樣保留給你檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在
-  模組、相依或環境，不在這兩個類別；覆蓋率與 review 的失敗是各類別自己的事，不算），或撤回時有檔案放不回去
+  模組、相依或環境，不在這兩個類別；覆蓋率與 review 的失敗是各類別自己的事，不算）、連續兩批的建置都因為同樣
+  的環境/設定問題失敗（Spring context 起不來、連線池初始化失敗——報告點名的是各批自己的測試類別，所以比的是問題
+  的種類，不是文字），或撤回時有檔案放不回去
   （多半是防毒軟體或 IDE 鎖住了檔案）——後面的批次也會遇到同樣的事，summary 會列出沒執行的類別。
 - **結果**：`summary.json` 的 `batches` 逐批列出結果、每輪卡在哪個 gate（`funnel`）與 artifacts 目錄，
   `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
   檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
   原因是 `runner-spawn-error`、`scope-violation`、`writer-no-op`、`reviewer-unparseable`、
-  `repeated-build-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
+  `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
   全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
   驗收。建置很慢的模組建議搭配 `UT_TEST_SCOPE=generated`，或把 `UT_BATCH_SIZE` 調大一些來分攤。
@@ -262,11 +266,15 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 - **「編譯與測試都通過，但有 N 個該執行的測試類別沒有真的被執行」。** 建置是綠的，但 surefire 沒有執行
   那些類別——綠燈只證明跑到的測試通過，所以這不算過關。最常見的原因是框架：classpath 上只有
   `junit-jupiter-api`、沒有 `junit-jupiter-engine` 時，surefire 3.0.0-M4 以前的版本不執行 JUnit 5 測試
-  （log 的「測試相依：」那一行會寫「只有 API、沒有 engine」與 surefire 版本）；沒有 vintage engine 的
-  JUnit Platform 不執行 JUnit 4 測試。其次是類名不符 surefire 的 includes（預設只跑 `*Test`、`Test*`、
-  `*Tests`、`*TestCase`）、類別層級的 `@Disabled` / `@Ignore`。回饋會列出這次實際執行了哪些類別、各是什麼
-  框架，writer 照著改寫。writer 沒改過的既有類別也在清單上時，是這輪的變更讓它們不再被執行（例如測試資源
-  裡的設定）。報告關掉或以 `@DisplayName` 命名時 loop 看不出來，只印 WARN、不判。
+  （log 的「測試相依：」那一行會寫「這個建置不執行 JUnit 5 測試」與 surefire 版本、provider）；沒有 vintage engine 的
+  JUnit Platform 不執行 JUnit 4 測試；surefire 設定成 JUnit 4 provider 的模組也不執行 JUnit 5（log 裡的
+  `Using configured provider …` 那一行，loop 以它為準）。其次是類名不符 surefire 的 includes（預設只跑 `*Test`、
+  `Test*`、`*TestCase`，`*Tests` 要 surefire 2.20 以後——Maven 3.8 沒指定版本時用的 2.12.4 不跑 `CalcTests`）、
+  類別層級的 `@Disabled` / `@Ignore`。回饋會列出這次實際執行了哪些類別、各是什麼框架，writer 照著改寫。
+  writer 加了測試的既有類別在清單上時，那個類別本來就沒被執行——加在那裡的測試等於沒寫。writer 沒改過的既有
+  類別也在清單上時，是這輪的變更讓它們不再被執行（例如測試資源裡的設定；分批時也包括前面批次寫好的測試）。
+  以類別層級 `@DisplayName` 命名的報告會對回類別；報告關掉、或完全對不到任何類別時 loop 看不出來，只印 WARN、
+  不判。
 - **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
   MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，

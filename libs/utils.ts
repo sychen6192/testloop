@@ -263,7 +263,9 @@ export function snapshotTree(root: string, opts: SnapshotOptions = {}): TreeSnap
       } catch {
         continue; // dangling symlink or a file that vanished mid-walk — nothing to compare
       }
-      snap[rel] = `${st.mtimeMs}:${st.size}`;
+      // Whole milliseconds: a time put back through a Date (as the encoding view restores a file
+      // it did not change) loses the fraction, and an untouched file read as changed.
+      snap[rel] = `${Math.floor(st.mtimeMs)}:${st.size}`;
     }
   };
   walk(root);

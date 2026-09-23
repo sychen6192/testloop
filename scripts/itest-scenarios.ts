@@ -104,6 +104,18 @@ public class ExistingTest {
 }
 `;
 const DISCOVERY_FILTER = "src/test/resources/META-INF/services/org.junit.platform.launcher.PostDiscoveryFilter";
+// A runner class with no test methods: JUnit 4 fails it "No runnable methods".
+const BASE_SERVICE_PATH = `${TEST_DIR}/BaseServiceTest.java`;
+const BASE_SERVICE_TEST = `package com.x;
+
+import org.junit.runner.RunWith;
+import org.junit.runners.BlockJUnit4ClassRunner;
+
+@RunWith(BlockJUnit4ClassRunner.class)
+public class BaseServiceTest {
+    protected Calc calc = new Calc();
+}
+`;
 const ran = (...classes: string[]) => classes.map((cls) => ({ cls, body: SUREFIRE_PASS(cls) }));
 const GREETER_TEST = `package com.x;
 
@@ -455,6 +467,28 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    name: "tests-not-run-grown",
+    desc: "writer 把測試加進一個從來沒被執行的既有 JUnit 5 類別（這個模組只跑 JUnit 4）→ 綠燈但加的測試沒被執行，判 FAIL；改寫成 JUnit 4 的新類別後通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [OLD_STYLE_PATH]: OLD_STYLE_TEST },
+    writer: [
+      {
+        write: {
+          [EXISTING_PATH]: EXISTING_TEST.replace(
+            "    @Test\n    void div_byOne_returnsSameValue",
+            "    @Test\n    void add_negatives() {\n        assertEquals(-3, new Calc().add(-1, -2));\n    }\n\n    @Test\n    void div_byOne_returnsSameValue",
+          ),
+        },
+      },
+      { write: { [EXISTING_PATH]: EXISTING_TEST, [CALC_TEST_PATH]: CALC_TEST_JUNIT4 } },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE), jacoco: JACOCO_GREEN },
+      { exit: 0, out: BUILD_SUCCESS(3), cleanSurefire: true, surefire: ran(OLD_STYLE, "com.x.CalcTest"), jacoco: JACOCO_GREEN },
+    ],
+  },
+  {
     name: "zero-tests",
     desc: "BUILD SUCCESS 但 Tests run: 0 → build gate 依 fail-closed 判 FAIL",
     entry: "orchestrate",
@@ -730,6 +764,31 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
 
+  {
+    name: "loop-scoped-final-verify-not-run",
+    desc: "限縮範圍下 writer 另外加了讓既有測試不再被探索到的測試資源：限縮的建置只跑新測試、看不出來 → 最終驗收的完整重跑發現 ExistingTest 沒被執行，餵回；拿掉後通過",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: DISCOVERY_FILTER, content: "com.x.OnlyCalc\n" } },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: DISCOVERY_FILTER, content: "" } }] },
+      { content: "已拿掉 discovery filter" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.CalcTest"), jacoco: JACOCO_GREEN }, // round 1, scoped
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.CalcTest"), jacoco: JACOCO_GREEN }, // round 1, full
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.CalcTest"), jacoco: JACOCO_GREEN }, // round 2, scoped
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.CalcTest"), jacoco: JACOCO_GREEN }, // round 2, full
+    ],
+  },
+
   // ── 多模組 reactor（core / common / web） ─────────────────────────────────
   {
     name: "multimodule-reactor-args",
@@ -861,6 +920,82 @@ export const SCENARIOS: Scenario[] = [
       },
       { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE) },
       { exit: 0, out: BUILD_SUCCESS(3), cleanSurefire: true, surefire: ran(OLD_STYLE, "com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "repair-flaky-hides-switch",
+    desc: "修復輪把失敗的測試改寫成不會被執行的框架，同一次建置剛好有別的測試 flaky 紅燈（紅燈不檢查誰沒跑）；下一輪什麼都不改、重跑轉綠 → 重跑也要檢查該跑的有跑，不能當成 flaky 放行",
+    entry: "repair",
+    extraFiles: { [OLD_STYLE_PATH]: OLD_STYLE_TEST },
+    writer: [{ write: { [EXISTING_PATH]: EXISTING_AS_TESTNG } }, {}],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran(OLD_STYLE),
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "expected: <5> but was: <4>", line: 13 }]) }],
+      },
+      {
+        exit: 1,
+        out: TEST_FAILURE(OLD_STYLE),
+        cleanSurefire: true,
+        surefireXml: [{ suite: OLD_STYLE, body: SUREFIRE_XML(OLD_STYLE, 1, [{ nested: "", method: "add_works", message: "timed out after 5 seconds", line: 9 }]) }],
+      },
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE) },
+    ],
+  },
+  {
+    name: "repair-abstract-refused",
+    desc: "修復輪把失敗的測試類別改成 abstract：@Test 與斷言一個不少，但它的測試不會再自己執行 → 防掏空擋下，不進建置",
+    entry: "repair",
+    writer: [
+      { write: { [EXISTING_PATH]: EXISTING_TEST.replace("class ExistingTest {", "abstract class ExistingTest {") } },
+      { write: { [EXISTING_PATH]: `${EXISTING_TEST}// fixed\n` } },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "expected: <5> but was: <4>", line: 13 }]) }],
+      },
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "repair-no-runnable-methods",
+    desc: "既有的 @RunWith 類別沒有任何測試方法（No runnable methods）而紅；writer 把它改成 abstract 是對的修法 → 一輪修好，不要求它「被執行」",
+    entry: "repair",
+    extraFiles: { [BASE_SERVICE_PATH]: BASE_SERVICE_TEST },
+    writer: [{ write: { [BASE_SERVICE_PATH]: BASE_SERVICE_TEST.replace("public class BaseServiceTest", "public abstract class BaseServiceTest") } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.BaseServiceTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.ExistingTest"),
+        surefireXml: [{ suite: "com.x.BaseServiceTest", body: SUREFIRE_XML("com.x.BaseServiceTest", 1, [{ nested: "", method: "initializationError", message: "No runnable methods", line: 1 }]) }],
+      },
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "repair-framework-switch-no-op",
+    desc: "修復輪把失敗的測試改寫成不會被執行的框架，被擋下後下一輪什麼都不改 → writer-no-op，不能被當成「重跑就好了」的 flaky 測試放行",
+    entry: "repair",
+    extraFiles: { [OLD_STYLE_PATH]: OLD_STYLE_TEST },
+    writer: [{ write: { [EXISTING_PATH]: EXISTING_AS_TESTNG } }, {}],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran(OLD_STYLE),
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "expected: <5> but was: <4>", line: 13 }]) }],
+      },
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE) },
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE) },
     ],
   },
   {
@@ -1979,6 +2114,143 @@ export const SCENARIOS: Scenario[] = [
         writeFiles: { "src/test/resources/approvals/Calc.received.txt": "written by a test during the build\n" },
       },
       { ...GREETER_GREEN, surefire: [{ cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") }] },
+    ],
+  },
+  {
+    name: "loop-batches-interrupt-mid-writer",
+    desc: "writer 寫到一半（建了 CalcTest、改了 ExistingTest）按 Ctrl-C → 這個 session 寫的檔也要撤回，不是當成別人的變更留著",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// the writer was here\n` } },
+        ],
+      },
+      { interrupt: true, content: "還在寫" },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-writer-401-mid-session",
+    desc: "writer 寫了檔之後，下一個請求 401（token 過期）→ runner-spawn-error 停下，但它已經寫的檔照樣撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { status: 401, body: '{"error":{"message":"token expired"}}' },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-crash-after-writer",
+    desc: "writer 的 session 結束後、這輪還沒記下它改了什麼之前 run 就當掉（寫不了 writer-summary.md）→ 它寫的檔照樣撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java", breakRunDir: true },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-repeated-env-failure",
+    desc: "連續兩批的建置都因為 Spring context 起不來而失敗（報告點名的是各自的測試類別）→ 環境問題，停下而不是每一批都燒完輪數",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      { exit: 1, out: CONTEXT_FAILURE, cleanSurefire: true },
+      { exit: 1, out: CONTEXT_FAILURE.replace("com.x.CalcTest", "com.x.GreeterTest"), cleanSurefire: true },
+    ],
+  },
+  {
+    name: "loop-batches-protect-earlier",
+    desc: "第 1 批通過、建立了 CalcTest；第 2 批的 writer 加了讓它不再被探索到的測試資源 → 綠燈但 CalcTest 沒被執行，第 2 批 FAIL；拿掉之後通過",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } },
+          { name: "write_file", args: { path: DISCOVERY_FILTER, content: "com.x.OnlyGreeter\n" } },
+        ],
+      },
+      { content: "已建立 GreeterTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: DISCOVERY_FILTER, content: "" } }] },
+      { content: "已拿掉 discovery filter" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") },
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.CalcTest"), jacoco: JACOCO_GREEN },
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER },
+      { exit: 0, out: BUILD_SUCCESS(6), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.CalcTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER },
+    ],
+  },
+  {
+    name: "loop-batches-protect-earlier-scoped",
+    desc: "同上，但 UT_TEST_SCOPE=generated：第 1 批只有最終驗收跑過完整模組，它記下的「有被執行的類別」也要傳給第 2 批 → 第 2 批的最終驗收發現 CalcTest 沒被執行",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } },
+          { name: "write_file", args: { path: DISCOVERY_FILTER, content: "com.x.OnlyGreeter\n" } },
+        ],
+      },
+      { content: "已建立 GreeterTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: DISCOVERY_FILTER, content: "" } }] },
+      { content: "已拿掉 discovery filter" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.CalcTest"), jacoco: JACOCO_GREEN }, // batch 1, scoped
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.CalcTest"), jacoco: JACOCO_GREEN }, // batch 1, full
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2 round 1, scoped
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2 round 1, full
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2 round 2, scoped
+      { exit: 0, out: BUILD_SUCCESS(6), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.CalcTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2 round 2, full
+    ],
+  },
+  {
+    name: "loop-dirty-target-skipped",
+    desc: "UT_ALLOW_DIRTY_BASELINE 下預檢的紅燈在上游模組、Maven 停在上游，目標模組根本沒被建置 → 直接中止說明，不是每一輪都「放行」一個沒編譯過的測試",
+    entry: "loop",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1" },
+    api: [],
+    mvn: [
+      {
+        exit: 1,
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefireXml: [
+          {
+            suite: "com.x.common.UtilTest",
+            module: "common",
+            body: SUREFIRE_XML("com.x.common.UtilTest", 1, [{ nested: "", method: "trim_stripsWhitespace", message: "expected: <a> but was: < a >", line: 11 }]),
+          },
+        ],
+      },
     ],
   },
   {

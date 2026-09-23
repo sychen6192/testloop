@@ -34,6 +34,8 @@ export interface TestStack {
   pluginEngine?: boolean;
   /** The maven-surefire-plugin version the module's tests ran with, from the build log. */
   surefireVersion?: string;
+  /** The provider surefire ran the tests with, when its log says (3.x prints it): the last word. */
+  surefireProvider?: SurefireProvider;
   junit4?: string;
   testng?: string;
   mockito?: string;
@@ -59,6 +61,36 @@ export interface TestStack {
   inferred?: string[];
   /** The pom chain ends at this parent outside the repo, whose dependency management is unknown. */
   unknownParent?: string;
+}
+
+export type SurefireProvider = "junit-platform" | "testng" | "junit4" | "junit47" | "junit3";
+
+const PROVIDERS: Array<[RegExp, SurefireProvider]> = [
+  [/\.JUnitPlatformProvider\b/, "junit-platform"],
+  [/\.TestNGProvider\b/, "testng"],
+  [/\.JUnit4Provider\b/, "junit4"],
+  [/\.JUnitCoreProvider\b/, "junit47"],
+  [/\.JUnit3Provider\b/, "junit3"],
+];
+
+/**
+ * Pure: the provider surefire ran the module's tests with — "Using auto detected provider …" or
+ * "Using configured provider …", which surefire 3 prints — attributed to the module by the header
+ * before it. undefined when the log does not say (surefire 2 does not).
+ */
+export function surefireProviderFromLog(log: string, artifactId: string | undefined): SurefireProvider | undefined {
+  let current: string | undefined;
+  let found: SurefireProvider | undefined;
+  for (const line of log.split(/\r?\n/)) {
+    const header = /--- \S.*? @ (\S+) ---/.exec(line);
+    if (header) {
+      current = header[1];
+      continue;
+    }
+    if (!/Using (?:auto detected|configured) provider/.test(line) || (artifactId && current !== artifactId)) continue;
+    for (const [re, p] of PROVIDERS) if (re.test(line)) found = p;
+  }
+  return found;
 }
 
 export const majorOf = (version: string | undefined): number => Number(/^(\d+)/.exec(version ?? "")?.[1] ?? NaN);
@@ -101,13 +133,30 @@ export function surefireResolvesEngine(version: string): boolean {
 export function jupiterRuns(stack: TestStack): boolean | undefined {
   if (stack.junit5 === undefined) return false;
   if (stack.source !== "surefire") return undefined;
-  if (stack.pluginEngine) return true;
+  // The provider surefire said it ran with settles which one runs; the JUnit Platform still needs
+  // the Jupiter engine (a vintage engine alone brings the platform in too), which the rest decides.
+  if (stack.surefireProvider && stack.surefireProvider !== "junit-platform") return false;
   const v = stack.surefireVersion;
+  // Before 3.0 the TestNG provider comes first whenever TestNG is on the classpath.
+  if (!stack.surefireProvider && v && majorOf(v) < 3 && stack.testng !== undefined) return false;
+  if (stack.pluginEngine) return true;
   if (!v) return undefined;
   if (surefireResolvesEngine(v)) return true;
   if (versionAtLeast(v, 2, 22) && stack.jupiterEngine) return true;
   // The plugin's configuration may come from a parent outside the repo: then it is not known.
   return stack.pluginEngine === false ? false : undefined;
+}
+
+/** Pure: why JUnit 5 does not run here, for the prompt — when jupiterRuns says it does not. */
+export function jupiterNotRunReason(stack: TestStack): string {
+  const v = stack.surefireVersion ? ` ${stack.surefireVersion}` : "";
+  if (stack.surefireProvider && stack.surefireProvider !== "junit-platform") {
+    return `surefire${v} 用的是 ${stack.surefireProvider} provider，不執行 JUnit 5 測試`;
+  }
+  if (!stack.surefireProvider && stack.testng !== undefined && majorOf(stack.surefireVersion) < 3) {
+    return `classpath 上有 TestNG，surefire${v} 會選 TestNG provider，不執行 JUnit 5 測試`;
+  }
+  return `classpath 上雖有 JUnit 5 的 API（junit-jupiter-api${stack.junit5 ? ` ${stack.junit5}` : ""}），但沒有 junit-jupiter-engine，surefire${v} 不會執行 JUnit 5 測試（編得過、但不會被執行）`;
 }
 
 /**
@@ -620,11 +669,18 @@ export function measureTestStack(mod: ModuleInfo, repoRoot: string, buildLog = "
   const stack: TestStack = (cp.length ? stackFromClasspath(cp) : undefined) ?? (facts ? stackFromPom(facts) : undefined) ?? {
     source: "pom",
   };
-  if (stack.junit5 !== undefined) {
+  if (stack.junit5 !== undefined || stack.testng !== undefined) {
     const surefire = surefireVersionFromLog(buildLog, facts?.artifactId);
     if (surefire) stack.surefireVersion = surefire;
-    // Seen whole only when no parent outside the repo can configure the plugin (Boot's does not).
-    if (facts?.surefirePluginDeps.some((d) => /^junit-(?:platform-surefire-provider|jupiter-engine|jupiter)$/.test(d))) stack.pluginEngine = true;
+    const provider = surefireProviderFromLog(buildLog, facts?.artifactId);
+    if (provider) stack.surefireProvider = provider;
+  }
+  if (stack.junit5 !== undefined) {
+    // The JUnit 5 setup documented for surefire 2.19–2.21: JUnit's own provider as a dependency of
+    // the plugin. An engine there without it does nothing before 3.0.0-M4, and after it the plugin
+    // resolves the engine itself. Seen whole only when no parent outside the repo can configure the
+    // plugin (Boot's does not).
+    if (facts?.surefirePluginDeps.includes("junit-platform-surefire-provider")) stack.pluginEngine = true;
     else if (facts && (!facts.externalParent || facts.externalParent === "spring-boot-starter-parent")) stack.pluginEngine = false;
   }
   if (stack.mockito !== undefined) {
@@ -667,9 +723,11 @@ export function mergeTestStack(prev: TestStack | undefined, next: TestStack | un
     base.javaRelease = level.javaRelease;
     base.javaReleaseFrom = level.javaReleaseFrom;
   }
-  // A build that failed before its tests has no surefire header: the version seen before stands.
+  // A build that failed before its tests has no surefire header: what was seen before stands.
   const surefire = next.surefireVersion ?? prev.surefireVersion;
-  if (surefire && base.junit5 !== undefined) base.surefireVersion = surefire;
+  if (surefire && (base.junit5 !== undefined || base.testng !== undefined)) base.surefireVersion = surefire;
+  const provider = next.surefireProvider ?? prev.surefireProvider;
+  if (provider && (base.junit5 !== undefined || base.testng !== undefined)) base.surefireProvider = provider;
   return base;
 }
 
@@ -680,7 +738,7 @@ export function describeTestStack(stack: TestStack | undefined): string {
   const parts: string[] = [];
   if (stack.junit5 !== undefined) {
     const runs = jupiterRuns(stack);
-    parts.push(`JUnit 5${v(stack.junit5)}${runs === false ? "（只有 API、沒有 engine：這個建置不執行 JUnit 5 測試）" : ""}`);
+    parts.push(`JUnit 5${v(stack.junit5)}${runs === false ? "（這個建置不執行 JUnit 5 測試）" : ""}`);
   }
   if (stack.junit4 !== undefined) parts.push(`JUnit 4${v(stack.junit4)}`);
   if (stack.testng !== undefined) parts.push(`TestNG${v(stack.testng)}`);
@@ -696,7 +754,7 @@ export function describeTestStack(stack: TestStack | undefined): string {
   if (stack.hamcrest !== undefined) parts.push(`Hamcrest${v(stack.hamcrest)}${stack.hamcrestCoreOnly ? "（只有 core）" : ""}`);
   if (stack.powermock !== undefined) parts.push(`PowerMock${v(stack.powermock)}`);
   if (stack.javaRelease) parts.push(`Java ${stack.javaRelease}`);
-  if (stack.surefireVersion) parts.push(`surefire ${stack.surefireVersion}`);
+  if (stack.surefireVersion) parts.push(`surefire ${stack.surefireVersion}${stack.surefireProvider ? `（${stack.surefireProvider} provider）` : ""}`);
   if (stack.usage) parts.push(`既有測試 JUnit 5 ${stack.usage.junit5}／JUnit 4 ${stack.usage.junit4}／TestNG ${stack.usage.testng} 個`);
   const from = stack.source === "surefire" ? "surefire 測試 classpath" : "pom 宣告（未經建置確認）";
   return `${parts.join("、") || "（沒有可辨識的測試相依）"}——來源：${from}`;

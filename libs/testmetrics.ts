@@ -24,6 +24,12 @@ export interface TestMetrics {
   assertions: number;
   /** Skip markers: a test that does not run, or ends as skipped instead of failed. */
   disabled: number;
+  /**
+   * Test methods that run on their own: not in an abstract class, not private / static / returning
+   * a value. Making a failing test's class abstract keeps every @Test and runs none; adding tests
+   * to an abstract base class (which run through its subclasses) leaves this count alone.
+   */
+  runnable: number;
 }
 
 // Keyed by path relative to the test root, forward slashes.
@@ -63,14 +69,51 @@ const TEST_ANNOTATION = /@(?:[\w.]+\.)?(Test|ParameterizedTest|RepeatedTest|Test
  * annotation is still there to count, the test is gone.
  */
 export function unrunnableTests(code: string): number {
+  return unrunnableAt(code).length;
+}
+
+// Where each unrunnable test's annotation is, for runnableTests to tell apart.
+function unrunnableAt(code: string): number[] {
+  const at: number[] = [];
+  for (const m of code.matchAll(TEST_ANNOTATION)) {
+    // Past the other annotations to the declaration: modifiers, type parameters (nested
+    // generics included: <T extends Comparable<T>>), return type, name.
+    const rest = code.slice(m.index! + m[0].length).replace(/^(?:\s*@[\w.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?)*/, "");
+    const decl =
+      /^\s*((?:(?:public|protected|private|static|final|synchronized|abstract|default|strictfp)\s+)*)(?:<(?:[^<>{};]|<(?:[^<>{};]|<[^<>{};]*>)*>)*>\s*)?([\w.$<>[\],?\s]+?)\s+[\w$]+\s*\(/.exec(rest);
+    if (!decl) continue; // on a class (TestNG), or not a method
+    if (/\b(?:private|static)\b/.test(decl[1])) at.push(m.index!);
+    else if (m[1] !== "TestFactory" && m[1] !== "TestTemplate" && decl[2].trim() !== "void") at.push(m.index!);
+  }
+  return at;
+}
+
+// The bodies of abstract classes: [from, to) spans of the code.
+function abstractBodies(code: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  for (const m of code.matchAll(/\babstract\s+(?:(?:public|protected|private|static|strictfp|sealed|non-sealed)\s+)*class\s+[\w$]+[^{;]*\{/g)) {
+    let depth = 0;
+    let i = m.index! + m[0].length - 1;
+    for (; i < code.length; i++) {
+      if (code[i] === "{") depth++;
+      else if (code[i] === "}" && --depth === 0) break;
+    }
+    spans.push([m.index!, i]);
+  }
+  return spans;
+}
+
+/** Pure: test methods that run on their own — see TestMetrics.runnable. */
+export function runnableTests(code: string): number {
+  const unrunnable = new Set(unrunnableAt(code));
+  const abstract = abstractBodies(code);
   let n = 0;
   for (const m of code.matchAll(TEST_ANNOTATION)) {
-    // Past the other annotations to the declaration: modifiers, return type, name.
+    if (unrunnable.has(m.index!) || abstract.some(([a, b]) => m.index! > a && m.index! < b)) continue;
+    // A TestNG @Test on the class is not a test method.
     const rest = code.slice(m.index! + m[0].length).replace(/^(?:\s*@[\w.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?)*/, "");
-    const decl = /^\s*((?:(?:public|protected|private|static|final|synchronized|abstract|default|strictfp)\s+)*)(?:<[^>{};]*>\s*)?([\w.$<>[\],?\s]+?)\s+[\w$]+\s*\(/.exec(rest);
-    if (!decl) continue; // on a class (TestNG), or not a method
-    if (/\b(?:private|static)\b/.test(decl[1])) n++;
-    else if (m[1] !== "TestFactory" && m[1] !== "TestTemplate" && decl[2].trim() !== "void") n++;
+    if (/^\s*(?:(?:public|protected|private|abstract|static|final|strictfp)\s+)*class\b/.test(rest)) continue;
+    n++;
   }
   return n;
 }
@@ -87,6 +130,7 @@ export function testMetrics(src: string): TestMetrics {
     // JUnit / AssertJ assert*, Mockito verify*, BDDMockito should(), JUnit fail()
     assertions: count(/\b(?:assert\w*|verify\w*|should|fail)\s*\(/g),
     disabled: count(SKIP_MARKERS) + (ABORT_IMPORTED.test(s) ? count(/(?<![.\w])abort\s*\(/g) : 0) + unrunnableTests(s),
+    runnable: runnableTests(s),
   };
 }
 
@@ -129,7 +173,7 @@ export function findShrunk(before: MetricsSnapshot, after: MetricsSnapshot): Shr
       if (b.tests > 0) out.push({ file, before: b, after: null });
       continue;
     }
-    if (a.tests < b.tests || a.assertions < b.assertions || a.disabled > b.disabled) {
+    if (a.tests < b.tests || a.assertions < b.assertions || a.disabled > b.disabled || a.runnable < b.runnable) {
       out.push({ file, before: b, after: a });
     }
   }

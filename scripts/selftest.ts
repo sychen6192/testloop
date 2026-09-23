@@ -48,7 +48,7 @@ import {
   renderSourceEncoding,
   renderReviewEncoding,
 } from "../prompts";
-import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics";
+import { testMetrics, findShrunk, collectTestMetrics, runnableTests } from "../libs/testmetrics";
 import {
   countTestsRun,
   detectEnvFailures,
@@ -118,11 +118,14 @@ import {
   stackFromPom,
   surefireResolvesEngine,
   surefireVersionFromLog,
+  surefireProviderFromLog,
 } from "../libs/teststack";
 import { codeOnly } from "../libs/javasrc";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import {
   checkTestsRan,
+  ranTestClasses,
+  targetModuleSkipped,
   classesRunInLog,
   classifyEnvFailures,
   crashedTestClasses,
@@ -785,6 +788,18 @@ console.log("\n[11] 迴圈強化（writer 變更偵測 / 未覆蓋行 / fix prom
   );
   check("diffSnapshots：無變更 → 空陣列", diffSnapshots(s1, s1).length === 0);
   check("snapshotTree：不存在的目錄 → 空快照", Object.keys(snapshotTree(path.join(tmp, "nope"))).length === 0);
+  // A time put back through a Date (as the encoding view restores a file it did not change) has
+  // whole milliseconds; the file's own had a fraction. Still the same file.
+  const precise = path.join(tmp, "com", "AT.java");
+  fs.utimesSync(precise, 1790203350.5842844, 1790203350.5842844);
+  const s2 = snapshotTree(tmp);
+  const st2 = fs.statSync(precise);
+  fs.utimesSync(precise, new Date(st2.atimeMs), new Date(st2.mtimeMs));
+  check(
+    "snapshotTree：修改時間被以 Date 放回（少了不到 1 毫秒的部分）→ 不算變更",
+    diffSnapshots(s2, snapshotTree(tmp)).length === 0,
+    `${st2.mtimeMs} → ${fs.statSync(precise).mtimeMs}`,
+  );
   fs.rmSync(tmp, { recursive: true, force: true });
 
   // coverage: missed lines and range compression
@@ -1541,6 +1556,39 @@ class T {
   );
   check("testMetrics：沒有從 Assumptions 靜態 import 的 abort() 是一般方法", testMetrics("class T { @Test void a() { abort(); } }").disabled === 0);
   check(
+    "runnableTests：abstract 類別裡的 @Test 不會自己執行；TestNG 掛在類別上的 @Test 不是測試方法；巢狀泛型的方法照樣算",
+    runnableTests("abstract class B { @Test void a() {} } class C extends B { @Test void b() {} }") === 1 &&
+      runnableTests("@Test public class N { public void a() {} }") === 0 &&
+      runnableTests("class G { @Test <T extends Comparable<T>> void generic() {} }") === 1,
+  );
+  check(
+    "testMetrics：把失敗的測試類別改成 abstract → @Test 一個不少，會自己執行的變 0（防掏空看得到）；在既有的 abstract 基底類別加測試不影響",
+    (() => {
+      const concrete = testMetrics("class FooTest { @Test void a() { assertEquals(1, 2); } }");
+      const madeAbstract = testMetrics("abstract class FooTest { @Test void a() { assertEquals(1, 2); } }");
+      const baseGrown = testMetrics("abstract class Base { @Test void a() {} @Test void b() {} }");
+      return concrete.runnable === 1 && madeAbstract.tests === 1 && madeAbstract.runnable === 0 && baseGrown.runnable === 0 &&
+        findShrunk({ "F.java": concrete }, { "F.java": madeAbstract }).length === 1 &&
+        findShrunk({ "B.java": testMetrics("abstract class Base { @Test void a() {} }") }, { "B.java": baseGrown }).length === 0;
+    })(),
+  );
+  check(
+    "testMetrics：在既有測試上方插入沒關上的 /** → 編不過的是這個 /**，不是「刪掉了測試」（交給建置報錯）",
+    (() => {
+      const ok = testMetrics("class T {\n  @Test void a() { assertEquals(1, 1); }\n  @Test void b() { assertEquals(2, 2); }\n}");
+      const broken = testMetrics("class T {\n  /** half a doc\n  @Test void a() { assertEquals(1, 1); }\n  @Test void b() { assertEquals(2, 2); }\n}");
+      return findShrunk({ "T.java": ok }, { "T.java": broken }).length === 0;
+    })(),
+  );
+  check(
+    "testMetrics：在既有測試上方插入沒關上的 text block（\"\"\"）→ 同樣交給建置報錯，後面的測試照算",
+    (() => {
+      const ok = testMetrics("class T {\n  @Test void a() { assertEquals(1, 1); }\n  @Test void b() { assertEquals(2, 2); }\n}");
+      const broken = testMetrics('class T {\n  String s = """\n  @Test void a() { assertEquals(1, 1); }\n  @Test void b() { assertEquals(2, 2); }\n}');
+      return findShrunk({ "T.java": ok }, { "T.java": broken }).length === 0;
+    })(),
+  );
+  check(
     "testMetrics：字串裡的 /*（\"**/*.java\"）不會吃掉後面到下一個註解之間的測試",
     testMetrics('class T {\n  String glob = "**/*.java";\n  @Test void a() { assertEquals(1, 1); }\n  /** doc */\n  @Test void b() { assertEquals(2, 2); }\n}').tests === 2,
   );
@@ -1559,8 +1607,8 @@ class T {
     })(),
   );
 
-  const foo = { tests: 4, assertions: 5, disabled: 1 };
-  const bar = { tests: 2, assertions: 2, disabled: 0 };
+  const foo = { tests: 4, assertions: 5, disabled: 1, runnable: 3 };
+  const bar = { tests: 2, assertions: 2, disabled: 0, runnable: 2 };
   const before = { "com/x/FooTest.java": foo, "com/x/BarTest.java": bar };
   const with_ = (m2: Partial<typeof foo>) => ({ ...before, "com/x/FooTest.java": { ...foo, ...m2 } });
   check("findShrunk：無變化 → 空", findShrunk(before, before).length === 0);
@@ -1571,6 +1619,7 @@ class T {
   );
   check("findShrunk：斷言減少 → 違規", findShrunk(before, with_({ assertions: 4 })).length === 1);
   check("findShrunk：新增 @Disabled → 違規", findShrunk(before, with_({ disabled: 2 })).length === 1);
+  check("findShrunk：會自己執行的 @Test 變少（類別改成 abstract）→ 違規", findShrunk(before, with_({ runnable: 2 })).length === 1);
   const del = findShrunk(before, { "com/x/FooTest.java": foo });
   check(
     "findShrunk：檔案被刪 → 違規且 after=null",
@@ -1578,13 +1627,13 @@ class T {
   );
   const grown = {
     ...before,
-    "com/x/FooTest.java": { tests: 6, assertions: 9, disabled: 0 },
-    "com/x/NewTest.java": { tests: 3, assertions: 3, disabled: 0 },
+    "com/x/FooTest.java": { tests: 6, assertions: 9, disabled: 0, runnable: 6 },
+    "com/x/NewTest.java": { tests: 3, assertions: 3, disabled: 0, runnable: 3 },
   };
   check("findShrunk：增加、或 writer 新建的檔 → 不違規", findShrunk(before, grown).length === 0);
   check(
     "findShrunk：writer 自己新建的檔之後縮水也不受約束（不在 before 裡）",
-    findShrunk(before, { ...grown, "com/x/NewTest.java": { tests: 0, assertions: 0, disabled: 0 } })
+    findShrunk(before, { ...grown, "com/x/NewTest.java": { tests: 0, assertions: 0, disabled: 0, runnable: 0 } })
       .length === 0,
   );
 
@@ -3237,19 +3286,20 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
       fs.existsSync(path.join(outDir, "com/x/RestoredHelper.class")),
   );
   fs.rmSync(outDir, { recursive: true, force: true });
-  // An output directory the batch's own first build created holds every test's classes, not only
-  // the batch's: only the outputs of what the rollback put back go.
+  // An output directory that did not exist when the batch started is all the batch's: a class
+  // named after nothing that is left — a second top-level class in a test the rollback took out —
+  // would otherwise stay, and surefire would run it in the next batch's build.
   const freshOut = path.join(os.tmpdir(), `testgen-out-fresh-${process.pid}`);
   fs.rmSync(freshOut, { recursive: true, force: true });
   const freshCap = captureOutputs([freshOut]);
-  for (const rel of ["com/x/ExistingTest.class", "com/x/NewTest.class", "app.yml"]) {
+  for (const rel of ["com/x/ExistingTest.class", "com/x/NewTest.class", "com/x/NewTestEdgeCases.class", "app.yml"]) {
     fs.mkdirSync(path.dirname(path.join(freshOut, rel)), { recursive: true });
     fs.writeFileSync(path.join(freshOut, rel), "x");
   }
   const freshRemoved = removeBatchOutputs(freshCap, ["java/com/x/NewTest.java"]).map((f) => path.relative(freshOut, f).replace(/\\/g, "/"));
   check(
-    "removeBatchOutputs：輸出目錄是這批的建置才建的 → 只清撤回的原始碼的輸出，其他測試的留著（不必全部重編）",
-    JSON.stringify(freshRemoved) === JSON.stringify(["com/x/NewTest.class"]) && fs.existsSync(path.join(freshOut, "com/x/ExistingTest.class")),
+    "removeBatchOutputs：輸出目錄是這批的建置才建的 → 裡面全是這批的，全部清掉（同一個檔裡第二個類別的 .class 也不留；下一次建置重編）",
+    JSON.stringify(freshRemoved) === JSON.stringify(["app.yml", "com/x/ExistingTest.class", "com/x/NewTest.class", "com/x/NewTestEdgeCases.class"]),
     JSON.stringify(freshRemoved),
   );
   fs.rmSync(freshOut, { recursive: true, force: true });
@@ -3276,6 +3326,17 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
   check(
     "batchFailureFingerprint：由 a–f 組成的英文字（facade、added）不當成 hash",
     batchFailureFingerprint("facade added", []) === "facade added",
+  );
+  check(
+    "batchFailureFingerprint：UUID（四位一組的部分十六進位規則抓不到）也拿掉",
+    batchFailureFingerprint("jdbc:h2:mem:0f8fad5b-d9cb-469f-a165-70867728950e failed", ["Calc.java"]) ===
+      batchFailureFingerprint("jdbc:h2:mem:7c9e6679-7425-40de-944b-e07fc1f90ae7 failed", ["Calc.java"]),
+  );
+  check(
+    "batchFailureFingerprint：類別名稱只在程式碼裡算（HelpTest、Help.java），Maven 文字裡的 [Help 1]、Could not 不算",
+    batchFailureFingerprint("[ERROR] Could not resolve -> [Help 1]", ["src/main/java/com/x/Help.java", "src/main/java/com/x/Could.java"]) ===
+      "[ERROR] Could not resolve -> [Help #]" &&
+      batchFailureFingerprint("HelpTest.java:[3,1] in com.x.Help.run(", ["src/main/java/com/x/Help.java"]).split("<target>").length === 3,
   );
   check(
     "batchFailureFingerprint：Windows 路徑的類別名稱照樣拿掉",
@@ -3626,7 +3687,55 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
     withoutProvider?.pluginEngine === false && jupiterRuns(withoutProvider) === false && frameworkOf(withoutProvider) === "JUnit 4",
     JSON.stringify(withoutProvider),
   );
+  // The engine alone among the plugin's dependencies does nothing before 3.0.0-M4 (only JUnit's own
+  // provider there does), and after it the plugin resolves the engine itself.
+  fs.writeFileSync(
+    path.join(legacy5, "pom.xml"),
+    legacy5Pom("<dependencies><dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter-engine</artifactId><version>5.3.2</version></dependency></dependencies>"),
+  );
+  const engineInPlugin = measureTestStack(legacy5Info, legacy5, "[INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ svc ---", Date.now() - 60_000);
+  check(
+    "measureTestStack：2.22.2、engine 只放在 surefire plugin 的相依裡（沒有 JUnit 的 provider）→ JUnit 5 不會執行",
+    engineInPlugin?.pluginEngine === false && jupiterRuns(engineInPlugin) === false && frameworkOf(engineInPlugin) === "JUnit 4",
+    JSON.stringify(engineInPlugin),
+  );
+  // surefire 3 prints the provider it ran with: that settles it.
+  const provLog = (p: string) =>
+    `[INFO] --- surefire:3.2.5:test (default-test) @ svc ---\n[INFO] Using auto detected provider org.apache.maven.surefire.${p}`;
+  const withNg = measureTestStack(legacy5Info, legacy5, provLog("junitplatform.JUnitPlatformProvider"), Date.now() - 60_000);
+  check(
+    "surefireProviderFromLog：「Using auto detected / configured provider」→ 哪個 provider；歸屬到目標模組",
+    surefireProviderFromLog(provLog("junitplatform.JUnitPlatformProvider"), "svc") === "junit-platform" &&
+      surefireProviderFromLog("[INFO] --- surefire:3.2.5:test (default-test) @ svc ---\n[INFO] Using configured provider org.apache.maven.surefire.junit4.JUnit4Provider", "svc") === "junit4" &&
+      surefireProviderFromLog(provLog("testng.TestNGProvider"), "other") === undefined &&
+      withNg?.surefireProvider === "junit-platform",
+    JSON.stringify(withNg),
+  );
   fs.rmSync(legacy5, { recursive: true, force: true });
+  const ngJupiter = { source: "surefire" as const, junit5: "5.9.2", testng: "7.8.0", jupiterEngine: true, pluginEngine: false };
+  check(
+    "jupiterRuns / frameworkOf：surefire 2.x 上 classpath 有 TestNG → TestNG provider 優先，JUnit 5 不會執行",
+    jupiterRuns({ ...ngJupiter, surefireVersion: "2.22.2" }) === false && frameworkOf({ ...ngJupiter, surefireVersion: "2.22.2" }) === "TestNG",
+  );
+  check(
+    "frameworkOf：surefire 說它用 JUnit Platform provider → JUnit 5（TestNG 測試在它底下不會執行）；說用 JUnit4Provider → JUnit 4",
+    frameworkOf({ ...ngJupiter, surefireVersion: "3.2.5", surefireProvider: "junit-platform", usage: { junit5: 0, junit4: 0, testng: 9 } }) === "JUnit 5" &&
+      frameworkOf({ source: "surefire", junit5: "5.9.2", junit4: "4.13.2", surefireVersion: "3.2.5", surefireProvider: "junit4" }) === "JUnit 4",
+  );
+  const platform = { source: "surefire" as const, junit5: "5.9.2", junit4: "4.13.2", jupiterEngine: false, pluginEngine: false, surefireProvider: "junit-platform" as const };
+  check(
+    "jupiterRuns：surefire 說的 provider 為準——3.x 設定成 junit47 provider → 不執行 JUnit 5（實測 3.2.5）",
+    jupiterRuns({ source: "surefire", junit5: "5.9.2", junit4: "4.13.2", surefireVersion: "3.2.5", surefireProvider: "junit47" }) === false,
+  );
+  check(
+    "jupiterRuns / frameworkOf：JUnit Platform provider 還要有 Jupiter engine——3.2.5 自己補上 → 執行；3.0.0-M3、classpath 上只有 vintage → 不執行，用 JUnit 4",
+    jupiterRuns({ ...platform, surefireVersion: "3.2.5" }) === true &&
+      jupiterRuns({ ...platform, surefireVersion: "3.0.0-M3" }) === false &&
+      frameworkOf({ ...platform, surefireVersion: "3.0.0-M3" }) === "JUnit 4" &&
+      frameworkOf({ ...platform, surefireVersion: "3.2.5" }) === "JUnit 5",
+  );
+  const configured4 = renderTestStack({ source: "surefire", junit5: "5.9.2", junit4: "4.13.2", surefireVersion: "3.2.5", surefireProvider: "junit4" });
+  check("prompt：provider 是 JUnit 4 → 說明原因是 provider，不是「沒有 engine」", configured4.includes("junit4 provider") && !configured4.includes("沒有 junit-jupiter-engine"), configured4);
 }
 
 // ---------------------------------------------------------------------------
@@ -3966,6 +4075,29 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
       JSON.stringify(er),
     );
 
+    // A journal that cannot be removed (an antivirus holding it) does not throw out of the close —
+    // on a crash's way out that ended the process before its summary was written.
+    const cjsRm = createRequire(import.meta.url)("node:fs") as { rmSync: (p: string, o?: object) => void };
+    const realRm = cjsRm.rmSync;
+    const jv = openEncodingView(ms950, tree)!;
+    cjsRm.rmSync = (p: string, o?: object) => {
+      if (jv.journal && p === jv.journal) throw Object.assign(new Error("resource busy"), { code: "EBUSY" });
+      realRm(p, o);
+    };
+    syncBuiltinESMExports();
+    let journalThrew = false;
+    try {
+      closeEncodingView(jv);
+    } catch {
+      journalThrew = true;
+    }
+    cjsRm.rmSync = realRm;
+    syncBuiltinESMExports();
+    check(
+      "closeEncodingView：復原日誌刪不掉（被鎖住）→ 不丟例外，檔案照樣放回；下一次執行的 recover 會清掉它",
+      !journalThrew && fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && recoverEncodingViews(tree).length === 0,
+    );
+
     const prodFile = f("com/x/Fee.java");
     fs.writeFileSync(prodFile, Buffer.concat([Buffer.from('class Fee { String m = "'), zh, Buffer.from('"; }\n')]));
     const views = sourceViews(ms950, [prodFile, f("com/x/AsciiTest.java")]);
@@ -4046,7 +4178,10 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     JSON.stringify(lexed),
   );
   check("codeOnly：字串裡的 \\\" 不結束字串", codeOnly('s = "a\\"b // c"; d();').endsWith("d();"));
-  check("codeOnly：沒結束的區塊註解吃到檔尾、不丟例外", codeOnly("a(); /* x").startsWith("a();") && codeOnly("a(); /* x").length === 9);
+  check(
+    "codeOnly：沒結束的區塊註解只清掉開頭的 /*，後面照樣當程式碼讀（編不過的檔交給建置報錯，不是讓後面的測試全部「消失」）",
+    codeOnly("a(); /* x").length === 9 && codeOnly("a(); /* x").endsWith(" x"),
+  );
 
   check(
     "testFrameworkOf：看 @Test 從哪裡 import——JUnit 4 的 @Test 配 JUnit 5 的 Assertions 仍是 JUnit 4",
@@ -4073,8 +4208,10 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
       et("package com.x;\nimport org.testng.annotations.Test;\n@Test(enabled = false)\npublic class FooTest { @Test public void a() {} }")?.disabled === true,
   );
   check(
-    "includedByDefault：surefire 預設的 includes（Test*、*Test、*Tests、*TestCase）",
-    ["a.FooTest", "a.TestFoo", "a.FooTests", "a.FooTestCase"].every(includedByDefault) && !["a.FooSpec", "a.FooIT", "a.FooTestHelper"].some(includedByDefault),
+    "includedByDefault：surefire 預設的 includes（Test*、*Test、*TestCase；*Tests 要 2.20 以後——2.12.4 不跑 CalcTests）",
+    ["a.FooTest", "a.TestFoo", "a.FooTests", "a.FooTestCase"].every((n) => includedByDefault(n)) &&
+      !["a.FooSpec", "a.FooIT", "a.FooTestHelper"].some((n) => includedByDefault(n)) &&
+      !includedByDefault("a.FooTests", "2.12.4") && includedByDefault("a.FooTests", "2.22.2") && includedByDefault("a.FooTest", "2.12.4"),
   );
   check(
     "classesRunInLog：surefire 的「Running」與「- in / -- in」行",
@@ -4183,7 +4320,29 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     untouched.includes("writer 介入前有被執行") && untouched.includes("junit-platform.properties"),
     untouched,
   );
+  const reactor = (web: string) =>
+    ["[INFO] Reactor Summary for parent 1.0:", "[INFO] ", "[INFO] parent ............................................. SUCCESS [  0.1 s]",
+      "[INFO] core ............................................... FAILURE [  2.1 s]", `[INFO] web ................................................ ${web}`,
+      "[INFO] ------------------------------------------------------------------------", "[INFO] BUILD FAILURE"].join("\n");
+  check(
+    "targetModuleSkipped：reactor 最後一個模組（-pl <模組> -am 的目標模組）是 SKIPPED → 目標模組沒有被建置",
+    targetModuleSkipped(reactor("SKIPPED")) && !targetModuleSkipped(reactor("FAILURE [  3.0 s]")) && !targetModuleSkipped("[INFO] BUILD SUCCESS") &&
+      // no separator line before BUILD FAILURE: that line is not a module's
+      targetModuleSkipped("[INFO] Reactor Summary:\n[INFO] common ...... FAILURE\n[INFO] web ....... SKIPPED\n[INFO] BUILD FAILURE"),
+  );
   check("renderRanCheck：全部都有執行 → null", renderRanCheck({ reported: [], notRun: [], allSkipped: [], ran: [], ranBefore: [] }, "maven") === null);
+  check(
+    "renderRanCheck：surefire 2.12.4 不跑 *Tests → 點名 includes（版本從 build log 讀）",
+    (renderRanCheck(
+      { reported: [], notRun: [{ file: f("CalcTests"), fqcn: "com.x.CalcTests", disabled: false, origin: "created", framework: "JUnit 4" }], allSkipped: [], ran: [{ fqcn: "com.x.AnyTest", framework: "JUnit 4" }], ranBefore: [], surefireVersion: "2.12.4" },
+      "maven",
+    ) ?? "").includes("*Tests 要 2.20 以後"),
+  );
+  const grownText = renderRanCheck(
+    { reported: [], notRun: [{ file: f("OldTest"), fqcn: "com.x.OldTest", disabled: false, origin: "grown", framework: "JUnit 5" }], allSkipped: [], ran: [{ fqcn: "com.x.AnyTest", framework: "JUnit 4" }], ranBefore: [] },
+    "maven",
+  ) ?? "";
+  check("renderRanCheck：在不會被執行的既有類別裡加了測試 → 說明加在這裡的測試不會被執行", grownText.includes("加在這裡的測試不會被執行"), grownText);
   const two = renderRanCheck(
     {
       reported: [],
@@ -4212,6 +4371,41 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     et("package com.x;\nimport org.junit.Test;\n@RunWith(Parameterized.class)public class FooTest { @Test public void a() {} }")?.fqcn === "com.x.FooTest" &&
       et("package com.x;\nimport org.junit.Test;\n@RunWith(Parameterized.class)abstract class FooTest { @Test public void a() {} }") === undefined,
   );
+
+  // A class-level @DisplayName under surefire's phrased reporters: the report is named by it — and
+  // a non-ASCII one arrives in the file name as "?"s — while other classes still show by FQCN.
+  const shownFile = src("ShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("Calc 加法")\nclass ShownTest { @Test void a() {} }\n');
+  const shown = expectedTestOf(fs.readFileSync(shownFile, "utf8"), shownFile, "created")!;
+  check("expectedTestOf：讀出類別層級的 @DisplayName", shown.displayName === "Calc 加法", JSON.stringify(shown));
+  report("TEST-com.x.OldTest.xml");
+  report("TEST-Calc ??.xml", '<testsuite name="Calc 加法" tests="1"><testcase name="a" classname="Calc 加法"/></testsuite>');
+  check(
+    "checkTestsRan：以 @DisplayName 命名的報告（檔名裡的中文變成 ?）照樣認得是它，別的類別照常以 FQCN 出現也一樣",
+    checkTestsRan("maven", mi, since, "", [shown])?.notRun.length === 0,
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  // TestNG: one TEST-TestSuite.xml for everything — its classes are what ran, and what to protect.
+  src("NgTest", "package com.x;\nimport org.testng.annotations.Test;\npublic class NgTest { @Test public void a() {} }\n");
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="1"><testcase name="a" classname="com.x.NgTest" time="0"/></testsuite>');
+  const ngRun = checkTestsRan("maven", mi, since, "", [newTest])!;
+  const ngText = renderRanCheck(ngRun, "maven") ?? "";
+  check(
+    "checkTestsRan：TestNG 模組（只有 TEST-TestSuite.xml）→ 從裡面的 testcase 認出執行了哪些類別，建議改寫成 TestNG",
+    ngRun.ran.some((r) => r.fqcn === "com.x.NgTest" && r.framework === "TestNG") && ngText.includes("改用 TestNG"),
+    ngText,
+  );
+  check("ranTestClasses：suite 報告裡的成員類別也記下（之後要一直能執行）", ranTestClasses("maven", mi, since, "").includes("com.x.NgTest"));
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  // A JUnit 4 suite class: its report is named after a class, and its members run only inside it.
+  src("AllTests", "package com.x;\nimport org.junit.runner.RunWith;\nimport org.junit.runners.Suite;\n@RunWith(Suite.class)\n@Suite.SuiteClasses({ OldTest.class })\npublic class AllTests {}\n");
+  report("TEST-com.x.AllTests.xml", '<testsuite name="com.x.AllTests" tests="1"><testcase name="a" classname="com.x.OldTest" time="0"/></testsuite>');
+  const viaSuite = ranTestClasses("maven", mi, since, "");
+  check(
+    "ranTestClasses：JUnit 4 suite 類別的報告以它自己命名 → 裡面的成員類別也記下",
+    viaSuite.includes("com.x.AllTests") && viaSuite.includes("com.x.OldTest"),
+    JSON.stringify(viaSuite),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
 
   // gradle deletes its results before each run: whatever is there is this run's (or an up-to-date one's).
   const g = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-ran-"));

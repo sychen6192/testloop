@@ -65,7 +65,7 @@ export function intEnv(name: string, def: number, min = 0, max = Infinity): numb
   }
   const n = numEnv(name, def, min, max);
   if (!Number.isSafeInteger(n)) {
-    console.error(`FATAL: ${name}=${raw} 必須是整數`);
+    console.error(`FATAL: ${name}=${raw} 超出可精確表示的整數範圍（±2^53）`);
     process.exit(1);
   }
   return n;

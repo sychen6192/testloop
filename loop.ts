@@ -38,9 +38,9 @@ import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
-import { detectBuildTool, runBaseline, writableRel } from "./gates/build";
+import { detectBuildTool, detectEnvFailures, runBaseline, targetModuleSkipped, writableRel } from "./gates/build";
 import { createRunner } from "./runners/runner";
-import { IterationRecord, orchestrate, repairBaseline, RepairResult } from "./orchestrator";
+import { IterationRecord, orchestrate, repairBaseline, RepairResult, WriterTrace, writerChangesSoFar } from "./orchestrator";
 import {
   batchFailureFingerprint,
   captureOutputs,
@@ -474,6 +474,15 @@ async function main() {
             `詳見 ${runDir}`,
         );
       }
+      // Maven stops the reactor at the failing upstream module: the target module was never built,
+      // and no round's build will get to it either. Tolerating that red is tolerating an untested run.
+      if (targetModuleSkipped(baseline.raw)) {
+        die(
+          `預檢時上游模組的紅燈讓 Maven 停在上游，目標模組 ${mod.moduleRel} 根本沒有被建置（reactor summary 裡是 SKIPPED）。\n` +
+            "UT_ALLOW_DIRTY_BASELINE 放行的是「既有的失敗」，但這裡每一輪的建置也都會停在同一個地方——writer 的測試從來不會被編譯或執行。\n" +
+            `請先修好上游模組，詳見 ${path.join(runDir, "baseline.log")}`,
+        );
+      }
       log("[WARN] UT_ALLOW_DIRTY_BASELINE=1：帶著既有紅燈繼續，已知失敗會標記為 pre-existing");
       // The gate now compares instead of requiring: these identities may keep failing, anything
       // else that fails is the writer's doing and still turns the round red.
@@ -605,7 +614,7 @@ interface BatchRun {
   batches: string[][];
   records: BatchRecord[];
   treeRel: string;
-  inFlight?: { index: number; dir: string; start: TreeCapture; outputs: OutputCapture; written: Set<string> };
+  inFlight?: { index: number; dir: string; start: TreeCapture; outputs: OutputCapture; trace: WriterTrace };
 }
 let batchRun: BatchRun | undefined;
 
@@ -646,7 +655,10 @@ async function runBatches(o: BatchRunInput): Promise<number> {
   const records = run.records;
   let stopped: { reason: string; message: string } | undefined;
   let stack = o.testStack;
+  // What every batch's green build must still run: the baseline's classes, then each passed batch's.
+  let ranBefore = o.ranAtBaseline;
   let prevFailure = "";
+  let prevEnv = "";
   banner(`分批執行：${total} 個目標類別分成 ${o.batches.length} 批（UT_BATCH_SIZE=${BATCH_SIZE}）`);
 
   for (let i = 0; i < o.batches.length; i++) {
@@ -661,8 +673,8 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     stack = mergeTestStack(stack, measureTestStack(o.mod, REPO_ROOT));
     const start = captureTree(testTree);
     const outputs = captureOutputs(testOutputDirs(o.mod.moduleRoot, o.buildTool));
-    const written = new Set<string>();
-    run.inFlight = { index: i, dir, start, outputs, written };
+    const trace: WriterTrace = { written: new Set<string>() };
+    run.inFlight = { index: i, dir, start, outputs, trace };
     const r = await orchestrate({
       targetClasses: batch,
       buildTool: o.buildTool,
@@ -678,9 +690,10 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       conventions,
       testStack: stack,
       sourceEncoding: o.sourceEncoding,
-      ranAtBaseline: o.ranAtBaseline,
-      writtenTo: written,
+      ranAtBaseline: ranBefore,
+      trace,
     });
+    if (r.success && r.ranTests) ranBefore = [...new Set([...(ranBefore ?? []), ...r.ranTests])].sort();
     const rec: BatchRecord = {
       batch: i + 1,
       targetClasses: batch,
@@ -696,7 +709,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     };
     // A scope violation is left exactly as it is: the changes outside src/test are the reason the
     // run stops, and the test files beside them are part of what a human has to look at.
-    if (!r.success && r.stopReason !== "scope-violation") rec.rolledBack = setAside(dir, start, outputs, treeRel, written);
+    if (!r.success && r.stopReason !== "scope-violation") rec.rolledBack = setAside(dir, start, outputs, treeRel, trace.written);
     run.inFlight = undefined;
     records.push(rec);
     fs.writeFileSync(path.join(o.runDir, "batches.json"), JSON.stringify(records, stripRaw, 2));
@@ -748,6 +761,17 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       break;
     }
     prevFailure = failure;
+    // An environment failure shows through the batch's own tests — a Spring context that will not
+    // start fails whatever test starts it — so it is compared by what it is, not by its text.
+    const env = !r.success && lastGate(r.funnel) === "build" ? detectEnvFailures(r.lastReport ?? "").join("、") : "";
+    if (env && env === prevEnv) {
+      stopped = {
+        reason: "repeated-env-failure",
+        message: `連續兩批的建置都因為同樣的環境/設定問題失敗（${env}）——改測試碼修不好，後面的批次也會一樣`,
+      };
+      break;
+    }
+    prevEnv = env;
   }
 
   const passed = records.filter((r) => r.success).length;
@@ -857,7 +881,8 @@ function batchShutdownState(): Record<string, unknown> {
   if (f) {
     let rolledBack: SetAside | { error: string } | null;
     try {
-      rolledBack = setAside(f.dir, f.start, f.outputs, run.treeRel, f.written) ?? null;
+      // A writer session the interrupt or the crash cut short: what it wrote so far is its too.
+      rolledBack = setAside(f.dir, f.start, f.outputs, run.treeRel, writerChangesSoFar(f.trace)) ?? null;
       if (rolledBack) attention.push(...attentionOf([{ batch: f.index + 1, stopReason: "interrupted", dir: f.dir, rolledBack }]));
     } catch (e) {
       rolledBack = { error: String(e) };
@@ -926,28 +951,41 @@ let crashRunDir: string | undefined;
 // still writing or a build still compiling would change the tree under the rollback — then a test
 // tree left in its ASCII view (libs/encoding.ts) is written back, as at any session's end, and the
 // batch rollback after it compares against what the batch started with.
+// Every step is guarded, and a second failure while crashing still ends the process with an error:
+// an unguarded throw in here came back through uncaughtException, found the crash already under
+// way, and the process ended with exit code 0 — no FATAL line, no summary, nothing rolled back.
 let crashing = false;
 function crash(e: unknown): void {
-  if (crashing) return;
-  crashing = true;
-  const err = e as { stack?: string } | undefined;
-  killAll();
-  finishOpenViews();
-  if (crashRunDir && !fs.existsSync(path.join(crashRunDir, "summary.json"))) {
+  const text = String((e as { stack?: string } | undefined)?.stack ?? e);
+  if (crashing) {
     try {
-      fs.writeFileSync(
-        path.join(crashRunDir, "summary.json"),
-        JSON.stringify(
-          { success: false, stopReason: "crash", error: String(err?.stack ?? e), ...batchShutdownState() },
-          stripRaw,
-          2,
-        ),
-      );
-    } catch {
-      /* best effort: the FATAL line below still says what happened */
+      process.stderr.write(`FATAL（收尾時又出錯）: ${text}\n`);
+    } finally {
+      process.exit(1);
     }
   }
-  die(String(err?.stack ?? e));
+  crashing = true;
+  const step = (what: string, fn: () => void) => {
+    try {
+      fn();
+    } catch (x) {
+      try {
+        process.stderr.write(`[WARN] crash 收尾時${what}失敗：${String(x)}\n`);
+      } catch {
+        /* nothing left to report with */
+      }
+    }
+  };
+  step("結束子行程", killAll);
+  step("還原編碼視圖", () => finishOpenViews());
+  step("寫 summary", () => {
+    if (!crashRunDir || fs.existsSync(path.join(crashRunDir, "summary.json"))) return;
+    fs.writeFileSync(
+      path.join(crashRunDir, "summary.json"),
+      JSON.stringify({ success: false, stopReason: "crash", error: text, ...batchShutdownState() }, stripRaw, 2),
+    );
+  });
+  die(text);
 }
 process.on("uncaughtException", crash);
 main().catch(crash);

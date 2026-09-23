@@ -10,6 +10,11 @@
  * Pure: `src` with comments, and the contents of string, character and text-block literals,
  * replaced by spaces. Same length with the line breaks kept, so an index or a line number in the
  * result is the same one in the source. The quotes stay: `"…"` still reads as an argument.
+ *
+ * A comment or text block left open does not compile. Blanking everything after it made the rest
+ * of the file vanish — every test in it "removed" — so its opener is blanked alone and the rest is
+ * read as code, which is what the source was before the stray opener went in. The build reports
+ * the error itself.
  */
 export function codeOnly(src: string): string {
   const out: string[] = [];
@@ -27,18 +32,25 @@ export function codeOnly(src: string): string {
       i = j;
     } else if (c === "/" && src[i + 1] === "*") {
       const end = src.indexOf("*/", i + 2);
-      const j = end < 0 ? n : end + 2;
-      blank(i, j);
-      i = j;
+      if (end < 0) {
+        blank(i, i + 2);
+        i += 2;
+        continue;
+      }
+      blank(i, end + 2);
+      i = end + 2;
     } else if (c === '"' && src[i + 1] === '"' && src[i + 2] === '"') {
       // A text block runs to the next unescaped """.
       let j = i + 3;
       while (j < n && !(src[j] === '"' && src[j + 1] === '"' && src[j + 2] === '"')) j += src[j] === "\\" ? 2 : 1;
-      j = Math.min(j, n);
       out.push('"', '"', '"');
+      if (j >= n) {
+        i += 3;
+        continue;
+      }
       blank(i + 3, j);
-      if (j < n) out.push('"', '"', '"');
-      i = Math.min(j + 3, n);
+      out.push('"', '"', '"');
+      i = j + 3;
     } else if (c === '"' || c === "'") {
       // A string or char literal ends at its quote — or, unterminated, at the end of the line.
       let j = i + 1;

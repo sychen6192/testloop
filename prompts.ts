@@ -7,7 +7,7 @@ import { SCORE_THRESHOLDS } from "./config";
 import { expectedTestPath } from "./libs/utils";
 import { TestConventions } from "./libs/conventions";
 import { ShrinkViolation } from "./libs/testmetrics";
-import { canMockStatic, frameworkSettled, jupiterRuns, majorOf, minorOf, TestStack, versionAtLeast } from "./libs/teststack";
+import { canMockStatic, frameworkSettled, jupiterNotRunReason, jupiterRuns, majorOf, minorOf, TestStack, versionAtLeast } from "./libs/teststack";
 import { isUtf8Name, SourceEncoding } from "./libs/encoding";
 
 // Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
@@ -68,6 +68,17 @@ type Framework = "JUnit 5" | "JUnit 4" | "TestNG";
 
 function frameworkKind(stack: TestStack | undefined): Framework {
   if (!stack) return "JUnit 5";
+  // The provider surefire said it ran with is what runs; it outranks every inference below.
+  switch (stack.surefireProvider) {
+    case "testng":
+      return "TestNG";
+    case "junit4":
+    case "junit47":
+    case "junit3":
+      return "JUnit 4";
+    case "junit-platform":
+      return stack.junit5 !== undefined && jupiterRuns(stack) !== false ? "JUnit 5" : stack.junit4 !== undefined ? "JUnit 4" : "JUnit 5";
+  }
   // JUnit 5 counts where the build runs it: with the API alone, before surefire 3.0.0-M4, a JUnit 5
   // test compiles and is never run.
   const has5 = stack.junit5 !== undefined && jupiterRuns(stack) !== false;
@@ -144,8 +155,8 @@ export function renderTestStack(stack: TestStack | undefined): string {
       );
       if (jupiterRuns(stack) === false) {
         lines.push(
-          `注意：classpath 上只有 JUnit 5 的 API，沒有 junit-jupiter-engine，surefire ${stack.surefireVersion} 不會執行 JUnit 5 測試` +
-            "——寫了也不會被執行，build gate 會把沒被執行的測試類別判 FAIL；模組要能跑 JUnit 5 得先在 pom 加上 engine（pom 不在你的可寫範圍，請在總結裡說明）",
+          `注意：${jupiterNotRunReason(stack)}——寫了也不會被執行，build gate 會把沒被執行的測試類別判 FAIL；` +
+            "模組要能跑 JUnit 5 得先改 pom（不在你的可寫範圍，請在總結裡說明）",
         );
       }
     } else if (u && u.junit5 > 0) {
@@ -165,8 +176,7 @@ export function renderTestStack(stack: TestStack | undefined): string {
     // pom declares — JUnit 5 may be there too, and saying "there is none" would be a guess.
     const which = frameworkSettled(stack)
       ? has5
-        ? `JUnit 4${ver(stack.junit4)}。classpath 上雖有 JUnit 5 的 API（junit-jupiter-api${ver(stack.junit5)}），但沒有 junit-jupiter-engine，` +
-          `surefire ${stack.surefireVersion} 不會執行 JUnit 5 測試（編得過、但不會被執行）`
+        ? `JUnit 4${ver(stack.junit4)}。${jupiterNotRunReason(stack)}`
         : `**只有** JUnit 4${ver(stack.junit4)}，沒有 JUnit 5`
       : u && u.junit4 > 0
         ? `JUnit 4${ver(stack.junit4)}——模組既有測試用的是 JUnit 4（${u.junit4} 個；${unsettled}），新測試跟它們一樣`
@@ -188,7 +198,9 @@ export function renderTestStack(stack: TestStack | undefined): string {
   }
   if (hasNg && (has5 || has4)) {
     lines.push(
-      stack.usage
+      stack.surefireProvider
+        ? `classpath 上同時有 TestNG 與 JUnit；surefire 這次用 ${stack.surefireProvider} provider 執行測試——新測試用 ${kind}`
+        : stack.usage
         ? `classpath 上同時有 TestNG 與 JUnit，surefire 只會用其中一個 provider 跑測試；本模組既有測試：TestNG ${stack.usage.testng} 個、` +
             `JUnit ${stack.usage.junit5 + stack.usage.junit4} 個——新測試跟既有測試用同一個框架（${kind}）`
         : "classpath 上同時有 TestNG 與 JUnit，surefire 只會用其中一個 provider 跑測試——新測試跟模組既有的測試用同一個框架",
@@ -533,6 +545,9 @@ export function renderShrinkFeedback(violations: ShrinkViolation[]): string {
       : `- ${v.file}：@Test ${v.before.tests} → ${v.after.tests}、斷言 ${v.before.assertions} → ${v.after.assertions}` +
         (v.after.disabled > v.before.disabled
           ? `、略過標記（@Disabled / @Ignore / @Test(enabled = false) / assume… / abort / 丟 SkipException 或 TestAbortedException / private、static 或有回傳值的 @Test）${v.before.disabled} → ${v.after.disabled}`
+          : "") +
+        (v.after.runnable < v.before.runnable
+          ? `、會自己執行的 @Test ${v.before.runnable} → ${v.after.runnable}（類別改成 abstract，或方法改成不會被執行的寫法）`
           : ""),
   );
   return `writer 刪減了既有測試，本輪判 FAIL——修復或補強是讓測試正確，不是讓它消失：
