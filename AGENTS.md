@@ -106,11 +106,14 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    `libs/teststack.ts` 從目標模組 surefire 報告裡的 `surefire.test.class.path` 量出測試相依（JUnit 4/5、
    Mockito 版本與能否用 MockitoExtension / mock static、AssertJ、Java 語言層級），模組還沒跑過測試時退回
    讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath；`libs/encoding.ts` 量出 javac 讀原始碼的
-   編碼（pom，退回 build log 裡 Maven 自己寫的平台編碼，再退回 JDK 預設編碼）。非 UTF-8 時另有確定性護欄：
+   編碼（pom 與 Spring Boot parent、build.gradle，退回建置自己說的平台編碼；都看不到就看原始碼是不是 UTF-8，
+   **不拿 JDK 預設編碼猜**）。非 UTF-8 時另有確定性護欄：
    每個 agent session 前把 `src/test/java` 的非 ASCII 字元改寫成 `\uXXXX` 的 ASCII 形式（UTF-8 編輯工具會把
    MS950 的中文默默換掉），session 後沒改的檔照原 bytes 與時間放回，改過的檔沒改的行維持原 bytes、新寫的行
    由 JDK（`libs/java/Transcode.java`，與 javac 同一套 charset）存成模組編碼；writer 寫進 U+FFFD 或解不開的檔
-   被改到，該輪 FAIL。找不到 JDK 時退回保守做法：含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`。
+   被改到，該輪 FAIL。沒有可用的 JDK（或編碼名稱不明）時退回保守做法：含非 ASCII 的既有檔不讓改，writer 的輸出
+   轉成 `\uXXXX`；writer 自己寫的檔永遠不在保護之列。視圖開著被中斷時照常關閉，被 SIGKILL 的由下一次執行從
+   使用者快取目錄裡的復原日誌放回（`recoverEncodingViews`）。
    測試類別可見性**沒有**放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
    但跨 package 的 class-symbol 套件沒有 `public` 就編不過。禁止在 standards 或 prompt 裡
    寫死任一邊。

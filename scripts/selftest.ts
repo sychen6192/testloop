@@ -87,8 +87,13 @@ import {
   closeEncodingView,
   escapeNonAscii,
   findJdk,
+  finishOpenViews,
+  gradleDaemonEncoding,
   gradleEncoding,
   isUtf8Name,
+  jdkCheckCharset,
+  recoverEncodingViews,
+  sourceViews,
   jdkDecode,
   jdkEncode,
   measureSourceEncoding,
@@ -105,6 +110,7 @@ import { canMockStatic, classpathFromSurefireXml, javaReleaseFromLog, measureTes
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import { classifyEnvFailures, readSurefireXml, isSurefireSummary, crashedTestClasses, unfinishedTestClasses } from "../gates/build";
 import { spawn, spawnSync } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { bundleFrom, caSummary, load, sourcePaths } from "../libs/tls";
@@ -3405,18 +3411,58 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     measureSourceEncoding({ moduleRoot: encRepo, moduleRel: "", multiModule: false }, encRepo)?.name === "MS950",
   );
   fs.rmSync(encRepo, { recursive: true, force: true });
+  // Configured where the loop cannot see: never the JDK's default charset — the sources decide.
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-encpom-"));
+  const outsideInfo = { moduleRoot: outside, moduleRel: "", multiModule: false };
+  fs.writeFileSync(path.join(outside, "pom.xml"), "<project><parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId><version>9</version></parent><artifactId>x</artifactId></project>");
+  fs.mkdirSync(path.join(outside, "src", "test", "java"), { recursive: true });
+  fs.writeFileSync(path.join(outside, "src", "test", "java", "ZhTest.java"), "// 中文 in UTF-8\nclass ZhTest {}\n");
   check(
-    "refineSourceEncoding：建置 log 說的平台編碼優先於之前讀的 JDK 預設，JDK 預設不蓋掉建置說過的",
-    refineSourceEncoding({ name: "UTF-8", source: "jdk" }, { name: "MS950", source: "platform" })?.name === "MS950" &&
-      refineSourceEncoding({ name: "MS950", source: "platform" }, { name: "UTF-8", source: "jdk" })?.name === "MS950" &&
+    "measureSourceEncoding：設定在 repo 外的 parent、原始碼是 UTF-8 → 當成 UTF-8（不拿 JDK 預設編碼猜）",
+    measureSourceEncoding(outsideInfo, outside) === undefined,
+    JSON.stringify(measureSourceEncoding(outsideInfo, outside)),
+  );
+  const outside2 = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-encpom-"));
+  fs.cpSync(outside, outside2, { recursive: true });
+  fs.writeFileSync(path.join(outside2, "src", "test", "java", "ZhTest.java"), Buffer.from([0x2f, 0x2f, 0x20, 0xa4, 0xa4, 0xa4, 0xe5, 0x0a]));
+  const sniffedEnc = measureSourceEncoding({ moduleRoot: outside2, moduleRel: "", multiModule: false }, outside2);
+  check(
+    "measureSourceEncoding：設定在 repo 外、原始碼不是 UTF-8 → 標為「非 UTF-8、名稱不明」（只保護、不轉換）",
+    sniffedEnc?.source === "sniffed",
+    JSON.stringify(sniffedEnc),
+  );
+  fs.writeFileSync(path.join(outside, "pom.xml"), "<project><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>2.7.18</version><relativePath/></parent><artifactId>x</artifactId></project>");
+  check("measureSourceEncoding：Spring Boot parent → UTF-8（它設了 project.build.sourceEncoding）", measureSourceEncoding(outsideInfo, outside)?.name === "UTF-8");
+  fs.rmSync(outside, { recursive: true, force: true });
+  fs.rmSync(outside2, { recursive: true, force: true });
+  check(
+    "gradleEncoding：只認 javac 的設定（compileJava / JavaCompile），javadoc 的 options.encoding 不算",
+    gradleEncoding("compileJava.options.encoding = 'MS950'") === "MS950" &&
+      gradleEncoding("tasks.withType(JavaCompile) {\n  options.encoding = 'Big5'\n}") === "Big5" &&
+      gradleEncoding("javadoc {\n  options.encoding = 'UTF-8'\n}") === undefined,
+  );
+  check(
+    "gradleDaemonEncoding：gradle.properties 的 org.gradle.jvmargs -Dfile.encoding",
+    gradleDaemonEncoding("org.gradle.jvmargs=-Xmx2g -Dfile.encoding=MS950\n") === "MS950" && gradleDaemonEncoding("org.gradle.caching=true\n") === undefined,
+  );
+  check(
+    "refineSourceEncoding：設定或建置說的優先於嗅探；建置什麼都沒說就維持之前的",
+    refineSourceEncoding({ name: "x", source: "sniffed" }, { name: "MS950", source: "platform" })?.name === "MS950" &&
+      refineSourceEncoding({ name: "MS950", source: "platform" }, { name: "x", source: "sniffed" })?.name === "MS950" &&
       refineSourceEncoding({ name: "MS950", source: "pom" }, undefined)?.name === "MS950",
   );
   check("isUtf8Name：UTF-8 / utf8 都算", isUtf8Name("UTF-8") && isUtf8Name("utf8") && !isUtf8Name("MS950"));
 
   check(
-    "escapeNonAscii：中文 → \\uXXXX，ASCII 不變，BOM 拿掉，emoji 成兩個 surrogate",
-    escapeNonAscii("\uFEFF// 測試 ok 😀") === "// \\u6e2c\\u8a66 ok \\ud83d\\ude00",
-    escapeNonAscii("\uFEFF// 測試 ok 😀"),
+    "escapeNonAscii：中文 → \\uXXXX，ASCII 不變，emoji 成兩個 surrogate；BOM 只在檔案開頭、要求時才拿掉",
+    escapeNonAscii("\uFEFF// 測試 ok 😀", undefined, { dropBom: true }) === "// \\u6e2c\\u8a66 ok \\ud83d\\ude00" &&
+      escapeNonAscii("\uFEFFid") === "\\ufeffid",
+    escapeNonAscii("\uFEFF// 測試 ok 😀", undefined, { dropBom: true }),
+  );
+  check(
+    "escapeNonAscii：以字元（code point）為單位決定——BMP 以外的字不會只跳脫一半",
+    escapeNonAscii("😀😁", (cp) => cp === 0x1f600) === "\\ud83d\\ude00😁",
+    escapeNonAscii("😀😁", (cp) => cp === 0x1f600),
   );
   check(
     "escapeNonAscii：奇數個反斜線後面的字元 → 那個反斜線寫成 \\u005c（否則 \\u 不會被當成跳脫）；偶數個不動",
@@ -3437,6 +3483,17 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
   const crlfOriginal = Buffer.concat([Buffer.from("// "), zh, Buffer.from("\r\nclass A {\r\n}\r\n")]);
   const crlfView = "// \\u4e2d\\u6587\r\nclass A {\r\n}\r\n";
   const merged = mergeEdited(crlfOriginal, crlfView, "// \\u4e2d\\u6587\nclass A {\n  int x; // 新增\n  // \\u4e2d\\u6587 ok\n}\n");
+  // Two lines that read alike but differ in bytes (MS950's box-drawing characters have two codes):
+  // each untouched one keeps its own; an inserted blank line in a CRLF file gets a CRLF.
+  const twin = Buffer.concat([Buffer.from("// "), Buffer.from([0xa2, 0xa4]), Buffer.from("\r\nx\r\n// "), Buffer.from([0xf9, 0xf9]), Buffer.from("\r\n")]);
+  const twinMerged = mergeEdited(twin, "// \\u2550\r\nx\r\n// \\u2550\r\n", "// \\u2550\nx\n\n// \\u2550\n");
+  check(
+    "mergeEdited：看起來一樣的兩行各自保留自己的 bytes；CRLF 檔裡新插入的空行也是 CRLF",
+    (twinMerged[0] as Buffer).equals(Buffer.concat([Buffer.from("// "), Buffer.from([0xa2, 0xa4, 0x0d])])) &&
+      twinMerged[2] === "\r" &&
+      (twinMerged[3] as Buffer).equals(Buffer.concat([Buffer.from("// "), Buffer.from([0xf9, 0xf9, 0x0d])])),
+    JSON.stringify(twinMerged.map((m) => (Buffer.isBuffer(m) ? m.toString("hex") : m))),
+  );
   check(
     "mergeEdited：沒改的行用原檔的 bytes（連 CRLF），改過與新增的行寫回字元、補上原檔的 CRLF",
     merged.length === 6 &&
@@ -3451,6 +3508,11 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
   );
 
   const jdk = findJdk();
+  // A JDK that is there but a transcoder that is not — it does not compile, it does not answer —
+  // is a failure, not a machine without a JDK.
+  const home = process.env.JAVA_HOME;
+  const jdkPresent = ["javac", "java"].every((t) => spawnSync(home ? path.join(home, "bin", t) : t, ["-version"], { stdio: "ignore" }).status === 0);
+  check("有 JDK 就有能用的轉碼器", !jdkPresent || !!jdk);
   if (!jdk) {
     console.log("  [SKIP] 找不到 JDK——轉碼器的檢查需要一個 JDK");
   } else {
@@ -3551,6 +3613,102 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
       cr.failed.length === 0 && fs.readFileSync(f("com/x/CrlfTest.java")).equals(crlf),
       JSON.stringify(cr),
     );
+    check(
+      "jdkCheckCharset：MS950 可用；UTF-16 與 ASCII 不相容；不存在的編碼名稱 → unknown",
+      jdkCheckCharset(jdk, "MS950") === "ok" && jdkCheckCharset(jdk, "UTF-16") === "notascii" && jdkCheckCharset(jdk, "No-Such-Charset") === "unknown",
+    );
+    check("openEncodingView：與 ASCII 不相容的編碼（UTF-16）→ 不轉換、不動任何檔", openEncodingView({ name: "UTF-16", source: "pom" }, tree) === undefined);
+    // Whatever else the JVM prints on stdout (-Xlog, an agent) is not read as an answer.
+    const savedOpts = process.env.JAVA_TOOL_OPTIONS;
+    process.env.JAVA_TOOL_OPTIONS = `${savedOpts ?? ""} -Xlog:gc`;
+    const noisy = jdkCheckCharset(jdk, "GBK");
+    process.env.JAVA_TOOL_OPTIONS = savedOpts;
+    if (savedOpts === undefined) delete process.env.JAVA_TOOL_OPTIONS;
+    check("轉碼器的回應有標記：JVM 在 stdout 印的其他東西（-Xlog:gc）不會被當成回應", noisy === "ok", noisy);
+    const [yen] = jdkEncode(jdk, "Shift_JIS", ['String p = "¥1,000";']);
+    check(
+      "jdkEncode：Shift_JIS 把 ¥ 存成 0x5C（javac 讀回來是反斜線）→ 來回轉換不一樣的字一律寫成 \\uXXXX",
+      !!yen && yen.toString("latin1") === 'String p = "\\u00a51,000";',
+      yen?.toString("latin1"),
+    );
+    // GB18030 can hold U+FFFD as a character; it is still written as the escape.
+    const [lostChar] = jdkEncode(jdk, "GB18030", ["s = \"\uFFFD\";"]);
+    check("jdkEncode：U+FFFD 永遠以 \\ufffd 存（連裝得下它的 GB18030 也是），不當成一個真的字", !!lostChar && lostChar.toString("latin1") === 's = "\\ufffd";', lostChar?.toString("latin1"));
+
+    // The writer's own UTF-8 from earlier in the run (before the encoding was known): converted,
+    // never locked away from it; deletable; a lost character in it reported every round.
+    const agentFile = f("com/x/AgentTest.java");
+    fs.writeFileSync(agentFile, "class AgentTest { String s = \"含稅\"; }\n");
+    const lostFile = f("com/x/AgentLostTest.java");
+    fs.writeFileSync(lostFile, 'class AgentLostTest { String s = "\\ufffd"; }\n');
+    const goneFile = f("com/x/AgentGoneTest.java");
+    fs.writeFileSync(goneFile, "class AgentGoneTest { String s = \"含稅\"; }\n");
+    const av = openEncodingView(ms950, tree, { agentFiles: [agentFile, lostFile, goneFile] })!;
+    check("openEncodingView：writer 自己先前寫的 UTF-8 檔不列為不能改", !av.protectedFiles.has(agentFile) && !av.protectedFiles.has(goneFile));
+    fs.rmSync(goneFile);
+    const ar = closeEncodingView(av);
+    check(
+      "closeEncodingView：writer 先前寫的 UTF-8 檔就算這輪沒碰也轉成 MS950；它刪掉的不會被放回",
+      big5.decode(fs.readFileSync(agentFile)) === 'class AgentTest { String s = "含稅"; }\n' && !fs.existsSync(goneFile),
+      JSON.stringify(ar),
+    );
+    check("closeEncodingView：writer 先前寫進的 \\ufffd 還在 → 每一輪都點名", base(ar.replacement) === "AgentLostTest.java", JSON.stringify(ar));
+    fs.rmSync(lostFile);
+
+    // A run killed with the view open: the next run puts the originals back from the journal.
+    const kv = openEncodingView(ms950, tree)!;
+    check("被砍掉之前：檔案是 ASCII 形式", !fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && kv.viewed.size > 0);
+    const recoveredFiles = recoverEncodingViews(tree);
+    check(
+      "recoverEncodingViews：下一次執行從復原日誌把原本的 bytes 放回",
+      fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && recoveredFiles.map((p) => path.basename(p)).includes("UntouchedTest.java"),
+      JSON.stringify(recoveredFiles.map((p) => path.basename(p))),
+    );
+    check("recoverEncodingViews：日誌用過就刪（再跑一次什麼都不做）", recoverEncodingViews(tree).length === 0);
+    restoreOpenViews();
+
+    // A write that fails on one file (another user's file: its time cannot be set) does not leave
+    // the rest in their view.
+    // The ESM namespace is read-only; the builtin's CommonJS object is not, and syncing carries the
+    // patch to every importer.
+    const cjsFs = createRequire(import.meta.url)("node:fs") as { utimesSync: unknown };
+    const realUtimes = cjsFs.utimesSync;
+    const ev = openEncodingView(ms950, tree)!;
+    cjsFs.utimesSync = () => {
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    };
+    syncBuiltinESMExports();
+    let threw = false;
+    let er: ReturnType<typeof closeEncodingView> | undefined;
+    try {
+      er = closeEncodingView(ev);
+    } catch {
+      threw = true;
+    }
+    cjsFs.utimesSync = realUtimes;
+    syncBuiltinESMExports();
+    check(
+      "closeEncodingView：設不了修改時間（別人的檔）不丟例外、不算失敗，每個檔照樣放回原本的內容",
+      !threw &&
+        er?.failed.length === 0 &&
+        fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) &&
+        big5.decode(fs.readFileSync(f("com/x/EditedTest.java"))).includes("補一個測試"),
+      JSON.stringify(er),
+    );
+
+    const prodFile = f("com/x/Fee.java");
+    fs.writeFileSync(prodFile, Buffer.concat([Buffer.from('class Fee { String m = "'), zh, Buffer.from('"; }\n')]));
+    const views = sourceViews(ms950, [prodFile, f("com/x/AsciiTest.java")]);
+    check(
+      "sourceViews：production 的中文以 MS950 解碼、寫成 \\uXXXX 給 prompt；純 ASCII 的檔不附",
+      views.length === 1 && views[0].view === 'class Fee { String m = "\\u4e2d\\u6587"; }\n',
+      JSON.stringify(views),
+    );
+    fs.rmSync(prodFile);
+    const sv = openEncodingView({ name: "非 UTF-8", source: "sniffed" }, tree)!;
+    check("openEncodingView：只嗅得出「不是 UTF-8」→ 不轉換，只保護", sv.mode === "protect" && sv.viewed.size === 0 && sv.protectedFiles.size > 0);
+    closeEncodingView(sv);
+
     // No JDK: what cannot be written back faithfully is protected, and the writer's text escaped.
     const savedHome = process.env.JAVA_HOME;
     const savedPath = process.env.PATH;

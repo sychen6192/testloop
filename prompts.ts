@@ -291,7 +291,7 @@ export type EncodingMode = "transcode" | "protect";
  */
 export function renderSourceEncoding(enc: SourceEncoding | undefined, locked: string[] = [], mode: EncodingMode = "transcode"): string {
   if (!enc || isUtf8Name(enc.name)) return "";
-  const why = enc.source === "pom" ? "專案設定的編碼" : enc.source === "platform" ? "pom 沒有設定，Maven 用了平台編碼" : "沒有設定，JDK 的預設編碼";
+  const why = enc.source === "pom" ? "專案設定的編碼" : enc.source === "platform" ? "沒有設定，建置用了平台編碼" : "設定不在 repo 裡";
   const lockedLines = (reason: string) =>
     locked.length
       ? [
@@ -310,12 +310,36 @@ export function renderSourceEncoding(enc: SourceEncoding | undefined, locked: st
           ...lockedLines(`不是有效的 ${enc.name}，pipeline 無法轉換`),
         ]
       : [
-          `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8，而這台機器找不到 JDK 來轉換編碼：`,
+          enc.source === "sniffed"
+            ? "本模組的 Java 原始碼不是 UTF-8（編碼設定不在 repo 裡，pipeline 看不出是哪一種），所以無法轉換："
+            : `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8，而這台機器沒有可用的 JDK 來轉換編碼：`,
           "- 你寫的測試碼只用 ASCII：註解、@DisplayName 一律用英文；字串常值需要中文等非 ASCII 字元時寫成 \\uXXXX" +
             "（pipeline 會把殘留的非 ASCII 字元自動轉成 \\uXXXX 讓它編得過，但英文註解比一串跳脫字元好讀）",
           ...lockedLines(`以 ${enc.name} 存、含非 ASCII 字元，你的工具以 UTF-8 讀寫會破壞裡面的字元（字串常值也是）`),
         ];
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The target classes as the module's encoding reads them. Production code is never put in a view
+ * on disk, and an agent tool reads its MS950 as mojibake — copied into an assertion, that is a test
+ * that can never pass.
+ */
+export function renderTargetSources(sources: Array<{ file: string; view: string }> | undefined, enc: SourceEncoding | undefined): string {
+  if (!sources?.length || !enc) return "";
+  // Bounded like any other part of a prompt; the rest of each file is still there to read.
+  const MAX_CHARS = 30_000;
+  let used = 0;
+  const blocks = sources.map((s) => {
+    const room = Math.max(0, MAX_CHARS - used);
+    const body = s.view.length > room ? `${s.view.slice(0, room)}\n…（以下省略 ${s.view.length - room} 字元）` : s.view;
+    used += body.length;
+    return `<source path="${s.file}">\n${body}\n</source>`;
+  });
+  return (
+    `目標類別的原始碼以 ${enc.name} 存，你的工具直接讀會看到亂碼。以下是 pipeline 以 ${enc.name} 解碼的內容（非 ASCII 字元寫成 \\uXXXX）——` +
+    `要引用裡面的中文字串（例外訊息、回傳值）時以這裡為準：\n${blocks.join("\n")}\n`
+  );
 }
 
 /** The same, for the reviewer: what it reads is the view, not how the author wrote it. */
@@ -355,6 +379,7 @@ export interface GeneratePromptInput {
   // Repo-relative test files the writer must not edit (see renderSourceEncoding).
   lockedFiles?: string[];
   encodingMode?: EncodingMode;
+  targetSources?: Array<{ file: string; view: string }>;
 }
 
 export function testRootRel(mod: ModuleInfo): string {
@@ -381,7 +406,7 @@ export function buildGeneratePrompt(input: GeneratePromptInput): string {
 目標類別：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
-${renderExistingTests(input.existingTests, input.lockedFiles, input.sourceEncoding?.name)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}
+${renderExistingTests(input.existingTests, input.lockedFiles, input.sourceEncoding?.name)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}${renderTargetSources(input.targetSources, input.sourceEncoding)}
 必須嚴格遵守以下品質標準：
 <standards>
 ${input.standards}
@@ -411,6 +436,7 @@ export interface FixPromptInput {
   sourceEncoding?: SourceEncoding;
   lockedFiles?: string[];
   encodingMode?: EncodingMode;
+  targetSources?: Array<{ file: string; view: string }>;
 }
 
 export function buildFixPrompt(input: FixPromptInput): string {
@@ -421,7 +447,7 @@ export function buildFixPrompt(input: FixPromptInput): string {
 ${input.gateReport}
 </gate_report>
 
-${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}
+${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles, input.encodingMode)}${renderTargetSources(input.targetSources, input.sourceEncoding)}
 本次任務的目標類別（測試範圍以此為準）：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
@@ -508,6 +534,7 @@ export interface ReviewPromptInput {
   mod: ModuleInfo;
   sourceEncoding?: SourceEncoding;
   encodingMode?: EncodingMode;
+  targetSources?: Array<{ file: string; view: string }>;
 }
 
 export function buildReviewPrompt(input: ReviewPromptInput): string {
@@ -523,7 +550,7 @@ export function buildReviewPrompt(input: ReviewPromptInput): string {
 ${pairs}
 （若實際測試檔名不同，請自行以 glob/grep 在該模組 src/test/java 下找到對應檔案。）
 
-${renderReviewEncoding(input.sourceEncoding, input.encodingMode)}審查依據為以下評分 rubric（分數帶與 Java 範例皆以此為準）：
+${renderReviewEncoding(input.sourceEncoding, input.encodingMode)}${renderTargetSources(input.targetSources, input.sourceEncoding)}審查依據為以下評分 rubric（分數帶與 Java 範例皆以此為準）：
 <rubric>
 ${input.rubric}
 </rubric>

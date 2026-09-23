@@ -5,15 +5,20 @@
 //
 //   Transcode decode <charset> <request>  each line "<in>\t<out>": <in> strictly decoded, written to <out> as UTF-8
 //   Transcode encode <charset> <request>  each line "<in>\t<out>": <in> (UTF-8) strictly encoded, written to <out>
-//   Transcode probe  <charset> <request>  line 1 is a UTF-8 file: prints the code points it holds that cannot be encoded
-//   Transcode info                        prints the default charset and the Java specification version
+//   Transcode probe  <charset> <request>  line 1 is a UTF-8 file: the code points in it that do not survive
+//                                         an encode and a decode — unmappable, or mapped to another character
+//                                         (U+00A5 is 0x5C in Shift_JIS, which javac reads back as a backslash)
+//   Transcode check  <charset>            "ok"; "unknown" (no such charset); "notascii" (ASCII is not itself)
+//   Transcode info                        the default charset, and the Java specification version
 //
-// One line of output per request line: "OK", or "ERR <reason>". Output is UTF-8.
+// Every line of output starts with "@@tc ", so whatever else the JVM prints on stdout (-Xlog, a
+// JAVA_TOOL_OPTIONS agent) is not read as an answer. One line per request line: "OK" or "ERR <reason>".
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
@@ -24,26 +29,65 @@ import java.nio.file.Paths;
 import java.util.List;
 
 public class Transcode {
+  private static PrintStream out;
+
+  private static void answer(String line) {
+    out.println("@@tc " + line);
+  }
+
   public static void main(String[] args) throws Exception {
-    PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), true, "UTF-8");
+    out = new PrintStream(new FileOutputStream(FileDescriptor.out), true, "UTF-8");
     if (args[0].equals("info")) {
-      out.println(Charset.defaultCharset().name());
-      out.println(System.getProperty("java.specification.version"));
+      answer(Charset.defaultCharset().name());
+      answer(System.getProperty("java.specification.version"));
+      return;
+    }
+    if (args[0].equals("check")) {
+      Charset cs;
+      try {
+        cs = Charset.forName(args[1]);
+      } catch (Exception e) {
+        answer("unknown");
+        return;
+      }
+      if (!cs.canEncode()) {
+        answer("notascii");
+        return;
+      }
+      for (int c = 0; c < 0x80; c++) {
+        byte[] b = String.valueOf((char) c).getBytes(cs);
+        if (b.length != 1 || b[0] != c) {
+          answer("notascii");
+          return;
+        }
+      }
+      answer("ok");
       return;
     }
     Charset cs = Charset.forName(args[1]);
     List<String> lines = Files.readAllLines(Paths.get(args[2]), StandardCharsets.UTF_8);
     if (args[0].equals("probe")) {
       String text = strictUtf8(Files.readAllBytes(Paths.get(lines.get(0))));
-      CharsetEncoder enc = cs.newEncoder();
+      CharsetEncoder enc = cs.newEncoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT);
+      CharsetDecoder dec = cs.newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT);
       StringBuilder missing = new StringBuilder();
       for (int i = 0; i < text.length(); ) {
         int cp = text.codePointAt(i);
         String ch = new String(Character.toChars(cp));
-        if (!enc.canEncode(ch)) missing.append(Integer.toHexString(cp)).append(' ');
+        boolean kept;
+        try {
+          kept = dec.decode(enc.encode(CharBuffer.wrap(ch))).toString().equals(ch);
+        } catch (CharacterCodingException e) {
+          kept = false;
+        }
+        if (!kept) missing.append(Integer.toHexString(cp)).append(' ');
         i += Character.charCount(cp);
       }
-      out.println(missing.toString().trim());
+      answer(missing.toString().trim());
       return;
     }
     for (String line : lines) {
@@ -65,9 +109,9 @@ public class Transcode {
           bytes.get(b);
           Files.write(Paths.get(p[1]), b);
         }
-        out.println("OK");
+        answer("OK");
       } catch (Exception e) {
-        out.println("ERR " + e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+        answer("ERR " + e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage().replace('\n', ' ')));
       }
     }
   }

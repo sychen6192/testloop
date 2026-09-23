@@ -149,6 +149,13 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
       // What the model was sent — tool results included — for the checks to read.
       fs.appendFileSync(path.join(root, ".itest", "api-requests.jsonl"), `${body.replace(/\n/g, " ")}\n`);
       const turn: ApiTurn = turns[i++] ?? { content: "沒有更多腳本回合了" };
+      if (turn.interrupt) {
+        try {
+          process.kill(JSON.parse(fs.readFileSync(repoLockPath(root), "utf8")).pid, "SIGINT");
+        } catch {
+          /* no run holds the lock: the checks will say so */
+        }
+      }
       for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
         fs.writeFileSync(path.join(root, rel), content);
@@ -1008,6 +1015,11 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
       p1.slice(0, 2500),
     );
     check(
+      "目標類別的原始碼以 MS950 解碼、寫成 \\uXXXX 附在 prompt（工具直接讀會是亂碼）",
+      p1.includes('<source path="src/main/java/com/x/Calc.java">') && p1.includes("// \\u8a08\\u7b97"),
+      p1.slice(0, 3000),
+    );
+    check(
       "writer 讀到的既有測試是 \\uXXXX 形式，不是亂碼",
       c.read(".itest/api-requests.jsonl").includes("\\\\u4e2d\\\\u6587") && !c.read(".itest/api-requests.jsonl").includes("\\ufffd"),
     );
@@ -1058,10 +1070,57 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
 
   "loop-encoding-learned-from-build": (c) => {
     check("最終成功", c.result.success === true, String(c.result.stopReason));
-    check("第 1 輪還不知道是 MS950", !c.runRead("iter-1/prompt.md").includes("MS950"));
+    const first = c.runRead("iter-1/prompt.md");
+    check("第 1 輪只看得出不是 UTF-8：保守做法（只寫 ASCII），不說是 MS950", !first.includes("MS950") && first.includes("不是 UTF-8") && first.includes("只用 ASCII"), first.slice(0, 2500));
     check("第 2 輪：第 1 輪建置的 log 說了 MS950 → prompt 改用 MS950 的說明", c.runRead("iter-2/prompt.md").includes("MS950"), c.runRead("iter-2/prompt.md").slice(0, 400));
     const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
     check("第 2 輪 writer 寫的中文以 MS950 存", new TextDecoder("big5").decode(calc).startsWith("// 兩數相加\n") && !calc.includes(Buffer.from("兩數相加")));
+  },
+
+  "loop-encoding-external-parent-utf8": (c) => {
+    check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("量不到編碼設定、原始碼是 UTF-8 → 當成 UTF-8（不拿 JDK 預設編碼猜）", JSON.parse(c.runRead("project-facts.json") || "{}").sourceEncoding === null, c.runRead("project-facts.json"));
+    check("prompt 沒有編碼的段落", !c.runRead("iter-1/prompt.md").includes("不是 UTF-8"));
+    const existing = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"), "utf8");
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"), "utf8");
+    check("writer 的中文照樣是 UTF-8（沒有被存成別的編碼）", existing.includes("// 中文") && existing.includes("補一個測試") && calc.startsWith("// 準備資料"));
+  },
+
+  "loop-encoding-sniffed-external": (c) => {
+    check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("量到「設定不在 repo 裡、原始碼不是 UTF-8」", c.runRead("project-facts.json").includes('"sniffed"'), c.runRead("project-facts.json"));
+    const p1 = c.runRead("iter-1/prompt.md");
+    check(
+      "prompt：看不出是哪一種編碼 → 只用 ASCII，點名不能改的 ExistingTest.java",
+      p1.includes("不是 UTF-8") && p1.includes("看不出") && p1.includes("只用 ASCII") && p1.includes("不能修改") && p1.includes("ExistingTest.java"),
+      p1.slice(0, 2500),
+    );
+    check("第 1 輪：被改壞的既有檔還原、該輪判 FAIL 不建置", c.runRead("iter-1/encoding-report.txt").includes("ExistingTest.java"));
+    const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"));
+    check("ExistingTest.java 仍是原本的 bytes", raw.includes(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5])) && !raw.includes(Buffer.from("補一個測試")));
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
+    check("CalcTest.java 全是 ASCII，中文成了 \\uXXXX", [...calc].every((b) => b < 0x80) && calc.toString().includes("\\u6e96\\u5099"), calc.toString().slice(0, 120));
+  },
+
+  "loop-encoding-interrupted": (c) => {
+    if (process.platform === "win32") return;
+    check("exit code 130（SIGINT）", c.code === 130, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("stopReason = interrupted:SIGINT", c.result.stopReason === "interrupted:SIGINT", String(c.result.stopReason));
+    const big5 = new TextDecoder("big5");
+    const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"));
+    check(
+      "ExistingTest.java：沒改的行維持 MS950 原 bytes、writer 補的行以 MS950 存——不是留在 \\uXXXX 形式",
+      raw.includes(Buffer.from([0x2f, 0x2f, 0x20, 0xa4, 0xa4, 0xa4, 0xe5])) && big5.decode(raw).includes("// 補一個測試") && !raw.includes(Buffer.from("\\u")),
+      raw.toString("latin1").slice(-200),
+    );
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
+    check("CalcTest.java：writer 寫的中文以 MS950 存", big5.decode(calc).startsWith("// 準備資料\n") && !calc.includes(Buffer.from("準備資料")));
+  },
+
+  "loop-encoding-no-op-round": (c) => {
+    check("第 2 輪 writer 沒改任何檔 → writer-no-op", c.result.stopReason === "writer-no-op", String(c.result.stopReason));
+    check("建置 2 次：預檢 + 第 1 輪（沒有為一輪沒有變更的修正再建置一次）", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+    check("既有的 MS950 檔維持原樣", fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java")).includes(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5])));
   },
 
   "loop-repair-ms950": (c) => {

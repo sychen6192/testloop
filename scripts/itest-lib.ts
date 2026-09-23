@@ -158,6 +158,8 @@ export interface ApiTurn {
    * agent a target repo overrode — which the api runner's own write_file can never be.
    */
   sideWrite?: Record<string, string>;
+  /** Ctrl-C while the agent session is running: SIGINT to the run holding the repo's lock. */
+  interrupt?: boolean;
 }
 
 // ─── Fixture contents ────────────────────────────────────────────────────────

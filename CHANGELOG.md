@@ -53,8 +53,15 @@
   `sourceEncoding=MS950`、production code 丟出中文例外訊息，writer 讀既有測試（讀到 `\uXXXX`）、以 UTF-8
   補一個斷言中文訊息的測試——轉存成 MS950 後真的 javac 編出來相等，`gates-passed`，diff 只有 12 行新增。
   writer 寫進 U+FFFD（某個工具讀錯編碼時就遺失的字）時該輪不進建置、點名檔案，連同上一輪還沒修的 gate
-  報告一起餵回。找不到 JDK 時退回保守做法（含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`）。
-  UTF-8 或量不到時完全不介入。
+  報告一起餵回；U+FFFD 一律以 `\ufffd` 存，之後 writer 寫過的檔裡還有就每輪再點名。目標類別的 production code
+  不改寫，解碼後以 `\uXXXX` 形式附在 prompt（writer 直接讀是亂碼，抄進斷言的中文永遠對不上）。量不到編碼設定
+  時**不拿 JDK 預設編碼猜**——建置沒印平台編碼表示有設定（多半在 repo 外的 parent；Spring Boot parent 設 UTF-8），
+  而繁中 Windows 的 JDK 17 預設 MS950，猜下去會把 UTF-8 模組當成 MS950——改看原始碼本身：不是 UTF-8 才保守處理。
+  沒有可用的 JDK 時退回保守做法（含非 ASCII 的既有檔不讓改，writer 的輸出轉成 `\uXXXX`；writer 自己寫的檔不在此列）。
+  Ctrl-C 或 crash 時視圖照常關閉；被 SIGKILL 的由下一次執行從使用者快取目錄裡的復原日誌放回。轉碼器編譯後快取
+  在使用者自己的目錄並檢查擁有者（共用 /tmp 裡預先放好的 class 就是以執行者身分跑的程式碼），回應加上標記
+  （`-Xlog` 之類印在 stdout 的東西不會被當成回應），「裝不裝得下」以 encode 再 decode 比對（Shift_JIS 把 ¥ 存成
+  0x5C、javac 讀回來是反斜線）。UTF-8 或量不到時完全不介入。
 - **公司網路支援：proxy 與 TLS 攔截**（`libs/proxy.ts`、`libs/tls.ts`，作法參考姊妹專案
   prloop 的實戰版本）。Node 內建的 fetch **完全無視** `HTTP_PROXY` / `HTTPS_PROXY`——curl、
   git、mvn 都吃，它不吃——所以在只能經 proxy 出去的網路上，症狀是一個沒頭沒尾的

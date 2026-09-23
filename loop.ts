@@ -58,10 +58,11 @@ import { describeTestStack, measureTestStack, mergeTestStack, TestStack } from "
 import {
   describeSourceEncoding,
   findJdk,
+  finishOpenViews,
   isUtf8Name,
   measureSourceEncoding,
+  recoverEncodingViews,
   refineSourceEncoding,
-  restoreOpenViews,
   SourceEncoding,
 } from "./libs/encoding";
 import { installShutdownHandlers, onShutdown } from "./libs/shell";
@@ -179,6 +180,13 @@ async function main() {
   }
   fs.mkdirSync(runDir, { recursive: true });
   crashRunDir = runDir;
+  // A run killed while its test sources were in their ASCII view (libs/encoding.ts) left them so;
+  // with the repo locked, nothing else can be using its journal.
+  const recovered = recoverEncodingViews(path.join(mod.moduleRoot, "src", "test", "java"));
+  if (recovered.length) {
+    log(`[WARN] 上一次執行在轉換編碼途中被終止，已把 ${recovered.length} 個測試檔還原成原本的內容：`);
+    recovered.forEach((f) => log(`  - ${path.relative(REPO_ROOT, f)}`));
+  }
   // Ctrl-C, SIGTERM, a hangup on an interactive terminal: the run still leaves a summary that
   // says it was interrupted, rather than a directory that looks like a run still going.
   onShutdown((reason) => {
@@ -276,12 +284,14 @@ async function main() {
   const logFacts = () => {
     log(`測試相依：${describeTestStack(testStack)}`);
     if (sourceEncoding && !isUtf8Name(sourceEncoding.name)) {
-      const jdk = findJdk();
+      const jdk = sourceEncoding.source === "sniffed" ? undefined : findJdk();
       log(
         `[WARN] 原始碼編碼：${describeSourceEncoding(sourceEncoding)}` +
           (jdk
             ? `——測試檔以 \\uXXXX 的 ASCII 形式交給 writer 與 reviewer，寫回時以 ${sourceEncoding.name} 存（轉碼用 ${jdk.java}）`
-            : "——找不到 JDK 來轉換編碼：writer 留下的非 ASCII 字元會轉成 \\uXXXX，含非 ASCII 字元的既有測試檔不讓 writer 修改"),
+            : "——無法轉換編碼（" +
+              (sourceEncoding.source === "sniffed" ? "不知道是哪一種" : "沒有可用的 JDK") +
+              "）：writer 留下的非 ASCII 字元會轉成 \\uXXXX，含非 ASCII 字元的既有測試檔不讓 writer 修改"),
       );
     } else if (sourceEncoding) {
       log(`原始碼編碼：${describeSourceEncoding(sourceEncoding)}`);
@@ -880,9 +890,9 @@ function repairHint(stopReason: string): string {
 let crashRunDir: string | undefined;
 
 main().catch((e) => {
-  // A test tree left in its ASCII view (libs/encoding.ts) goes back first; the batch rollback after
-  // it compares against what the batch started with.
-  restoreOpenViews();
+  // A test tree left in its ASCII view (libs/encoding.ts) is written back first, as at any
+  // session's end; the batch rollback after it compares against what the batch started with.
+  finishOpenViews();
   if (crashRunDir && !fs.existsSync(path.join(crashRunDir, "summary.json"))) {
     try {
       fs.writeFileSync(

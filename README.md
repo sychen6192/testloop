@@ -268,11 +268,21 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   是純 ASCII、怎麼讀寫都不會壞；session 結束後，沒改的檔拿回原本的 bytes 與修改時間，改過的檔「沒改的行
   維持原本的 bytes、writer 寫的行以 MS950 存」（MS950 放不下的字存成 `\uXXXX`）——轉換用 JDK 本身的
   charset，跟 javac 讀檔的是同一套，所以 writer 可以照常補強既有的中文測試檔，git diff 也只有它改的行。
-  找不到 JDK（`JAVA_HOME` 與 PATH 上都沒有 `javac`）時退回保守做法：writer 只寫 ASCII，含非 ASCII 字元的
-  既有測試檔不讓它改（被改到就照原 bytes 還原並判該輪失敗）。writer 寫進 U+FFFD（`�`，某個工具用錯編碼
-  讀檔時就已遺失的字）時該輪不進建置、點名檔案。編碼的來源依序是 pom（或 `build.gradle` 的
-  `options.encoding`）、建置 log 裡 Maven 寫的平台編碼、JDK 的預設編碼。如果專案的原始碼其實是 UTF-8、
-  只是 pom 沒設，在 pom 加上 `<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>` 才是根本解法。
+  目標類別（production code）的原始碼不會被改寫，但 writer 直接讀它一樣是亂碼，所以 loop 把它解碼後以同樣的
+  `\uXXXX` 形式附在 prompt 裡。沒有可用的 JDK（`JAVA_HOME` 與 PATH 上都沒有 `javac`，或轉碼器不回應）時退回
+  保守做法：writer 只寫 ASCII，含非 ASCII 字元的既有測試檔不讓它改（被改到就照原 bytes 還原並判該輪失敗）；
+  writer 自己寫的檔永遠不在此列。writer 寫進 U+FFFD（`�`，某個工具用錯編碼讀檔時就已遺失的字）時該輪不進建置、
+  點名檔案，而且 U+FFFD 一律以 `�` 存、不當成一個真的字。
+  編碼的來源依序是 pom（`spring-boot-starter-parent` 設了 UTF-8；`build.gradle` 的 compileJava / JavaCompile
+  `options.encoding`）、建置時的平台編碼（Maven 的 log、`gradle.properties` 的 `-Dfile.encoding`）；都看不到時
+  （設定在 repo 外的公司 parent、profile、settings.xml），就看原始碼本身：不是 UTF-8 就走保守做法，否則當成
+  UTF-8——**不拿 JDK 的預設編碼猜**：建置沒印平台編碼就表示有設定，繁中 Windows 的 JDK 17 預設 MS950，
+  猜了會把 UTF-8 模組當成 MS950。執行中按 Ctrl-C 或 crash 時，writer 寫到一半的檔照常以模組編碼寫回；
+  程序被 SIGKILL（OOM、CI 取消）來不及處理時，下一次在同一個 repo 執行會從復原日誌（使用者自己的
+  `~/.cache/testgen`，Windows 是 `%LOCALAPPDATA%\testgen`）把檔案放回原本的內容。api runner 讀檔有字數上限
+  （`UT_API_MAX_TOOL_RESULT_CHARS`），中文很多的測試檔換成 `\uXXXX` 形式後可能變長一倍，讀不完整時調大它。
+  如果專案的原始碼其實是 UTF-8、只是 pom 沒設，在 pom 加上
+  `<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>` 才是根本解法。
 
 - **doctor 說 agent 找不到。** 回工具 clone 目錄執行 `npm run setup`。
 - **中途中止，說「writer 修改了測試範圍以外的檔案」。** writer 動了 production code、

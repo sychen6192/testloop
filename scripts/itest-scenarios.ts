@@ -99,6 +99,15 @@ const EXISTING_TEST_MS950 = [
 ];
 const PLATFORM_MS950 =
   "[WARNING] Using platform encoding (MS950 actually) to copy filtered resources, i.e. build is platform dependent!\n";
+// The target class as a zh-TW repo keeps it: "// 計算" (計 = AD70, 算 = BAE2) on its first line.
+const CALC_MS950 = [...Buffer.from("// "), 0xad, 0x70, 0xba, 0xe2, ...Buffer.from(`\n${CALC_JAVA}`)];
+// A pom whose parent lives outside the repo: whatever it configures, the loop cannot read.
+const CORP_POM = `<project><modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId><version>9</version><relativePath/></parent>
+  <groupId>com.x</groupId><artifactId>fixture</artifactId><version>1.0</version>
+</project>
+`;
+const EXISTING_TEST_UTF8_ZH = EXISTING_TEST.replace("class ExistingTest {", "// 中文\nclass ExistingTest {");
 // What an agent tool reads of that file: every non-ASCII character as its \uXXXX escape.
 const EXISTING_VIEW = EXISTING_TEST.replace("class ExistingTest {", "// \\u4e2d\\u6587\nclass ExistingTest {");
 const JACOCO_GREETER = { pkg: "com/x", file: "Greeter.java", line: [0, 4] as [number, number], branch: [0, 4] as [number, number] };
@@ -1417,7 +1426,7 @@ export const SCENARIOS: Scenario[] = [
     desc: "pom 沒設編碼、Maven 用平台編碼 MS950：writer 與 reviewer 讀到 \\uXXXX 形式的既有測試；沒改的行維持 MS950 原 bytes，writer 寫的中文以 MS950 存",
     entry: "loop",
     jdk: true,
-    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950, [PROD_PATH]: CALC_MS950 },
     api: [
       { toolCalls: [{ name: "read_file", args: { path: EXISTING_PATH } }] },
       {
@@ -1483,7 +1492,7 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "loop-encoding-learned-from-build",
-    desc: "跳過預檢、JDK 預設是 UTF-8：第 1 輪不知道模組其實以 MS950 編譯；第 1 輪建置的 log 說了，第 2 輪就改用 MS950 的處理",
+    desc: "跳過預檢：第 1 輪只看得出原始碼不是 UTF-8（保守做法：只寫 ASCII）；第 1 輪建置的 log 說了 MS950，第 2 輪就改用 MS950 的轉換",
     entry: "loop",
     jdk: true,
     env: { UT_SKIP_REVIEW: "1", UT_SKIP_BASELINE: "1" },
@@ -1504,6 +1513,85 @@ export const SCENARIOS: Scenario[] = [
         ],
       },
       { ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) },
+    ],
+  },
+  {
+    name: "loop-encoding-external-parent-utf8",
+    desc: "編碼設定在 repo 外的 parent、原始碼是 UTF-8、建置沒印平台編碼：當成 UTF-8——就算 JDK 的預設編碼不是 UTF-8（繁中 Windows 的 JDK 17 以前），也不拿它來猜",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", JAVA_TOOL_OPTIONS: "-Dfile.encoding=COMPAT", LANG: "C", LC_ALL: "C" },
+    extraFiles: { "pom.xml": CORP_POM, [EXISTING_PATH]: EXISTING_TEST_UTF8_ZH },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: EXISTING_PATH, content: EXISTING_TEST_UTF8_ZH.replace(/}\n$/, "    // 補一個測試\n}\n") } },
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料\n${calcTest(1)}` } },
+        ],
+      },
+      { content: "已補測試" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-encoding-sniffed-external",
+    desc: "編碼設定在 repo 外（parent 設了 MS950，loop 讀不到）：原始碼不是 UTF-8 → 保守做法——含中文的既有測試不讓改（被改壞就還原）、writer 的中文轉成 \\uXXXX",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { "pom.xml": CORP_POM },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料\n${calcTest(1)}` } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// 補一個測試\n` } },
+        ],
+      },
+      { content: "已建立 CalcTest.java，也補了 ExistingTest" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料：兩數相加\n${calcTest(2)}` } }] },
+      { content: "改寫在 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-encoding-interrupted",
+    desc: "MS950 模組、writer session 進行到一半按 Ctrl-C：它已經寫的檔照常以 MS950 寫回（沒改的行維持原 bytes），不會留在 \\uXXXX 形式",
+    entry: "loop",
+    jdk: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料\n${calcTest(1)}` } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: EXISTING_VIEW.replace(/}\n$/, "    // 補一個測試\n}\n") } },
+        ],
+      },
+      { content: "…", interrupt: true },
+    ],
+    mvn: [{ ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) }, GREEN_BUILD],
+  },
+  {
+    name: "loop-encoding-no-op-round",
+    desc: "MS950 模組、修正輪 writer 什麼都沒改：視圖開了又關（檔案換成 ASCII 形式再換回來）不算它的變更 → writer-no-op，不多跑一次一樣的建置",
+    entry: "loop",
+    jdk: true,
+    env: { UT_SKIP_REVIEW: "1" },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      { content: "我修不好" },
+    ],
+    mvn: [
+      { ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) },
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [
+          { suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add", message: "expected: <3> but was: <4>", line: 9 }]) },
+        ],
+      },
     ],
   },
   {

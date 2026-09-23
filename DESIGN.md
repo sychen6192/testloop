@@ -93,8 +93,19 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    而不是 Node 的 decoder：MS950 與 WHATWG 的 big5 有差異，javac 用的是 JDK 的 charset，用同一套才不會在
    邊角字上錯位；而跑 Maven 的機器一定有 JDK。細節：`\` 前面有奇數個反斜線時不會被當成跳脫的開頭
    （`C:\資料`），那個反斜線寫成 `\u005c`；寫回字元時只動非 ASCII 的跳脫（`\u0022`、`\u005c` 對 lexer 有
-   意義）；U+FFFD 不存（那是某個工具讀錯編碼時就遺失的字），該輪失敗並點名。reviewer 也透過同一個視圖讀檔。
-   找不到 JDK 時退回第一版的保守做法。
+   意義）；U+FFFD 一律以 `�` 存、不當成一個真的字（那是某個工具讀錯編碼時就遺失的字），該輪失敗並點名，
+   之後 writer 寫過的檔裡還有就每輪再點名。reviewer 也透過同一個視圖讀檔；目標類別的 production code 不改寫，
+   解碼後附在 prompt 裡。probe「裝不裝得下」用 encode 再 decode 回來比對，不用 `canEncode`：Shift_JIS 把 ¥ 存成
+   0x5C，javac 讀回來是反斜線。沒有可用的 JDK、或編碼名稱不明時退回第一版的保守做法——writer 自己寫的檔
+   不在保護之列（先前在 UTF-8 下寫的，這時照常轉換，否則它永遠改不了自己的檔）。
+   **量不到就不猜。** 編碼的來源只有看得到的設定與建置自己說的平台編碼；兩者都沒有時看原始碼本身（不是
+   UTF-8 就保守處理）。第一版曾在建置沒說時退回 JDK 的預設編碼，那是錯的：Maven 用平台編碼時一定會印出來，
+   沒印就是有設定——多半在 repo 外的 parent（Spring Boot 設 UTF-8）——而繁中 Windows 的 JDK 17 預設 MS950，
+   猜下去會把 UTF-8 模組當成 MS950，writer 寫的每個中文字都以 javac 讀不對的 bytes 存檔。
+   **收尾不能只靠程序還活著。** 視圖開著的時候被中斷（Ctrl-C、crash），照常關閉——writer 寫到一半的檔一樣以
+   模組編碼寫回；被 SIGKILL 來不及處理的，原本的 bytes 在打開視圖之前就寫進使用者自己的快取目錄當復原日誌，
+   下一次在同一個 repo 執行時放回。轉碼器與日誌都放在使用者自己的快取目錄、檢查擁有者：共用的 /tmp 裡一個
+   預先放好的 `Transcode.class` 就是以執行者身分跑的程式碼。
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表

@@ -68,6 +68,7 @@ import {
   openEncodingView,
   refineSourceEncoding,
   SourceEncoding,
+  sourceViews,
 } from "./libs/encoding";
 
 export interface OrchestratorConfig {
@@ -115,6 +116,18 @@ function protectedList(view: EncodingView | undefined): string[] {
   return view ? [...view.protectedFiles.keys()].map(relToRepo).sort() : [];
 }
 
+// The files the writer has written this run, as the view wants them: absolute test sources.
+// writerChanges() keeps .java paths relative to src/test/java and everything else under resources/.
+function agentSources(testRoot: string, written: Iterable<string>): string[] {
+  return [...written].filter((f) => f.endsWith(".java") && !f.startsWith("resources/")).map((f) => path.join(testRoot, f));
+}
+
+// The target classes as the module's encoding reads them, for the prompt: production code is never
+// put in a view on disk, and an agent tool reads MS950 as mojibake.
+function targetSourceViews(enc: SourceEncoding | undefined, targetClasses: string[]): Array<{ file: string; view: string }> {
+  return sourceViews(enc, targetClasses.map((c) => path.join(REPO_ROOT, c))).map((v) => ({ file: relToRepo(v.file), view: v.view }));
+}
+
 const listFiles = (files: string[]) =>
   [...files.slice(0, 20).map((f) => `  - ${relToRepo(f)}`), ...(files.length > 20 ? [`  …另 ${files.length - 20} 個`] : [])].join("\n");
 
@@ -130,7 +143,7 @@ function encodingViewAfter(view: EncodingView | undefined, save: (name: string, 
     log(
       view.mode === "transcode"
         ? `[${name}] writer 改寫的 ${r.converted.length} 個測試檔已以 ${name} 存檔（沒改到的行維持原本的內容）`
-        : `[${name}] 找不到 JDK：writer 寫的 ${r.converted.length} 個測試檔裡的非 ASCII 字元已轉成 \\uXXXX`,
+        : `[${name}] 無法轉換編碼：writer 寫的 ${r.converted.length} 個測試檔裡的非 ASCII 字元已轉成 \\uXXXX`,
     );
     save("encoding-converted.txt", r.converted.map(relToRepo).join("\n"));
   }
@@ -139,17 +152,18 @@ function encodingViewAfter(view: EncodingView | undefined, save: (name: string, 
     problems.push(
       (view.mode === "transcode"
         ? `以下測試檔不是有效的 ${name}，pipeline 無法安全轉換，`
-        : `以下測試檔以 ${name} 存、含非 ASCII 字元，而這台機器找不到 JDK 來轉換編碼，`) +
+        : `以下測試檔含非 ASCII 字元，而 pipeline 無法轉換這個模組的編碼（${name}），`) +
         `你的工具改它們會破壞裡面的字元，所以已還原成原本的內容。這些檔案不能修改；要補測試時，在同一個 package 另建新的測試類別：\n${listFiles(r.restored)}`,
     );
   }
   if (r.replacement.length) {
     problems.push(
-      `以下測試檔含有 U+FFFD（�）——那是某個工具用錯的編碼讀檔時就已經遺失的字元，存進測試裡永遠是錯的。` +
-        `請把它們換回實際的字（或它的 \\uXXXX）：\n${listFiles(r.replacement)}`,
+      `以下測試檔含有 U+FFFD（在你讀到的檔案裡顯示為 \\ufffd）——那是某個工具用錯的編碼讀檔時就已經遺失的字元，` +
+        `存進測試裡永遠是錯的（pipeline 只以 \\ufffd 存，不會當成原本的字）。請換回實際的字；production 的中文字串以 prompt 裡` +
+        `「目標類別的原始碼」或失敗報告裡的實際值為準：\n${listFiles(r.replacement)}`,
     );
   }
-  if (r.failed.length) problems.push(`以下測試檔無法轉成 ${name}（既有的已還原，新的保留原樣）：\n${listFiles(r.failed)}`);
+  if (r.failed.length) problems.push(`以下測試檔無法以 ${name} 寫回（既有的已還原，新的保留原樣）：\n${listFiles(r.failed)}`);
   if (!problems.length) return null;
   const report = problems.join("\n\n");
   save("encoding-report.txt", report);
@@ -335,7 +349,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 1: generate or fix
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
-    const encView = openEncodingView(sourceEncoding, testRoot);
+    // Taken before the view opens and after it closes: what the round changed, net of the view.
+    const before = snapshotTree(writableTree);
+    const protectedBefore = snapshotProtected();
+    const encView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
+    const targetSources = targetSourceViews(sourceEncoding, cfg.targetClasses);
     const prompt = feedback
       ? buildFixPrompt({
           gateReport: feedback,
@@ -348,6 +366,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           sourceEncoding,
           encodingMode: encView?.mode,
           lockedFiles: protectedList(encView),
+          targetSources,
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
@@ -359,16 +378,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           sourceEncoding,
           encodingMode: encView?.mode,
           lockedFiles: protectedList(encView),
+          targetSources,
         });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(writableTree);
-    const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
-    // Read off the tree before the view closes: closing it gives the untouched files their
-    // original bytes back, which would read as changes of their own.
-    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     const encodingReport = encodingViewAfter(encView, save);
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
     }
@@ -516,13 +532,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     } else {
       log("Step 4/4：執行品質 review gate");
       // The reviewer reads through the same view: raw MS950 through a UTF-8 tool is mojibake.
-      const reviewView = openEncodingView(sourceEncoding, testRoot);
+      const reviewView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
       const reviewPrompt = buildReviewPrompt({
         targetClasses: cfg.targetClasses,
         rubric: cfg.rubric,
         mod: cfg.mod,
         sourceEncoding,
         encodingMode: reviewView?.mode,
+        targetSources: targetSourceViews(sourceEncoding, cfg.targetClasses),
       });
       save("review-prompt.md", reviewPrompt);
 
@@ -803,7 +820,9 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       fs.writeFileSync(path.join(dir, name), content);
     banner(`修復既有紅燈 第 ${round}/${REPAIR_MAX_ITER} 輪`);
 
-    const encView = openEncodingView(sourceEncoding, testRootForEncoding);
+    const before = snapshotTree(writableTree);
+    const protectedBefore = snapshotProtected();
+    const encView = openEncodingView(sourceEncoding, testRootForEncoding, { agentFiles: agentSources(testRootForEncoding, touched) });
     const prompt = buildRepairPrompt({
       brokenFiles: brokenList(current),
       report,
@@ -817,11 +836,9 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(writableTree);
-    const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
-    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     const encodingReport = encodingViewAfter(encView, save);
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     save("writer-summary.md", writer.text || "（writer 未回傳文字）");
     log(`[writer 總結] ${tail(writer.text, 1500)}`);
     if (writer.status === "spawn-error") {
