@@ -59,6 +59,8 @@ import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
 import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
+import { measureTestStack, TestStack } from "./libs/teststack";
+import { captureNonUtf8Sources, isUtf8Name, repairWriterEncoding, SourceEncoding } from "./libs/encoding";
 
 export interface OrchestratorConfig {
   targetClasses: string[];
@@ -78,6 +80,69 @@ export interface OrchestratorConfig {
   // the per-round gate had already accepted, for failures neither of them caused.
   tolerate?: string[];
   conventions?: TestConventions;
+  // Measured by loop.ts from the baseline; see libs/teststack.ts.
+  testStack?: TestStack;
+  // The encoding javac reads the module's sources in; see libs/encoding.ts.
+  sourceEncoding?: SourceEncoding;
+}
+
+// A stack read off the pom is a guess about what is declared. The first build that runs a test
+// records the real classpath, and every prompt after it states that instead.
+function refineTestStack(stack: TestStack | undefined, mod: ModuleInfo, buildLog: string): TestStack | undefined {
+  if (stack?.source === "surefire") return stack;
+  const measured = measureTestStack(mod, REPO_ROOT, buildLog);
+  if (measured?.source !== "surefire") return stack;
+  measured.javaRelease ??= stack?.javaRelease;
+  log("測試相依：已從這次建置的測試 classpath 量得實際的相依，之後的 prompt 以此為準");
+  return measured;
+}
+
+// Around each writer session in a module whose sources are not UTF-8 (libs/encoding.ts): the
+// non-UTF-8 test files are captured before the session — the writer is told they cannot be edited,
+// and any change to them is undone after — and what the writer left outside ASCII is escaped.
+interface EncodingGuard {
+  encoding: SourceEncoding;
+  originals: Map<string, Buffer>;
+  /** Repo-relative, for the prompt. */
+  locked: string[];
+}
+
+function encodingGuardBefore(enc: SourceEncoding | undefined, testRoot: string): EncodingGuard | undefined {
+  if (!enc || isUtf8Name(enc.name)) return undefined;
+  const originals = captureNonUtf8Sources(testRoot);
+  const locked = [...originals.keys()].map((p) => path.relative(REPO_ROOT, p).replace(/\\/g, "/")).sort();
+  return { encoding: enc, originals, locked };
+}
+
+/** A failure report when files had to be put back, null otherwise. */
+function encodingGuardAfter(
+  guard: EncodingGuard | undefined,
+  writableTree: string,
+  rawChanged: string[],
+  save: (name: string, content: string) => void,
+): string | null {
+  if (!guard) return null;
+  const fix = repairWriterEncoding(
+    rawChanged.map((r) => path.join(writableTree, r)),
+    guard.originals,
+  );
+  const rel = (p: string) => path.relative(REPO_ROOT, p).replace(/\\/g, "/");
+  if (fix.escaped.length) {
+    log(
+      `[${guard.encoding.name}] 已把 ${fix.escaped.length} 個測試檔裡的非 ASCII 字元轉成 \\uXXXX` +
+        `（模組原始碼以 ${guard.encoding.name} 編譯，UTF-8 的中文不是編不過、就是編成亂碼）`,
+    );
+    save("encoding-escaped.txt", fix.escaped.map(rel).join("\n"));
+  }
+  if (!fix.restored.length) return null;
+  const list = fix.restored.map((f) => `  - ${rel(f)}`).join("\n");
+  save("encoding-restored.txt", fix.restored.map(rel).join("\n"));
+  log(`[FAIL] writer 改了以 ${guard.encoding.name} 存的既有測試檔，已還原（${fix.restored.length} 檔）——本輪判 FAIL，不進建置`);
+  return (
+    `以下既有測試檔以 ${guard.encoding.name} 編碼、含非 ASCII 字元（多半是中文）。你的工具以 UTF-8 讀寫它們，` +
+    `會把那些字元（包括字串常值）破壞掉，所以 pipeline 已把它們還原成原本的內容，本輪判 FAIL：\n${list}\n` +
+    "這些檔案不能修改。要補測試時，在同一個 package 另建新的測試類別（例如 <ClassName>AdditionalTest.java），只用 ASCII 撰寫。"
+  );
 }
 
 // One row per iteration: which gate the round reached and how it ended.
@@ -153,8 +218,8 @@ function outOfScopeChanges(before: Record<string, string>, after: Record<string,
 // file (an expected-output fixture under src/test/resources) read as "changed nothing", and the
 // round ended the run as writer-no-op. Paths come back relative to src/test/java for the .java
 // ones, as every artifact and -Dtest derivation expects, and as resources/… otherwise.
-function writerChanges(before: Record<string, string>, after: Record<string, string>): string[] {
-  return diffSnapshots(before, after).map((c) => (c.startsWith("java/") ? c.slice("java/".length) : c));
+function writerChanges(rawChanged: string[]): string[] {
+  return rawChanged.map((c) => (c.startsWith("java/") ? c.slice("java/".length) : c));
 }
 
 // A violation list can be hundreds of paths long when something regenerates a directory; the
@@ -172,6 +237,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   let prevFingerprint: string | null = null;
   let lastVerdict: ReviewVerdict | undefined;
   let lastCov = "（尚未執行覆蓋率檢查）";
+  let testStack = cfg.testStack;
   const funnel: IterationRecord[] = [];
   let totalOutputTokens: number | undefined;
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -242,6 +308,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 1: generate or fix
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
+    const encGuard = encodingGuardBefore(cfg.sourceEncoding, testRoot);
     const prompt = feedback
       ? buildFixPrompt({
           gateReport: feedback,
@@ -250,6 +317,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           targetClasses: cfg.targetClasses,
           preExisting: cfg.preExisting,
           conventions: cfg.conventions,
+          testStack,
+          sourceEncoding: cfg.sourceEncoding,
+          lockedFiles: encGuard?.locked,
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
@@ -257,6 +327,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           mod: cfg.mod,
           existingTests: cfg.existingTests,
           conventions: cfg.conventions,
+          testStack,
+          sourceEncoding: cfg.sourceEncoding,
+          lockedFiles: encGuard?.locked,
         });
     save("prompt.md", prompt);
 
@@ -278,7 +351,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       );
     }
 
-    const changed = writerChanges(before, snapshotTree(writableTree));
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    const changed = writerChanges(rawChanged);
     changed.forEach((f) => everWritten.add(f));
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
@@ -300,6 +374,17 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           `\n（writer 的可寫範圍只有目標模組的 src/test/；production code、建置檔與其他模組一律唯讀。）`,
         iter,
       );
+    }
+
+    // Before the no-op check and the shrink guard: putting a file back can undo the round's only
+    // change, and a restored file has its original counts again.
+    const encodingReport = encodingGuardAfter(encGuard, writableTree, rawChanged, save);
+    if (encodingReport) {
+      record({ gate: "writer", outcome: "encoding-restored", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      const stop = failRound(encodingReport, "連續兩輪修改同一批不能改的編碼檔，判定迴圈卡住，提前結束。");
+      if (stop) return stop;
+      log("→ 帶著編碼報告進入下一輪");
+      continue;
     }
 
     if (changed.length === 0) {
@@ -351,6 +436,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       tolerate: cfg.tolerate,
     });
     save("build.log", build.raw ?? build.report);
+    testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "");
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
       record({
@@ -540,6 +626,8 @@ export interface RepairConfig {
   mod: ModuleInfo;
   runDir: string;
   baseline: BaselineResult;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
 }
 
 export interface RepairResult {
@@ -600,6 +688,8 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const originalMetrics = collectTestMetrics(testRoot);
   const touched = new Set<string>();
   let current = cfg.baseline;
+  let testStack = cfg.testStack;
+  const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
   let prevFingerprint: string | null = null;
 
   const brokenList = (b: BaselineResult) => [
@@ -668,12 +758,16 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       fs.writeFileSync(path.join(dir, name), content);
     banner(`修復既有紅燈 第 ${round}/${REPAIR_MAX_ITER} 輪`);
 
+    const encGuard = encodingGuardBefore(cfg.sourceEncoding, testRootForEncoding);
     const prompt = buildRepairPrompt({
       brokenFiles: brokenList(current),
       report,
       standards: cfg.standards,
       mod: cfg.mod,
       round,
+      testStack,
+      sourceEncoding: cfg.sourceEncoding,
+      lockedFiles: encGuard?.locked,
     });
     save("prompt.md", prompt);
 
@@ -690,7 +784,8 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       );
     }
 
-    const changed = writerChanges(before, snapshotTree(writableTree));
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    const changed = writerChanges(rawChanged);
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
@@ -703,6 +798,17 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
           "這些變更「未被還原」——請以 git diff 檢視並自行還原後重跑。",
         round,
       );
+    }
+    const encodingReport = encodingGuardAfter(encGuard, writableTree, rawChanged, save);
+    if (encodingReport) {
+      report = clampText(encodingReport, MAX_FEEDBACK_CHARS);
+      save("feedback.md", report);
+      const fingerprint = feedbackFingerprint(report);
+      if (prevFingerprint === fingerprint) {
+        return giveUp("stuck", `連續兩輪修改同一批不能改的編碼檔，判定迴圈卡住。\n${report}`, round);
+      }
+      prevFingerprint = fingerprint;
+      continue;
     }
     if (changed.length === 0) {
       // A writer that looked and found nothing to fix may be right: a test that failed once at the
@@ -749,6 +855,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
 
     current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
     save("build.log", current.raw);
+    testStack = refineTestStack(testStack, cfg.mod, current.raw);
     save("build-summary.md", current.summary);
     console.log(current.summary);
     // A build that never finished locates nothing; carried on, it became "unlocatable" next round.

@@ -16,6 +16,10 @@ loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ �
         │  專案慣例掃描（scanTestConventions）→ 可見性結論寫進 prompt
         │  預檢基準（runBaseline，與 build gate 同一道指令）
         │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
+        │  測試相依量測（measureTestStack：surefire classpath，退回 pom）與原始碼編碼量測
+        │    （measureSourceEncoding：pom，退回 build log 的平台編碼）→ 寫進 prompt
+        │  資料夾目標 → 依 UT_BATCH_SIZE 分批，每批一個完整的 orchestrate；
+        │    沒通過的批次撤回它對 src/test 的變更（保留在 batch-NN/rejected/）
         │
 orchestrator.ts  ←-- 唯一 loop controller（確定性）
         │  每輪迭代：
@@ -71,6 +75,17 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    慣例掃描先量出「既有測試怎麼寫的」，三者都在第一輪之前完成並寫進 prompt。
    （否則 writer 會拿迭代次數去修別人的編譯錯誤、在既有測試旁邊再開一個
    `<Class>UnitTest.java`、或用錯可見性讓整個模組編不過。）
+   測試相依與原始碼編碼同理：standards 描述的是一套 stack（JUnit 5、MockitoExtension、AssertJ），
+   部門的 repo 跑的是好幾套。只有 JUnit 4 的模組拒絕每一個 JUnit 5 import，沒有 inline mock maker
+   的 mockStatic 編得過卻在執行時失敗，MS950 模組裡的 UTF-8 中文不是讓模組編不過、就是讓字串常值編成
+   亂碼（maven-compiler-plugin 3.13 + JDK 21 印出 unmappable character 後照樣 BUILD SUCCESS）——每一種
+   都是 writer 一輪一輪才撞到的失敗，而它照著改的 prompt 寫的正是失敗的寫法。模組其實早就知道答案：
+   surefire 在每次執行的報告裡記錄了測試 classpath，Maven 在每次建置的 log 裡寫了它用的平台編碼。
+   所以量它、寫進 prompt；量不到的（模組還沒跑過測試時的 pom 推斷）明說是推斷。編碼另有一道
+   確定性的護欄，因為 prompt 攔不住工具：agent 的編輯工具以 UTF-8 讀寫，改一個 MS950 既有測試檔會把
+   裡面的中文（包括字串常值）默默變成別的字——所以非 UTF-8 的檔案在 writer 前後比對、有變動一律照原
+   bytes 還原並判該輪失敗；writer 自己留下的非 ASCII 字元則轉成 `\uXXXX`（javac 先處理 Unicode 跳脫，
+   字串值不變）。
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表
@@ -166,6 +181,32 @@ itest 三個情境如承諾：`loop-dirty-tolerated`（既有失敗原樣通過�
 
 mutation 實測：把識別退回類別層級，第三個情境**從 exit 2 變成 exit 0**——writer 弄壞的測試
 直接放行，正是這道護欄存在的理由。拿掉編譯錯誤護欄與第七道護欄，各自對應的 selftest 轉紅。
+
+## 已採納：資料夾目標分批（2026-09-23）
+
+**問題。** 目標是資料夾時，所有類別交給同一個 `orchestrate()`：一個 writer session 寫全部的測試、
+一個 reviewer session 讀全部的測試、共用一份 `UT_MAX_ITER`。類別一多，session 就超出模型的 context
+與 `UT_AGENT_TIMEOUT_MS`——README 因此建議「一次只鎖定單一 class」，等於把這個工具最自然的用法
+（對整個 package 執行）列為已知會失敗；而且只要有一個類別修不綠，整個 run 就以 stuck / max-iterations
+結束，其他類別的進度一起停在半路。
+
+**作法。** `loop.ts` 依路徑排序後每 `UT_BATCH_SIZE`（預設 1）個類別一批，每批跑一次完整的
+`orchestrate()`：新的 session、自己的輪數、自己的 artifacts 目錄（`batch-NN-<類別>/`）。預檢與修復
+在所有批次之前只做一次。控制流仍只在 `loop.ts` + `orchestrator.ts`（硬規則 1）。
+
+**隔離。** 沒通過的批次會撤回它對 `src/test` 的**所有**變更——新增的檔移走、改過的檔照批次開始時的
+內容還原、刪掉的放回——嘗試的版本依 repo 相對路徑保留在該批的 `rejected/`。比對用內容不用 mtime。
+不撤回的話，一個留下編譯錯誤的批次會讓後面每一批的 build gate 都紅，而那不是後面那些 writer 的錯。
+結果是 `src/test` 最後只留下通過所有 gate 的測試。
+
+**提前停止。** 三種情況不跑後面的批次，因為它們不屬於某一批：agent 無法執行（spawn-error）、writer 改了
+測試範圍外的檔案（scope-violation——那批**不撤回**，變更原樣交給人檢視，否則後面每一批都建置在被改過的
+production code 上）、連續兩批以同一個 `writer-no-op` 或 `reviewer-unparseable` 結束（模型端或權限的問題，
+每批重新發現一次只是空轉）。
+
+**不變的部分。** 只有一批時（單一類別，或 `UT_BATCH_SIZE` 不小於類別數）走原本的路徑，artifacts
+版面、summary 形狀、失敗時測試檔留在原處，都與以前相同。分批不改 build gate 的承諾：每批仍是完整
+模組建置（或 `UT_TEST_SCOPE=generated` 時每批通過前的完整驗收）。代價是建置次數隨批數增加，README 說明。
 
 ## 已否決方案（防止重新提案）
 

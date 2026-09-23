@@ -22,7 +22,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 控制流只有兩個檔案，兩者並排於根目錄：
 
 - **`loop.ts`** — entry point：參數驗證、模組偵測、rubric 載入、startup guard、版本戳記、
-  既有測試偵測、預檢基準（baseline）、建立 `runs/<repo 名>/<ts>/`。
+  既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
+  目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它對
+  `src/test` 的變更（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
@@ -98,7 +100,13 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
-   class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論。
+   class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論；
+   `libs/teststack.ts` 從目標模組 surefire 報告裡的 `surefire.test.class.path` 量出測試相依（JUnit 4/5、
+   Mockito 版本與能否用 MockitoExtension / mock static、AssertJ、Java 語言層級），模組還沒跑過測試時退回
+   讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath；`libs/encoding.ts` 量出 javac 讀原始碼的
+   編碼（pom，退回 build log 裡 Maven 自己寫的平台編碼）。非 UTF-8 時另有確定性護欄：writer 前後比對
+   非 UTF-8 的測試檔，有變動一律照原 bytes 還原並判該輪 FAIL（UTF-8 編輯工具會把 MS950 的中文默默換掉），
+   writer 留下的非 ASCII 字元轉成 `\uXXXX`（否則依工具鏈不是編不過，就是字串常值編成亂碼、中文斷言永遠對不上）。
    測試類別可見性**沒有**放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
    但跨 package 的 class-symbol 套件沒有 `public` 就編不過。禁止在 standards 或 prompt 裡
    寫死任一邊。
@@ -165,6 +173,9 @@ libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter a
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
+libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更（captureTree / rollbackTree）
+libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
+libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 writer 輸出護欄（\uXXXX 跳脫、原編碼檔還原）
 scripts/selftest.ts   純邏輯自測＋架構不變式 assert
 scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
 scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼

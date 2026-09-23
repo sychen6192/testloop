@@ -50,7 +50,8 @@ echo 'export PATH="$PATH:'$(pwd)'/bin"' >> ~/.zshrc && source ~/.zshrc
 自架單卡（約 32GB VRAM）跑 27B 級 dense 模型的實測建議：
 
 - writer 與 reviewer 共用同一顆模型即可，省去每輪換模的 reload 成本。
-- 一次只鎖定單一 class 當目標，讓 writer 每輪只產一個測試檔。同時重寫多個大檔會慢到撞逾時。
+- 目標是資料夾時 loop 會一次處理一個類別（`UT_BATCH_SIZE=1`），writer 每輪只產一個測試檔；
+  不建議調大——同時重寫多個大檔會慢到撞逾時。
 - 設 `UT_AGENT_TIMEOUT_MS=1500000`，約 25 分鐘。dense 模型約 15–25 tok/s，這給完整生成
   留餘裕，避免被 SIGTERM 截斷。
 - 將 opencode 中該模型的 context（如 Ollama 的 `num_ctx`）設為 65536。扣掉 plugin 與 MCP
@@ -116,10 +117,13 @@ testgen doctor <package 路徑> --smoke   # preflight，並實測 provider 一�
 testgen <package 路徑>                  # 端對端執行
 ```
 
-起手挑一個依賴最少的簡單 class。退出碼定義：`0` 全數通過、`2` 迭代用盡仍未通過、`1` 致命錯誤。
+起手挑一個依賴最少的簡單 class。退出碼定義：`0` 全數通過、`2` 有目標沒通過（單一類別是迭代用盡；
+分批時是任何一批沒過）、`1` 致命錯誤。
 
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
-覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記。
+覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
+量到的測試相依與原始碼編碼（見下方 Troubleshooting）。資料夾目標分批時，每批在自己的
+`batch-NN-<類別>/` 底下。
 
 ## 參數
 
@@ -130,7 +134,8 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
 | `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
-| `UT_MAX_ITER` | 5 | 最大迭代輪數 |
+| `UT_MAX_ITER` | 5 | 最大迭代輪數（分批時為每批） |
+| `UT_BATCH_SIZE` | 1 | 目標是資料夾時，每批幾個類別。每批是一個完整的 writer → gate 迴圈：新的 session、自己的迭代輪數；沒通過的批次撤回它對 `src/test` 的變更（保留在該批的 `rejected/`），不影響其他批次。見「一次處理整個資料夾」 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
@@ -210,9 +215,46 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
 - **覆蓋率反而更準**：限縮後 JaCoCo 只記錄目標測試造成的覆蓋，不會被別的測試順帶碰到而灌水。
 - Maven only。Gradle 會顯示警告並退回 `module`。
 
+## 一次處理整個資料夾
+
+目標是資料夾時，loop 把裡面的類別依路徑排序、每 `UT_BATCH_SIZE` 個（預設 1）一批，**每批各自跑完整的
+writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / reviewer session、自己的 `UT_MAX_ITER` 輪數。
+預檢與修復在所有批次之前只做一次。
+
+- **一批沒過不會拖垮其他批。** 沒通過的批次會撤回它對 `src/test` 的所有變更——新增的檔移走、改過的檔
+  還原成原本的內容——嘗試的版本依 repo 相對路徑保留在 `runs/<repo>/<ts>/batch-NN-<類別>/rejected/`，
+  清單在同目錄的 `rollback.md`。下一批因此從一個還編得過的模組開始，`src/test` 最後只留下通過所有 gate
+  的測試。
+- **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
+  變更原樣保留給你檢視），或連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束——後面的批次
+  也會遇到同樣的事，summary 會列出沒執行的類別。
+- **結果**：`summary.json` 的 `batches` 逐批列出結果與 artifacts 目錄，`notRun` 是沒執行的類別；
+  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`，中途被中斷也看得到進度。
+- **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
+  驗收。建置很慢的模組建議搭配 `UT_TEST_SCOPE=generated`，或把 `UT_BATCH_SIZE` 調大一些來分攤。
+- 只有一個類別（或 `UT_BATCH_SIZE` 不小於類別數）時就是單一一批，行為與 artifacts 版面都和以前一樣：
+  沒通過時測試檔留在原處，由你決定怎麼處理。
+
 ## Troubleshooting
 
 先跑 `testgen doctor <目標> --smoke`，多數問題會直接指出修法。常見情形如下。
+
+- **writer 一直寫專案沒有的東西（JUnit 5、`MockitoExtension`、`mockStatic`、`var`），每輪編不過。**
+  loop 會量目標模組的測試相依並寫進 prompt：優先讀預檢留下的 surefire 報告裡的測試 classpath
+  （實際跑過的，最準），模組還沒有任何測試跑過時退回讀 pom（連同 Spring Boot 版本推斷，prompt 會
+  標明是推斷）；writer 的測試第一次跑過之後，後面的 prompt 就改用實際 classpath。量到什麼在 log 的
+  「測試相依：」那一行與 `project-facts.json`。只有 JUnit 4 的模組會被告知用 JUnit 4 的寫法，
+  沒有 inline mock maker 時會被告知不能 mock static / final。
+- **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
+  MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
+  以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，
+  就是編得過但字串常值成了亂碼（maven-compiler-plugin 3.13 + JDK 21 印出 unmappable character 後照樣
+  BUILD SUCCESS），斷言中文訊息的測試因此永遠對不上；而 agent 的編輯工具以 UTF-8 讀寫，改一個 MS950 的
+  既有測試檔會把裡面的中文默默換成別的字。loop 會處理兩件事：
+  writer 留下的非 ASCII 字元轉成 `\uXXXX`（字串值不變、編得過），以 MS950 存且含中文的既有測試檔不讓
+  writer 改——被改到就照原 bytes 還原並判該輪失敗，writer 改在新的測試類別（`<類別>AdditionalTest.java`）
+  補測試。如果專案的原始碼其實是 UTF-8、只是 pom 沒設，在 pom 加上
+  `<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>` 才是根本解法。
 
 - **doctor 說 agent 找不到。** 回工具 clone 目錄執行 `npm run setup`。
 - **中途中止，說「writer 修改了測試範圍以外的檔案」。** writer 動了 production code、

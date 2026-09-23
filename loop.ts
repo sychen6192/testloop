@@ -29,6 +29,7 @@ import {
   AGENT_TIMEOUT_MS,
   BUILD_TIMEOUT_MS,
   MAVEN_EXTRA_ARGS,
+  BATCH_SIZE,
 } from "./config";
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
@@ -40,6 +41,10 @@ import { getToolVersion } from "./libs/version";
 import { detectBuildTool, runBaseline, writableRel } from "./gates/build";
 import { createRunner } from "./runners/runner";
 import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
+import { captureTree, chunk, rollbackTree, RollbackReport } from "./libs/batch";
+import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
+import { describeTestStack, measureTestStack, TestStack } from "./libs/teststack";
+import { isUtf8Name, measureSourceEncoding, SourceEncoding } from "./libs/encoding";
 import { installShutdownHandlers, onShutdown } from "./libs/shell";
 import { acquireRepoLock } from "./libs/lock";
 import { PreExistingFailures } from "./prompts";
@@ -160,7 +165,10 @@ async function main() {
   onShutdown((reason) => {
     const p = path.join(runDir, "summary.json");
     if (!fs.existsSync(p)) {
-      fs.writeFileSync(p, JSON.stringify({ success: false, stopReason: `interrupted:${reason}` }, null, 2));
+      fs.writeFileSync(
+        p,
+        JSON.stringify({ success: false, stopReason: `interrupted:${reason}`, batches: batchProgress }, stripRaw, 2),
+      );
     }
   });
 
@@ -194,6 +202,7 @@ async function main() {
         writerModel: WRITER_MODEL || "(agent default)",
         reviewerModel: REVIEWER_MODEL || "(agent default)",
         maxIter: MAX_ITER,
+        batchSize: BATCH_SIZE,
         strictCov: STRICT_COV,
         allowZeroTests: ALLOW_ZERO_TESTS,
         skipBaseline: SKIP_BASELINE,
@@ -231,6 +240,33 @@ async function main() {
   // The baseline's failing identities, handed to the gate only under UT_ALLOW_DIRTY_BASELINE.
   let tolerate: string[] | undefined;
   let repair: RepairResult | undefined;
+  // What the module's tests compile and run against, measured — see libs/teststack.ts. Measured
+  // again after anything that runs tests, since a surefire classpath beats a reading of the pom.
+  let testStack: TestStack | undefined;
+  // And the encoding javac reads the sources in (libs/encoding.ts): the pom's, or the platform's,
+  // which Maven names in every build log when the pom sets none.
+  let sourceEncoding: SourceEncoding | undefined;
+  const measureStack = (buildLog = "") => {
+    const m = measureTestStack(mod, REPO_ROOT, buildLog);
+    if (m) m.javaRelease ??= testStack?.javaRelease;
+    testStack = m ?? testStack;
+    sourceEncoding = measureSourceEncoding(mod, REPO_ROOT, buildLog) ?? sourceEncoding;
+    fs.writeFileSync(
+      path.join(runDir, "project-facts.json"),
+      JSON.stringify({ testStack: testStack ?? null, sourceEncoding: sourceEncoding ?? null }, null, 2),
+    );
+  };
+  const logFacts = () => {
+    log(`測試相依：${describeTestStack(testStack)}`);
+    if (sourceEncoding && !isUtf8Name(sourceEncoding.name)) {
+      log(
+        `[WARN] 原始碼編碼：${sourceEncoding.name}（${sourceEncoding.source === "pom" ? "pom 設定" : "pom 沒設定，Maven 用平台編碼"}）` +
+          "——writer 留下的非 ASCII 字元會轉成 \\uXXXX，以這個編碼存、含中文的既有測試檔不讓 writer 修改",
+      );
+    } else if (sourceEncoding) {
+      log(`原始碼編碼：${sourceEncoding.name}`);
+    }
+  };
   if (SKIP_BASELINE && ALLOW_DIRTY_BASELINE) {
     die(
       "UT_SKIP_BASELINE=1 與 UT_ALLOW_DIRTY_BASELINE=1 不能並用：沒有預檢就沒有「writer 介入前\n" +
@@ -240,6 +276,8 @@ async function main() {
   }
   if (SKIP_BASELINE) {
     log("[WARN] UT_SKIP_BASELINE=1：跳過預檢，既有紅燈將無法與 writer 造成的失敗區分");
+    measureStack();
+    logFacts();
   } else {
     banner("預檢基準（baseline）");
     const baseline = await runBaseline(buildTool, mod);
@@ -257,6 +295,8 @@ async function main() {
           `被 signal 終止多半是記憶體不足。詳見 ${path.join(runDir, "baseline.log")}`,
       );
     }
+    measureStack(baseline.raw);
+    logFacts();
 
     let clean = baseline.clean;
     // Repairing is only possible where the writer may write. A red common/ in a reactor, or a
@@ -276,7 +316,8 @@ async function main() {
     }
     if (!clean && REPAIR_BASELINE && repairable) {
       banner("修復既有紅燈（repair）");
-      repair = await repairBaseline({ runner, buildTool, standards, mod, runDir, baseline });
+      repair = await repairBaseline({ runner, buildTool, standards, mod, runDir, baseline, testStack, sourceEncoding });
+      measureStack();
       fs.writeFileSync(
         path.join(runDir, "repair-summary.md"),
         [
@@ -413,6 +454,27 @@ async function main() {
     }
   }
 
+  // A folder target runs as batches, each its own maker-checker loop; one batch is today's run.
+  const batches = chunk(targetClasses, BATCH_SIZE);
+  if (batches.length > 1) {
+    const code = await runBatches({
+      batches,
+      buildTool,
+      runner,
+      standards,
+      rubric: effectiveRubric,
+      mod,
+      runDir,
+      preExisting,
+      tolerate,
+      repair,
+      testStack,
+      sourceEncoding,
+    });
+    log(`artifacts 已寫入：${runDir}`);
+    process.exit(code);
+  }
+
   let result;
   try {
     result = await orchestrate({
@@ -428,6 +490,8 @@ async function main() {
       preExisting,
       tolerate,
       conventions,
+      testStack,
+      sourceEncoding,
     });
   } catch (e) {
     // A crashed run must still leave a summary — otherwise the artifacts directory
@@ -466,6 +530,220 @@ async function main() {
   process.exit(result.success ? 0 : 2);
 }
 
+// ─── Batches ─────────────────────────────────────────────────────────────────
+//
+// A folder target used to be one run: one writer session for every class, one reviewer session
+// reading every test, one budget of rounds. With more than a few classes the sessions outgrew the
+// model's context and the agent timeout (the README advised targeting one class at a time), and a
+// single class that would not go green ended the run for all the others. Each batch is now a
+// maker-checker loop of its own. A batch that fails has its changes to the test tree set aside —
+// copied to <batch>/rejected and the tree put back — so the next batch starts from a module that
+// still builds, and src/test ends the run holding only tests that passed every gate.
+
+interface BatchRecord {
+  batch: number;
+  targetClasses: string[];
+  dir: string;
+  success: boolean;
+  stopReason: string;
+  iterations: number;
+  totalOutputTokens?: number;
+  coverageReport?: string;
+  finalFeedback?: string;
+  finalVerdict?: ReviewVerdict;
+  rolledBack?: RollbackReport & { rejectedDir: string };
+}
+
+// Read by the interrupt and crash handlers, so a run cut short still says which batches finished.
+let batchProgress: BatchRecord[] | undefined;
+
+// Stop reasons that belong to the environment rather than the batch: the next batch would meet them
+// too. A scope violation also leaves files outside src/test changed on disk for a human to look at,
+// and every later batch would be built against them.
+const RUN_STOPS = new Set(["runner-spawn-error", "scope-violation"]);
+// Failures that come from outside the batch when they repeat — a writer session that never gets to
+// write, a reviewer model that does not answer in JSON. Two batches in a row end the run rather
+// than every remaining batch spending its rounds and builds rediscovering it.
+const REPEAT_STOPS = new Set(["writer-no-op", "reviewer-unparseable"]);
+
+interface BatchRunInput {
+  batches: string[][];
+  buildTool: BuildTool;
+  runner: AgentRunner;
+  standards: string;
+  rubric: string;
+  mod: ModuleInfo;
+  runDir: string;
+  preExisting?: PreExistingFailures;
+  tolerate?: string[];
+  repair?: RepairResult;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
+}
+
+async function runBatches(o: BatchRunInput): Promise<number> {
+  const records: BatchRecord[] = [];
+  batchProgress = records;
+  const total = o.batches.reduce((n, b) => n + b.length, 0);
+  const width = String(o.batches.length).length;
+  const testTree = path.join(o.mod.moduleRoot, "src", "test");
+  const treeRel = path.relative(REPO_ROOT, testTree).replace(/\\/g, "/");
+  let stopped: { reason: string; message: string } | undefined;
+  let stack = o.testStack;
+  banner(`分批執行：${total} 個目標類別分成 ${o.batches.length} 批（UT_BATCH_SIZE=${BATCH_SIZE}）`);
+
+  for (let i = 0; i < o.batches.length; i++) {
+    const batch = o.batches[i];
+    const tag = `batch-${String(i + 1).padStart(width, "0")}-${path.basename(batch[0], ".java")}`;
+    const dir = path.join(o.runDir, tag);
+    banner(`第 ${i + 1}/${o.batches.length} 批：${batch.map((c) => path.basename(c)).join("、")}`);
+    // Measured again per batch: earlier batches add tests, and a later class's test may be among them.
+    const existingTests = batch.map((cls) => ({ cls, tests: findExistingTests(cls, REPO_ROOT) }));
+    const conventions = scanTestConventions(path.join(testTree, "java"), REPO_ROOT);
+    // Earlier batches' builds leave a surefire classpath behind even when the baseline had none.
+    const measured = measureTestStack(o.mod, REPO_ROOT);
+    if (measured) measured.javaRelease ??= stack?.javaRelease;
+    stack = measured ?? stack;
+    const start = captureTree(testTree);
+    const r = await orchestrate({
+      targetClasses: batch,
+      buildTool: o.buildTool,
+      runner: o.runner,
+      standards: o.standards,
+      rubric: o.rubric,
+      skipReview: SKIP_REVIEW,
+      mod: o.mod,
+      runDir: dir,
+      existingTests,
+      preExisting: o.preExisting,
+      tolerate: o.tolerate,
+      conventions,
+      testStack: stack,
+      sourceEncoding: o.sourceEncoding,
+    });
+    const rec: BatchRecord = {
+      batch: i + 1,
+      targetClasses: batch,
+      dir,
+      success: r.success,
+      stopReason: r.stopReason,
+      iterations: r.iterations,
+      totalOutputTokens: r.totalOutputTokens,
+      coverageReport: r.coverageReport,
+      finalFeedback: r.finalFeedback,
+      finalVerdict: r.finalVerdict,
+    };
+    // A scope violation is left exactly as it is: the changes outside src/test are the reason the
+    // run stops, and the test files beside them are part of what a human has to look at.
+    if (!r.success && r.stopReason !== "scope-violation") {
+      const rejectedDir = path.join(dir, "rejected");
+      const rb = rollbackTree(start, rejectedDir, treeRel);
+      const touched = rb.created.length + rb.restored.length + rb.undeleted.length + rb.unrestorable.length;
+      if (touched) {
+        rec.rolledBack = { ...rb, rejectedDir };
+        fs.writeFileSync(path.join(dir, "rollback.md"), renderRollback(rb, rejectedDir, treeRel));
+        log(
+          `這批的測試變更已移出 ${treeRel}（新增 ${rb.created.length}、還原 ${rb.restored.length + rb.undeleted.length} 個檔），` +
+            `嘗試的版本保留在 ${rejectedDir}`,
+        );
+        if (rb.unrestorable.length) {
+          log(`[WARN] 以下檔案過大、沒有備份，維持這批留下的狀態：${rb.unrestorable.join("、")}`);
+        }
+      }
+    }
+    records.push(rec);
+    fs.writeFileSync(path.join(o.runDir, "batches.json"), JSON.stringify(records, stripRaw, 2));
+    log(
+      r.success
+        ? `[OK] 第 ${i + 1}/${o.batches.length} 批通過（${r.iterations} 輪）`
+        : `[FAIL] 第 ${i + 1}/${o.batches.length} 批未通過（${r.stopReason}，${r.iterations} 輪）`,
+    );
+
+    if (RUN_STOPS.has(r.stopReason)) {
+      stopped = {
+        reason: r.stopReason,
+        message:
+          r.stopReason === "scope-violation"
+            ? "writer 改了測試範圍以外的檔案，變更未還原、需要人工檢視"
+            : "agent 無法執行——這是環境問題，後面的批次也會一樣",
+      };
+      break;
+    }
+    const prev = records[records.length - 2];
+    if (!r.success && REPEAT_STOPS.has(r.stopReason) && prev && !prev.success && prev.stopReason === r.stopReason) {
+      stopped = {
+        reason: r.stopReason,
+        message: `連續兩批都以 ${r.stopReason} 結束——多半是模型端或權限的問題，不是這兩個類別本身`,
+      };
+      break;
+    }
+  }
+
+  const passed = records.filter((r) => r.success).length;
+  const notRun = o.batches.slice(records.length).flat();
+  const success = passed === o.batches.length;
+  const stopReason = success ? "gates-passed" : stopped ? `stopped:${stopped.reason}` : "some-batches-failed";
+  const tokens = records.reduce<number | undefined>(
+    (n, r) => (r.totalOutputTokens === undefined ? n : (n ?? 0) + r.totalOutputTokens),
+    undefined,
+  );
+
+  banner("SUMMARY");
+  log(`結果：${passed}/${o.batches.length} 批通過（stop=${stopReason}）`);
+  for (const r of records) {
+    const names = r.targetClasses.map((c) => path.basename(c, ".java")).join("、");
+    log(
+      r.success
+        ? `  [OK]   ${names}（${r.iterations} 輪）`
+        : `  [FAIL] ${names}：${r.stopReason}（${r.iterations} 輪）` +
+            (r.rolledBack ? `——測試已移出 src/test，見 ${r.rolledBack.rejectedDir}` : ""),
+    );
+  }
+  if (notRun.length) {
+    log(`未執行的 ${notRun.length} 個類別（${stopped?.message ?? "提前停止"}）：`);
+    notRun.forEach((c) => log(`  - ${c}`));
+  }
+  if (tokens !== undefined) log(`writer output tokens 合計：${tokens}`);
+  const failed = records.filter((r) => !r.success);
+  if (failed.length) {
+    log("未通過的批次，失敗報告在各自的 artifacts 目錄（feedback.md、rollback.md）。");
+  }
+  fs.writeFileSync(
+    path.join(o.runDir, "summary.json"),
+    JSON.stringify(
+      {
+        success,
+        stopReason,
+        batchSize: BATCH_SIZE,
+        batches: records,
+        notRun,
+        targetClasses: o.batches.flat(),
+        totalOutputTokens: tokens,
+        repair: o.repair,
+        toleratedFailures: o.tolerate ?? [],
+      },
+      stripRaw,
+      2,
+    ),
+  );
+  return success ? 0 : 2;
+}
+
+function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string): string {
+  const list = (title: string, files: string[]) =>
+    files.length ? [`${title}：`, ...files.map((f) => `  - ${treeRel}/${f}`)] : [];
+  return [
+    `這批沒有通過所有 gate，它對 ${treeRel} 的變更已撤回，嘗試的版本保留在：`,
+    `  ${rejectedDir}`,
+    "（依原本的 repo 相對路徑存放，要採用時整個複製回 repo 即可）",
+    "",
+    ...list("這批新增、已移出的檔案", rb.created),
+    ...list("這批修改過、已還原為原本內容的檔案", rb.restored),
+    ...list("這批刪掉、已放回的檔案", rb.undeleted),
+    ...list("過大沒有備份、維持這批留下狀態的檔案", rb.unrestorable),
+  ].join("\n");
+}
+
 // Why repair gave up decides what the operator should look at. The one hint used for all of them
 // — production code or Lombok in pom.xml — was wrong for most: a writer that could not finish, a
 // build that did not, a repair that went round in circles.
@@ -498,7 +776,11 @@ main().catch((e) => {
     try {
       fs.writeFileSync(
         path.join(crashRunDir, "summary.json"),
-        JSON.stringify({ success: false, stopReason: "crash", error: String(e?.stack ?? e) }, null, 2),
+        JSON.stringify(
+          { success: false, stopReason: "crash", error: String(e?.stack ?? e), batches: batchProgress },
+          stripRaw,
+          2,
+        ),
       );
     } catch {
       /* best effort: the FATAL line below still says what happened */

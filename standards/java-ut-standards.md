@@ -1,8 +1,13 @@
 # Java Unit Test 品質標準
 
 ## 框架與相依
-- JUnit 5（`org.junit.jupiter`），Mock 使用 Mockito（`@ExtendWith(MockitoExtension.class)`）
-- 斷言優先使用 AssertJ（`assertThat(...)`）；若專案未引入 AssertJ 則使用 JUnit 5 assertions
+- 測試框架與函式庫以 pipeline 在 prompt 中列出的「本模組測試 classpath」為準（它量的是模組實際
+  跑過的測試）；那份清單與下面的預設衝突時，以清單為準。沒有清單時預設為：
+  JUnit 5（`org.junit.jupiter`），Mock 使用 Mockito（`@ExtendWith(MockitoExtension.class)`）
+- 斷言優先使用 AssertJ（`assertThat(...)`）；classpath 上沒有 AssertJ 時使用所用測試框架內建的 assertions
+- `MockitoExtension` 預設 strict stubs：沒被測試用到的 `when(...)` 會讓測試以
+  `UnnecessaryStubbingException` 失敗。只 stub 該測試真的會走到的呼叫，不要在 `@BeforeEach` 裡預先
+  stub 所有情境；確有需要時對單一 stub 用 `lenient()`
 - 不得引入未在 pom.xml / build.gradle 宣告的新相依
 
 ## 結構與命名

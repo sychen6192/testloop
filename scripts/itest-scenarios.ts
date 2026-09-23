@@ -36,6 +36,71 @@ const BROKEN_PATH = `${TEST_DIR}/BrokenTest.java`;
 const PROD_PATH = "src/main/java/com/x/Calc.java";
 const SUPPORT_PATH = "src/test/java/com/x/Support.java";
 
+// A second and third class in the target folder, for the batch scenarios. Sorted by path, the
+// batches are Calc, Greeter, Zeta.
+const GREETER_PATH = "src/main/java/com/x/Greeter.java";
+const GREETER_JAVA = `package com.x;
+
+public class Greeter {
+    public String greet(String name) {
+        if (name == null || name.isEmpty()) {
+            return "Hello, stranger";
+        }
+        return "Hello, " + name;
+    }
+}
+`;
+const GREETER_TEST_PATH = `${TEST_DIR}/GreeterTest.java`;
+const GREETER_TEST = `package com.x;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class GreeterTest {
+    @Test
+    void greet_withName_saysHello() {
+        assertEquals("Hello, Ada", new Greeter().greet("Ada"));
+    }
+
+    @Test
+    void greet_withoutName_greetsStranger() {
+        assertEquals("Hello, stranger", new Greeter().greet(""));
+    }
+}
+`;
+const ZETA_PATH = "src/main/java/com/x/Zeta.java";
+const ZETA_JAVA = `package com.x;
+
+public class Zeta {
+    public int twice(int x) {
+        return x * 2;
+    }
+}
+`;
+// A Spring Boot 2.1 module: its starter-test brings JUnit 4 only. What the pom implies is all the
+// loop knows until a test has run; the first run's surefire report records the real classpath.
+const BOOT21_POM = `<project><modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>2.1.4.RELEASE</version><relativePath/></parent>
+  <groupId>com.x</groupId><artifactId>fixture</artifactId><version>1.0</version>
+  <properties><java.version>1.8</java.version></properties>
+  <dependencies>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+  </dependencies>
+</project>
+`;
+const JUNIT4_CLASSPATH = "/m2/junit/junit/4.13.2/junit-4.13.2.jar:/m2/org/mockito/mockito-core/2.23.4/mockito-core-2.23.4.jar:/m2/org/assertj/assertj-core/3.11.1/assertj-core-3.11.1.jar";
+const withClasspath = (xml: string, cp: string) =>
+  xml.replace("<properties>", `<properties><property name="surefire.test.class.path" value="${cp}"/>`);
+// ExistingTest as a zh-TW Windows repo keeps it: MS950 bytes, "// 中文" (中 = A4 A4, 文 = A4 E5).
+const EXISTING_TEST_MS950 = [
+  ...Buffer.from(EXISTING_TEST.replace("class ExistingTest {", "// ")),
+  0xa4, 0xa4, 0xa4, 0xe5,
+  ...Buffer.from("\nclass ExistingTest {" + EXISTING_TEST.split("class ExistingTest {")[1]),
+];
+const PLATFORM_MS950 =
+  "[WARNING] Using platform encoding (MS950 actually) to copy filtered resources, i.e. build is platform dependent!\n";
+const JACOCO_GREETER = { pkg: "com/x", file: "Greeter.java", line: [0, 4] as [number, number], branch: [0, 4] as [number, number] };
+
 // Distinct by length, so "the writer changed something" is detectable regardless of mtime
 // resolution. Rounds that must not no-op use a fresh variant each time.
 const calcTest = (n: number) => `${CALC_TEST}\n// variant ${"x".repeat(n)}\n`;
@@ -1267,6 +1332,167 @@ export const SCENARIOS: Scenario[] = [
         ...(k === 1 ? { jacoco: JACOCO_GREEN } : {}),
       })),
     ],
+  },
+  {
+    name: "loop-teststack-into-prompt",
+    desc: "測試相依量測進 prompt：第 1 輪用 pom 推斷（Spring Boot 2.1 → 只有 JUnit 4）；第 1 輪跑過測試後，第 2 輪改用實際 classpath",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { "pom.xml": BOOT21_POM },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(1) } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(2) } }] },
+      { content: "已修正" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [
+          {
+            suite: "com.x.CalcTest",
+            body: withClasspath(
+              SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add", message: "expected: <3> but was: <4>", line: 9 }]),
+              JUNIT4_CLASSPATH,
+            ),
+          },
+        ],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "loop-encoding-platform-ms950",
+    desc: "pom 沒設編碼、Maven 用平台編碼 MS950：writer 的中文轉成 \\uXXXX；它用 UTF-8 改壞的 MS950 既有測試檔照原 bytes 還原、該輪 FAIL",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraBytes: { [EXISTING_PATH]: EXISTING_TEST_MS950 },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料\n${calcTest(1)}` } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// 補一個測試\n` } },
+        ],
+      },
+      { content: "已建立 CalcTest.java，也補了 ExistingTest" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: `// 準備資料：兩數相加\n${calcTest(2)}` } }] },
+      { content: "改寫在 CalcTest.java" },
+    ],
+    mvn: [{ ...GREEN_BUILD, out: PLATFORM_MS950 + BUILD_SUCCESS(4) }, GREEN_BUILD],
+  },
+  // ── Folder targets run as batches ──────────────────────────────────────────
+  {
+    name: "loop-batches-isolate-failure",
+    desc: "資料夾目標分批：第 1 批（Calc）修不好 → 撤回它對 src/test 的變更、繼續第 2 批（Greeter）並通過",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "2" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// the writer touched an existing test\n` } },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+      { content: "修不好" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      { exit: 1, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`), cleanSurefire: true },
+      {
+        ...GREEN_BUILD,
+        surefire: [{ cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") }],
+        jacoco: JACOCO_GREETER,
+      },
+    ],
+  },
+  {
+    name: "loop-batches-all-pass",
+    desc: "資料夾兩個類別分兩批、各自通過 → exit 0，每批一個 artifacts 目錄，沒有任何撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      GREEN_BUILD,
+      {
+        ...GREEN_BUILD,
+        surefire: [{ cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") }],
+        jacoco: JACOCO_GREETER,
+      },
+    ],
+  },
+  {
+    name: "loop-batch-size-covers-all",
+    desc: "UT_BATCH_SIZE 不小於類別數 → 單一一批，行為與 artifacts 版面和以前一樣",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_BATCH_SIZE: "2" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } },
+        ],
+      },
+      { content: "已建立兩個測試檔" },
+    ],
+    mvn: [
+      GREEN_BUILD,
+      {
+        ...GREEN_BUILD,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") },
+          { cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") },
+        ],
+        jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+      },
+    ],
+  },
+  {
+    name: "loop-batches-repeat-no-op-stops",
+    desc: "連續兩批 writer 都沒有產出（writer-no-op）→ 那是模型端或權限的問題，停下而不是每一批都空轉",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "2" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [{ content: "略過" }, { content: "略過" }, { content: "略過" }, { content: "略過" }],
+    mvn: [GREEN_BUILD, { ...GREEN_BUILD, jacoco: JACOCO_RED }, GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-spawn-error-stops",
+    desc: "分批時 agent 無法執行（spawn-error）→ 整個 run 停下，不對每個類別各試一次",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [{ status: 401, body: '{"error":{"message":"invalid api key"}}' }],
+    mvn: [GREEN_BUILD],
+  },
+  {
+    name: "loop-batches-scope-violation-stops",
+    desc: "分批時 writer 改了 production code → 整個 run 停下，變更原樣留給人檢視（不撤回、不跑後面的批次）",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      {
+        toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }],
+        sideWrite: { [PROD_PATH]: CALC_JAVA.replace("return a + b;", "return a + b + 0;") },
+      },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD],
   },
   {
     name: "loop-repair-then-generate",

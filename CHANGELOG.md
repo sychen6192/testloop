@@ -8,6 +8,36 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **資料夾目標自動分批（`UT_BATCH_SIZE`，預設 1）。** 目標是資料夾時，所有類別原本交給同一個 writer
+  session 寫、同一個 reviewer session 審、共用一份輪數；類別一多就超出模型的 context 與 agent 逾時
+  （README 因此建議一次只做一個類別），而且只要一個類別修不綠，整個 run 就停下、其他類別一起卡在半路。
+  現在依路徑排序、每批一個類別，各自跑完整的 writer → gate 迴圈（新的 session、自己的輪數、自己的
+  `batch-NN-<類別>/` artifacts）。沒通過的批次撤回它對 `src/test` 的所有變更——新增的移走、改過的還原、
+  刪掉的放回——嘗試的版本保留在該批的 `rejected/`（清單在 `rollback.md`），所以下一批從一個編得過的
+  模組開始，`src/test` 最後只留下通過所有 gate 的測試。agent 無法執行、writer 改了範圍外的檔案（不撤回、
+  原樣交給人檢視）、或連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束時提前停止，
+  summary 列出沒執行的類別。每批跑完就更新 `batches.json`。只有一批時行為、artifacts 版面與以前完全相同。
+- **量測目標模組的測試相依，當成事實寫進 prompt。** standards 寫死 JUnit 5 + `MockitoExtension` + AssertJ，
+  prompt 的第一行也寫死「（JUnit 5）」；在只有 JUnit 4 的模組（Spring Boot 2.2 以前）每個 JUnit 5 import
+  都編不過，沒有 `mockito-junit-jupiter` 就沒有 `MockitoExtension`，沒有 inline mock maker 的 `mockStatic`
+  在執行時失敗——writer 每輪撞一個，而它照著改的 prompt 寫的正是失敗的寫法。現在從目標模組 surefire 報告
+  的 `surefire.test.class.path` 量出 JUnit 4/5、TestNG、Mockito 版本與能力、AssertJ / Hamcrest，連同
+  Java 語言層級（編譯 log 或 pom）寫進 generate / fix / repair prompt；模組還沒跑過測試時退回讀 pom
+  （含 Spring Boot 版本推斷，明說是推斷、不宣稱「沒有」），第一次有測試跑過就改用實際 classpath。
+  以真的 Maven 專案驗證：JUnit 5 + Mockito 5 的專案與 JUnit 4.12 + Mockito 2 + surefire 2.22 的老專案都量得對。
+  standards 改為「以量到的 classpath 為準」，並補上 `MockitoExtension` 預設 strict stubs 的提醒
+  （`UnnecessaryStubbingException` 是 LLM 寫的測試最常見的失敗之一）。結果記在 `project-facts.json`。
+- **原始碼編碼不是 UTF-8 的模組（MS950 等）。** writer 以 UTF-8 寫的中文在 MS950 模組裡依工具鏈有兩種
+  下場：單獨的 javac 直接報 error、編不過；maven-compiler-plugin 3.13 + JDK 21 則印出
+  `[ERROR] unmappable character` 後照樣 BUILD SUCCESS，`"含稅金額"` 編成 8 個亂碼字元——斷言中文訊息的
+  測試永遠對不上，writer 從失敗報告抄回正確的中文、再以 UTF-8 寫回，又是亂碼，以 stuck 收場（以真的
+  Maven 專案重現）。而 prompt 是中文，writer 寫中文註解、字串或 `@DisplayName` 是常態。pom 沒設 `project.build.sourceEncoding` 的專案在繁中 Windows、JDK 17 以前也是
+  MS950。更糟的是 agent 的編輯工具以 UTF-8 讀寫：改一個 MS950 既有測試檔，會把裡面的中文（字串常值
+  也是）默默換成別的字，而檔案照樣編得過。現在 loop 量出 javac 實際用的編碼（pom 設定，退回 Maven
+  在每次建置 log 裡寫的平台編碼），不是 UTF-8 時：prompt 告知只用 ASCII 並點名不能改的檔；writer 留下
+  的非 ASCII 字元轉成 `\uXXXX`（javac 先處理 Unicode 跳脫，字串值不變——以真的 Maven 專案在
+  `sourceEncoding=MS950` 下跑完整的 loop 驗證：三輪都轉換、建置通過、`gates-passed`）；非 UTF-8 的測試檔在 writer 前後比對，有變動一律照原 bytes 還原並判該輪
+  失敗，writer 改在新的測試類別補測試。修復迴圈同樣適用。UTF-8 或量不到時完全不介入。
 - **公司網路支援：proxy 與 TLS 攔截**（`libs/proxy.ts`、`libs/tls.ts`，作法參考姊妹專案
   prloop 的實戰版本）。Node 內建的 fetch **完全無視** `HTTP_PROXY` / `HTTPS_PROXY`——curl、
   git、mvn 都吃，它不吃——所以在只能經 proxy 出去的網路上，症狀是一個沒頭沒尾的
@@ -80,6 +110,8 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **目標類別的順序在不同機器上不一樣。** 資料夾裡的類別依檔案系統的 readdir 順序列出（ext4 是雜湊順序），
+  prompt 裡的順序、分批的順序都因此不可重現。現在依路徑排序。
 - **跑到一半「莫名其妙中斷」：實測重現出五個成因，全部修掉。** 以真的 Maven 專案（JUnit 5 +
   Mockito + JaCoCo）加一個行為像模型的假 OpenAI 端點，完整跑 `loop.ts`，把真實環境會遇到的狀況
   逐一注入。五個都能讓 run 在第 N 輪突然停下，而且停下時的訊息都指向錯的地方：

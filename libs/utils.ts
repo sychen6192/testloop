@@ -27,7 +27,9 @@ export function listJavaClasses(target: string, repoRoot: string): string[] {
     }
   };
   walk(target);
-  return out;
+  // readdir order is the file system's (hash order on ext4): sorted, the batches and the order in
+  // the prompt are the same on every machine and every run.
+  return out.sort();
 }
 
 function hasBuildFile(dir: string): boolean {

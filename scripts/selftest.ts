@@ -42,6 +42,9 @@ import {
   renderPreExisting,
   renderConventions,
   renderShrinkFeedback,
+  renderTestStack,
+  frameworkOf,
+  renderSourceEncoding,
 } from "../prompts";
 import { testMetrics, findShrunk, collectTestMetrics } from "../libs/testmetrics";
 import {
@@ -77,6 +80,9 @@ import {
 import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { acquireRepoLock, repoLockFile } from "../libs/lock";
+import { captureTree, chunk, rollbackTree } from "../libs/batch";
+import { captureNonUtf8Sources, escapeNonAscii, isUtf8Name, repairWriterEncoding, sourceEncodingFrom } from "../libs/encoding";
+import { classpathFromSurefireXml, javaReleaseFromLog, measureTestStack, pomFactsFromChain, stackFromClasspath, stackFromPom } from "../libs/teststack";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import { classifyEnvFailures, readSurefireXml, isSurefireSummary, crashedTestClasses, unfinishedTestClasses } from "../gates/build";
 import { spawn, spawnSync } from "node:child_process";
@@ -2837,6 +2843,251 @@ process.stdin.on("end", () => {
 
   check("runnerCannotRunHint：api runner 不叫人去裝 opencode", !runnerCannotRunHint("api").includes("opencode") && runnerCannotRunHint("api").includes("[FAIL]"));
   check("runnerCannotRunHint：opencode runner 維持原本的指引", runnerCannotRunHint("opencode").includes("UT_OPENCODE_BIN"));
+}
+
+// ---------------------------------------------------------------------------
+// 24. Folder targets as batches: splitting, and putting a failed batch's test tree back
+// ---------------------------------------------------------------------------
+console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
+{
+  check("chunk：依序切成最多 n 個一組", JSON.stringify(chunk([1, 2, 3, 4, 5], 2)) === "[[1,2],[3,4],[5]]");
+  check("chunk：size < 1 視為 1", chunk([1, 2], 0).length === 2);
+  check("chunk：空陣列 → 沒有批次", chunk([], 3).length === 0);
+
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-batch-"));
+  const put = (rel: string, content: string | Buffer) => {
+    fs.mkdirSync(path.dirname(path.join(tree, rel)), { recursive: true });
+    fs.writeFileSync(path.join(tree, rel), content);
+  };
+  put("java/com/x/ATest.java", "class ATest {}\n");
+  put("java/com/x/Same.java", "class Same {}\n");
+  put("resources/data.json", "{}\n");
+  const big = Buffer.alloc(9 * 1024 * 1024, 65);
+  put("resources/big.bin", big);
+  const cap = captureTree(tree);
+  // What a batch does: a new test in a new package, an edit, a deletion, an identical rewrite,
+  // and a change to a file too large to have been kept.
+  put("java/com/y/NewTest.java", "class NewTest {}\n");
+  put("java/com/x/ATest.java", "class ATest { /* batch edit */ }\n");
+  fs.rmSync(path.join(tree, "resources/data.json"));
+  put("java/com/x/Same.java", "class Same {}\n");
+  put("resources/big.bin", Buffer.alloc(9 * 1024 * 1024 + 1, 66));
+  const rejected = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-rejected-"));
+  const rb = rollbackTree(cap, rejected, "mod/src/test");
+  check(
+    "rollbackTree：新增的移走、改過的還原、刪掉的放回，內容相同的重寫不算變更",
+    JSON.stringify(rb.created) === JSON.stringify(["java/com/y/NewTest.java"]) &&
+      JSON.stringify(rb.restored) === JSON.stringify(["java/com/x/ATest.java"]) &&
+      JSON.stringify(rb.undeleted) === JSON.stringify(["resources/data.json"]),
+    JSON.stringify(rb),
+  );
+  check(
+    "rollbackTree：樹回到擷取時的內容",
+    fs.readFileSync(path.join(tree, "java/com/x/ATest.java"), "utf8") === "class ATest {}\n" &&
+      fs.readFileSync(path.join(tree, "resources/data.json"), "utf8") === "{}\n" &&
+      !fs.existsSync(path.join(tree, "java/com/y/NewTest.java")),
+  );
+  check("rollbackTree：批次新建、清空後的目錄一併移除", !fs.existsSync(path.join(tree, "java/com/y")));
+  check(
+    "rollbackTree：嘗試的版本依前綴 + 相對路徑保留",
+    fs.readFileSync(path.join(rejected, "mod/src/test/java/com/x/ATest.java"), "utf8").includes("batch edit") &&
+      fs.existsSync(path.join(rejected, "mod/src/test/java/com/y/NewTest.java")),
+  );
+  check(
+    "rollbackTree：過大沒有備份的檔被改了 → 回報無法還原、保留那個版本，不假裝還原了",
+    JSON.stringify(rb.unrestorable) === JSON.stringify(["resources/big.bin"]) &&
+      fs.existsSync(path.join(rejected, "mod/src/test/resources/big.bin")),
+    JSON.stringify(rb.unrestorable),
+  );
+  const again = rollbackTree(captureTree(tree), rejected);
+  check(
+    "rollbackTree：什麼都沒變 → 什麼都不做",
+    again.created.length + again.restored.length + again.undeleted.length + again.unrestorable.length === 0,
+    JSON.stringify(again),
+  );
+  fs.rmSync(tree, { recursive: true, force: true });
+  fs.rmSync(rejected, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 25. The module's test stack, measured (libs/teststack.ts) and rendered into the prompt
+// ---------------------------------------------------------------------------
+console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt");
+{
+  const posix = '<properties>\n<property name="java.version" value="17"/>\n<property name="surefire.test.class.path" value="/r/target/test-classes:/m2/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar:/m2/org/mockito/mockito-core/5.11.0/mockito-core-5.11.0.jar:/m2/org/mockito/mockito-junit-jupiter/5.11.0/mockito-junit-jupiter-5.11.0.jar:/m2/org/assertj/assertj-core/3.25.3/assertj-core-3.25.3.jar"/>\n</properties>';
+  const modern = stackFromClasspath(classpathFromSurefireXml(posix));
+  check(
+    "surefire classpath（POSIX）→ JUnit 5、Mockito 5（MockitoExtension、inline）、AssertJ",
+    modern.source === "surefire" && modern.junit5 === "5.10.2" && modern.junit4 === undefined && modern.mockito === "5.11.0" &&
+      modern.mockitoJupiter === true && modern.mockitoInline === true && modern.assertj === "3.25.3",
+    JSON.stringify(modern),
+  );
+  const win =
+    '<property name="surefire.test.class.path" value="C:\\r\\target\\test-classes;C:\\m2\\junit\\junit\\4.12\\junit-4.12.jar;C:\\m2\\org\\mockito\\mockito-core\\2.23.4\\mockito-core-2.23.4.jar;C:\\m2\\org\\hamcrest\\hamcrest-core\\1.3\\hamcrest-core-1.3.jar"/>';
+  const legacy = stackFromClasspath(classpathFromSurefireXml(win));
+  check(
+    "surefire classpath（Windows，; 分隔、磁碟機代號含 :）→ 只有 JUnit 4、Mockito 2（沒有 MockitoExtension、沒有 inline）",
+    legacy.junit4 === "4.12" && legacy.junit5 === undefined && legacy.mockito === "2.23.4" &&
+      legacy.mockitoJupiter === false && legacy.mockitoInline === false && legacy.assertj === undefined && legacy.hamcrest === "1.3",
+    JSON.stringify(legacy),
+  );
+  check(
+    "surefire classpath：mockito-inline jar → 可 mock static（Mockito 4）",
+    stackFromClasspath(["/m/mockito-core-4.11.0.jar", "/m/mockito-inline-4.11.0.jar"]).mockitoInline === true,
+  );
+  check("surefire classpath：屬性值裡的 XML 跳脫字元照樣解開", classpathFromSurefireXml('<property name="surefire.test.class.path" value="/a&amp;b/junit-4.13.2.jar"/>')[0] === "/a&b/junit-4.13.2.jar");
+  check("surefire classpath：沒有 classpath 屬性 → 空", classpathFromSurefireXml("<testsuite/>").length === 0);
+
+  const bootPom = (v: string) =>
+    `<project><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>${v}</version><relativePath/></parent>` +
+    "<artifactId>svc</artifactId><properties><java.version>1.8</java.version></properties>" +
+    "<dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency></dependencies></project>";
+  const boot21 = stackFromPom(pomFactsFromChain([bootPom("2.1.4.RELEASE")]));
+  check(
+    "pom：Spring Boot 2.1 的 starter-test → 推斷只有 JUnit 4（標明是推斷）",
+    boot21?.source === "pom" && boot21.junit4 !== undefined && boot21.junit5 === undefined && !!boot21.inferred?.some((l) => l.includes("只帶 JUnit 4")),
+    JSON.stringify(boot21),
+  );
+  const boot23 = stackFromPom(pomFactsFromChain([bootPom("2.3.12.RELEASE")]));
+  check("pom：Spring Boot 2.3 → JUnit 5 與 JUnit 4（vintage）都有", boot23?.junit5 !== undefined && boot23?.junit4 !== undefined, JSON.stringify(boot23));
+  const boot27 = stackFromPom(pomFactsFromChain([bootPom("2.7.18")]));
+  check("pom：Spring Boot 2.7 → 只有 JUnit 5、有 mockito-junit-jupiter", boot27?.junit5 !== undefined && boot27?.junit4 === undefined && boot27?.mockitoJupiter === true, JSON.stringify(boot27));
+  const reactorParent =
+    "<project><artifactId>parent</artifactId><properties><junit.version>5.9.2</junit.version><maven.compiler.release>11</maven.compiler.release></properties>" +
+    "<dependencyManagement><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version></dependency></dependencies></dependencyManagement></project>";
+  const child =
+    "<project><parent><artifactId>parent</artifactId></parent><artifactId>web</artifactId>" +
+    "<dependencies><dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>${junit.version}</version></dependency></dependencies>" +
+    "<build><plugins><plugin><artifactId>maven-surefire-plugin</artifactId><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies></plugin></plugins></build></project>";
+  const reactorFacts = pomFactsFromChain([child, reactorParent]);
+  const reactor = stackFromPom(reactorFacts);
+  check(
+    "pom：父 pom 的屬性解開 ${junit.version}；dependencyManagement 與 plugin 自己的相依不算",
+    reactor?.junit5 === "5.9.2" && reactor?.junit4 === undefined && reactorFacts.artifactId === "web",
+    JSON.stringify(reactor),
+  );
+
+  const multiLog = [
+    "[INFO] --- maven-compiler-plugin:3.11.0:testCompile (default-testCompile) @ common ---",
+    "[INFO] Compiling 4 source files with javac [debug target 1.8] to target/test-classes",
+    "[INFO] --- compiler:3.13.0:compile (default-compile) @ web ---",
+    "[INFO] Compiling 9 source files with javac [debug release 17] to target/classes",
+    "[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ web ---",
+    "[INFO] Compiling 3 source files with javac [debug deprecation release 17] to target/test-classes",
+  ].join("\n");
+  check("編譯 log：語言層級歸屬到目標模組（不是上游模組的 1.8）", javaReleaseFromLog(multiLog, "web") === "17", String(javaReleaseFromLog(multiLog, "web")));
+  check("編譯 log：什麼都沒編（up to date）→ 量不到", javaReleaseFromLog("[INFO] Nothing to compile - all classes are up to date", "web") === undefined);
+
+  const j4 = renderTestStack(legacy);
+  check(
+    "prompt：只有 JUnit 4 → 明說不能用 JUnit 5 的寫法、用 MockitoJUnitRunner、沒有 AssertJ",
+    j4.includes("只有 JUnit 4") && j4.includes("@ExtendWith") && j4.includes("MockitoJUnitRunner") && j4.includes("沒有 AssertJ") && frameworkOf(legacy) === "JUnit 4",
+    j4,
+  );
+  check("prompt：JUnit 4.12 沒有 assertThrows，4.13 才有", j4.includes("沒有 assertThrows") && renderTestStack({ ...legacy, junit4: "4.13.2" }).includes("Assert.assertThrows"));
+  check("prompt：Mockito 2 沒有 mockStatic（不是「編得過、執行時失敗」）", j4.includes("沒有 mockStatic"), j4);
+  const m5 = renderTestStack(modern);
+  check("prompt：Mockito 5 → MockitoExtension（提醒 strict stubs）、可 mock static", m5.includes("MockitoExtension") && m5.includes("strict stubs") && m5.includes("可以 mock static"), m5);
+  const noJupiter = renderTestStack({ source: "surefire", junit5: "5.9.0", mockito: "3.3.3", mockitoJupiter: false, mockitoInline: false });
+  check("prompt：沒有 mockito-junit-jupiter 的 Mockito 3.3 → initMocks（openMocks 是 3.4 才有）", noJupiter.includes("initMocks(this)") && !noJupiter.includes("openMocks"), noJupiter);
+  const pomOnly = renderTestStack({ source: "pom", junit5: "5.9.2" });
+  check("prompt：來自 pom 的清單不宣稱「沒有 AssertJ / Mockito」（多數相依是間接帶進來的）", !pomOnly.includes("沒有 AssertJ") && !pomOnly.includes("沒有 Mockito") && pomOnly.includes("沒列出的不代表沒有"), pomOnly);
+  check("prompt：Java 8 → 列出不能用的語法與 API", renderTestStack({ source: "pom", javaRelease: "8" }).includes("var") && renderTestStack({ source: "pom", javaRelease: "8" }).includes("List.of"));
+  check("prompt：Java 21 → 不列限制", !renderTestStack({ source: "pom", javaRelease: "21" }).includes("不能用"));
+  check("prompt：量不到 → 不加任何段落、任務行維持 JUnit 5", renderTestStack(undefined) === "" && frameworkOf(undefined) === "JUnit 5");
+
+  // measureTestStack on disk: a surefire report wins over the pom; the pom is the fallback.
+  const mod = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-stack-"));
+  fs.writeFileSync(path.join(mod, "pom.xml"), bootPom("2.1.4.RELEASE"));
+  const info = { moduleRoot: mod, moduleRel: "", multiModule: false };
+  const fromPom = measureTestStack(info, mod);
+  check("measureTestStack：沒有 surefire 報告 → 讀 pom（含 java.version 1.8 → 8）", fromPom?.source === "pom" && fromPom.javaRelease === "8", JSON.stringify(fromPom));
+  fs.mkdirSync(path.join(mod, "target", "surefire-reports"), { recursive: true });
+  fs.writeFileSync(path.join(mod, "target", "surefire-reports", "TEST-a.AppTest.xml"), `<testsuite>${posix}</testsuite>`);
+  const fromRun = measureTestStack(info, mod);
+  check("measureTestStack：有 surefire 報告 → 以實際 classpath 為準", fromRun?.source === "surefire" && fromRun.junit5 === "5.10.2", JSON.stringify(fromRun));
+  fs.mkdirSync(path.join(mod, "src", "test", "resources", "mockito-extensions"), { recursive: true });
+  fs.writeFileSync(path.join(mod, "src", "test", "resources", "mockito-extensions", "org.mockito.plugins.MockMaker"), "mock-maker-inline\n");
+  fs.writeFileSync(path.join(mod, "target", "surefire-reports", "TEST-a.AppTest.xml"), `<testsuite>${win}</testsuite>`);
+  check("measureTestStack：mock-maker-inline 開關 → 可 mock static", measureTestStack(info, mod)?.mockitoInline === true);
+  fs.rmSync(mod, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 26. Non-UTF-8 source encodings (libs/encoding.ts)
+// ---------------------------------------------------------------------------
+console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
+{
+  check("sourceEncodingFrom：compiler plugin 的 <encoding> 優先", sourceEncodingFrom({ compilerEncoding: "MS950", sourceEncoding: "UTF-8" }, "")?.name === "MS950");
+  check("sourceEncodingFrom：project.build.sourceEncoding", sourceEncodingFrom({ sourceEncoding: "Big5" }, "")?.source === "pom");
+  check(
+    "sourceEncodingFrom：pom 沒設 → 讀 resources plugin 2.x 的平台編碼警告",
+    sourceEncodingFrom({}, "[WARNING] Using platform encoding (MS950 actually) to copy filtered resources, i.e. build is platform dependent!")?.name === "MS950",
+  );
+  check(
+    "sourceEncodingFrom：pom 沒設 → 讀 compiler / resources 3.x 的警告",
+    JSON.stringify(sourceEncodingFrom({}, "[WARNING] File encoding has not been set, using platform encoding Cp950, i.e. build is platform dependent!")) ===
+      JSON.stringify({ name: "Cp950", source: "platform" }),
+  );
+  check("sourceEncodingFrom：解不開的 ${...} 不算設定，退回 log", sourceEncodingFrom({ sourceEncoding: "${enc}" }, "")  === undefined);
+  check("isUtf8Name：UTF-8 / utf8 都算", isUtf8Name("UTF-8") && isUtf8Name("utf8") && !isUtf8Name("MS950"));
+  check(
+    "escapeNonAscii：中文 → \\uXXXX，ASCII 不變，BOM 拿掉，emoji 成兩個 surrogate",
+    escapeNonAscii("\uFEFF// 測試 ok 😀") === "// \\u6e2c\\u8a66 ok \\ud83d\\ude00",
+    escapeNonAscii("\uFEFF// 測試 ok 😀"),
+  );
+
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-enc-"));
+  const f = (rel: string) => path.join(tree, rel);
+  fs.mkdirSync(f("com/x"), { recursive: true });
+  // "// 中文" in Big5/MS950: 中 = A4 A4, 文 = A4 E5 — not valid UTF-8.
+  const big5 = Buffer.from([0x2f, 0x2f, 0x20, 0xa4, 0xa4, 0xa4, 0xe5, 0x0a]);
+  for (const name of ["Overwritten", "Rewritten", "Deleted", "Untouched"]) fs.writeFileSync(f(`com/x/${name}Test.java`), big5);
+  fs.writeFileSync(f("com/x/AsciiTest.java"), "class AsciiTest {}\n");
+  const originals = captureNonUtf8Sources(tree);
+  check("captureNonUtf8Sources：只收非 UTF-8 的 .java", originals.size === 4 && !originals.has(f("com/x/AsciiTest.java")), String(originals.size));
+  // What a UTF-8 edit tool leaves behind, and what a writer writes itself.
+  fs.writeFileSync(f("com/x/OverwrittenTest.java"), Buffer.from(big5).toString("utf8") + "// edited\n");
+  fs.writeFileSync(f("com/x/RewrittenTest.java"), "// \u0124 accidental but valid UTF-8\n");
+  fs.rmSync(f("com/x/DeletedTest.java"));
+  fs.writeFileSync(f("com/x/NewTest.java"), "class NewTest { String s = \"金額為負數\"; }\n");
+  fs.writeFileSync(f("com/x/NewAsciiTest.java"), "class NewAsciiTest {}\n");
+  const changedFiles = ["OverwrittenTest", "RewrittenTest", "DeletedTest", "NewTest", "NewAsciiTest"].map((n) => f(`com/x/${n}.java`));
+  const fix = repairWriterEncoding(changedFiles, originals);
+  check(
+    "repairWriterEncoding：改過（U+FFFD、或意外成了合法 UTF-8）與刪掉的原編碼檔一律照原 bytes 放回",
+    JSON.stringify(fix.restored.map((p) => path.basename(p)).sort()) === JSON.stringify(["DeletedTest.java", "OverwrittenTest.java", "RewrittenTest.java"]) &&
+      ["Overwritten", "Rewritten", "Deleted"].every((n) => fs.readFileSync(f(`com/x/${n}Test.java`)).equals(big5)),
+    JSON.stringify(fix),
+  );
+  check(
+    "repairWriterEncoding：writer 自己寫的中文 → \\uXXXX（值不變、全 ASCII），純 ASCII 的新檔不動",
+    JSON.stringify(fix.escaped.map((p) => path.basename(p))) === JSON.stringify(["NewTest.java"]) &&
+      fs.readFileSync(f("com/x/NewTest.java"), "utf8") === 'class NewTest { String s = "\\u91d1\\u984d\\u70ba\\u8ca0\\u6578"; }\n' &&
+      fs.readFileSync(f("com/x/NewAsciiTest.java"), "utf8") === "class NewAsciiTest {}\n",
+    fs.readFileSync(f("com/x/NewTest.java"), "utf8"),
+  );
+  check("repairWriterEncoding：沒被動到的原編碼檔不在任何清單", fs.readFileSync(f("com/x/UntouchedTest.java")).equals(big5));
+  fs.rmSync(tree, { recursive: true, force: true });
+
+  const ms950 = { name: "MS950", source: "platform" as const };
+  const promptPart = renderSourceEncoding(ms950, ["src/test/java/com/x/FeeTest.java"]);
+  check(
+    "prompt：非 UTF-8 → 只用 ASCII、點名不能改的檔與替代做法",
+    promptPart.includes("MS950") && promptPart.includes("只用 ASCII") && promptPart.includes("FeeTest.java") && promptPart.includes("AdditionalTest"),
+    promptPart,
+  );
+  check("prompt：UTF-8 或量不到 → 什麼都不加", renderSourceEncoding({ name: "UTF-8", source: "pom" }) === "" && renderSourceEncoding(undefined) === "");
+  const existingLocked = renderExistingTests(
+    [{ cls: "src/main/java/com/x/Fee.java", tests: ["src/test/java/com/x/FeeTest.java"] }],
+    ["src/test/java/com/x/FeeTest.java"],
+    "MS950",
+  );
+  check(
+    "prompt：既有測試檔被鎖住時，不再同時要求「必須修改它、嚴禁另建新檔」",
+    existingLocked.includes("不能修改") && existingLocked.includes("FeeAdditionalTest.java") && existingLocked.includes("除外"),
+    existingLocked,
+  );
 }
 
 // ---------------------------------------------------------------------------

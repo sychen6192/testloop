@@ -60,8 +60,9 @@ export interface MvnStep {
   surefire?: Array<{ cls: string; body: string; module?: string }>;
   /** Surefire XML reports written as TEST-<suite>.xml — the source the gate prefers. */
   surefireXml?: Array<{ suite: string; body: string; module?: string }>;
-  /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. */
-  jacoco?: JacocoSpec;
+  /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. An array
+   *  writes one sourcefile per entry — several target classes in one report. */
+  jacoco?: JacocoSpec | JacocoSpec[];
   /** Which module's target/ the jacoco report lands in; "" is the root. */
   jacocoModule?: string;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
@@ -105,6 +106,8 @@ export interface Scenario {
   env?: Record<string, string>;
   /** Extra fixture files, repo-relative. */
   extraFiles?: Record<string, string>;
+  /** Files written as raw bytes, after extraFiles — a Big5 source is not a JS string. */
+  extraBytes?: Record<string, number[]>;
   /** Leave the pre-existing test out (nothing for the shrink guard to protect). */
   omitExisting?: boolean;
   /** "multi" builds a reactor with common/core/web and targets web. Default "single". */
@@ -298,14 +301,17 @@ for (const r of step.surefireXml || []) {
 }
 
 if (step.jacoco) {
-  const j = step.jacoco;
-  const lines = (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>').join("\\n");
-  const xml = '<?xml version="1.0" encoding="UTF-8"?>\\n' +
-    '<report name="fixture">\\n<package name="' + j.pkg + '">\\n' +
-    '<sourcefile name="' + j.file + '">\\n' + lines + '\\n' +
+  const specs = [].concat(step.jacoco);
+  const sourcefile = (j) =>
+    '<sourcefile name="' + j.file + '">\\n' +
+    (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>').join("\\n") + '\\n' +
     '<counter type="LINE" missed="' + j.line[0] + '" covered="' + j.line[1] + '"/>\\n' +
     '<counter type="BRANCH" missed="' + j.branch[0] + '" covered="' + j.branch[1] + '"/>\\n' +
-    '</sourcefile>\\n</package>\\n</report>\\n';
+    '</sourcefile>\\n';
+  const pkgs = [...new Set(specs.map((j) => j.pkg))];
+  const xml = '<?xml version="1.0" encoding="UTF-8"?>\\n<report name="fixture">\\n' +
+    pkgs.map((p) => '<package name="' + p + '">\\n' + specs.filter((j) => j.pkg === p).map(sourcefile).join("") + '</package>\\n').join("") +
+    '</report>\\n';
   const out = path.join(root, step.jacocoModule || ".", "target", "site", "jacoco", "jacoco.xml");
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, xml);
@@ -598,6 +604,10 @@ export function buildFixture(root: string, sc: Scenario): void {
     if (!sc.omitExisting) write(root, `${TEST_DIR}/ExistingTest.java`, EXISTING_TEST);
   }
   for (const [rel, content] of Object.entries(sc.extraFiles ?? {})) write(root, rel, content);
+  for (const [rel, bytes] of Object.entries(sc.extraBytes ?? {})) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), Buffer.from(bytes));
+  }
 
   // .itest is a dot-directory, so the writer-scope snapshot ignores it — the plan, the call
   // counter and the argv log all change during a run without looking like a scope violation.

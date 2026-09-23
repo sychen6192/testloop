@@ -13,7 +13,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, gitAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
+import { ApiTurn, buildFixture, envKnobsInSource, EXISTING_TEST, gitAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
 import { SCENARIOS } from "./itest-scenarios";
 import { planSpawn } from "../libs/shell";
 
@@ -59,6 +59,7 @@ const BASE_ENV: Record<string, string> = {
   UT_MAX_FAILURE_CASES: "10",
   UT_MAX_FEEDBACK_CHARS: "12000",
   UT_MAX_ITER: "5",
+  UT_BATCH_SIZE: "1",
   UT_MIN_BRANCH_COV: "70",
   UT_MIN_LINE_COV: "80",
   UT_MODEL: "",
@@ -968,6 +969,99 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     const dtest = second.find((a) => a.startsWith("-Dtest=")) ?? "";
     check("第 2 輪的 -Dtest 仍含 writer 第 1 輪寫的 CalcBehaviourTest", dtest.includes("CalcBehaviourTest"), dtest);
     check("最終成功", c.result.success === true, String(c.result.stopReason));
+  },
+
+  "loop-teststack-into-prompt": (c) => {
+    check("最終成功", c.result.success === true, JSON.stringify(c.result.stopReason));
+    const p1 = c.runRead("iter-1/prompt.md");
+    check("第 1 輪任務行寫 JUnit 4（不是寫死的 JUnit 5）", p1.includes("撰寫單元測試（JUnit 4）"), p1.slice(0, 200));
+    check("第 1 輪：pom 推斷只有 JUnit 4，並標明是推斷", p1.includes("只有 JUnit 4") && p1.includes("由版本推斷"), p1.slice(0, 1500));
+    check("第 1 輪：Java 8 的限制", p1.includes("Java 語言層級：8"));
+    const p2 = c.runRead("iter-2/prompt.md");
+    check("第 2 輪改用實際 classpath（JUnit 4.13.2 有 assertThrows、Mockito 2 沒有 mockStatic）", p2.includes("測試 classpath 上實際有的東西") && p2.includes("4.13.2") && p2.includes("沒有 mockStatic"), p2.slice(0, 2000));
+    check("量測結果落地在 project-facts.json", c.runRead("project-facts.json").includes("junit4"));
+  },
+
+  "loop-encoding-platform-ms950": (c) => {
+    check("最終成功", c.result.success === true && c.code === 0, `${String(c.result.stopReason)} code=${c.code}`);
+    check("量到 MS950（來自 Maven 的平台編碼警告）", c.runRead("project-facts.json").includes("MS950"), c.runRead("project-facts.json"));
+    const p1 = c.runRead("iter-1/prompt.md");
+    check("prompt 告知 MS950、只用 ASCII，並點名不能改的 ExistingTest.java", p1.includes("MS950") && p1.includes("只用 ASCII") && p1.includes("不能修改") && p1.includes("ExistingTest.java"), p1.slice(0, 2500));
+    check("第 1 輪：改壞的 MS950 檔已還原、該輪判 FAIL 不建置", c.runRead("iter-1/encoding-restored.txt").includes("ExistingTest.java"));
+    const raw = fs.readFileSync(path.join(c.root, "src/test/java/com/x/ExistingTest.java"));
+    check("ExistingTest.java 仍是原本的 MS950 bytes", raw.includes(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5])) && !raw.includes(Buffer.from("補一個測試")), raw.toString("latin1").slice(-120));
+    const calc = fs.readFileSync(path.join(c.root, "src/test/java/com/x/CalcTest.java"));
+    check("CalcTest.java 全是 ASCII，中文成了 \\uXXXX", [...calc].every((b) => b < 0x80) && calc.toString().includes("\\u6e96\\u5099"), calc.toString().slice(0, 120));
+    check("第 2 輪的 prompt 帶著還原報告", c.runRead("iter-2/prompt.md").includes("還原成原本的內容"));
+    check("建置 2 次：預檢 + 第 2 輪（第 1 輪沒進建置）", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-batches-isolate-failure": (c) => {
+    check("exit code 2（有一批沒過）", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("stopReason = some-batches-failed", c.result.stopReason === "some-batches-failed", String(c.result.stopReason));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "兩批都跑了：第 1 批失敗（writer-no-op）、第 2 批通過",
+      b.length === 2 && b[0].success === false && b[0].stopReason === "writer-no-op" && b[1].success === true,
+      JSON.stringify(b.map((x) => [x.stopReason, x.success])),
+    );
+    check("失敗那批新增的 CalcTest.java 已移出 src/test", !c.exists("src/test/java/com/x/CalcTest.java"));
+    check("失敗那批改過的 ExistingTest.java 還原成原本的內容", c.read("src/test/java/com/x/ExistingTest.java") === EXISTING_TEST);
+    check(
+      "嘗試的版本依 repo 相對路徑保留在 rejected/",
+      c.runExists("batch-1-Calc/rejected/src/test/java/com/x/CalcTest.java") &&
+        c.runRead("batch-1-Calc/rejected/src/test/java/com/x/ExistingTest.java").includes("touched an existing test"),
+    );
+    check("rollback.md 列出撤回的檔案", c.runRead("batch-1-Calc/rollback.md").includes("CalcTest.java"), c.runRead("batch-1-Calc/rollback.md"));
+    check("第 2 批的測試留在 src/test", c.exists("src/test/java/com/x/GreeterTest.java"));
+    const p2 = c.runRead("batch-2-Greeter/iter-1/prompt.md");
+    check("每批各自的 prompt 只含自己的類別", p2.includes("Greeter.java") && !p2.includes("Calc.java"), p2.slice(0, 600));
+    check("建置 3 次：預檢 + 第 1 批 + 第 2 批", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    check("逐批進度落地在 batches.json", c.runRead("batches.json").includes("Greeter.java"));
+  },
+
+  "loop-batches-all-pass": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("summary 判定成功", c.result.success === true && c.result.stopReason === "gates-passed", String(c.result.stopReason));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("兩批都通過、都沒有撤回", b.length === 2 && b.every((x) => x.success === true && !x.rolledBack), JSON.stringify(b));
+    check("兩個測試檔都在", c.exists("src/test/java/com/x/CalcTest.java") && c.exists("src/test/java/com/x/GreeterTest.java"));
+    check("沒有 rejected 目錄", !c.runExists("batch-1-Calc/rejected") && !c.runExists("batch-2-Greeter/rejected"));
+    const params = JSON.parse(c.runRead("params.json") || "{}");
+    check("params.json 記錄 batchSize", params.batchSize === 1, String(params.batchSize));
+  },
+
+  "loop-batch-size-covers-all": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("單一一批：summary 沒有 batches、artifacts 在 run 目錄最上層", c.result.batches === undefined && c.runExists("iter-1/prompt.md"));
+    const p = c.runRead("iter-1/prompt.md");
+    check("同一個 prompt 含兩個類別", p.includes("Calc.java") && p.includes("Greeter.java"));
+  },
+
+  "loop-batches-repeat-no-op-stops": (c) => {
+    check("停在第 2 批：stopReason = stopped:writer-no-op", c.result.stopReason === "stopped:writer-no-op", String(c.result.stopReason));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("只跑了兩批", b.length === 2, String(b.length));
+    const notRun = JSON.stringify(c.result.notRun ?? []);
+    check("第 3 個類別列在 notRun", notRun.includes("Zeta.java"), notRun);
+    check("說明為什麼停", c.stdout.includes("連續兩批"), c.stdout.slice(-800));
+    check("exit code 2", c.code === 2, `code=${c.code}`);
+  },
+
+  "loop-batches-spawn-error-stops": (c) => {
+    check("stopReason = stopped:runner-spawn-error", c.result.stopReason === "stopped:runner-spawn-error", String(c.result.stopReason));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check("只跑了第 1 批", b.length === 1, String(b.length));
+    check("Greeter 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Greeter.java"));
+    check("只有預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-batches-scope-violation-stops": (c) => {
+    check("stopReason = stopped:scope-violation", c.result.stopReason === "stopped:scope-violation", String(c.result.stopReason));
+    check("不撤回：writer 寫的測試檔原樣留著", c.exists("src/test/java/com/x/CalcTest.java"));
+    check("production 的變更留在磁碟交人檢視", c.read("src/main/java/com/x/Calc.java").includes("a + b + 0"));
+    check("後面的批次不跑", JSON.stringify(c.result.notRun ?? []).includes("Greeter.java"));
+    check("只有預檢那一次建置", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
   },
 
   "loop-repair-then-generate": (c) => {

@@ -7,6 +7,8 @@ import { SCORE_THRESHOLDS } from "./config";
 import { expectedTestPath } from "./libs/utils";
 import { TestConventions } from "./libs/conventions";
 import { ShrinkViolation } from "./libs/testmetrics";
+import { TestStack } from "./libs/teststack";
+import { isUtf8Name, SourceEncoding } from "./libs/encoding";
 
 // Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
 export const DIMENSION_ONELINERS = `你產出的測試之後會依以下六個維度被審查（評分細則由審查方持有）：
@@ -58,16 +60,165 @@ ${parts.join("\n")}
 `;
 }
 
-export function renderExistingTests(existing: ExistingTests[]): string {
+// ─── The measured test stack ─────────────────────────────────────────────────
+
+const major = (v: string | undefined) => Number(/^(\d+)/.exec(v ?? "")?.[1] ?? NaN);
+const minor = (v: string | undefined) => Number(/^\d+\.(\d+)/.exec(v ?? "")?.[1] ?? NaN);
+const ver = (v: string | undefined) => (v ? ` ${v}` : "");
+
+/** The framework new tests are written in, as the task line names it. */
+export function frameworkOf(stack: TestStack | undefined): string {
+  if (stack?.junit5 !== undefined) return "JUnit 5";
+  if (stack?.junit4 !== undefined) return "JUnit 4";
+  if (stack?.testng !== undefined) return "TestNG";
+  return "JUnit 5";
+}
+
+// What the language level rules out, newest first; only the ones below the module's level apply.
+const LANGUAGE_FEATURES: Array<[number, string]> = [
+  [17, "sealed 類別"],
+  [16, "record、instanceof pattern matching"],
+  [15, "text block（\"\"\"）"],
+  [14, "switch expression"],
+  [10, "var"],
+  [9, "List.of / Set.of / Map.of 等 Java 9+ API"],
+];
+
+/**
+ * Measured test stack -> prompt text. From a surefire classpath every statement is a fact,
+ * absences included; from the pom only what is declared (or what the Spring Boot line implies)
+ * is said, because most of a test stack arrives transitively and an undeclared library may well
+ * be there.
+ */
+export function renderTestStack(stack: TestStack | undefined): string {
+  if (!stack) return "";
+  const exact = stack.source === "surefire";
+  const lines: string[] = [];
+
+  const has5 = stack.junit5 !== undefined;
+  const has4 = stack.junit4 !== undefined;
+  if (has5) {
+    lines.push(
+      `測試框架：JUnit 5${ver(stack.junit5)}` +
+        (has4 ? `，另有 JUnit 4${ver(stack.junit4)}（vintage）——新測試一律用 JUnit 5` : ""),
+    );
+  } else if (has4 && (exact || stack.inferred?.some((l) => l.includes("只帶 JUnit 4")))) {
+    const assertThrows = !stack.junit4 || major(stack.junit4) > 4 || minor(stack.junit4) >= 13;
+    lines.push(
+      `測試框架：**只有 JUnit 4**${ver(stack.junit4)}，沒有 JUnit 5。用 org.junit.Test、org.junit.Before、org.junit.Assert；` +
+        (assertThrows
+          ? "例外用 Assert.assertThrows（JUnit 4.13+）。"
+          : "例外用 @Test(expected = …)，或 try { …; fail(); } catch (預期的例外 e) { 驗證訊息 }——這個版本沒有 assertThrows。") +
+        "標準裡 JUnit 5 的寫法（org.junit.jupiter.*、@ExtendWith、@BeforeEach、@DisplayName、@Nested、@ParameterizedTest）一律不能用",
+    );
+  } else if (has4) {
+    lines.push(`pom 宣告了 JUnit 4${ver(stack.junit4)}`);
+  } else if (stack.testng !== undefined) {
+    lines.push(
+      `測試框架：TestNG${ver(stack.testng)}${exact ? "，沒有 JUnit" : ""}。用 org.testng.annotations.Test、@BeforeMethod、org.testng.Assert`,
+    );
+  }
+
+  if (stack.mockito !== undefined) {
+    const parts = [`Mockito${ver(stack.mockito)}`];
+    if (major(stack.mockito) === 1) {
+      parts.push("1.x：參數匹配器在 org.mockito.Matchers（沒有 ArgumentMatchers），runner 是 org.mockito.runners.MockitoJUnitRunner");
+    }
+    if (has5 && stack.mockitoJupiter) {
+      parts.push("可用 @ExtendWith(MockitoExtension.class)——它預設 strict stubs，沒被用到的 stub 會讓測試失敗（UnnecessaryStubbingException）");
+    } else if (has5 && stack.mockitoJupiter === false) {
+      const openMocks = !stack.mockito || major(stack.mockito) > 3 || (major(stack.mockito) === 3 && minor(stack.mockito) >= 4);
+      parts.push(
+        `沒有 mockito-junit-jupiter：不能用 @ExtendWith(MockitoExtension.class)，改在 @BeforeEach 呼叫 MockitoAnnotations.${openMocks ? "openMocks(this)" : "initMocks(this)"}`,
+      );
+    } else if (!has5 && has4 && major(stack.mockito) !== 1) {
+      parts.push("搭配 @RunWith(MockitoJUnitRunner.class)");
+    }
+    if (stack.mockitoInline) {
+      parts.push("可以 mock static 方法與 final 類別（inline mock maker）");
+    } else if (exact) {
+      const hasMockStatic = !stack.mockito || major(stack.mockito) > 3 || (major(stack.mockito) === 3 && minor(stack.mockito) >= 4);
+      parts.push(
+        "**不能** mock static 方法與 final 類別/方法（" +
+          (hasMockStatic ? "沒有 inline mock maker——mockStatic 編得過、執行時失敗" : "這個版本沒有 mockStatic，也沒有 inline mock maker") +
+          "）；遇到時改從呼叫端可注入的相依替換，或測試它的可觀察結果",
+      );
+    }
+    lines.push(parts.join("；"));
+  } else if (exact) {
+    lines.push("沒有 Mockito：不能用 @Mock / mock()，需要替身時手寫簡單的 stub 或 fake 類別");
+  }
+
+  if (stack.assertj !== undefined) {
+    lines.push(`斷言：AssertJ${ver(stack.assertj)}${stack.hamcrest !== undefined ? `、Hamcrest${ver(stack.hamcrest)}` : ""}`);
+  } else if (exact) {
+    lines.push(
+      `斷言：**沒有 AssertJ**，用 ${has5 ? "org.junit.jupiter.api.Assertions" : has4 ? "org.junit.Assert" : "測試框架內建的 assertions"}` +
+        (stack.hamcrest !== undefined ? `（或 Hamcrest${ver(stack.hamcrest)}）` : ""),
+    );
+  }
+
+  const release = Number(stack.javaRelease);
+  if (stack.javaRelease && Number.isFinite(release)) {
+    const unavailable = LANGUAGE_FEATURES.filter(([since]) => release < since).map(([, what]) => what);
+    lines.push(
+      `Java 語言層級：${stack.javaRelease}` + (unavailable.length ? `——不能用 ${unavailable.reverse().join("、")}` : ""),
+    );
+  }
+
+  if (!lines.length) return "";
+  const header = exact
+    ? "本模組測試 classpath 上實際有的東西（pipeline 從上一次跑過的測試量得，以此為準；標準裡的預設寫法與此衝突時，以這裡為準）："
+    : "本模組 pom 宣告的測試相依（pipeline 讀 pom 得出。這個模組還沒有跑過測試，量不到實際 classpath——" +
+      "沒列出的不代表沒有，許多相依是間接帶進來的，請以 pom 與既有測試為準）：";
+  const inferred = stack.inferred?.length ? `\n（由版本推斷：${stack.inferred.join("；")}）` : "";
+  return `${header}\n${lines.map((l) => `- ${l}`).join("\n")}${inferred}\n`;
+}
+
+// `locked`: existing test files the writer cannot edit without destroying them (non-UTF-8 files
+// in a non-UTF-8 module — see renderSourceEncoding). For those, and only those, a new test class
+// beside them is the way to add tests.
+export function renderExistingTests(existing: ExistingTests[], locked: string[] = [], encoding = ""): string {
   const withTests = existing.filter((e) => e.tests.length > 0);
   if (withTests.length === 0) return "";
+  const isLocked = new Set(locked);
+  const show = (t: string, cls: string) =>
+    isLocked.has(t)
+      ? `${t}（${encoding} 編碼、含非 ASCII 字元——不能修改；請在同一個 package 另建 ` +
+        `${path.basename(cls, ".java")}AdditionalTest.java 補測試）`
+      : t;
   const rows = withTests
-    .map((e) => `- ${e.cls}\n  已存在：${e.tests.join("、")}`)
+    .map((e) => `- ${e.cls}\n  已存在：${e.tests.map((t) => show(t, e.cls)).join("、")}`)
     .join("\n");
+  const anyLocked = withTests.some((e) => e.tests.some((t) => isLocked.has(t)));
   return `以下目標類別「已經有」測試檔，必須直接開啟並修改/補強這些既有檔案：
 ${rows}
-嚴禁另建新檔（例如 <ClassName>UnitTest.java）來繞過既有測試——那會產生重複測試。
+嚴禁另建新檔（例如 <ClassName>UnitTest.java）來繞過既有測試——那會產生重複測試。${anyLocked ? "（上面標明不能修改的檔案除外。）" : ""}
 `;
+}
+
+/**
+ * A module compiled from a non-UTF-8 encoding, told to the writer. The loop already escapes what
+ * the writer leaves outside ASCII and restores the files it cannot edit (libs/encoding.ts); this
+ * is so the writer does not spend its rounds meeting either.
+ */
+export function renderSourceEncoding(enc: SourceEncoding | undefined, locked: string[] = []): string {
+  if (!enc || isUtf8Name(enc.name)) return "";
+  const why = enc.source === "pom" ? "pom 設定的編碼" : "pom 沒有設定，Maven 用了平台編碼";
+  const lines = [
+    `本模組的 Java 原始碼以 **${enc.name}** 編譯（${why}），不是 UTF-8：`,
+    "- 你寫的測試碼只用 ASCII：註解、@DisplayName 一律用英文；字串常值需要中文等非 ASCII 字元時寫成 \\uXXXX" +
+      "（pipeline 會把殘留的非 ASCII 字元自動轉成 \\uXXXX 讓它編得過，但英文註解比一串跳脫字元好讀）",
+  ];
+  if (locked.length) {
+    lines.push(
+      `- 以下既有測試檔以 ${enc.name} 存、含非 ASCII 字元。你的工具以 UTF-8 讀寫，修改它們會破壞裡面的字元（字串常值也是），` +
+        "所以**不能修改**——pipeline 會還原並判該輪失敗。要補測試時，在同一個 package 另建新的測試類別（例如 <ClassName>AdditionalTest.java）：",
+      ...locked.slice(0, 20).map((f) => `  - ${f}`),
+      ...(locked.length > 20 ? [`  …另 ${locked.length - 20} 個`] : []),
+    );
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 export function renderPreExisting(pre: PreExistingFailures | undefined): string {
@@ -92,6 +243,10 @@ export interface GeneratePromptInput {
   mod: ModuleInfo;
   existingTests: ExistingTests[];
   conventions?: TestConventions;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
+  // Repo-relative test files the writer must not edit (see renderSourceEncoding).
+  lockedFiles?: string[];
 }
 
 export function testRootRel(mod: ModuleInfo): string {
@@ -109,7 +264,7 @@ export function buildGeneratePrompt(input: GeneratePromptInput): string {
   const buildFile = input.mod.moduleRel
     ? `${input.mod.moduleRel}/pom.xml（或 build.gradle）`
     : "pom.xml（或 build.gradle）";
-  return `你的任務：為以下 Java 類別撰寫單元測試（JUnit 5）。
+  return `你的任務：為以下 Java 類別撰寫單元測試（${frameworkOf(input.testStack)}）。
 
 目標模組：${input.mod.multiModule ? input.mod.moduleRel : "（單一模組專案）"}
 測試檔一律放在：${root}/<對應 package>/<ClassName>Test.java
@@ -118,7 +273,7 @@ export function buildGeneratePrompt(input: GeneratePromptInput): string {
 目標類別：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
-${renderExistingTests(input.existingTests)}${renderConventions(input.conventions)}
+${renderExistingTests(input.existingTests, input.lockedFiles, input.sourceEncoding?.name)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
 必須嚴格遵守以下品質標準：
 <standards>
 ${input.standards}
@@ -144,6 +299,9 @@ export interface FixPromptInput {
   targetClasses: string[];
   preExisting?: PreExistingFailures;
   conventions?: TestConventions;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
+  lockedFiles?: string[];
 }
 
 export function buildFixPrompt(input: FixPromptInput): string {
@@ -154,7 +312,7 @@ export function buildFixPrompt(input: FixPromptInput): string {
 ${input.gateReport}
 </gate_report>
 
-${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}
+${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
 本次任務的目標類別（測試範圍以此為準）：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
@@ -181,6 +339,9 @@ export interface RepairPromptInput {
   standards: string;
   mod: ModuleInfo;
   round: number;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
+  lockedFiles?: string[];
 }
 
 // The repair loop's writer prompt. Its definition of "fixed" is the one the guards enforce:
@@ -197,6 +358,7 @@ ${input.brokenFiles.map((f) => `- ${f}`).join("\n")}
 ${input.report}
 </build_report>
 
+${renderTestStack(input.testStack)}${renderSourceEncoding(input.sourceEncoding, input.lockedFiles)}
 修復的定義：讓測試**正確地通過**，不是讓它消失。以下由 pipeline 以確定性方式檢查，違反即判 FAIL 或中止：
 - 只能修改 ${root} 下的測試檔與 ${testResourcesRel(input.mod)} 下的測試資源；不得修改 production code、pom.xml / build.gradle 或其他任何檔案
 - 既有測試檔的 @Test 方法數與斷言數不得減少、不得新增 @Disabled

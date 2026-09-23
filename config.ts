@@ -57,6 +57,12 @@ export function numEnv(name: string, def: number, min = 0, max = Infinity): numb
 export const MAX_TIMER_MS = 2_147_483_647;
 
 export const MAX_ITER = numEnv("UT_MAX_ITER", 5, 1);
+// Target classes per batch when the target is a folder. Each batch is a full maker-checker loop
+// of its own — fresh writer and reviewer sessions, its own MAX_ITER rounds — and a batch that
+// fails is set aside without ending the run. One class per batch is what a writer session can
+// reliably finish; a whole package in one session outgrew the model's context and the agent
+// timeout, and one class that would not go green ended the run for every other class.
+export const BATCH_SIZE = numEnv("UT_BATCH_SIZE", 1, 1);
 // Upper bound on the failure report fed back to the writer each round. A build log grows with
 // the module, not with the writer's mistake — an unbounded report crowds the model's context
 // out with maven boilerplate and leaves no room to actually fix anything.
