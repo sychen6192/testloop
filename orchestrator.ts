@@ -55,8 +55,8 @@ import {
   PreExistingFailures,
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
-import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
-import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
+import { collectTestMetrics, findShrunk, MetricsSnapshot } from "./libs/testmetrics";
+import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult, ExpectedTest, expectedTestOf } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
 import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
@@ -93,6 +93,47 @@ export interface OrchestratorConfig {
   testStack?: TestStack;
   // The encoding javac reads the module's sources in; see libs/encoding.ts.
   sourceEncoding?: SourceEncoding;
+  // The test classes the module's build ran before any writer: from the baseline, or from the
+  // repair that made it green. What a green round must still run; see testsThatMustRun.
+  ranAtBaseline?: string[];
+}
+
+/**
+ * The test classes a green build must have run (gates/build.ts checkTestsRan): each one the writer
+ * created, and each one it changed that ran before it started. When the build runs the whole
+ * module, also every class that ran before the writer started, touched or not: a round that gets
+ * its green by making other tests stop running — a framework switch, a discovery filter among the
+ * test resources — is seen there, whatever it edited. A class that ran before is required only
+ * while its source is there: a stale compiled class ran too, and the next compile may drop it.
+ */
+function testsThatMustRun(
+  testRoot: string,
+  written: Iterable<string>,
+  preexisting: MetricsSnapshot,
+  ranBefore: string[] | undefined,
+  wholeModule: boolean,
+): ExpectedTest[] {
+  const before = new Set(ranBefore ?? []);
+  const out = new Map<string, ExpectedTest>();
+  for (const rel of written) {
+    if (!rel.endsWith(".java") || rel.startsWith("resources/")) continue;
+    const file = path.join(testRoot, rel);
+    let src: string;
+    try {
+      src = fs.readFileSync(file, "latin1");
+    } catch {
+      continue; // deleted
+    }
+    const t = expectedTestOf(src, file, rel in preexisting ? "changed" : "created");
+    if (t && (t.origin === "created" || before.has(t.fqcn))) out.set(t.fqcn, t);
+  }
+  if (wholeModule) {
+    for (const fqcn of before) {
+      const file = path.join(testRoot, ...fqcn.split(".")) + ".java";
+      if (!out.has(fqcn) && fs.existsSync(file)) out.set(fqcn, { file, fqcn, disabled: false, origin: "untouched" });
+    }
+  }
+  return [...out.values()];
 }
 
 // Measured again after every build: a stack read off the pom is a guess about what is declared,
@@ -485,6 +526,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const build = await runBuildAndTests(cfg.buildTool, cfg.mod, {
       onlyTests,
       tolerate: cfg.tolerate,
+      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped),
+      ranBefore: cfg.ranAtBaseline,
     });
     save("build.log", build.raw ?? build.report);
     testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
@@ -606,7 +649,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // skipping it would trade the promise away for the same saving.
       if (scoped) {
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
-        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, { tolerate: cfg.tolerate });
+        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, {
+          tolerate: cfg.tolerate,
+          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
+          ranBefore: cfg.ranAtBaseline,
+        });
         save("final-verify.log", full.raw ?? full.report);
         if (!full.passed) {
           log("[FAIL] 最終驗收：模組其他測試被打壞");
@@ -703,6 +750,8 @@ export interface RepairResult {
   report: string;
   // Every test file the repair rounds touched — the diff a human should read before committing.
   changedFiles: string[];
+  // On success: the test classes the green build ran — what every later round must keep running.
+  ranTests?: string[];
 }
 
 // A writer-changed path (relative to src/test/java, or resources/…) as a repo-relative path.
@@ -749,6 +798,8 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const originalMetrics = collectTestMetrics(testRoot);
   const touched = new Set<string>();
   let current = cfg.baseline;
+  // What ran before the repair — the failing classes included — has to be running when it is green.
+  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map((c) => c.replace(/\$.*$/, ""))])];
   let testStack = cfg.testStack;
   let sourceEncoding = cfg.sourceEncoding;
   const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -769,7 +820,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   // order serves both.
   const describe = (b: BaselineResult) =>
     clampText(
-      brokenList(b).length === 0
+      brokenList(b).length === 0 || b.notRun
         ? b.summary
         : `${b.summary}` +
             (b.failureDetail ? `\n失敗明細：${b.failureDetail}` : "") +
@@ -893,6 +944,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
             remaining: { compileErrorFiles: [], failingTestClasses: [] },
             report: `預檢時失敗、重跑後通過的測試（flaky）：${current.failingTestClasses.join("、")}`,
             changedFiles: [...touched].sort(),
+            ranTests: recheck.ranTests,
           };
         }
       }
@@ -918,7 +970,13 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     }
 
     const rebuildStartedAt = Date.now();
-    current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+    current = await runBaseline(
+      cfg.buildTool,
+      cfg.mod,
+      "repair",
+      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+      ranBefore,
+    );
     save("build.log", current.raw);
     testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
     sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, current.raw));
@@ -934,6 +992,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         remaining: { compileErrorFiles: [], failingTestClasses: [] },
         report: current.summary,
         changedFiles: [...touched].sort(),
+        ranTests: current.ranTests,
       };
     }
     report = describe(current);

@@ -52,6 +52,14 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    任一檔案數量減少（或略過標記增加）該輪即 FAIL
    餵回，不進建置（`UT_ALLOW_TEST_SHRINK=1` 只警告）。刻意用數量不用方法名：standards 要求
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
+   第四面是**有跑才算**：綠燈只證明「跑到的測試」通過。surefire 2.22 在只有 `junit-jupiter-api` 的模組
+   裡不執行 JUnit 5 測試（BUILD SUCCESS），沒有 vintage engine 的 JUnit Platform 不執行 JUnit 4 測試，
+   類名不符 includes、類別層級停用的也一樣——而把失敗的測試改寫成不會被執行的框架，`@Test` 與斷言一個
+   不少，數量量尺看不出來。所以 build gate 的綠燈另要求（`gates/build.ts` 的 `checkTestsRan`）：writer
+   新寫的測試類別、改過且 writer 介入前有執行的類別、以及跑完整模組時**每一個** writer 介入前有執行的
+   類別（`ranAtBaseline`；測試資源裡的 discovery filter 也擋得到），都要在這次建置的 surefire 報告或
+   log 的 `Running` 行裡出現；writer 新寫而測試全部 skipped 的也不算。報告看不出類別（報告關了、以
+   `@DisplayName` 命名）時只印 WARN、不判——判錯會讓每一輪都 FAIL。修復迴圈同樣套用。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
    （`opencode` 預設；`api` 直接打 OpenAI-compatible endpoint、tool loop 自己跑，工具在
@@ -105,7 +113,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論；
    `libs/teststack.ts` 從目標模組 surefire 報告裡的 `surefire.test.class.path` 量出測試相依（JUnit 4/5、
    Mockito 版本與能否用 MockitoExtension / mock static、AssertJ、Java 語言層級），模組還沒跑過測試時退回
-   讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath；`libs/encoding.ts` 量出 javac 讀原始碼的
+   讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath。JUnit 5 會不會被執行另外量：classpath 上
+   只有 API 時，surefire 3.0.0-M4 起自己補 engine、之前的版本不執行（版本讀建置 log，engine 也可能在
+   plugin 自己的相依裡，`jupiterRuns`）。pom 只說宣告了什麼，**不宣稱「只有 JUnit 4」**——JUnit 5 可能是
+   間接帶進來的；唯一例外是 Spring Boot 版本推斷、且沒有其他 repo 外的 parent；`libs/encoding.ts` 量出 javac 讀原始碼的
    編碼（pom 與 Spring Boot parent、build.gradle，退回建置自己說的平台編碼；都看不到就看原始碼是不是 UTF-8，
    **不拿 JDK 預設編碼猜**）。非 UTF-8 時另有確定性護欄：
    每個 agent session 前把 `src/test/java` 的非 ASCII 字元改寫成 `\uXXXX` 的 ASCII 形式（UTF-8 編輯工具會把
@@ -163,7 +174,7 @@ loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基�
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
@@ -176,6 +187,7 @@ libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不�
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
+libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記

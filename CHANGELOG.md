@@ -135,6 +135,23 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **沒被執行的測試不再算過關。** 以真的 Maven 實測：surefire 2.22.2、classpath 上只有 `junit-jupiter-api`
+  （沒有 engine）的模組，writer 寫的 JUnit 5 測試編得過、一個都沒執行，BUILD SUCCESS；既有的 JUnit 4 測試
+  剛好覆蓋滿目標類別，coverage gate 也過——一個沒執行過的測試以 gates-passed 收場。反過來，修復迴圈的
+  writer 把失敗的測試改寫成不會被執行的框架，`@Test` 與斷言一個不少，防掏空量尺看不出來，模組卻綠了。
+  現在綠燈的建置必須真的執行了：writer 新寫的測試類別、它改過且介入前有執行的類別，以及跑完整模組時
+  writer 介入前有執行的每一個類別（讓其他測試不被探索到的測試資源也擋得到）——以這次建置的 surefire
+  報告（TestNG 的單一 `TEST-TestSuite.xml`、`@Nested` 的 `$內部類別` 報告、reportNameSuffix 都認得）或 log
+  的 `Running` 行為準；writer 新寫的類別測試全部 skipped 也不算。沒執行時該輪 FAIL，回饋點名類別與它的寫法、
+  這次實際執行了哪些類別各是什麼框架、類名是否符合 surefire 的 includes、是否類別層級停用。看不出來時
+  （報告關了、寫到別處、以 `@DisplayName` 命名）只印 WARN、不判。修復迴圈同樣套用。
+- **測試相依不再把「classpath 上有 JUnit 5」當成「JUnit 5 會被執行」。** surefire 3.0.0-M4 起才會替只有
+  API 的模組補 engine，而補上的 engine 不記在 `surefire.test.class.path`——兩種情況的 classpath 一模一樣
+  （實測 3.2.5 與 2.22.2）。現在另從建置 log 讀 surefire 版本、從 pom 讀 plugin 自己的相依（2.19–2.21 時代的
+  provider 設定），JUnit 5 不會被執行時告訴 writer 用 JUnit 4，並說明原因。pom 來源不再宣稱「只有 JUnit 4、
+  沒有 JUnit 5」——宣告了 junit:junit 不代表沒有間接帶進來的 JUnit 5；只有 Spring Boot 版本推斷、且沒有其他
+  repo 外的 parent 時例外。沒有既有測試可看時改用 pom 宣告的框架（以前預設 JUnit 5）。classpath 上看不到
+  inline mock maker 時說「看不到」並建議避開，不再斷言「不能」（開關檔也可能在相依的 jar 裡）。
 - **修復迴圈被防掏空擋下的那一輪，下一輪 writer 看不到還有哪些紅燈。** 刪減報告取代了建置的失敗報告，
   writer 補回被刪的測試之後，對原本要修的紅燈一無所知。現在兩份一起餵回。
 - **次數、上限這類設定給了小數時照單全收。** `UT_API_MAX_TOKENS=4096.5` 原封不動送到模型端點，被當成不合法

@@ -25,6 +25,15 @@ export interface TestStack {
    */
   source: "surefire" | "pom";
   junit5?: string;
+  /**
+   * junit-jupiter-engine on the test classpath. Before surefire 3.0.0-M4 it is what makes the
+   * build run JUnit 5 tests at all: with the API alone they compile and are never run.
+   */
+  jupiterEngine?: boolean;
+  /** The surefire plugin's own dependencies (in-repo poms) supply a JUnit Platform provider or engine. */
+  pluginEngine?: boolean;
+  /** The maven-surefire-plugin version the module's tests ran with, from the build log. */
+  surefireVersion?: string;
   junit4?: string;
   testng?: string;
   mockito?: string;
@@ -66,6 +75,50 @@ export function versionAtLeast(version: string | undefined, major: number, minor
 /** Static mocking needs both the inline mock maker and the mockStatic API (Mockito 3.4). */
 export function canMockStatic(stack: TestStack): boolean {
   return !!stack.mockitoInline && versionAtLeast(stack.mockito, 3, 4);
+}
+
+/** Pure: surefire 3.0.0-M4 or later — the first that resolves the JUnit 5 engine by itself. */
+export function surefireResolvesEngine(version: string): boolean {
+  const m = /^(\d+)\.(\d+)(?:\.(\d+))?(-.*)?$/.exec(version.trim());
+  if (!m) return false;
+  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)];
+  if (major !== 3) return major > 3;
+  if (minor > 0 || patch > 0) return true;
+  if (!m[4]) return true; // 3.0.0 itself
+  const milestone = /^-M(\d+)$/.exec(m[4]);
+  return !!milestone && Number(milestone[1]) >= 4;
+}
+
+/**
+ * Pure: whether the module's build runs JUnit 5 tests — true, false, or undefined when that
+ * cannot be told. A JUnit 5 test the build does not run compiles, passes nothing and fails
+ * nothing: the writer's round looks green until the coverage gate finds the class untested.
+ *
+ * Measured, from the test classpath: surefire 3.0.0-M4 and later resolve the engine for the API
+ * themselves; before that the engine has to be on the test classpath (2.22) or come with a
+ * provider in the plugin's dependencies (the setup JUnit documented for 2.19–2.21).
+ */
+export function jupiterRuns(stack: TestStack): boolean | undefined {
+  if (stack.junit5 === undefined) return false;
+  if (stack.source !== "surefire") return undefined;
+  if (stack.pluginEngine) return true;
+  const v = stack.surefireVersion;
+  if (!v) return undefined;
+  if (surefireResolvesEngine(v)) return true;
+  if (versionAtLeast(v, 2, 22) && stack.jupiterEngine) return true;
+  // The plugin's configuration may come from a parent outside the repo: then it is not known.
+  return stack.pluginEngine === false ? false : undefined;
+}
+
+/**
+ * Pure: whether the stack's framework is the whole story. A surefire classpath is. A pom only
+ * says what is declared: JUnit 5 may arrive transitively, or from a parent outside the repo —
+ * the one exception is the Spring Boot line saying JUnit 4 is all its starter brings, with no
+ * other parent in the way.
+ */
+export function frameworkSettled(stack: TestStack): boolean {
+  if (stack.source === "surefire") return true;
+  return !stack.unknownParent && !!stack.inferred?.some((l) => l.includes("只帶 JUnit 4"));
 }
 
 // ─── Surefire: the classpath of a real run ───────────────────────────────────
@@ -128,11 +181,13 @@ export function stackFromClasspath(entries: string[]): TestStack | undefined {
     const core = HAMCREST_CORE.exec(entry);
     if (core) hamcrestCore ??= core[1];
     if (/(?:^|[\\/])mockito-junit-jupiter-\d[\w.-]*\.jar$/.test(entry)) stack.mockitoJupiter = true;
+    if (/(?:^|[\\/])junit-jupiter-engine-\d[\w.-]*\.jar$/.test(entry)) stack.jupiterEngine = true;
     if (/(?:^|[\\/])mockito-inline-\d[\w.-]*\.jar$/.test(entry)) stack.mockitoInline = true;
   }
   // A classpath without a test framework is not a test classpath: say nothing rather than
   // "no Mockito, no AssertJ".
   if (stack.junit5 === undefined && stack.junit4 === undefined && stack.testng === undefined) return undefined;
+  if (stack.junit5 !== undefined) stack.jupiterEngine ??= false;
   if (stack.hamcrest === undefined && hamcrestCore !== undefined) {
     stack.hamcrest = hamcrestCore;
     stack.hamcrestCoreOnly = true;
@@ -201,6 +256,8 @@ export interface PomFacts {
   artifactId?: string;
   /** The top of the in-repo chain inherits from a parent that is not in the repo. */
   externalParent?: string;
+  /** artifactIds of maven-surefire-plugin's own dependencies (a provider, an engine). */
+  surefirePluginDeps: string[];
 }
 
 const tag = (xml: string, name: string) => new RegExp(`<${name}>\\s*([^<]*?)\\s*</${name}>`).exec(xml)?.[1];
@@ -237,7 +294,7 @@ export function resolvePomValue(facts: PomFacts, v: string | undefined): string 
  * win over parent ones, as Maven's inheritance does.
  */
 export function pomFactsFromChain(chain: string[]): PomFacts {
-  const facts: PomFacts = { properties: {}, dependencies: [], compiler: {} };
+  const facts: PomFacts = { properties: {}, dependencies: [], compiler: {}, surefirePluginDeps: [] };
   const poms = chain.map(effectivePom);
   for (let i = poms.length - 1; i >= 0; i--) {
     const props = /<properties>([\s\S]*?)<\/properties>/.exec(poms[i])?.[1] ?? "";
@@ -272,6 +329,14 @@ export function pomFactsFromChain(chain: string[]): PomFacts {
   }
   const top = parentOf(poms[poms.length - 1] ?? "");
   if (top?.artifactId) facts.externalParent = top.artifactId;
+  for (const pom of poms) {
+    // The engine of the JUnit 5 setup documented for surefire before 2.22: a provider and the
+    // engine as the plugin's dependencies, only the API on the test classpath.
+    for (const plugin of pom.matchAll(/<plugin>(?:(?!<\/plugin>)[\s\S])*?<artifactId>maven-surefire-plugin<\/artifactId>(?:(?!<\/plugin>)[\s\S])*?<\/plugin>/g)) {
+      const deps = /<dependencies>([\s\S]*?)<\/dependencies>/.exec(plugin[0])?.[1] ?? "";
+      for (const d of deps.matchAll(/<artifactId>\s*([^<]*?)\s*<\/artifactId>/g)) facts.surefirePluginDeps.push(resolve(d[1]) ?? d[1]);
+    }
+  }
   for (const pom of poms) {
     const plugin = /<plugin>(?:(?!<\/plugin>)[\s\S])*?<artifactId>maven-compiler-plugin<\/artifactId>(?:(?!<\/plugin>)[\s\S])*?<\/plugin>/.exec(pom)?.[0];
     const conf = plugin ? (/<configuration>([\s\S]*?)<\/configuration>/.exec(plugin)?.[1] ?? "") : "";
@@ -444,6 +509,19 @@ export function javaReleaseFromLog(log: string, artifactId: string | undefined):
   return found;
 }
 
+/**
+ * Pure: the maven-surefire-plugin version that ran the module's tests, from its execution header
+ * ("--- maven-surefire-plugin:2.22.2:test (default-test) @ web ---"; Maven 3.9 prints
+ * "--- surefire:3.2.5:test"). undefined when the log has none for the module.
+ */
+export function surefireVersionFromLog(log: string, artifactId: string | undefined): string | undefined {
+  let found: string | undefined;
+  for (const m of log.matchAll(/--- (?:maven-)?surefire(?:-plugin)?:([^:\s]+):test\b[^@\n]*@ (\S+) ---/g)) {
+    if (!artifactId || m[2] === artifactId) found = m[1];
+  }
+  return found;
+}
+
 function normalizeRelease(v: string | undefined): string | undefined {
   if (!v) return undefined;
   const m = /^1\.(\d+)$/.exec(v.trim());
@@ -542,6 +620,13 @@ export function measureTestStack(mod: ModuleInfo, repoRoot: string, buildLog = "
   const stack: TestStack = (cp.length ? stackFromClasspath(cp) : undefined) ?? (facts ? stackFromPom(facts) : undefined) ?? {
     source: "pom",
   };
+  if (stack.junit5 !== undefined) {
+    const surefire = surefireVersionFromLog(buildLog, facts?.artifactId);
+    if (surefire) stack.surefireVersion = surefire;
+    // Seen whole only when no parent outside the repo can configure the plugin (Boot's does not).
+    if (facts?.surefirePluginDeps.some((d) => /^junit-(?:platform-surefire-provider|jupiter-engine|jupiter)$/.test(d))) stack.pluginEngine = true;
+    else if (facts && (!facts.externalParent || facts.externalParent === "spring-boot-starter-parent")) stack.pluginEngine = false;
+  }
   if (stack.mockito !== undefined) {
     const maker = mockMakerSwitch(mod.moduleRoot);
     if (maker === "inline") stack.mockitoInline = true;
@@ -556,11 +641,13 @@ export function measureTestStack(mod: ModuleInfo, repoRoot: string, buildLog = "
     stack.javaRelease = fromPom;
     stack.javaReleaseFrom = "pom";
   }
-  // Several frameworks, or a declared one that a parent outside the repo may add JUnit 5 to: the
-  // module's existing tests show which one its build runs.
+  // Several frameworks, or only a pom's word for which one: the module's existing tests show
+  // which one its build runs.
   const frameworks = [stack.junit5, stack.junit4, stack.testng].filter((f) => f !== undefined).length;
-  const unsettled = stack.source === "pom" && !!stack.unknownParent && stack.junit5 === undefined && frameworks > 0;
-  if (frameworks > 1 || unsettled) stack.usage = frameworkUsage(path.join(mod.moduleRoot, "src", "test", "java"));
+  if (frameworks > 1 || !frameworkSettled(stack)) {
+    const usage = frameworkUsage(path.join(mod.moduleRoot, "src", "test", "java"));
+    if (frameworks > 0 || usage.junit5 + usage.junit4 + usage.testng > 0) stack.usage = usage;
+  }
   return Object.keys(stack).length > 1 ? stack : undefined;
 }
 
@@ -580,6 +667,9 @@ export function mergeTestStack(prev: TestStack | undefined, next: TestStack | un
     base.javaRelease = level.javaRelease;
     base.javaReleaseFrom = level.javaReleaseFrom;
   }
+  // A build that failed before its tests has no surefire header: the version seen before stands.
+  const surefire = next.surefireVersion ?? prev.surefireVersion;
+  if (surefire && base.junit5 !== undefined) base.surefireVersion = surefire;
   return base;
 }
 
@@ -588,14 +678,17 @@ export function describeTestStack(stack: TestStack | undefined): string {
   if (!stack) return "量不到（沒有可採用的 surefire 報告，pom 也沒有宣告可辨識的測試相依）";
   const v = (x: string | undefined) => (x ? ` ${x}` : "");
   const parts: string[] = [];
-  if (stack.junit5 !== undefined) parts.push(`JUnit 5${v(stack.junit5)}`);
+  if (stack.junit5 !== undefined) {
+    const runs = jupiterRuns(stack);
+    parts.push(`JUnit 5${v(stack.junit5)}${runs === false ? "（只有 API、沒有 engine：這個建置不執行 JUnit 5 測試）" : ""}`);
+  }
   if (stack.junit4 !== undefined) parts.push(`JUnit 4${v(stack.junit4)}`);
   if (stack.testng !== undefined) parts.push(`TestNG${v(stack.testng)}`);
   if (stack.mockito !== undefined) {
     const caps = [
       stack.mockitoJupiter === undefined ? "" : `MockitoExtension ${stack.mockitoJupiter ? "可用" : "不可用"}`,
-      stack.mockitoInline === undefined ? "" : `final mock ${stack.mockitoInline ? "可用" : "不可用"}`,
-      stack.mockitoInline === undefined ? "" : `static mock ${canMockStatic(stack) ? "可用" : "不可用"}`,
+      stack.mockitoInline === undefined ? "" : `inline mock maker ${stack.mockitoInline ? "有" : "看不到"}`,
+      stack.mockitoInline === undefined ? "" : `static mock ${canMockStatic(stack) ? "可用" : versionAtLeast(stack.mockito, 3, 4) ? "要 inline mock maker" : "沒有（Mockito 3.4 才有）"}`,
     ].filter(Boolean);
     parts.push(`Mockito${v(stack.mockito)}${caps.length ? `（${caps.join("、")}）` : ""}`);
   }
@@ -603,6 +696,8 @@ export function describeTestStack(stack: TestStack | undefined): string {
   if (stack.hamcrest !== undefined) parts.push(`Hamcrest${v(stack.hamcrest)}${stack.hamcrestCoreOnly ? "（只有 core）" : ""}`);
   if (stack.powermock !== undefined) parts.push(`PowerMock${v(stack.powermock)}`);
   if (stack.javaRelease) parts.push(`Java ${stack.javaRelease}`);
+  if (stack.surefireVersion) parts.push(`surefire ${stack.surefireVersion}`);
+  if (stack.usage) parts.push(`既有測試 JUnit 5 ${stack.usage.junit5}／JUnit 4 ${stack.usage.junit4}／TestNG ${stack.usage.testng} 個`);
   const from = stack.source === "surefire" ? "surefire 測試 classpath" : "pom 宣告（未經建置確認）";
   return `${parts.join("、") || "（沒有可辨識的測試相依）"}——來源：${from}`;
 }

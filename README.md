@@ -254,10 +254,18 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   （實際跑過的，最準），模組還沒有任何測試跑過時退回讀 pom（連同 Spring Boot 版本推斷，prompt 會
   標明是推斷）；writer 的測試第一次跑過之後，後面的 prompt 就改用實際 classpath。量到什麼在 log 的
   「測試相依：」那一行與 `project-facts.json`。只有 JUnit 4 的模組會被告知用 JUnit 4 的寫法，
-  沒有 inline mock maker 時會被告知不能 mock static / final。surefire 2.21 以前的報告不記錄測試
-  classpath，這時一律讀 pom；pom 繼承 repo 外的公司 parent 時，parent 帶了什麼量不到，loop 不斷定框架，
-  改看既有測試用哪一個。量到的不對時，看 log 那一行寫的來源——`pom 宣告（未經建置確認）` 表示還沒有
+  classpath 上看不到 inline mock maker 時會被建議避開 mock static / final。surefire 2.21 以前的報告不記錄測試
+  classpath，這時一律讀 pom；pom 只說宣告了什麼，loop 不會因此宣稱「只有 JUnit 4」，有既有測試就看它們
+  用哪一個。量到的不對時，看 log 那一行寫的來源——`pom 宣告（未經建置確認）` 表示還沒有
   可採用的 surefire 報告。
+- **「編譯與測試都通過，但有 N 個該執行的測試類別沒有真的被執行」。** 建置是綠的，但 surefire 沒有執行
+  那些類別——綠燈只證明跑到的測試通過，所以這不算過關。最常見的原因是框架：classpath 上只有
+  `junit-jupiter-api`、沒有 `junit-jupiter-engine` 時，surefire 3.0.0-M4 以前的版本不執行 JUnit 5 測試
+  （log 的「測試相依：」那一行會寫「只有 API、沒有 engine」與 surefire 版本）；沒有 vintage engine 的
+  JUnit Platform 不執行 JUnit 4 測試。其次是類名不符 surefire 的 includes（預設只跑 `*Test`、`Test*`、
+  `*Tests`、`*TestCase`）、類別層級的 `@Disabled` / `@Ignore`。回饋會列出這次實際執行了哪些類別、各是什麼
+  框架，writer 照著改寫。writer 沒改過的既有類別也在清單上時，是這輪的變更讓它們不再被執行（例如測試資源
+  裡的設定）。報告關掉或以 `@DisplayName` 命名時 loop 看不出來，只印 WARN、不判。
 - **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
   MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，

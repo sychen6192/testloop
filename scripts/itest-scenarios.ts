@@ -51,6 +51,60 @@ public class Greeter {
 }
 `;
 const GREETER_TEST_PATH = `${TEST_DIR}/GreeterTest.java`;
+// A module whose build runs JUnit 4: an existing JUnit 4 test, and CalcTest written for JUnit 4.
+const OLD_STYLE = "com.x.OldStyleTest";
+const OLD_STYLE_PATH = `${TEST_DIR}/OldStyleTest.java`;
+const OLD_STYLE_TEST = `package com.x;
+
+import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+
+public class OldStyleTest {
+    @Test
+    public void add_works() {
+        assertEquals(3, new Calc().add(1, 2));
+    }
+}
+`;
+const CALC_TEST_JUNIT4 = `package com.x;
+
+import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+
+public class CalcTest {
+    @Test
+    public void add_twoPositives_returnsSum() {
+        assertEquals(3, new Calc().add(1, 2));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void div_byZero_throwsIllegalArgument() {
+        new Calc().div(1, 0);
+    }
+}
+`;
+// The failing ExistingTest "repaired" into TestNG: as many @Test and assertions as before, and a
+// framework this module's build does not run.
+const EXISTING_AS_TESTNG = `package com.x;
+
+import org.testng.annotations.Test;
+import static org.testng.Assert.assertEquals;
+
+public class ExistingTest {
+
+    @Test
+    public void add_twoPositives_returnsSum() {
+        assertEquals(new Calc().add(1, 2), 3);
+    }
+
+    @Test
+    public void div_byOne_returnsSameValue() {
+        assertEquals(new Calc().div(5, 1), 5);
+    }
+}
+`;
+const DISCOVERY_FILTER = "src/test/resources/META-INF/services/org.junit.platform.launcher.PostDiscoveryFilter";
+const ran = (...classes: string[]) => classes.map((cls) => ({ cls, body: SUREFIRE_PASS(cls) }));
 const GREETER_TEST = `package com.x;
 
 import org.junit.jupiter.api.Test;
@@ -211,6 +265,14 @@ class LegacyTest {
 }
 `;
 const LEGACY_CASE = { nested: "", method: "old_behaviour", message: "已知失敗", line: 21 };
+/** Green, with LegacyTest among what ran — once it is repaired, every build runs it. */
+const GREEN_WITH_LEGACY = {
+  ...GREEN_BUILD,
+  surefire: [
+    { cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") },
+    { cls: LEGACY, body: SUREFIRE_PASS(LEGACY) },
+  ],
+};
 /** The module arrives with one test already failing, and it keeps failing every round. */
 const LEGACY_RED = () => ({
   exit: 1,
@@ -350,6 +412,18 @@ export const SCENARIOS: Scenario[] = [
     env: { UT_SKIP_REVIEW: "1" },
     writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST }, outputTokens: 123 }],
     mvn: [GREEN_BUILD],
+  },
+  {
+    name: "tests-not-run-framework",
+    desc: "建置綠，但 writer 的 JUnit 5 測試沒被執行（這個模組跑的是 JUnit 4）→ build gate FAIL，說明要改寫成 JUnit 4；改寫後通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [OLD_STYLE_PATH]: OLD_STYLE_TEST },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }, { write: { [CALC_TEST_PATH]: CALC_TEST_JUNIT4 } }],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE), jacoco: JACOCO_GREEN },
+      { exit: 0, out: BUILD_SUCCESS(3), cleanSurefire: true, surefire: ran(OLD_STYLE, "com.x.CalcTest"), jacoco: JACOCO_GREEN },
+    ],
   },
   {
     name: "zero-tests",
@@ -575,7 +649,7 @@ export const SCENARIOS: Scenario[] = [
     ],
     mvn: [
       { exit: 1, out: TEST_FAILURE("com.x.CalcBehaviourTest"), cleanSurefire: true },
-      GREEN_BUILD,
+      { ...GREEN_BUILD, surefire: [{ cls: "com.x.CalcBehaviourTest", body: SUREFIRE_PASS("com.x.CalcBehaviourTest") }] },
     ],
   },
   {
@@ -634,7 +708,7 @@ export const SCENARIOS: Scenario[] = [
     entry: "orchestrate",
     layout: "multi",
     env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
-    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST } }],
+    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST.replace("package com.x;", "package com.x.web;") } }],
     mvn: [
       {
         exit: 0,
@@ -742,6 +816,24 @@ export const SCENARIOS: Scenario[] = [
   },
 
   // ── 既有紅燈修復迴圈 ───────────────────────────────────────────────────────
+  {
+    name: "repair-framework-switch",
+    desc: "修復輪把失敗的測試改寫成這個建置不執行的框架（@Test 與斷言數都沒少，防掏空量尺看不出來）→ 綠燈但它沒被執行，不算修好",
+    entry: "repair",
+    extraFiles: { [OLD_STYLE_PATH]: OLD_STYLE_TEST },
+    writer: [{ write: { [EXISTING_PATH]: EXISTING_AS_TESTNG } }, { write: { [EXISTING_PATH]: `${EXISTING_TEST}// fixed\n` } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran(OLD_STYLE),
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "expected: <5> but was: <4>", line: 13 }]) }],
+      },
+      { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE) },
+      { exit: 0, out: BUILD_SUCCESS(3), cleanSurefire: true, surefire: ran(OLD_STYLE, "com.x.ExistingTest") },
+    ],
+  },
   {
     name: "repair-success",
     desc: "預檢紅燈 → 修復一輪轉綠，改過的檔案列進結果",
@@ -871,7 +963,7 @@ export const SCENARIOS: Scenario[] = [
         cleanSurefire: true,
         surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "reads_fixture", message: "expected: <1050> but was: <1049>", line: 9 }]) }],
       },
-      GREEN_BUILD,
+      { ...GREEN_BUILD, surefire: [{ cls: "com.x.ExistingTest", body: SUREFIRE_PASS("com.x.ExistingTest") }] },
     ],
   },
   {
@@ -979,7 +1071,7 @@ export const SCENARIOS: Scenario[] = [
         ].join("\n"),
         cleanSurefire: true,
       },
-      GREEN_BUILD,
+      { ...GREEN_BUILD, surefire: [{ cls: "com.x.ExistingTest", body: SUREFIRE_PASS("com.x.ExistingTest") }] },
     ],
   },
   {
@@ -1060,6 +1152,28 @@ export const SCENARIOS: Scenario[] = [
   // 三個情境對應設計文件承諾的三道驗證：既有失敗原樣通過、新失敗被擋、
   // 同一類別裡的另一個方法失敗被擋（最後一個是「識別到方法層級」那道護欄的 mutation 目標）。
   {
+    name: "loop-other-tests-stop-running",
+    desc: "writer 加了一個讓其他測試不被探索到的測試資源 → 綠燈但既有測試沒被執行，build gate FAIL；拿掉之後通過",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: DISCOVERY_FILTER, content: "com.x.OnlyNewTests\n" } },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: DISCOVERY_FILTER, content: "" } }] },
+      { content: "已拿掉 discovery filter" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") },
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.CalcTest"), jacoco: JACOCO_GREEN },
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN },
+    ],
+  },
+  {
     name: "loop-dirty-tolerated",
     desc: "既有失敗照樣紅，但 gate 扣除後放行 → exit 0；summary.json 留下容忍了什麼",
     entry: "loop",
@@ -1068,7 +1182,7 @@ export const SCENARIOS: Scenario[] = [
       { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
       { content: "已建立 CalcTest.java" },
     ],
-    mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN }],
+    mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }],
   },
   {
     name: "loop-dirty-new-failure-blocked",
@@ -1315,8 +1429,8 @@ export const SCENARIOS: Scenario[] = [
           "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in com.x.AutoConfigTest\n" +
           TEST_FAILURE(LEGACY),
       },
-      GREEN_BUILD,
-      GREEN_BUILD,
+      GREEN_WITH_LEGACY,
+      GREEN_WITH_LEGACY,
     ],
   },
   {
@@ -1659,7 +1773,10 @@ export const SCENARIOS: Scenario[] = [
       GREEN_BUILD,
       {
         ...GREEN_BUILD,
-        surefire: [{ cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") }],
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") },
+          { cls: "com.x.GreeterTest", body: SUREFIRE_PASS("com.x.GreeterTest") },
+        ],
         jacoco: JACOCO_GREETER,
       },
     ],

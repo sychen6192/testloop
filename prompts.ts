@@ -7,7 +7,7 @@ import { SCORE_THRESHOLDS } from "./config";
 import { expectedTestPath } from "./libs/utils";
 import { TestConventions } from "./libs/conventions";
 import { ShrinkViolation } from "./libs/testmetrics";
-import { canMockStatic, majorOf, minorOf, TestStack, versionAtLeast } from "./libs/teststack";
+import { canMockStatic, frameworkSettled, jupiterRuns, majorOf, minorOf, TestStack, versionAtLeast } from "./libs/teststack";
 import { isUtf8Name, SourceEncoding } from "./libs/encoding";
 
 // Six dimensions as name + one-liner for the writer — direction only, no rubric detail (avoid teaching-to-the-test).
@@ -68,37 +68,30 @@ type Framework = "JUnit 5" | "JUnit 4" | "TestNG";
 
 function frameworkKind(stack: TestStack | undefined): Framework {
   if (!stack) return "JUnit 5";
-  const exact = stack.source === "surefire";
-  const has5 = stack.junit5 !== undefined;
+  // JUnit 5 counts where the build runs it: with the API alone, before surefire 3.0.0-M4, a JUnit 5
+  // test compiles and is never run.
+  const has5 = stack.junit5 !== undefined && jupiterRuns(stack) !== false;
   const has4 = stack.junit4 !== undefined;
   const hasNg = stack.testng !== undefined;
+  const u = stack.usage;
   // TestNG beside JUnit: surefire runs one provider, and which one depends on its version. The
   // module's existing tests say which one they are written for.
-  if (hasNg && (has5 || has4) && stack.usage) {
-    const u = stack.usage;
-    if (u.testng > u.junit5 + u.junit4) return "TestNG";
-  }
+  if (hasNg && (has5 || has4) && u && u.testng > u.junit5 + u.junit4) return "TestNG";
   if (has5) return "JUnit 5";
-  if (has4 && frameworkSettled(stack)) return "JUnit 4";
-  if (hasNg && frameworkSettled(stack)) return "TestNG";
-  // Unsettled: the module's existing tests show what its build runs. With none to go by, JUnit 5
-  // fails loudest when wrong — a compile error the task line's fallback names — where a JUnit 4
-  // test on a JUnit Platform without the vintage engine compiles and silently never runs.
-  const u = stack.usage;
-  if (u && u.junit5 === 0) {
-    if (has4 && u.junit4 > 0 && u.junit4 >= u.testng) return "JUnit 4";
-    if (hasNg && u.testng > 0) return "TestNG";
+  if (frameworkSettled(stack)) {
+    if (has4) return "JUnit 4";
+    if (hasNg) return "TestNG";
+    return "JUnit 5";
   }
+  // Only a pom's word: the existing tests show what the build compiles; with none to go by, what
+  // the pom declares. Either way the build gate checks that the new tests were actually run — a
+  // JUnit 4 test on a JUnit Platform without the vintage engine compiles and is never run.
+  if (u && u.junit5 > 0) return "JUnit 5";
+  if (u && u.junit4 > 0 && u.junit4 >= u.testng) return "JUnit 4";
+  if (u && u.testng > 0) return "TestNG";
+  if (has4) return "JUnit 4";
+  if (hasNg) return "TestNG";
   return "JUnit 5";
-}
-
-/**
- * Whether the declared framework is the whole story. A surefire classpath is; from a pom, a
- * declared junit:junit or testng only is when nothing outside the repo adds dependencies — a
- * corporate parent may well bring JUnit 5 — or the Spring Boot line says JUnit 4 is all there is.
- */
-function frameworkSettled(stack: TestStack): boolean {
-  return stack.source === "surefire" || !stack.unknownParent || !!stack.inferred?.some((l) => l.includes("只帶 JUnit 4"));
 }
 
 /** The framework new tests are written in, as the task line names it. */
@@ -138,18 +131,28 @@ export function renderTestStack(stack: TestStack | undefined): string {
   const assertj = stack.assertj !== undefined;
   const lines: string[] = [];
 
+  // Why a pom's word is not the whole story, for the lines that go by it.
+  const unsettled = stack.unknownParent
+    ? `pom 繼承 repo 外的 parent ${stack.unknownParent}，它帶進哪些測試相依量不到`
+    : "pom 只列出宣告的相依，實際的測試 classpath 要等測試跑過才知道";
+  const u = stack.usage;
   if (kind === "JUnit 5") {
     if (has5) {
       lines.push(
         `測試框架：${frameworkOf(stack)}${ver(stack.junit5)}` +
-          (has4 ? `，另有 JUnit 4${ver(stack.junit4)}（vintage）——新測試一律用 JUnit 5` : ""),
+          (has4 ? `，另有 JUnit 4${ver(stack.junit4)}——新測試一律用 JUnit 5` : ""),
       );
-    } else if (has4 || hasNg) {
-      // Declared, but not the whole story, and no existing tests to settle it.
-      const declared = has4 ? `JUnit 4${ver(stack.junit4)}` : `TestNG${ver(stack.testng)}`;
+      if (jupiterRuns(stack) === false) {
+        lines.push(
+          `注意：classpath 上只有 JUnit 5 的 API，沒有 junit-jupiter-engine，surefire ${stack.surefireVersion} 不會執行 JUnit 5 測試` +
+            "——寫了也不會被執行，build gate 會把沒被執行的測試類別判 FAIL；模組要能跑 JUnit 5 得先在 pom 加上 engine（pom 不在你的可寫範圍，請在總結裡說明）",
+        );
+      }
+    } else if (u && u.junit5 > 0) {
+      const declared = has4 ? `JUnit 4${ver(stack.junit4)}` : hasNg ? `TestNG${ver(stack.testng)}` : "";
       lines.push(
-        `測試框架：pom 宣告了 ${declared}，但繼承 repo 外的 parent ${stack.unknownParent}，是否另有 JUnit 5 量不到。` +
-          `先用 JUnit 5；若編譯錯誤說 org.junit.jupiter 不存在，改用 ${has4 ? "JUnit 4（org.junit.Test，測試類別與方法都要 public）" : "TestNG（org.testng.annotations.Test）"}`,
+        `測試框架：JUnit 5——模組既有測試有 ${u.junit5} 個用 JUnit 5` +
+          `（${declared ? `pom 只宣告了 ${declared}` : "pom 沒有直接宣告測試框架"}，JUnit 5 是間接帶進來的；${unsettled}），新測試用 JUnit 5`,
       );
     }
   } else if (kind === "JUnit 4") {
@@ -158,11 +161,16 @@ export function renderTestStack(stack: TestStack | undefined): string {
       : versionAtLeast(stack.junit4, 4, 13)
         ? "例外用 Assert.assertThrows（JUnit 4.13+）"
         : "例外用 @Test(expected = …)，或 try { …; fail(); } catch (預期的例外 e) { 驗證訊息 }（assertThrows 要 JUnit 4.13 才有）";
-    // Settled, JUnit 4 is all there is; chosen from the existing tests, it is what they use — a
-    // parent outside the repo might add JUnit 5, and saying "there is none" would be a guess.
+    // Settled, JUnit 4 is all that runs; from a pom it is what the existing tests use or what the
+    // pom declares — JUnit 5 may be there too, and saying "there is none" would be a guess.
     const which = frameworkSettled(stack)
-      ? `**只有** JUnit 4${ver(stack.junit4)}，沒有 JUnit 5`
-      : `JUnit 4${ver(stack.junit4)}——模組既有測試都用 JUnit 4（pom 繼承 repo 外的 parent ${stack.unknownParent}，是否另有 JUnit 5 量不到），新測試跟它們一樣`;
+      ? has5
+        ? `JUnit 4${ver(stack.junit4)}。classpath 上雖有 JUnit 5 的 API（junit-jupiter-api${ver(stack.junit5)}），但沒有 junit-jupiter-engine，` +
+          `surefire ${stack.surefireVersion} 不會執行 JUnit 5 測試（編得過、但不會被執行）`
+        : `**只有** JUnit 4${ver(stack.junit4)}，沒有 JUnit 5`
+      : u && u.junit4 > 0
+        ? `JUnit 4${ver(stack.junit4)}——模組既有測試用的是 JUnit 4（${u.junit4} 個；${unsettled}），新測試跟它們一樣`
+        : `JUnit 4${ver(stack.junit4)}——pom 宣告了 junit:junit（${unsettled}），新測試用 JUnit 4`;
     lines.push(
       `測試框架：${which}。用 org.junit.Test、org.junit.Before、org.junit.Assert；` +
         "測試類別、@Test 與 @Before / @After 方法都必須是 public（JUnit 4 會拒絕 package-private 的測試）；" +
@@ -170,8 +178,11 @@ export function renderTestStack(stack: TestStack | undefined): string {
         "標準裡 JUnit 5 的寫法（org.junit.jupiter.*、@ExtendWith、@BeforeEach、@DisplayName、@Nested、@ParameterizedTest）一律不能用",
     );
   } else {
+    const why = frameworkSettled(stack)
+      ? ""
+      : `（${u && u.testng > 0 ? `模組既有測試用的是 TestNG（${u.testng} 個）` : "pom 宣告了 testng"}；${unsettled}）`;
     lines.push(
-      `測試框架：TestNG${ver(stack.testng)}。用 org.testng.annotations.Test、@BeforeMethod、org.testng.Assert；` +
+      `測試框架：TestNG${ver(stack.testng)}${why}。用 org.testng.annotations.Test、@BeforeMethod、org.testng.Assert；` +
         "JUnit 的 @ExtendWith(MockitoExtension.class) 在 TestNG 下沒有作用，mock 在 @BeforeMethod 裡初始化",
     );
   }
@@ -211,11 +222,13 @@ export function renderTestStack(stack: TestStack | undefined): string {
           : "可以 mock final 類別；mockStatic 要 Mockito 3.4 以上",
       );
     } else if (exact) {
-      const hasMockStatic = versionAtLeast(stack.mockito, 3, 4);
+      // What the classpath shows, not a verdict: a switch file can also come inside a dependency jar.
+      const unseen = "classpath 上看不到 inline mock maker（沒有 mockito-inline，模組也沒有 mock-maker-inline 設定）";
       parts.push(
-        "**不能** mock final 類別/方法與 static 方法（" +
-          (hasMockStatic ? "沒有 inline mock maker——mockStatic 編得過、執行時失敗" : "這個版本沒有 mockStatic，也沒有 inline mock maker") +
-          "）；遇到時改從呼叫端可注入的相依替換，或測試它的可觀察結果",
+        (versionAtLeast(stack.mockito, 3, 4)
+          ? `mock final 類別/方法與 mockStatic 都要 inline mock maker，${unseen}——mockStatic 編得過，執行時多半失敗`
+          : `這個版本沒有 mockStatic（Mockito 3.4 才有）；mock final 類別/方法要 inline mock maker，${unseen}`) +
+          "；避免 mock final 與 static，改從呼叫端可注入的相依替換，或測試它的可觀察結果",
       );
     }
     lines.push(parts.join("；"));

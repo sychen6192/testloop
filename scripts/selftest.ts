@@ -106,9 +106,34 @@ import {
   sourceEncodingFrom,
   unescapeNonAscii,
 } from "../libs/encoding";
-import { canMockStatic, classpathFromSurefireXml, javaReleaseFromLog, measureTestStack, mergeTestStack, pomFactsFromChain, stackFromClasspath, stackFromPom } from "../libs/teststack";
+import {
+  canMockStatic,
+  classpathFromSurefireXml,
+  javaReleaseFromLog,
+  jupiterRuns,
+  measureTestStack,
+  mergeTestStack,
+  pomFactsFromChain,
+  stackFromClasspath,
+  stackFromPom,
+  surefireResolvesEngine,
+  surefireVersionFromLog,
+} from "../libs/teststack";
+import { codeOnly } from "../libs/javasrc";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
-import { classifyEnvFailures, readSurefireXml, isSurefireSummary, crashedTestClasses, unfinishedTestClasses } from "../gates/build";
+import {
+  checkTestsRan,
+  classesRunInLog,
+  classifyEnvFailures,
+  crashedTestClasses,
+  expectedTestOf,
+  includedByDefault,
+  isSurefireSummary,
+  readSurefireXml,
+  renderRanCheck,
+  testFrameworkOf,
+  unfinishedTestClasses,
+} from "../gates/build";
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
@@ -3195,6 +3220,21 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
     !boot21Prompt.includes("Assert.assertThrows") && boot21Prompt.includes("assertThatThrownBy") && boot21Prompt.includes("public") && frameworkOf(boot21) === "JUnit 4",
     boot21Prompt,
   );
+  check("prompt（Boot 2.1、沒有其他外部 parent）：依 Boot 的版本推斷「只有 JUnit 4」", boot21Prompt.includes("**只有** JUnit 4"), boot21Prompt);
+  const corpBoot = stackFromPom(
+    pomFactsFromChain([
+      "<project><parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId><version>9</version></parent><artifactId>x</artifactId>" +
+        "<dependencyManagement><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-dependencies</artifactId>" +
+        "<version>2.1.4.RELEASE</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>" +
+        "<dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId></dependency></dependencies></project>",
+    ]),
+  )!;
+  const corpBootPrompt = renderTestStack(corpBoot);
+  check(
+    "pom：Boot 2.1 的 BOM、但 parent 是 repo 外的公司 parent → 用 JUnit 4，不宣稱「只有」（parent 可能另帶 JUnit 5）",
+    frameworkOf(corpBoot) === "JUnit 4" && !corpBootPrompt.includes("只有") && corpBootPrompt.includes("corp-parent"),
+    corpBootPrompt,
+  );
   const boot15 = stackFromPom(pomFactsFromChain([bootPom("1.5.22.RELEASE")]))!;
   const boot15Prompt = renderTestStack(boot15);
   check(
@@ -3253,25 +3293,85 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
   )!;
   const corporatePrompt = renderTestStack(corporate);
   check(
-    "pom：只宣告 junit:junit、但繼承 repo 外的公司 parent、沒有既有測試 → 不斷定是 JUnit 4（parent 可能另帶 JUnit 5），並給編譯失敗時的退路",
-    corporate.unknownParent === "corp-parent" && frameworkOf(corporate) === "JUnit 5" && corporatePrompt.includes("corp-parent") &&
-      corporatePrompt.includes("org.junit.jupiter 不存在") && !corporatePrompt.includes("只有"),
+    "pom：只宣告 junit:junit、繼承 repo 外的公司 parent、沒有既有測試 → 用宣告的 JUnit 4，不宣稱「只有」「沒有 JUnit 5」，並說明為什麼不確定",
+    corporate.unknownParent === "corp-parent" && frameworkOf(corporate) === "JUnit 4" && corporatePrompt.includes("corp-parent") &&
+      corporatePrompt.includes("pom 宣告了 junit:junit") && !corporatePrompt.includes("只有") && !corporatePrompt.includes("沒有 JUnit 5"),
     corporatePrompt || JSON.stringify(corporate),
   );
   const corporateUsed = { ...corporate, usage: { junit5: 0, junit4: 7, testng: 0 } };
   const corporateUsedPrompt = renderTestStack(corporateUsed);
   check(
     "pom：同上、但既有測試都是 JUnit 4 → 用 JUnit 4，且不宣稱「沒有 JUnit 5」",
-    frameworkOf(corporateUsed) === "JUnit 4" && corporateUsedPrompt.includes("既有測試都用 JUnit 4") && !corporateUsedPrompt.includes("沒有 JUnit 5"),
+    frameworkOf(corporateUsed) === "JUnit 4" && corporateUsedPrompt.includes("既有測試用的是 JUnit 4（7 個") && !corporateUsedPrompt.includes("沒有 JUnit 5"),
     corporateUsedPrompt,
   );
   check(
     "pom：同上、但既有測試有 JUnit 5 的 → 用 JUnit 5",
     frameworkOf({ ...corporate, usage: { junit5: 1, junit4: 7, testng: 0 } }) === "JUnit 5",
   );
+  const declared4 = stackFromPom(
+    pomFactsFromChain(["<project><artifactId>x</artifactId><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies></project>"]),
+  )!;
+  const declared4Prompt = renderTestStack(declared4);
   check(
-    "pom：只宣告 junit:junit、沒有外部 parent → JUnit 4",
-    frameworkOf(stackFromPom(pomFactsFromChain(["<project><artifactId>x</artifactId><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies></project>"]))) === "JUnit 4",
+    "pom：只宣告 junit:junit、沒有外部 parent → JUnit 4；但 JUnit 5 可能是間接帶進來的 → 不宣稱「只有」「沒有 JUnit 5」",
+    frameworkOf(declared4) === "JUnit 4" && !declared4Prompt.includes("只有") && !declared4Prompt.includes("沒有 JUnit 5") && declared4Prompt.includes("實際的測試 classpath"),
+    declared4Prompt,
+  );
+  check(
+    "pom：沒宣告任何框架、既有測試是 JUnit 5 → JUnit 5，並說明它是間接帶進來的",
+    (() => {
+      const u = { source: "pom" as const, mockito: "4.11.0", usage: { junit5: 3, junit4: 0, testng: 0 } };
+      const p = renderTestStack(u);
+      return frameworkOf(u) === "JUnit 5" && p.includes("既有測試有 3 個用 JUnit 5");
+    })(),
+  );
+
+  // Whether JUnit 5 tests run at all: the API alone is not enough before surefire 3.0.0-M4.
+  const apiOnly = stackFromClasspath(["/m/junit-jupiter-api-5.9.0.jar", "/m/junit-4.13.2.jar", "/m/mockito-core-4.11.0.jar"])!;
+  check(
+    "surefire classpath：只有 junit-jupiter-api → jupiterEngine=false；有 junit-jupiter-engine → true",
+    apiOnly.jupiterEngine === false && stackFromClasspath(["/m/junit-jupiter-api-5.9.0.jar", "/m/junit-jupiter-engine-5.9.0.jar"])!.jupiterEngine === true,
+  );
+  check(
+    "surefireResolvesEngine：3.0.0-M4 起 surefire 才會自己替 API 帶 engine",
+    ["3.0.0-M4", "3.0.0-M10", "3.0.0", "3.1.2", "4.0.0-beta-1"].every(surefireResolvesEngine) &&
+      !["3.0.0-M3", "2.22.2", "2.12.4", "3.0.0-SNAPSHOT", "x"].some(surefireResolvesEngine),
+  );
+  const api2222 = { ...apiOnly, surefireVersion: "2.22.2", pluginEngine: false };
+  check("jupiterRuns：surefire 2.22.2、只有 API → 不執行 JUnit 5", jupiterRuns(api2222) === false);
+  check("jupiterRuns：surefire 3.0.0-M4、只有 API → 執行（plugin 自己解析 engine）", jupiterRuns({ ...api2222, surefireVersion: "3.0.0-M4" }) === true);
+  check("jupiterRuns：2.22.2、engine 在測試 classpath → 執行", jupiterRuns({ ...api2222, jupiterEngine: true }) === true);
+  check(
+    "jupiterRuns：2.19.1、engine 在 classpath 但 plugin 沒有 provider → 不執行（2.22 以前沒有內建 JUnit Platform）",
+    jupiterRuns({ ...api2222, surefireVersion: "2.19.1", jupiterEngine: true }) === false,
+  );
+  check("jupiterRuns：plugin 自己的相依裡有 provider / engine → 執行", jupiterRuns({ ...api2222, pluginEngine: true }) === true);
+  check("jupiterRuns：不知道 surefire 版本 → 不斷定", jupiterRuns({ ...api2222, surefireVersion: undefined }) === undefined);
+  check("jupiterRuns：plugin 設定可能在 repo 外的 parent → 不斷定", jupiterRuns({ ...api2222, pluginEngine: undefined }) === undefined);
+  check("jupiterRuns：讀 pom 得來的 → 不斷定", jupiterRuns({ source: "pom", junit5: "5.9.0" }) === undefined);
+  const api2222Prompt = renderTestStack(api2222);
+  check(
+    "prompt：surefire 2.22.2 只有 JUnit 5 API、另有 JUnit 4 → 用 JUnit 4，說明 JUnit 5 測試不會被執行，不宣稱「只有 JUnit 4」",
+    frameworkOf(api2222) === "JUnit 4" && api2222Prompt.includes("不會執行 JUnit 5 測試") && api2222Prompt.includes("2.22.2") && !api2222Prompt.includes("**只有**"),
+    api2222Prompt,
+  );
+  check("prompt：surefire 3.2.5 只有 JUnit 5 API → JUnit 5", frameworkOf({ ...api2222, surefireVersion: "3.2.5" }) === "JUnit 5");
+  check(
+    "surefire 版本：舊版 header（maven-surefire-plugin:x:test），歸屬到目標模組",
+    surefireVersionFromLog("[INFO] --- maven-surefire-plugin:2.19.1:test (default-test) @ common ---\n[INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ web ---", "web") === "2.22.2",
+  );
+  check("surefire 版本：Maven 3.9 的短 header（surefire:3.2.5:test）", surefireVersionFromLog("12:00 [INFO] --- surefire:3.2.5:test (default-test) @ web ---", "web") === "3.2.5");
+  check("surefire 版本：log 裡沒有目標模組的 → 量不到", surefireVersionFromLog("[INFO] --- surefire:3.2.5:test (default-test) @ common ---", "web") === undefined);
+  check(
+    "mergeTestStack：編譯失敗的建置（log 沒有 surefire）不抹掉先前量到的 surefire 版本",
+    mergeTestStack(api2222, { ...apiOnly, surefireVersion: undefined })?.surefireVersion === "2.22.2",
+  );
+  const noInline = renderTestStack({ source: "surefire", junit5: "5.9.0", jupiterEngine: true, mockito: "4.11.0", mockitoJupiter: true, mockitoInline: false });
+  check(
+    "prompt：classpath 上看不到 inline mock maker → 照實說「看不到」並建議避開，不斷言「不能」（開關也可能在相依的 jar 裡）",
+    noInline.includes("看不到 inline mock maker") && !noInline.includes("**不能**") && noInline.includes("mockStatic 編得過"),
+    noInline,
   );
 
   const multiLog = [
@@ -3370,6 +3470,38 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
     JSON.stringify(corpStack),
   );
   fs.rmSync(corp, { recursive: true, force: true });
+
+  // The JUnit 5 setup of the surefire 2.19–2.21 days: a provider (and the engine) as the plugin's
+  // own dependencies, only the API on the test classpath. Measured, it runs; the same classpath on
+  // 2.22 without them does not.
+  const legacy5 = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-stack-"));
+  const legacy5Info = { moduleRoot: legacy5, moduleRel: "", multiModule: false };
+  const legacy5Pom = (pluginDeps: string) =>
+    "<project><artifactId>svc</artifactId><dependencies>" +
+    "<dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter-api</artifactId><version>5.3.2</version></dependency>" +
+    "<dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies>" +
+    `<build><plugins><plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId>${pluginDeps}</plugin></plugins></build></project>`;
+  fs.writeFileSync(
+    path.join(legacy5, "pom.xml"),
+    legacy5Pom("<dependencies><dependency><groupId>org.junit.platform</groupId><artifactId>junit-platform-surefire-provider</artifactId><version>1.3.2</version></dependency></dependencies>"),
+  );
+  const legacy5Report = path.join(legacy5, "target", "surefire-reports", "TEST-a.OldTest.xml");
+  fs.mkdirSync(path.dirname(legacy5Report), { recursive: true });
+  fs.writeFileSync(legacy5Report, '<testsuite><property name="surefire.test.class.path" value="/r/target/test-classes:/m/junit-jupiter-api-5.3.2.jar:/m/junit-4.12.jar"/></testsuite>');
+  const withProvider = measureTestStack(legacy5Info, legacy5, "[INFO] --- maven-surefire-plugin:2.19.1:test (default-test) @ svc ---", Date.now() - 60_000);
+  check(
+    "measureTestStack：surefire plugin 自己的相依裡有 JUnit Platform provider → JUnit 5 會執行",
+    withProvider?.pluginEngine === true && withProvider.surefireVersion === "2.19.1" && jupiterRuns(withProvider) === true && frameworkOf(withProvider) === "JUnit 5",
+    JSON.stringify(withProvider),
+  );
+  fs.writeFileSync(path.join(legacy5, "pom.xml"), legacy5Pom(""));
+  const withoutProvider = measureTestStack(legacy5Info, legacy5, "[INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ svc ---", Date.now() - 60_000);
+  check(
+    "measureTestStack：2.22.2、只有 API、plugin 沒有 provider → JUnit 5 不會執行，新測試用 JUnit 4",
+    withoutProvider?.pluginEngine === false && jupiterRuns(withoutProvider) === false && frameworkOf(withoutProvider) === "JUnit 4",
+    JSON.stringify(withoutProvider),
+  );
+  fs.rmSync(legacy5, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -3774,6 +3906,203 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     existingLocked.includes("不能修改") && existingLocked.includes("FeeAdditionalTest.java") && existingLocked.includes("除外"),
     existingLocked,
   );
+}
+
+// ---------------------------------------------------------------------------
+// 27. Were the writer's tests run? (gates/build.ts checkTestsRan) — and the Java lexer under it
+// ---------------------------------------------------------------------------
+console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）與 codeOnly");
+{
+  const lexed = codeOnly('String u = "http://x/*y"; // @Test\n/* @Test */ char q = \'"\'; String t = """\n  @Test "\n  """; @Test void a() {}\n');
+  check(
+    "codeOnly：註解、字串、字元、text block 的內容都清成空白，長度與換行不變",
+    lexed.length === 'String u = "http://x/*y"; // @Test\n/* @Test */ char q = \'"\'; String t = """\n  @Test "\n  """; @Test void a() {}\n'.length &&
+      (lexed.match(/@Test/g) ?? []).length === 1 && lexed.includes("void a()") && lexed.split("\n").length === 5,
+    JSON.stringify(lexed),
+  );
+  check("codeOnly：字串裡的 \\\" 不結束字串", codeOnly('s = "a\\"b // c"; d();').endsWith("d();"));
+  check("codeOnly：沒結束的區塊註解吃到檔尾、不丟例外", codeOnly("a(); /* x").startsWith("a();") && codeOnly("a(); /* x").length === 9);
+
+  check(
+    "testFrameworkOf：看 @Test 從哪裡 import——JUnit 4 的 @Test 配 JUnit 5 的 Assertions 仍是 JUnit 4",
+    testFrameworkOf("import org.junit.Test;\nimport static org.junit.jupiter.api.Assertions.assertEquals;") === "JUnit 4" &&
+      testFrameworkOf("import org.junit.jupiter.api.*;") === "JUnit 5" &&
+      testFrameworkOf("import org.testng.annotations.Test;") === "TestNG" &&
+      testFrameworkOf("import org.junit.jupiter.params.ParameterizedTest;") === "JUnit 5" &&
+      testFrameworkOf("import java.util.List;") === undefined,
+  );
+  const f = (name: string) => `/r/src/test/java/com/x/${name}.java`;
+  const et = (src: string, name = "FooTest") => expectedTestOf(src, f(name), "created");
+  check(
+    "expectedTestOf：套件＋類名；沒有 @Test 的 helper、abstract 基底、interface 不算",
+    et("package com.x;\nimport org.junit.jupiter.api.Test;\nclass FooTest { @Test void a() {} }")?.fqcn === "com.x.FooTest" &&
+      et("package com.x;\nclass FooTest { void helper() {} }") === undefined &&
+      et("package com.x;\nimport org.junit.Test;\npublic abstract class FooTest { @Test public void a() {} }") === undefined &&
+      et("package com.x;\ninterface FooTest { @org.junit.jupiter.api.Test default void a() {} }") === undefined,
+  );
+  check("expectedTestOf：@Test 只出現在註解裡 → 不是測試類別", et("package com.x;\n// @Test\nclass FooTest {}") === undefined);
+  check(
+    "expectedTestOf：類別層級的 @Disabled（說明字串裡有分號也一樣）→ disabled；方法層級的不算",
+    et('package com.x;\nimport org.junit.jupiter.api.*;\n@Disabled("later; maybe")\nclass FooTest { @Test void a() {} }')?.disabled === true &&
+      et("package com.x;\nimport org.junit.jupiter.api.*;\nclass FooTest { @Disabled @Test void a() {} @Test void b() {} }")?.disabled === false &&
+      et("package com.x;\nimport org.testng.annotations.Test;\n@Test(enabled = false)\npublic class FooTest { @Test public void a() {} }")?.disabled === true,
+  );
+  check(
+    "includedByDefault：surefire 預設的 includes（Test*、*Test、*Tests、*TestCase）",
+    ["a.FooTest", "a.TestFoo", "a.FooTests", "a.FooTestCase"].every(includedByDefault) && !["a.FooSpec", "a.FooIT", "a.FooTestHelper"].some(includedByDefault),
+  );
+  check(
+    "classesRunInLog：surefire 的「Running」與「- in / -- in」行",
+    JSON.stringify(
+      classesRunInLog(
+        "[INFO] Running com.x.FooTest\n[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s - in com.x.BarTest\r\n" +
+          "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.Baz$Inner\n[INFO] Running npm install\n",
+      ).sort(),
+    ) === JSON.stringify(["com.x.BarTest", "com.x.Baz$Inner", "com.x.FooTest"]),
+  );
+
+  // On disk: a module whose build ran its JUnit 4 test and not the writer's JUnit 5 one.
+  const m = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-ran-"));
+  const mi = { moduleRoot: m, moduleRel: "", multiModule: false };
+  const src = (name: string, body: string) => {
+    const p = path.join(m, "src", "test", "java", "com", "x", `${name}.java`);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+    return p;
+  };
+  const reports = path.join(m, "target", "surefire-reports");
+  fs.mkdirSync(reports, { recursive: true });
+  const report = (name: string, body = '<testsuite name="x" tests="2" skipped="0"></testsuite>', ageMs = 0) => {
+    const p = path.join(reports, name);
+    fs.writeFileSync(p, body);
+    if (ageMs) fs.utimesSync(p, (Date.now() - ageMs) / 1000, (Date.now() - ageMs) / 1000);
+  };
+  src("OldTest", "package com.x;\nimport org.junit.Test;\npublic class OldTest { @Test public void a() {} }\n");
+  const newFile = src("NewTest", "package com.x;\nimport org.junit.jupiter.api.Test;\nclass NewTest { @Test void a() {} }\n");
+  const newTest = expectedTestOf(fs.readFileSync(newFile, "utf8"), newFile, "created")!;
+  const since = Date.now() - 10_000;
+  report("TEST-com.x.OldTest.xml");
+  report("TEST-com.x.NewTest.xml", undefined, 60_000); // an earlier build's
+  const r1 = checkTestsRan("maven", mi, since, "[INFO] Tests run: 1", [newTest])!;
+  const r1Report = renderRanCheck(r1, "maven") ?? "";
+  check(
+    "checkTestsRan：writer 的 JUnit 5 類別沒有這次建置的報告（舊的不算）→ 沒被執行；報告說出本模組執行的是 JUnit 4、要改寫",
+    r1.notRun.map((t) => t.fqcn).join() === "com.x.NewTest" && r1.ran.map((r) => `${r.fqcn}:${r.framework}`).join() === "com.x.OldTest:JUnit 4" &&
+      r1Report.includes("JUnit 5 寫法") && r1Report.includes("都是 JUnit 4 寫法") && r1Report.includes("org.junit.Test"),
+    r1Report,
+  );
+  report("TEST-com.x.NewTest$Inner.xml");
+  check("checkTestsRan：@Nested 類別的報告（TEST-<類別>$<內部類別>.xml）也算有執行", checkTestsRan("maven", mi, since, "", [newTest])?.notRun.length === 0);
+  fs.rmSync(path.join(reports, "TEST-com.x.NewTest$Inner.xml"));
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3"><testcase name="a" classname="com.x.NewTest" time="0"/></testsuite>');
+  check("checkTestsRan：TestNG 的單一 TEST-TestSuite.xml——看裡面每個 testcase 的 classname", checkTestsRan("maven", mi, since, "", [newTest])?.notRun.length === 0);
+  fs.rmSync(path.join(reports, "TEST-TestSuite.xml"));
+  check(
+    "checkTestsRan：報告不在，但 surefire 的 log 說「Running <類別>」→ 算有執行",
+    checkTestsRan("maven", mi, since, "[INFO] Running com.x.NewTest\n", [newTest])?.notRun.length === 0,
+  );
+  report("TEST-com.x.NewTest.xml", '<testsuite name="com.x.NewTest" tests="3" skipped="3"></testsuite>');
+  const skipped = checkTestsRan("maven", mi, since, "", [newTest])!;
+  check(
+    "checkTestsRan：writer 新寫的類別測試全部被略過 → 不算執行",
+    skipped.notRun.length === 0 && skipped.allSkipped.length === 1 && skipped.allSkipped[0].tests === 3 && (renderRanCheck(skipped, "maven") ?? "").includes("全部被略過"),
+  );
+  check(
+    "checkTestsRan：改過的既有類別全部略過 → 不是 writer 能決定的，不判",
+    checkTestsRan("maven", mi, since, "", [{ ...newTest, origin: "changed" }])?.allSkipped.length === 0,
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  report("TEST-Adding numbers.xml", '<testsuite name="Adding numbers" tests="2"><testcase name="a" classname="Adding numbers"/></testsuite>');
+  check(
+    "checkTestsRan：報告以 @DisplayName 命名（usePhrasedFileName）、對不到任何測試類別 → 看不到，不判",
+    checkTestsRan("maven", mi, since, "[INFO] Tests run: 2", [newTest]) === undefined,
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  check(
+    "checkTestsRan：模組沒有這次的報告、log 也沒列類別，但說有跑測試 → 看不到，不判（報告可能關了或寫到別處）",
+    checkTestsRan("maven", mi, since, "[INFO] Tests run: 5, Failures: 0", [newTest]) === undefined,
+  );
+  const none = checkTestsRan("maven", mi, since, "[INFO] Tests run: 0, Failures: 0", [newTest]);
+  check("checkTestsRan：surefire 說一個測試都沒跑 → 全部沒執行", none?.notRun.length === 1);
+  const upstream = checkTestsRan("maven", mi, since, "[INFO] Running com.up.CommonTest\n[INFO] Tests run: 3, Failures: 0\n[INFO] No tests to run.", [newTest]);
+  check(
+    "checkTestsRan：reactor 裡上游模組的「Running」不算本模組跑過什麼；本模組說 No tests to run → 全部沒執行",
+    upstream?.notRun.length === 1 && !upstream.reported.includes("com.up.CommonTest"),
+    JSON.stringify(upstream?.reported),
+  );
+  const withBefore = checkTestsRan("maven", mi, since, "[INFO] No tests to run.", [newTest], ["com.x.OldTest"])!;
+  const withBeforeReport = renderRanCheck(withBefore, "maven") ?? "";
+  check(
+    "checkTestsRan：限縮執行時這次沒有別的類別可比 → 用 writer 介入前跑過的類別說明本模組執行的是哪個框架",
+    withBefore.ran.length === 0 && withBeforeReport.includes("writer 介入前的建置執行的是：JUnit 4 寫法 1 個") && withBeforeReport.includes("都是 JUnit 4 寫法"),
+    withBeforeReport,
+  );
+  // A class that ran before the writer and not now is no evidence of what runs: its source may
+  // have been rewritten into the very framework that does not.
+  const switched = { file: newFile, fqcn: "com.x.NewTest", disabled: false, origin: "changed" as const, framework: "JUnit 5" as const };
+  const switchedReport = renderRanCheck(checkTestsRan("maven", mi, since, "[INFO] No tests to run.", [switched], ["com.x.OldTest", "com.x.NewTest"])!, "maven") ?? "";
+  check(
+    "checkTestsRan：沒被執行的類別不當成「介入前跑的是什麼」的證據（它的原始碼可能剛被改成不會跑的框架）",
+    switchedReport.includes("writer 介入前的建置執行的是：JUnit 4 寫法 1 個。") && switchedReport.includes("都是 JUnit 4 寫法"),
+    switchedReport,
+  );
+  const spec = expectedTestOf("package com.x;\nimport org.junit.Test;\npublic class FooSpec { @Test public void a() {} }", f("FooSpec"), "created")!;
+  const specReport = renderRanCheck({ reported: [], notRun: [spec], allSkipped: [], ran: [], ranBefore: [] }, "maven") ?? "";
+  check("renderRanCheck：類名不符 surefire 預設的 includes → 點名", specReport.includes("類名不符 surefire 預設的 includes"), specReport);
+  const untouched = renderRanCheck(
+    { reported: [], notRun: [{ file: f("OldTest"), fqcn: "com.x.OldTest", disabled: false, origin: "untouched", framework: "JUnit 4" }], allSkipped: [], ran: [{ fqcn: "com.x.AnyTest", framework: "JUnit 4" }], ranBefore: [] },
+    "maven",
+  ) ?? "";
+  check(
+    "renderRanCheck：writer 沒碰的既有類別不再被執行 → 說是這輪的變更造成的，指向共用的資源與基底類別",
+    untouched.includes("writer 介入前有被執行") && untouched.includes("junit-platform.properties"),
+    untouched,
+  );
+  check("renderRanCheck：全部都有執行 → null", renderRanCheck({ reported: [], notRun: [], allSkipped: [], ran: [], ranBefore: [] }, "maven") === null);
+  const two = renderRanCheck(
+    {
+      reported: [],
+      notRun: ["com.x.ATest", "com.x.BTest"].map((fqcn) => ({ file: f(fqcn.split(".").pop()!), fqcn, disabled: false, origin: "untouched" as const, framework: "JUnit 4" as const })),
+      allSkipped: [],
+      ran: [
+        ...["com.x.C1Test", "com.x.C2Test", "com.x.C3Test"].map((fqcn) => ({ fqcn, framework: "JUnit 4" as const })),
+        { fqcn: "com.x.NgTest", framework: "TestNG" as const },
+      ],
+      ranBefore: [],
+    },
+    "maven",
+  ) ?? "";
+  check(
+    "renderRanCheck：同一個原因停掉的多個既有類別只說一次",
+    (two.match(/本身沒被改過/g) ?? []).length === 1 && two.includes("上面 2 個既有類別"),
+    two,
+  );
+  const mixed = renderRanCheck(
+    { reported: [], notRun: [{ ...newTest }], allSkipped: [], ran: [{ fqcn: "com.x.NgTest", framework: "TestNG" }, ...["A", "B", "C"].map((n) => ({ fqcn: `com.x.${n}Test`, framework: "JUnit 4" as const }))], ranBefore: [] },
+    "maven",
+  ) ?? "";
+  check("renderRanCheck：被執行的有好幾種框架 → 建議改用最多的那一種", mixed.includes("改用 JUnit 4（"), mixed);
+  check(
+    "expectedTestOf：類別宣告緊接在 ) 後面也讀得到修飾字（@RunWith(X.class)abstract class 是 abstract）",
+    et("package com.x;\nimport org.junit.Test;\n@RunWith(Parameterized.class)public class FooTest { @Test public void a() {} }")?.fqcn === "com.x.FooTest" &&
+      et("package com.x;\nimport org.junit.Test;\n@RunWith(Parameterized.class)abstract class FooTest { @Test public void a() {} }") === undefined,
+  );
+
+  // gradle deletes its results before each run: whatever is there is this run's (or an up-to-date one's).
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-ran-"));
+  fs.mkdirSync(path.join(g, "src", "test", "java", "com", "x"), { recursive: true });
+  fs.copyFileSync(newFile, path.join(g, "src", "test", "java", "com", "x", "NewTest.java"));
+  const gResults = path.join(g, "build", "test-results", "test");
+  fs.mkdirSync(gResults, { recursive: true });
+  fs.writeFileSync(path.join(gResults, "TEST-com.x.NewTest.xml"), '<testsuite name="com.x.NewTest" tests="1" skipped="0"></testsuite>');
+  const old = (Date.now() - 3_600_000) / 1000;
+  fs.utimesSync(path.join(gResults, "TEST-com.x.NewTest.xml"), old, old);
+  check(
+    "checkTestsRan（gradle）：結果目錄裡的就是最近一次執行的，不看修改時間",
+    checkTestsRan("gradle", { moduleRoot: g, moduleRel: "", multiModule: false }, Date.now(), "", [newTest])?.notRun.length === 0,
+  );
+  fs.rmSync(g, { recursive: true, force: true });
+  fs.rmSync(m, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

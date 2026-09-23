@@ -267,6 +267,9 @@ async function main() {
   // The baseline's failing identities, handed to the gate only under UT_ALLOW_DIRTY_BASELINE.
   let tolerate: string[] | undefined;
   let repair: RepairResult | undefined;
+  // The test classes the module's build ran before any writer: every green round must still run
+  // them (gates/build.ts checkTestsRan). None without a baseline.
+  let ranAtBaseline: string[] | undefined;
   // What the module's tests compile and run against, measured — see libs/teststack.ts. Measured
   // again after anything that runs tests, since a surefire classpath beats a reading of the pom.
   let testStack: TestStack | undefined;
@@ -328,6 +331,7 @@ async function main() {
     }
     measureStack(baseline.raw, baselineStartedAt);
     logFacts();
+    ranAtBaseline = baseline.ranTests;
 
     let clean = baseline.clean;
     // Repairing is only possible where the writer may write. A red common/ in a reactor, or a
@@ -368,6 +372,8 @@ async function main() {
       );
       if (repair.success) {
         clean = true;
+        // The repair's green build ran what the red one could not: compile errors hide every test.
+        ranAtBaseline = [...new Set([...(ranAtBaseline ?? []), ...(repair.ranTests ?? [])])].sort();
         if (repair.stopReason === "flaky-baseline") {
           log(`[WARN] ${repair.report}——不是穩定的紅燈，照常開始產生測試；這些測試本身需要人檢視`);
         } else {
@@ -501,6 +507,7 @@ async function main() {
       repair,
       testStack,
       sourceEncoding,
+      ranAtBaseline,
     });
     log(`artifacts 已寫入：${runDir}`);
     process.exit(code);
@@ -523,6 +530,7 @@ async function main() {
       conventions,
       testStack,
       sourceEncoding,
+      ranAtBaseline,
     });
   } catch (e) {
     // A crashed run must still leave a summary — otherwise the artifacts directory
@@ -621,6 +629,7 @@ interface BatchRunInput {
   repair?: RepairResult;
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
+  ranAtBaseline?: string[];
 }
 
 const lastGate = (funnel: IterationRecord[]) => funnel[funnel.length - 1]?.gate;
@@ -666,6 +675,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       conventions,
       testStack: stack,
       sourceEncoding: o.sourceEncoding,
+      ranAtBaseline: o.ranAtBaseline,
     });
     const rec: BatchRecord = {
       batch: i + 1,

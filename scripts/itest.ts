@@ -433,6 +433,17 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("prompt 落地", c.runExists("iter-1/prompt.md"));
   },
 
+  "tests-not-run-framework": (c) => {
+    check("第 2 輪（改寫成 JUnit 4 後）才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("第 1 輪記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "回饋點名沒被執行的類別與它的寫法，並指出這個模組執行的是 JUnit 4、要改寫",
+      fb.includes("com.x.CalcTest（JUnit 5 寫法）") && fb.includes("都是 JUnit 4 寫法") && fb.includes("org.junit.Test"),
+      fb.slice(0, 800),
+    );
+  },
+
   "zero-tests": (c) => {
     check("建置綠燈仍判 FAIL", c.result.success === false);
     const fb = c.runRead("iter-1/feedback.md");
@@ -606,6 +617,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("成功那輪也做了完整驗收", c.runExists("iter-2/final-verify.log"));
   },
 
+  "repair-framework-switch": (c) => {
+    check("第 1 輪的「綠燈」不算修好，第 2 輪才修好", c.result.success === true && c.result.rounds === 2, JSON.stringify(c.result));
+    const fb = c.runRead("repair-1/feedback.md");
+    check(
+      "回饋點名它改之前有被執行、這次沒有，而且是 TestNG 寫法",
+      fb.includes("com.x.ExistingTest（TestNG 寫法）") && fb.includes("改之前有被執行") && fb.includes("JUnit 4 寫法"),
+      fb.slice(0, 800),
+    );
+    check("綠燈的建置沒有錯誤可節錄：回饋不附建置 log 的尾巴", !fb.includes("錯誤節錄"), fb.slice(-400));
+    check("建置 3 次：預檢 + 兩輪修復", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  },
+
   "repair-success": (c) => {
     check("修復成功", c.result.success === true, JSON.stringify(c.result));
     check("stopReason=repaired", c.result.stopReason === "repaired");
@@ -754,6 +777,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
       !c.runRead("baseline.log").includes(String.fromCharCode(27)),
       c.runRead("baseline.log").slice(0, 200),
     );
+  },
+
+  "loop-other-tests-stop-running": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "回饋點名不再被執行的既有測試，指向測試資源裡的設定",
+      fb.includes("com.x.ExistingTest") && fb.includes("writer 介入前有被執行") && fb.includes("META-INF/services"),
+      fb.slice(0, 800),
+    );
+    check("預檢 + 兩輪 gate 共 3 次建置", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
   },
 
   "loop-dirty-tolerated": (c) => {

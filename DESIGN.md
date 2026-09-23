@@ -55,6 +55,16 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    assumption——`assumeTrue(false)` 讓失敗的測試以「略過」結束，數量卻一個不少）不得增加，否則該輪 FAIL 餵回。（writer 能
    刪測試 = 能把失敗「刪到會過」= 同一個洞的另一面。有了這兩道 assert，「修復既有紅燈」才敢
    交給 writer 做——先前否決的理由是修好與掏空在 build gate 眼裡一模一樣，現在分得出來。）
+   第三道是**有跑才算**：綠燈只證明跑到的測試通過，沒證明該跑的有跑。以真的 Maven 實測：surefire 2.22.2、
+   classpath 上只有 `junit-jupiter-api`（沒有 engine）的模組，writer 寫的 JUnit 5 測試編得過、一個都沒執行，
+   BUILD SUCCESS——既有的 JUnit 4 測試剛好把目標類別覆蓋滿，於是 coverage gate 也過，一個沒執行過的測試
+   以 gates-passed 交差。反過來也成立：把失敗的測試改寫成這個建置不執行的框架，數量一個不少、數量量尺看不出來，
+   模組卻綠了。所以綠燈另要求這次建置的 surefire 報告（或 log 的 `Running` 行）點得出這些類別：writer 新寫的、
+   它改過而介入前有執行的，跑完整模組時再加上介入前有執行的**全部**類別——一個讓其他測試不被探索到的測試
+   資源（`META-INF/services` 底下的 discovery filter）也逃不掉。writer 新寫的類別測試全部 skipped 也不算。
+   判不出來時不判：報告關了、寫到別處、以 `@DisplayName` 命名（對不到任何測試類別）時只印 WARN——這道檢查
+   判錯的代價是每一輪都 FAIL、run 永遠不會成功，比放過一個沒執行的測試更糟。回饋說出這次執行了哪些類別、
+   各是什麼框架（限縮執行時退回 writer 介入前執行的那些），writer 才知道該改寫成什麼。
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；
    agent .md body 只放不變的角色契約。（skill 機制是 description-triggered
    的機率性載入，自動 loop 不能靠機率。）
@@ -82,7 +92,15 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    亂碼（maven-compiler-plugin 3.13 + JDK 21 印出 unmappable character 後照樣 BUILD SUCCESS）——每一種
    都是 writer 一輪一輪才撞到的失敗，而它照著改的 prompt 寫的正是失敗的寫法。模組其實早就知道答案：
    surefire 在每次執行的報告裡記錄了測試 classpath，Maven 在每次建置的 log 裡寫了它用的平台編碼。
-   所以量它、寫進 prompt；量不到的（模組還沒跑過測試時的 pom 推斷）明說是推斷。編碼另有一道
+   所以量它、寫進 prompt；量不到的（模組還沒跑過測試時的 pom 推斷）明說是推斷。
+   「classpath 上有 JUnit 5」不等於「JUnit 5 會被執行」：surefire 3.0.0-M4 起才會替只有 API 的模組補上
+   engine（實測 3.2.5 補上 jupiter 與 vintage engine、兩種測試都跑；2.22.2 一個 JUnit 5 測試都不跑），而
+   `surefire.test.class.path` 在兩種情況下一模一樣——補上的 engine 不記在那裡。能分辨的只有建置 log 裡的
+   surefire 版本，以及 plugin 自己的相依（2.19–2.21 時代的 provider 設定）。pom 更是只說宣告了什麼：
+   宣告了 junit:junit 不代表沒有 JUnit 5（間接相依、repo 外的 parent 都帶得進來），所以 pom 來源一律不說
+   「只有 JUnit 4」，只有 Spring Boot 版本推斷（且沒有其他外部 parent）例外；沒有既有測試可看時，用 pom
+   宣告的框架——猜錯時「有跑才算」會在第一輪點出來。mock maker 同理：開關檔也可能在某個相依的 jar 裡，
+   classpath 上看不到 inline mock maker 時說「看不到」、建議避開，不說「不能」。編碼另有一道
    確定性的護欄，因為 prompt 攔不住工具：agent 的編輯工具以 UTF-8 讀寫，改一個 MS950 既有測試檔會把
    裡面的中文（包括字串常值）默默變成別的字。第一版的做法是把這些檔「鎖住」——被改到就還原、叫 writer 另建
    `<Class>AdditionalTest.java`——但那跟「既有測試檔一律直接補強、嚴禁另建」衝突，修復迴圈也永遠修不了一個
