@@ -39,7 +39,12 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    （否則 loop 收斂性交給模型心情。）
 2. **驗證權不外包**：writer 無 bash；所有 hard gate 由 script 執行並解析原始輸出。
    （writer 能自跑測試 = 能自述通過 = gate 被架空。）同理 writer 的寫入範圍也由 script
-   assert：每輪前後對 repo 拍快照，`src/test` 以外有變動即中止。（writer 能改 production
+   assert：每輪前後對 repo 拍快照，`src/test` 以外有變動即中止——例外只有 loop 自己的 runs
+   目錄，與別的程序寫的輸出（被 git ignore、不在 `src/` 底下、不是建置檔、且形狀是輸出：
+   `logs/`、`out/`、`bin/`、`*.log`、本機 DB 檔等；只印 WARN）。後者是 allowlist 而不是「被 ignore
+   就豁免」：Spring Boot 從模組根載入 `./config/application.yml`，被 ignore 的設定檔一樣是測試會讀的
+   東西。（執行中的應用程式寫 `logs/app.log`、IDE 自己建置到 `out/`，先前都會在隨機的輪次以
+   scope-violation 中止。）（writer 能改 production
    code = 能把測試「改到會過」= build gate 被架空。這條先前只靠 prompt 勸導，實測 writer
    加一個 method 進 production 後 loop 照樣 gates-passed。）同樣由 script 守的還有既有測試
    的數量：`@Test` 數、斷言數不得減少、`@Disabled` 不得增加，否則該輪 FAIL 餵回。（writer 能
@@ -86,6 +91,17 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
 | bash | [FAIL] | [FAIL] | 驗證權在 loop（原則 2） |
 | webfetch | [FAIL] | [FAIL] | 無需求、縮小面 |
 | skill | [FAIL] | 互動模式限 test-quality-evaluator | pipeline 走注入；skill 只供人工 debug |
+| task | [FAIL] | [FAIL] | subagent 拿到的是 opencode 預設工具組（含 bash），等於繞過上面每一列；runner 只看得到 `[tool] task [completed]`。guard 強制 `tools.task: false` |
+
+opencode 的 `permission` 另外收斂兩件事（guard 不檢查這一段，只影響 opencode runtime）：
+
+- **writer 的 `edit` 只允許 `src/test/**`**。其餘路徑 `deny`：模型想改 `pom.xml` 加依賴、或替目標類別
+  加 constructor 時拿到的是工具錯誤，session 繼續；先前是 `edit: allow`，改下去之後 snapshot guard
+  判 scope-violation 中止整個 run。snapshot guard 仍是 assert，這一層只是讓它很少需要開火——與
+  api runner 的 `write_file` 拒寫範圍外路徑同一個道理。
+- **`external_directory: deny`（兩個 agent）**。opencode 預設是 `ask`，而 `opencode run` 非互動時會
+  自動拒絕 ask，且**拒絕會結束整個 session**：模型只要讀一次 `~/.m2` 裡的依賴原始碼或 stack trace
+  上的絕對路徑，writer 就空手結束、下一輪 writer-no-op。`deny` 讓模型拿到工具錯誤後繼續。
 
 模型建議：writer 走本地 Qwen3-coder（便宜狂迭代）、reviewer 走 Claude——
 cross-model 降低 self-agreement bias，且弱模型 follow 長 rubric 穩定度差。

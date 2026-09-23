@@ -98,6 +98,12 @@ export function testRootRel(mod: ModuleInfo): string {
   return path.join(mod.moduleRel, "src", "test", "java").replace(/\\/g, "/");
 }
 
+// The writer's whole writable tree — what the scope guard and the opencode edit permission
+// grant: test sources under java/, and test resources (fixtures, expected outputs) beside them.
+function testResourcesRel(mod: ModuleInfo): string {
+  return path.join(mod.moduleRel, "src", "test", "resources").replace(/\\/g, "/");
+}
+
 export function buildGeneratePrompt(input: GeneratePromptInput): string {
   const root = testRootRel(input.mod);
   const buildFile = input.mod.moduleRel
@@ -123,7 +129,7 @@ ${DIMENSION_ONELINERS}
 流程要求：
 1. 先讀取每個目標類別的原始碼與其相依介面，理解行為與邊界。
 2. 參考 ${buildFile} 已宣告的測試相依，以及專案既有測試的風格。
-3. 只建立/修改 ${root} 下的測試檔案。不要執行任何建置或測試指令（由外部 pipeline 負責驗證）。
+3. 只建立/修改 ${root} 下的測試檔案（測試需要的資料檔放 ${testResourcesRel(input.mod)}）。不要執行任何建置或測試指令（由外部 pipeline 負責驗證）。
 4. 不得修改 production code、不得刪除仍有效的測試、不得使用 @Disabled。
 
 完成後以清單列出你建立/修改的檔案。`;
@@ -152,7 +158,7 @@ ${renderPreExisting(input.preExisting)}${renderConventions(input.conventions)}
 本次任務的目標類別（測試範圍以此為準）：
 ${input.targetClasses.map((c) => `- ${c}`).join("\n")}
 
-請修正 ${root} 中相關的測試檔案，讓上述所有問題被解決。仍然嚴格遵守：
+請修正 ${root} 中相關的測試檔案（或 ${testResourcesRel(input.mod)} 的測試資源），讓上述所有問題被解決。仍然嚴格遵守：
 <standards>
 ${input.standards}
 </standards>
@@ -192,7 +198,7 @@ ${input.report}
 </build_report>
 
 修復的定義：讓測試**正確地通過**，不是讓它消失。以下由 pipeline 以確定性方式檢查，違反即判 FAIL 或中止：
-- 只能修改 ${root} 下的測試檔；不得修改 production code、pom.xml / build.gradle 或其他任何檔案
+- 只能修改 ${root} 下的測試檔與 ${testResourcesRel(input.mod)} 下的測試資源；不得修改 production code、pom.xml / build.gradle 或其他任何檔案
 - 既有測試檔的 @Test 方法數與斷言數不得減少、不得新增 @Disabled
 - 若根因在 production code 或建置設定（例如 Lombok 的 annotation processor 未在 test scope 生效，
   導致 @Slf4j 產不出 log 欄位），以測試碼能自足的方式處理（例如移除測試碼中的 logging），

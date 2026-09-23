@@ -3,6 +3,13 @@ import { QUIET } from "../config";
 
 const START_TS = Date.now();
 
+// A console that went away must not take the run with it. When the reader of a `| tee` pipe
+// exits, or the terminal hangs up, Node reports EPIPE / EIO as an 'error' event on
+// process.stdout — with no listener that is an uncaught exception, and it fires at the *next*
+// log line, possibly minutes later, with stderr usually gone to the same dead place. The run's
+// real record is runs/<ts>/; losing the console is survivable, losing the run is not.
+for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
+
 export function elapsed(): string {
   const s = Math.floor((Date.now() - START_TS) / 1000);
   const mm = String(Math.floor(s / 60)).padStart(2, "0");

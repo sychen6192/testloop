@@ -38,16 +38,23 @@ export const TARGET_ARG = process.argv[2];
 // Numeric env vars fail fast on garbage. `Number("five")` is NaN, and NaN silently
 // disables whatever it configures: a NaN MAX_ITER runs zero rounds, a NaN timeout
 // fires immediately and kills every agent. Exiting with the variable's name beats both.
-export function numEnv(name: string, def: number, min = 0): number {
+export function numEnv(name: string, def: number, min = 0, max = Infinity): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return def;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < min) {
-    console.error(`FATAL: ${name}=${raw} 不是有效數值（需 >= ${min}）`);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.error(
+      `FATAL: ${name}=${raw} 不是有效數值（需 >= ${min}${Number.isFinite(max) ? ` 且 <= ${max}` : ""}）`,
+    );
     process.exit(1);
   }
   return n;
 }
+
+// setTimeout's ceiling. A longer delay is not "wait longer": Node clamps it to 1ms and fires at
+// once, so an operator who sets a huge UT_AGENT_TIMEOUT_MS to mean "never time out" would have
+// every agent and every build killed the moment it starts. ~24.8 days is already "never".
+export const MAX_TIMER_MS = 2_147_483_647;
 
 export const MAX_ITER = numEnv("UT_MAX_ITER", 5, 1);
 // Upper bound on the failure report fed back to the writer each round. A build log grows with
@@ -115,7 +122,7 @@ export const WRITER_MODEL = process.env.UT_WRITER_MODEL ?? process.env.UT_MODEL 
 export const REVIEWER_MODEL = process.env.UT_REVIEWER_MODEL ?? "";
 
 // Per-run agent wall-clock timeout (replaces the SDK's maxSessionTurns).
-export const AGENT_TIMEOUT_MS = numEnv("UT_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1000);
+export const AGENT_TIMEOUT_MS = numEnv("UT_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1000, MAX_TIMER_MS);
 
 // --- api runner (UT_RUNNER=api): POST <base>/chat/completions with tools ---
 // Base URL of any OpenAI-compatible server, e.g. http://localhost:11434/v1 (Ollama),
@@ -135,11 +142,27 @@ export const API_MAX_TOKENS = numEnv("UT_API_MAX_TOKENS", 8192);
 // Tool results are clipped to this many characters so one read cannot fill the context.
 export const API_MAX_TOOL_RESULT_CHARS = numEnv("UT_API_MAX_TOOL_RESULT_CHARS", 24000, 500);
 export const WRITER_TEMPERATURE = numEnv("UT_WRITER_TEMPERATURE", 0.2);
+// How long a transient model-side failure is retried before the session is reported as not
+// finished. api runner: network errors, 429 and 5xx on one request, once the endpoint has answered
+// this run. opencode runner: re-running a session whose opencode exited abnormally (it gives up on
+// a provider error by itself), once that agent has completed a session this run. A model server
+// restarting or a gateway shedding load is over in a minute or two; three quick attempts used to
+// end the whole run on a few seconds of 503. Bounded by UT_AGENT_TIMEOUT_MS too. 0 = no retries;
+// any other value gets at least one. Before the endpoint has answered (api) or the agent has done
+// anything (opencode) this does not apply: 3 quick attempts, or none, and the failure is reported
+// as configuration.
+export const AGENT_RETRY_WINDOW_MS = numEnv("UT_AGENT_RETRY_WINDOW_MS", 3 * 60 * 1000, 0, MAX_TIMER_MS);
 // The reviewer's temperature is 0 by architecture (hard rule 3), not by configuration.
 export const REVIEWER_TEMPERATURE = 0;
 // Build/test gate wall-clock timeout. A hung mvn (unreachable repo, a test with a real
 // socket) was the one unbounded wait left in the pipeline.
-export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000);
+export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000, MAX_TIMER_MS);
+// How much build output is kept in memory for the gates (characters). Beyond it the head is
+// dropped and only its [ERROR] / "Tests run:" lines survive. An unbounded capture crashed the
+// whole tool at V8's ~512M-character string limit when a test logged heavily.
+// At most 200M: the window is trimmed once it reaches twice this, and that join must stay under
+// V8's ~536M-character limit.
+export const MAX_BUILD_OUTPUT_CHARS = numEnv("UT_MAX_BUILD_OUTPUT_CHARS", 64 * 1024 * 1024, 100_000, 200 * 1024 * 1024);
 export const OPENCODE_BIN = process.env.UT_OPENCODE_BIN ?? "opencode";
 
 // --- Corporate network: proxy and TLS interception ---------------------------

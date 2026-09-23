@@ -9,6 +9,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+// readFileSync on a FIFO or a device blocks the whole process; only regular files are sources.
+function isRegularFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 // Reading every test source in a large module costs more than the signal is worth; the
 // convention is legible from a sample. Suites are what the cap could realistically miss,
 // so filenames are scanned for suite-ish names first and always read.
@@ -59,10 +68,16 @@ export function scanTestConventions(testRoot: string, repoRoot: string): TestCon
 
   const files: string[] = [];
   const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith(".java")) files.push(p);
+      else if (e.name.endsWith(".java") && isRegularFile(p)) files.push(p);
     }
   };
   walk(testRoot);

@@ -9,6 +9,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+// readFileSync on a FIFO or a device blocks the whole process; only regular files are sources.
+function isRegularFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export interface TestMetrics {
   tests: number;
   assertions: number;
@@ -47,10 +56,16 @@ export function collectTestMetrics(testRoot: string): MetricsSnapshot {
   const snap: MetricsSnapshot = {};
   if (!fs.existsSync(testRoot)) return snap;
   const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return; // unreadable or vanished mid-walk: nothing to protect, and no reason to end the run
+    }
+    for (const e of entries) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith(".java")) {
+      else if (e.name.endsWith(".java") && isRegularFile(p)) {
         try {
           snap[path.relative(testRoot, p).replace(/\\/g, "/")] = testMetrics(
             fs.readFileSync(p, "utf8"),

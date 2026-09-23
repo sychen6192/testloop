@@ -11,7 +11,9 @@
 // artifacts they read.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { repoLockFile } from "../libs/lock";
 
 export const TESTGEN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -64,6 +66,8 @@ export interface MvnStep {
   jacocoModule?: string;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
   jacocoAgeMs?: number;
+  /** The build is killed by SIGKILL after printing its output (POSIX): the OOM killer. */
+  killed?: boolean;
 }
 
 export interface JacocoSpec {
@@ -89,7 +93,8 @@ export interface WriterAction {
 export interface ReviewAction {
   text: string;
   toolCallCount?: number;
-  status?: "spawn-error";
+  /** spawn-error: never ran. timeout: ran but did not finish (deadline, provider outage). */
+  status?: "spawn-error" | "timeout";
 }
 
 export interface Scenario {
@@ -112,12 +117,29 @@ export interface Scenario {
   proxy?: boolean;
   /** entry=loop: also set UT_NO_PROXY to the endpoint's host:port, so it bypasses. */
   noProxy?: boolean;
+  /** Make the fixture a git repo (committed), so .gitignore takes effect. */
+  git?: boolean;
+  /** entry=loop: put UT_RUNS_DIR inside the repo instead of under the dot-dir .itest. */
+  runsInRepo?: boolean;
+  /** entry=loop: another live testgen already holds this repo's lock. */
+  lockHeld?: boolean;
   mvn: MvnStep[];
 }
 
 export interface ApiTurn {
   toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
   content?: string;
+  /** finish_reason to report; "length" = the completion hit max_tokens. */
+  finishReason?: string;
+  /** Answer this request with an HTTP error instead: an overloaded server, a full context. */
+  status?: number;
+  body?: string;
+  /**
+   * Files the endpoint writes into the fixture (relative to its root) while serving this turn.
+   * Stands in for a writer runtime whose edit permission reaches past src/test — an opencode
+   * agent a target repo overrode — which the api runner's own write_file can never be.
+   */
+  sideWrite?: Record<string, string>;
 }
 
 // ─── Fixture contents ────────────────────────────────────────────────────────
@@ -294,6 +316,8 @@ if (step.jacoco) {
 }
 
 process.stdout.write(vary(step.out || "") + "\\n");
+// The OOM killer's way of ending a build: no exit code, no summary, just gone.
+if (step.killed && process.platform !== "win32") process.kill(process.pid, "SIGKILL");
 process.exit(step.exit);
 `;
 
@@ -580,6 +604,30 @@ export function buildFixture(root: string, sc: Scenario): void {
   write(root, ".itest/mvn-plan.json", JSON.stringify(sc.mvn, null, 2));
   write(root, ".itest/mvn-argv.log", "");
   fs.mkdirSync(path.join(root, RUN_DIR), { recursive: true });
+  if (sc.git) {
+    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+    // The developer's global git config must not reach the fixture: commit signing would block on
+    // a pinentry prompt, and a global pre-commit hook could fail the commit.
+    const commit = ["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "fixture"];
+    for (const args of [["init", "-q"], ["add", "-A"], commit]) {
+      execFileSync("git", args, { cwd: root, env, stdio: "ignore" });
+    }
+  }
+}
+
+/** Whether a git binary answers at all; scenarios that need one are skipped, not crashed, without it. */
+export function gitAvailable(): boolean {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The lock file loop.ts takes for a repo — same derivation, so a scenario can hold it. */
+export function repoLockPath(root: string): string {
+  return repoLockFile(fs.realpathSync.native(root));
 }
 
 /** Apply one scripted writer round to the fixture. */

@@ -13,6 +13,7 @@ import {
   WRITER_MODEL,
   REVIEWER_MODEL,
   AGENT_TIMEOUT_MS,
+  AGENT_RETRY_WINDOW_MS,
   OPENCODE_BIN,
   OPENCODE_JSON_EVENTS,
   OPENCODE_SKIP_PERMS,
@@ -45,6 +46,9 @@ export function traceEvent(
   } catch {
     return; // non-JSON line (diagnostic noise), skip
   }
+  // Valid JSON that is not an event — a plugin printing `null` — is noise too, and reading
+  // `.part` off null threw inside the stdout handler: uncaught, the whole run gone.
+  if (!ev || typeof ev !== "object") return;
   const part = (ev.part ?? {}) as Record<string, unknown>;
   const kindRaw = String(part.type ?? ev.type ?? "");
   const kind = kindRaw.replace(/_/g, "-"); // normalize step_start <-> step-start
@@ -131,20 +135,105 @@ export function buildInvocation(
   return args;
 }
 
+// One opencode process, start to exit. `exited` = it ended on its own with a non-zero code or an
+// unexpected signal, which is not the same thing as finishing: opencode gives up on a provider
+// outage after its own retries (about 75s) and exits 1.
+type Attempt =
+  | { kind: "ok" | "timeout" | "spawn-error"; output: AgentRunOutput; active?: boolean }
+  | { kind: "exited"; output: AgentRunOutput; why: string; active: boolean };
+
+export interface OpencodeRunnerOptions {
+  retryWindowMs?: number;
+  retryDelayMs?: number;
+  // Tests point these at a scripted stand-in; production uses UT_OPENCODE_BIN / UT_AGENT_TIMEOUT_MS.
+  bin?: string;
+  timeoutMs?: number;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Re-runs are bounded by the retry window; the count only stops a zero delay from spinning, and
+// is derived from the window so that a long window is not ended early by it.
+const MAX_RESPAWNS = 6;
+const MAX_RESPAWN_BACKOFF_MS = 60_000;
+
 export class OpencodeRunner implements AgentRunner {
-  private runAgent(
+  private readonly retryWindowMs: number;
+  private readonly retryDelayMs: number;
+  private readonly bin: string;
+  private readonly timeoutMs: number;
+  // Agents that have completed a session this run. Until one has, an abnormal exit is almost
+  // always configuration (model name, provider auth) and should stop the run in seconds; after
+  // it has, the same exit is an outage, and re-running the session outlasts it. Per agent,
+  // because the writer and the reviewer can be on different models and providers.
+  private readonly worked = new Set<string>();
+
+  constructor(opts: OpencodeRunnerOptions = {}) {
+    this.retryWindowMs = opts.retryWindowMs ?? AGENT_RETRY_WINDOW_MS;
+    this.retryDelayMs = opts.retryDelayMs ?? 15_000;
+    this.bin = opts.bin ?? OPENCODE_BIN;
+    this.timeoutMs = opts.timeoutMs ?? AGENT_TIMEOUT_MS;
+  }
+
+  // The exit code used to be discarded: an opencode that gave up on a 503 was logged as
+  // "[OK] 完成", the writer had changed nothing, and the next round ended the run as
+  // writer-no-op with a hint about permissions. Now an abnormal exit is re-run within the retry
+  // window, and reported for what it is when that runs out.
+  private async runAgent(
     label: string,
     agent: string,
     model: string,
     prompt: string,
     allowSkipPerms: boolean,
   ): Promise<AgentRunOutput> {
+    log(`[${label}] session 啟動（agent=${agent}, model=${model || "（agent 預設）"}）`);
+    const stopHeartbeat = startHeartbeat(`[${label}]`);
+    const deadline = Date.now() + this.timeoutMs;
+    let failingSince: number | undefined;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        const r = await this.runOnce(label, agent, model, prompt, allowSkipPerms, deadline - Date.now());
+        // A session that got as far as calling tools, emitting text or reporting tokens proved the
+        // model and provider work — even if it later timed out or exited on a provider error.
+        if (r.kind === "ok" || r.active) this.worked.add(agent);
+        if (r.kind !== "exited") return r.output;
+        if (!this.worked.has(agent)) {
+          log(`[FAIL] [${label}] ${r.why}`);
+          return { text: "", status: "spawn-error" };
+        }
+        // A session that did work before it failed had a working provider until then: the outage
+        // being waited out starts now, not at an earlier failure.
+        if (r.active) failingSince = undefined;
+        failingSince ??= Date.now();
+        const delay = Math.min(this.retryDelayMs * 2 ** (attempt - 1), MAX_RESPAWN_BACKOFF_MS);
+        const outOfWindow =
+          this.retryWindowMs === 0 || Date.now() - failingSince + delay > this.retryWindowMs;
+        const maxRespawns = MAX_RESPAWNS + Math.ceil(this.retryWindowMs / MAX_RESPAWN_BACKOFF_MS);
+        if (attempt >= maxRespawns || outOfWindow || Date.now() + delay >= deadline) {
+          log(`[WARN] [${label}] ${r.why}——重新執行的額度已用完，以已收到的輸出繼續`);
+          return { ...r.output, status: "timeout" };
+        }
+        log(`[WARN] [${label}] ${r.why}——${(delay / 1000).toFixed(0)} 秒後重新執行（第 ${attempt} 次）`);
+        await sleep(delay);
+      }
+    } finally {
+      stopHeartbeat();
+    }
+  }
+
+  private runOnce(
+    label: string,
+    agent: string,
+    model: string,
+    prompt: string,
+    allowSkipPerms: boolean,
+    timeoutMs: number,
+  ): Promise<Attempt> {
     return new Promise((resolve) => {
-      log(
-        `[${label}] session 啟動（agent=${agent}, model=${model || "（agent 預設）"}）`,
-      );
-      const stopHeartbeat = startHeartbeat(`[${label}]`);
       const started = Date.now();
+      if (timeoutMs <= 0) {
+        resolve({ kind: "timeout", output: { text: "", status: "timeout" } });
+        return;
+      }
 
       const skipPerms = allowSkipPerms && OPENCODE_SKIP_PERMS;
       if (skipPerms) {
@@ -159,11 +248,10 @@ export class OpencodeRunner implements AgentRunner {
 
       // Windows needs the command resolved through PATHEXT, and .cmd shims routed via
       // cmd.exe — Node refuses to spawn them directly since the CVE-2024-27980 fix.
-      const plan = planSpawn(OPENCODE_BIN, args);
+      const plan = planSpawn(this.bin, args);
       if (plan.error) {
         log(`[FAIL] [${label}] ${plan.error}`);
-        stopHeartbeat();
-        resolve({ text: "", status: "spawn-error" });
+        resolve({ kind: "spawn-error", output: { text: "", status: "spawn-error" } });
         return;
       }
 
@@ -192,21 +280,43 @@ export class OpencodeRunner implements AgentRunner {
         outputTokens: undefined as number | undefined,
       };
       let rawStdout = "";
-      let stdoutBuf = "";
+      // The current, unterminated line, as chunks. Only a chunk containing a newline triggers a
+      // join: re-splitting one growing string on every chunk was quadratic in a long event line.
+      let pending: string[] = [];
+      let lastError = "";
+      const onLine = (line: string) => {
+        if (!line.trim()) return;
+        traceEvent(line, `[${label}]`, acc);
+        if (line.includes('"error"')) {
+          try {
+            const ev = JSON.parse(line) as { type?: string; error?: { name?: string; data?: { message?: string } } };
+            if (ev && ev.type === "error") {
+              lastError = String(ev.error?.data?.message ?? ev.error?.name ?? "").slice(0, 300);
+            }
+          } catch {
+            /* not an event */
+          }
+        }
+      };
 
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
-        rawStdout += chunk;
-        stdoutBuf += chunk;
-        const lines = stdoutBuf.split("\n");
-        stdoutBuf = lines.pop() ?? ""; // keep the partial line for the next chunk
-        for (const line of lines) {
-          if (line.trim()) traceEvent(line, `[${label}]`, acc);
+        if (!OPENCODE_JSON_EVENTS) rawStdout += chunk; // only the non-JSONL mode returns it
+        const nl = chunk.lastIndexOf("\n");
+        if (nl < 0) {
+          pending.push(chunk);
+          return;
         }
+        pending.push(chunk.slice(0, nl));
+        const complete = pending.join("");
+        pending = [chunk.slice(nl + 1)];
+        for (const line of complete.split("\n")) onLine(line);
       });
 
+      let stderrTail = "";
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
+        stderrTail = (stderrTail + chunk).slice(-2000);
         for (const line of chunk.trim().split("\n")) {
           if (line.trim()) logVerbose(`[${label}] ${line}`);
         }
@@ -219,7 +329,7 @@ export class OpencodeRunner implements AgentRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         log(
-          `[WARN] [${label}] 逾時 ${AGENT_TIMEOUT_MS}ms，終止 opencode 程序樹` +
+          `[WARN] [${label}] 逾時 ${this.timeoutMs}ms，終止 opencode 程序樹` +
             `（模型較慢時請調高 UT_AGENT_TIMEOUT_MS）`,
         );
         killTree(child, "SIGTERM");
@@ -231,10 +341,12 @@ export class OpencodeRunner implements AgentRunner {
             killTree(child, "SIGKILL");
           }, 10_000);
         }
-      }, AGENT_TIMEOUT_MS);
+      }, timeoutMs);
 
       let finished = false;
       let spawnError: string | undefined;
+      let exitCode: number | null = null;
+      let exitSignal: NodeJS.Signals | null = null;
       let drainTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (finished) return;
@@ -242,14 +354,43 @@ export class OpencodeRunner implements AgentRunner {
         clearTimeout(timer);
         if (killEscalation) clearTimeout(killEscalation);
         if (drainTimer) clearTimeout(drainTimer);
-        stopHeartbeat();
+        // Whatever is still in the group — a grandchild that outlived opencode, or a SIGTERM
+        // ignorer whose escalation was just cancelled — must not keep running: it would go on
+        // writing test files while the gates judge them. POSIX only; see libs/shell.ts.
+        if (DETACH_CHILDREN) killTree(child, "SIGKILL");
         if (spawnError) {
           log(`[FAIL] [${label}] ${spawnError}`);
-          resolve({ text: "", status: "spawn-error" });
+          resolve({ kind: "spawn-error", output: { text: "", status: "spawn-error" } });
           return;
         }
-        if (stdoutBuf.trim()) traceEvent(stdoutBuf, `[${label}]`, acc); // flush the partial line
+        const partial = pending.join("");
+        if (partial.trim()) onLine(partial); // flush the partial line
         const secs = ((Date.now() - started) / 1000).toFixed(0);
+        // JSONL mode: use accumulated text (or the last text part if empty);
+        // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout — no events to count,
+        // so tool/token usage is unobservable (undefined), not zero.
+        const output = (status: AgentRunOutput["status"]): AgentRunOutput =>
+          OPENCODE_JSON_EVENTS
+            ? {
+                text: acc.text.trim() ? acc.text : acc.lastText,
+                status,
+                toolCallCount: acc.toolCalls.size,
+                outputTokens: acc.outputTokens,
+              }
+            : { text: rawStdout, status };
+        const active = acc.toolCalls.size > 0 || (acc.outputTokens ?? 0) > 0 || acc.text.trim() !== "";
+        if (!timedOut && (exitCode !== 0 || exitSignal !== null)) {
+          const detail = lastError || stderrTail.trim().split("\n").pop()?.slice(0, 300) || "";
+          resolve({
+            kind: "exited",
+            active,
+            output: output("timeout"),
+            why:
+              `opencode 異常結束（exit=${exitCode ?? "-"}${exitSignal ? `, signal=${exitSignal}` : ""}，耗時 ${secs} 秒）` +
+              (detail ? `：${detail}` : ""),
+          });
+          return;
+        }
         // A killed run is not a completed one; say so, but still hand back what arrived —
         // fail-closed means the gate judges the partial output, not this function.
         log(
@@ -257,20 +398,7 @@ export class OpencodeRunner implements AgentRunner {
             ? `[WARN] [${label}] 逾時中止（耗時 ${secs} 秒），以已收到的輸出繼續`
             : `[OK] [${label}] 完成（耗時 ${secs} 秒）`,
         );
-        const status = timedOut ? "timeout" : "ok";
-        // JSONL mode: use accumulated text (or the last text part if empty);
-        // non-JSONL (UT_OPENCODE_JSON=0): return the whole stdout — no events to count,
-        // so tool/token usage is unobservable (undefined), not zero.
-        if (OPENCODE_JSON_EVENTS) {
-          resolve({
-            text: acc.text.trim() ? acc.text : acc.lastText,
-            status,
-            toolCallCount: acc.toolCalls.size,
-            outputTokens: acc.outputTokens,
-          });
-        } else {
-          resolve({ text: rawStdout, status });
-        }
+        resolve({ kind: timedOut ? "timeout" : "ok", active, output: output(timedOut ? "timeout" : "ok") });
       };
 
       // 'close' waits for the stdio pipes to close as well as for the process to exit, so any
@@ -278,7 +406,9 @@ export class OpencodeRunner implements AgentRunner {
       // Windows timeout into a permanent hang. 'exit' always fires; let the pipes drain
       // briefly, then finish regardless. finish() is idempotent, so the usual ordering
       // ('close' first, promptly) is unaffected.
-      child.on("exit", () => {
+      child.on("exit", (code, signal) => {
+        exitCode = code;
+        exitSignal = signal;
         drainTimer = setTimeout(() => {
           logVerbose(`[${label}] 程序已結束但輸出管線未關閉，不再等待`);
           finish();
@@ -286,7 +416,7 @@ export class OpencodeRunner implements AgentRunner {
       });
       child.on("close", finish);
       child.on("error", (err) => {
-        spawnError = `${explainSpawnError(err, OPENCODE_BIN)}——請確認已安裝 opencode CLI，或以 UT_OPENCODE_BIN 指定路徑`;
+        spawnError = `${explainSpawnError(err, this.bin)}——請確認已安裝 opencode CLI，或以 UT_OPENCODE_BIN 指定路徑`;
         finish();
       });
     });

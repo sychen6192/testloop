@@ -105,6 +105,7 @@ testgen <package 路徑>
 | `UT_API_MAX_TURNS` | 60 | 單次 session 最多幾個 assistant 回合 |
 | `UT_API_MAX_TOKENS` | 8192 | 傳給 `max_tokens`；0 = 用伺服器預設 |
 | `UT_API_MAX_TOOL_RESULT_CHARS` | 24000 | 單次工具結果上限，超過截斷 |
+| `UT_AGENT_RETRY_WINDOW_MS` | 180000 | 模型端暫時故障時持續重試多久。api runner：端點回應過之後，連線錯誤、429、5xx 以指數退避重試（尊重 `Retry-After`）；opencode runner：同一個 agent 完成過 session 之後，opencode 異常結束（多半是 provider 故障）就重新執行。都受 `UT_AGENT_TIMEOUT_MS` 限制。`0` = 不重試；大於 0 時至少重試一次。這個 run 裡端點從未回應過（api：只快速試 3 次）或 agent 從未做過事（opencode：不重新執行）時不適用，直接判定設定錯誤 |
 | `UT_WRITER_TEMPERATURE` | 0.2 | writer 溫度；reviewer 固定 0，不可設定 |
 
 ## 第一次執行
@@ -136,7 +137,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_SKIP_BASELINE` | - | 1 = 跳過預檢基準建置（省一次 build，但既有紅燈將無法與 writer 造成的失敗區分） |
 | `UT_REPAIR_BASELINE` | 1 | 0 = 預檢發現既有紅燈時直接中止，不進修復迴圈 |
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
-| `UT_REPAIR_NO_PROGRESS_ROUNDS` | 2 | 連續幾輪紅燈數沒下降就停。stuck 需要兩輪報告完全相同，「修好 A 又弄壞 B」的報告每輪都不一樣卻毫無進展，只有數量抓得到 |
+| `UT_REPAIR_NO_PROGRESS_ROUNDS` | 2 | 連續幾輪紅燈數沒下降就停。stuck 需要兩輪報告完全相同，「修好 A 又弄壞 B」的報告每輪都不一樣卻毫無進展，只有數量抓得到。例外是**揭露**：上一輪有編譯錯誤、這輪修好了一些，而新紅燈都在沒改過、也沒引用這輪改過的類別的檔案裡（改了測試資源則不算），算進展 |
 | `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行。既有紅燈會標記為 pre-existing 寫進 prompt，**且 build gate 改為「失敗集合不得超出預檢基準」**——既有失敗可以續紅，writer 新弄壞的照樣擋。與 `UT_SKIP_BASELINE` 互斥（沒有基準就沒有可扣除的集合，會直接中止）。預設中止 |
 | `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
@@ -149,6 +150,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
 | `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |
+| `UT_MAX_BUILD_OUTPUT_CHARS` | 67108864 | 建置輸出在記憶體中保留的字元上限；超過時丟棄前段、只留尾端與 `[ERROR]` / `Tests run:` 行（避免測試大量輸出 log 時撐爆字串上限而中斷） |
 | `UT_STANDARDS_PATH` | 工具內建 | writer 契約（standards）路徑覆蓋 |
 | `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋。未設時依序找目標 repo、工具內建 |
 | `UT_JACOCO_XML` | 自動搜尋 | 報告路徑覆蓋 |
@@ -241,10 +243,12 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
 - **smoke FAIL，或 writer 沒動靜。** provider 未設定，或 model 欄位為空。見「Provider 與
   模型設定」。
 - **writer 有跑但沒寫檔。** 非互動模式下 permission 被擋。常見根因是 global
-  `~/.config/opencode/opencode.json` 設了 `"permission": {"edit": "ask"}`，蓋過 agent 的
-  `edit: allow`。首選解法是在目標 repo 根放一份 project 級 `opencode.json`，內容
-  `{"permission": {"edit": "allow"}}`，只影響該 repo。最後手段是 `UT_OC_SKIP_PERMS=1`；
-  writer 的 bash 與 web 本來就關閉，風險有限。
+  `~/.config/opencode/opencode.json` 設了 `"permission": {"edit": "ask"}`，蓋過 agent 只對
+  `src/test/**` 放行的 edit 權限。首選解法是在目標 repo 根放一份 project 級 `opencode.json`，內容
+  `{"permission": {"edit": {"*": "deny", "src/test/**": "allow", "**/src/test/**": "allow"}}}`，
+  只影響該 repo，範圍與 agent 定義相同。**不要**設成 `"edit": "allow"`——那會把 pom.xml 與
+  production code 也開放給 writer，改下去就是 scope-violation 中止。最後手段是
+  `UT_OC_SKIP_PERMS=1`；writer 的 bash 與 web 本來就關閉，越界的寫入仍會被範圍快照擋下並中止。
 - **writer 探索完就結束，或寫大檔寫到一半中斷。** session 固定開銷太大：plugin 與 MCP 工具
   schema 可吃掉 20k 以上 tokens，模型 context 不夠用。在目標 repo 的 project `opencode.json`
   調高該模型 context。Ollama 範例：
@@ -265,6 +269,17 @@ UT_TEST_SCOPE=generated testgen <package 路徑>
   fail-closed 防的是捏造的假 verdict。改用更強的 `UT_REVIEWER_MODEL`。確定要放行設
   `UT_REVIEWER_MUST_READ=0`，或暫時 `UT_SKIP_REVIEW=1` 只跑 hard gate。
 - **trace 裡 glob 與 grep 一律 `[error]`。** 缺 ripgrep。見下一節。
+- **（api runner）log 出現「N 秒後重試」。** 端點回了 429 / 5xx 或連線中斷，runner 正在等它恢復，
+  最多 `UT_AGENT_RETRY_WINDOW_MS`（預設 3 分鐘）。端點**從未回應過**時只快速試 3 次就以 spawn-error
+  中止——那幾乎都是 `UT_API_BASE_URL`、proxy 或金鑰設錯，實際的 HTTP 錯誤在 `[FAIL]` 那一行。
+- **（api runner）log 出現「context 已滿」。** 對話超過模型的 context（vLLM 的 `--max-model-len`）。
+  runner 會先省略較早的工具結果、再降低 `max_tokens` 後重送；頻繁出現代表 context 太小，調大伺服器
+  context，或調小 `UT_API_MAX_TOKENS`、`UT_API_MAX_TOOL_RESULT_CHARS`。
+- **（api runner）log 出現「回覆超過輸出上限被截斷」。** 模型一次輸出超過 `max_tokens`（通常是一口氣
+  write_file 整個測試類別）；runner 會要它拆成小步驟重送。頻繁出現就調大 `UT_API_MAX_TOKENS`。
+- **要跑很久、想丟到背景再登出。** `nohup bin/testgen <目標> > testgen.log 2>&1 &` 可以安全登出——stdin
+  不是終端機時，斷線的 SIGHUP 只會記一行 `[WARN]`，run 照常進行。互動式終端直接關掉則會像 Ctrl-C 一樣
+  收掉整棵程序樹並寫出 `summary.json`（`interrupted:SIGHUP`）。也可以用 tmux。
 - **writer 逾時被中止。** 預設 15 分鐘對 dense 模型太短，見「Provider 與模型設定」的
   `UT_AGENT_TIMEOUT_MS=1500000` 建議。逾時會終止整棵 opencode 程序樹（Windows 走
   `taskkill /T /F`），已產出的部分仍會交給 gate 判斷，不會靜默當成通過。

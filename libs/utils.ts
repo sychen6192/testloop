@@ -1,6 +1,8 @@
-// Pure helpers: Java-file walk, module detection, test-path derivation.
+// Shared helpers: Java-file walk, module detection, test-path derivation, the writer-scope
+// snapshot. Mostly pure; the snapshot reads the tree and splitForeignChanges asks git.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { ModuleInfo } from "./types";
 
 // List Java classes under target (dir or single .java); paths relative to repoRoot.
@@ -108,6 +110,36 @@ export function feedbackFingerprint(s: string): string {
   );
 }
 
+/**
+ * Pure: why a Java source has nothing a unit test could execute, or null when it may have code.
+ *
+ * A service package is typically `FooService` (an interface) beside `FooServiceImpl`. The
+ * interface compiles to no executable code at all, so no test can cover it — handing it to the
+ * writer as a target spends effort on a pointless test, and a reviewer that expects one can block
+ * a round the writer cannot fix. Only two shapes are claimed, both verified against JaCoCo, which
+ * writes them with no counters: annotation types, and interfaces whose body declares nothing but
+ * abstract methods. Anything with a `{` or `=` in the interface body — a default method, a nested
+ * type, a constant, an annotation argument — is left in: this errs toward keeping a target, and
+ * the coverage gate already reads a code-less class from the report as nothing to cover.
+ */
+export function codelessTypeReason(src: string): string | null {
+  const code = src
+    .replace(/"""[\s\S]*?"""/g, '""')
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/[^\n]*/g, " ")
+    .replace(/"(?:\\.|[^"\\\n])*"/g, '""')
+    .replace(/'(?:\\.|[^'\\\n])*'/g, "''");
+  const decl = /(?:^|[\s;}])(@\s*interface|interface|class|enum|record)\s+[A-Za-z_$][\w$]*/.exec(code);
+  if (!decl) return null;
+  if (decl[1].startsWith("@")) return "annotation";
+  if (decl[1] !== "interface") return null;
+  const open = code.indexOf("{", decl.index + decl[0].length);
+  if (open < 0) return null;
+  const close = code.lastIndexOf("}");
+  const body = code.slice(open + 1, close > open ? close : undefined);
+  return /[{=]/.test(body) ? null : "interface（只有抽象方法）";
+}
+
 // Pure: does `fileName` look like an existing test for `className`?
 // Deliberately narrow — only the canonical name and the qualifiers a previous run or a
 // colleague actually uses (FooTest / FooTests / FooUnitTest / TestFoo). A looser pattern
@@ -189,7 +221,24 @@ export function snapshotTree(root: string, opts: SnapshotOptions = {}): TreeSnap
   const snap: TreeSnapshot = {};
   if (!fs.existsSync(root)) return snap;
   const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch (err) {
+      // The walk covers the whole repo twice a round, and anything in it can fail to list: a
+      // directory an IDE or dev server deletes while it regenerates output (ENOENT), a docker
+      // volume owned by another uid (EACCES), a Big5 name Node decodes lossily (ENOENT on the
+      // mangled path), a tree deeper than PATH_MAX. Throwing here ended the whole run with a
+      // FATAL stack trace at a random round. None of it is the writer's doing: a vanished
+      // directory is recorded like a vanished file (not at all), and an unreadable one by its
+      // state, so a directory that *becomes* unreadable between two snapshots still counts.
+      if (d === root) throw err;
+      const code = (err as NodeJS.ErrnoException).code ?? "?";
+      if (code === "ENOENT" || code === "ENOTDIR") return;
+      snap[`${path.relative(root, d).replace(/\\/g, "/")}/`] = `unreadable:${code}`;
+      return;
+    }
+    for (const e of entries) {
       const p = path.join(d, e.name);
       const rel = path.relative(root, p).replace(/\\/g, "/");
       if (e.isDirectory()) {
@@ -224,10 +273,90 @@ const SCOPE_IGNORED_DIRS = new Set(["target", "build", "node_modules"]);
 export function writerScopeSkip(
   repoRoot: string,
   moduleRoot: string,
+  // Directories the loop itself writes to while the writer runs — its own runs/ artifacts, when
+  // UT_RUNS_DIR or the tool clone sits inside the target repo. Every run aborted in round 1 over
+  // the loop's own writer-summary.md. Absolute or repo-relative; ones outside the repo are moot.
+  loopOwned: string[] = [],
 ): (rel: string, name: string) => boolean {
-  const moduleRel = path.relative(repoRoot, moduleRoot).replace(/\\/g, "/");
-  const writable = moduleRel ? `${moduleRel}/src/test` : "src/test";
-  return (rel, name) => name.startsWith(".") || SCOPE_IGNORED_DIRS.has(name) || rel === writable;
+  // The walk's paths carry the on-disk case; these are built from what the user typed. On a
+  // case-insensitive file system (Windows, macOS) `cd C:\work\shop` for a directory named
+  // `Shop` made the writable tree — or the loop's own runs dir — fail to match, and the writer's
+  // own tests (or writer-summary.md) were a scope-violation in round 1. realpath gives the
+  // on-disk case; both ends go through it so a symlinked repo path stays consistent.
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const root = real(repoRoot);
+  const relTo = (p: string) => path.relative(root, p).replace(/\\/g, "/");
+  const testTree = path.join(moduleRoot, "src", "test");
+  const writable = relTo(fs.existsSync(testTree) ? real(testTree) : path.join(real(moduleRoot), "src", "test"));
+  const owned = new Set(
+    loopOwned
+      .map((d) => relTo(real(path.resolve(repoRoot, d))))
+      .filter((r) => r && !r.startsWith("..") && !path.isAbsolute(r)),
+  );
+  return (rel, name) =>
+    name.startsWith(".") || SCOPE_IGNORED_DIRS.has(name) || rel === writable || owned.has(rel);
+}
+
+/**
+ * Splits out-of-scope changes into the ones the scope guard must act on and the ones that are
+ * someone else's: git-ignored, outside any src/ tree, and shaped like output — logs/ of an
+ * application running from the repo, out/ or bin/ of an IDE building on its own, a local
+ * database, pid and swap files. Those changed during the writer's session because something else
+ * wrote them, and the guard used to stop the run over them at whatever round they happened to
+ * change. The list is an allowlist on purpose: being ignored is not enough. Spring Boot loads
+ * ./application.yml and ./config/ from the working directory, which for surefire is the module
+ * root, so an ignored <module>/config/application.yml is configuration the tests read.
+ * Everything else keeps full strength: tracked files (git does not report them as ignored),
+ * anything under src/ even when ignored (an ignored application-local.yml is still
+ * configuration the tests load), build files, and everything when the repo is not a git repo
+ * or git is missing.
+ */
+// Build files are never someone else's change, ignored or not: the build reads them.
+const BUILD_FILE = /(?:^|\/)(?:pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gradle\.properties|lombok\.config|mvnw(?:\.cmd)?|gradlew(?:\.bat)?)$/;
+const FOREIGN_OUTPUT_DIRS = new Set(["logs", "log", "out", "bin", "tmp", "temp"]);
+const FOREIGN_OUTPUT_FILE = /\.(?:log(?:\.\d+)?(?:\.gz)?|pid|tmp|swp|lck|lock|class|mv\.db|trace\.db|h2\.db|sqlite3?|db)$/i;
+
+function outputShaped(rel: string): boolean {
+  const parts = rel.split("/");
+  const name = parts.pop() ?? "";
+  return parts.some((d) => FOREIGN_OUTPUT_DIRS.has(d)) || FOREIGN_OUTPUT_FILE.test(name);
+}
+
+export function splitForeignChanges(repoRoot: string, paths: string[]): { kept: string[]; foreign: string[] } {
+  const candidates = paths.filter((p) => !p.split("/").includes("src") && !BUILD_FILE.test(p) && outputShaped(p));
+  if (!candidates.length) return { kept: paths, foreign: [] };
+  // Git must be answering for this repo, not for an ancestor that happens to contain it: an SVN
+  // or unversioned checkout inside a workspace repo that ignores `projects/` (or a dotfiles repo
+  // ignoring `*`) reports everything as ignored, and the exemption would swallow real edits.
+  // `git check-ignore .` exits 0 exactly when the repo root itself is ignored.
+  try {
+    execFileSync("git", ["check-ignore", "-q", "."], { cwd: repoRoot, stdio: "ignore" });
+    return { kept: paths, foreign: [] };
+  } catch {
+    /* exit 1: the root is not ignored (or no git at all, handled below) */
+  }
+  let out = "";
+  try {
+    out = execFileSync("git", ["check-ignore", "--stdin", "-z"], {
+      cwd: repoRoot,
+      input: candidates.join("\0") + "\0",
+      stdio: ["pipe", "pipe", "ignore"],
+      // An IDE regenerating out/ changes tens of thousands of files; at the default 1MB the
+      // answer overflowed, and the fallback exempted nothing — the very case this is for.
+      maxBuffer: 256 * 1024 * 1024,
+    }).toString();
+  } catch {
+    // exit 1 = none of them is ignored; 128 = not a git repo, or no git: nothing is exempt.
+    out = "";
+  }
+  const ignored = new Set(out.split("\0").filter(Boolean));
+  return { kept: paths.filter((p) => !ignored.has(p)), foreign: paths.filter((p) => ignored.has(p)) };
 }
 
 // Paths that were added, removed, or modified between two snapshots.

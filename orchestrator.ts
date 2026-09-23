@@ -5,7 +5,8 @@
 // only blockers + below-threshold dims (advisories stay out of the loop to avoid thrash).
 //
 // Early-abort rules (all fail-closed, none burn remaining rounds):
-// - runner spawn-error: the agent never ran; retrying cannot help.
+// - runner spawn-error (writer or reviewer): the agent cannot run; retrying cannot help, and a
+//   reviewer that cannot run is not something the writer can fix by rewriting tests.
 // - writer no-op after a failed round: nothing changed, the same gates would fail identically.
 // - identical feedback twice in a row: the loop is stuck, more rounds add cost, not progress.
 // - writer touched a file outside its test tree: every later gate would judge tests against
@@ -27,6 +28,8 @@ import {
   REPAIR_NO_PROGRESS_ROUNDS,
   REVIEW_MAX_RETRIES,
   TEST_SCOPE,
+  RUNNER_KIND,
+  RUNS_DIR,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
@@ -39,6 +42,7 @@ import {
   stripRaw,
   testClassNames,
   writerScopeSkip,
+  splitForeignChanges,
 } from "./libs/utils";
 import {
   buildGeneratePrompt,
@@ -54,7 +58,7 @@ import { TestConventions } from "./libs/conventions";
 import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
 import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
-import { runReviewGate, isUnparseable } from "./gates/review";
+import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
 
 export interface OrchestratorConfig {
   targetClasses: string[];
@@ -101,6 +105,66 @@ export interface OrchestratorResult {
   finalVerdict?: ReviewVerdict;
 }
 
+// What "the agent could not run" means depends on the runner, and so does the fix. Telling an api
+// runner user to install opencode sent them looking in the wrong place; the runner has already
+// logged the real cause (the HTTP status and body) on its [FAIL] line.
+export function runnerCannotRunHint(runner: string = RUNNER_KIND): string {
+  if (runner === "api") {
+    return "api runner 無法使用端點：網址、金鑰或模型名稱有誤，或端點從未回應過——實際的 HTTP 錯誤見上方 [FAIL] 那一行。";
+  }
+  if (runner === "qwen") return "qwen runner 無法啟動：請確認已安裝 @qwen-code/sdk 並設定 OPENAI_API_KEY / OPENAI_BASE_URL。";
+  return "請確認 opencode CLI 可用，或以 UT_OPENCODE_BIN 指定路徑。";
+}
+
+// A writer that changed nothing is only "no-op" when it finished. One that was cut short (its
+// deadline, a request that kept failing, a context it could not shrink) never got to write, and
+// the runner's [WARN] line says which — pointing at permissions instead hid that line's cause.
+function noOpReason(status: string, rel: string, repair: boolean): string {
+  const who = repair ? "修復輪 writer" : "上一輪 gate 失敗後，writer";
+  if (status !== "ok") {
+    return (
+      `${who} 的 session 沒有正常完成（status=${status}：逾時、請求持續失敗、context 已滿或回覆一直被截斷，原因見上方 ` +
+      `[WARN] [writer] 那一行），${rel} 下沒有任何檔案被變更。`
+    );
+  }
+  return (
+    `${who} 未變更 ${rel} 下任何檔案。常見原因：模型 context 耗盡、非互動模式寫檔被 permission 擋下` +
+    "（見 README Troubleshooting）。"
+  );
+}
+
+// What the writer session changed outside its scope, minus what something else changed: see
+// splitForeignChanges. The foreign part is logged, never silently dropped.
+function outOfScopeChanges(before: Record<string, string>, after: Record<string, string>): string[] {
+  const { kept, foreign } = splitForeignChanges(REPO_ROOT, diffSnapshots(before, after));
+  if (foreign.length) {
+    log(
+      `[WARN] writer session 期間有 ${foreign.length} 個 git-ignored、不在 src/ 下的檔案變動` +
+        `（多半是執行中的應用程式或 IDE），不計為 writer 越界：`,
+    );
+    foreign.slice(0, 10).forEach((f) => log(`  - ${f}`));
+    if (foreign.length > 10) log(`  …另 ${foreign.length - 10} 個`);
+  }
+  return kept;
+}
+
+// What the writer changed in its writable tree — all of <module>/src/test, the tree write_file
+// and the scope guard both allow. Watching only src/test/java made a fix that was a resource
+// file (an expected-output fixture under src/test/resources) read as "changed nothing", and the
+// round ended the run as writer-no-op. Paths come back relative to src/test/java for the .java
+// ones, as every artifact and -Dtest derivation expects, and as resources/… otherwise.
+function writerChanges(before: Record<string, string>, after: Record<string, string>): string[] {
+  return diffSnapshots(before, after).map((c) => (c.startsWith("java/") ? c.slice("java/".length) : c));
+}
+
+// A violation list can be hundreds of paths long when something regenerates a directory; the
+// report names the first ones and the count, and the full list goes to scope-violations.txt.
+function listViolations(paths: string[]): string {
+  const shown = paths.slice(0, 20).map((f) => `  - ${f}`);
+  if (paths.length > 20) shown.push(`  …另 ${paths.length - 20} 個（完整清單見 scope-violations.txt）`);
+  return shown.join("\n");
+}
+
 export async function orchestrate(cfg: OrchestratorConfig): Promise<OrchestratorResult> {
   let feedback: string | null = null;
   // Previous round's report, normalized — see feedbackFingerprint for why the raw strings
@@ -111,8 +175,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const funnel: IterationRecord[] = [];
   let totalOutputTokens: number | undefined;
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
+  const writableTree = path.join(cfg.mod.moduleRoot, "src", "test");
+  // Every file the writer has written this run. Scoped rounds build -Dtest from it, not from the
+  // last round's changes: a round that fixed only a helper left the writer's own test class out of
+  // -Dtest, ran zero tests, and got told to create <Class>Test.java — a duplicate.
+  const everWritten = new Set<string>();
   // Everything in the repo outside the module's test source set is read-only for the writer.
-  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot);
+  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
   // What every pre-existing test file had before round 1. The writer may reshape the files it
   // creates, but may not take anything away from these — see libs/testmetrics.ts.
@@ -191,7 +260,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(testRoot);
+    const before = snapshotTree(writableTree);
     const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
     if (writer.outputTokens !== undefined) {
@@ -204,14 +273,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       record({ gate: "writer", outcome: "spawn-error", changedFiles: 0 });
       return fail(
         "runner-spawn-error",
-        "writer 程序未能啟動（spawn 失敗）。這是環境問題，重試不會改善：" +
-          "請確認 opencode CLI 可用，或以 UT_OPENCODE_BIN 指定路徑。",
+        `writer 無法執行（spawn-error）。這是環境問題，重試不會改善：${runnerCannotRunHint()}`,
         iter,
       );
     }
 
-    const changed = diffSnapshots(before, snapshotTree(testRoot));
-    const outOfScope = diffSnapshots(protectedBefore, snapshotProtected());
+    const changed = writerChanges(before, snapshotTree(writableTree));
+    changed.forEach((f) => everWritten.add(f));
+    const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
 
@@ -225,8 +294,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       return fail(
         "scope-violation",
         `writer 修改了測試範圍以外的檔案，本次執行中止：\n` +
-          outOfScope.map((f) => `  - ${f}`).join("\n") +
+          listViolations(outOfScope) +
           `\n這些變更「未被還原」——請以 git diff 檢視並自行還原後重跑。` +
+          `\n（若這些檔案不是 writer 改的——例如同時有別的程序在寫 repo——請讓那個程序停下，或把該目錄加進 .gitignore。）` +
           `\n（writer 的可寫範圍只有目標模組的 src/test/；production code、建置檔與其他模組一律唯讀。）`,
         iter,
       );
@@ -237,12 +307,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         // A failed gate demanded changes and none arrived — the same gates would fail
         // identically. Common causes: context exhausted, permission-blocked writes.
         record({ gate: "writer", outcome: "no-op", changedFiles: 0 });
-        return fail(
-          "writer-no-op",
-          `上一輪 gate 失敗後，writer 未變更 ${testRootRel(cfg.mod)} 下任何檔案。` +
-            "常見原因：模型 context 耗盡、非互動模式寫檔被 permission 擋下（見 README Troubleshooting）。",
-          iter,
-        );
+        return fail("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), false), iter);
       }
       // Round 1 with no changes can be legitimate (tests already exist); the gates still
       // judge, but the summary must say the tool generated nothing this run.
@@ -279,7 +344,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const buildStartedAt = Date.now();
     // Whatever the writer just touched counts too: it may have named its file something the
     // expected-path derivation does not predict, and a test that is not in -Dtest never runs.
-    const onlyTests = scoped ? testClassNames([...scopeSeed, ...changed]) : undefined;
+    const onlyTests = scoped ? testClassNames([...scopeSeed, ...everWritten]) : undefined;
     if (onlyTests) log(`  範圍限縮：-Dtest=${onlyTests.join(",")}`);
     const build = await runBuildAndTests(cfg.buildTool, cfg.mod, {
       onlyTests,
@@ -351,6 +416,21 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         );
       }
       lastVerdict = verdict;
+      // A reviewer that cannot run at all is the environment, exactly like a writer that cannot:
+      // fed back as a blocker it cost a whole writer round and a build, and came back identical.
+      if (verdict?.parseError === REVIEWER_SPAWN_ERROR) {
+        record({
+          gate: "review",
+          outcome: "spawn-error",
+          changedFiles: changed.length,
+          writerOutputTokens: writer.outputTokens,
+        });
+        return fail(
+          "runner-spawn-error",
+          `reviewer 無法執行（spawn-error）。這是環境問題，writer 改測試碼不會改善：${runnerCannotRunHint()}`,
+          iter,
+        );
+      }
       if (verdict && isUnparseable(verdict)) {
         record({
           gate: "review",
@@ -466,14 +546,42 @@ export interface RepairResult {
   success: boolean;
   rounds: number;
   // "repaired" | "repair-max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
-  // | "scope-violation" | "unlocatable-failure" | "repair-no-progress"
-  // | "scope-violation"
+  // | "scope-violation" | "unlocatable-failure" | "repair-no-progress" | "build-aborted"
+  // | "flaky-baseline" (success: the red did not reproduce on a rebuild)
   stopReason: string;
   // Still red when repair gave up; empty on success.
   remaining: PreExistingFailures;
   report: string;
   // Every test file the repair rounds touched — the diff a human should read before committing.
   changedFiles: string[];
+}
+
+// A writer-changed path (relative to src/test/java, or resources/…) as a repo-relative path.
+function repoRelTest(mod: ModuleInfo, changed: string): string {
+  const base = changed.startsWith("resources/") ? path.join(mod.moduleRoot, "src", "test") : path.join(mod.moduleRoot, "src", "test", "java");
+  return path.relative(REPO_ROOT, path.join(base, changed)).replace(/\\/g, "/");
+}
+
+// The test source a broken item lives in: compile errors name the file, failing tests the class
+// (an inner class lives in its outer class's file).
+function brokenItemFile(mod: ModuleInfo, item: string): string {
+  if (item.endsWith(".java")) return (path.isAbsolute(item) ? path.relative(REPO_ROOT, item) : item).replace(/\\/g, "/");
+  return repoRelTest(mod, `${item.replace(/\$.*$/, "").replace(/\./g, "/")}.java`);
+}
+
+// Could this round's edits have broken `file` without touching it? Yes when it names a class
+// the writer edited (a shared helper, a base class), and always when a test resource was edited:
+// resources are reached through profiles, classpath scanning and string paths, not names.
+// Unreadable counts as yes — the answer only ever decides whether a round earns progress.
+function couldBeBrokenBy(file: string, changed: string[]): boolean {
+  if (changed.some((c) => !c.endsWith(".java"))) return true;
+  let src: string;
+  try {
+    src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
+  } catch {
+    return true;
+  }
+  return changed.some((c) => new RegExp(`\\b${path.basename(c, ".java").replace(/[^\w$]/g, "")}\\b`).test(src));
 }
 
 /**
@@ -486,7 +594,8 @@ export interface RepairResult {
  */
 export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
-  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot);
+  const writableTree = path.join(cfg.mod.moduleRoot, "src", "test");
+  const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
   const originalMetrics = collectTestMetrics(testRoot);
   const touched = new Set<string>();
@@ -534,7 +643,9 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   // the stuck check never fires, while the module is no closer to green than when it started.
   // Seeded from the baseline, so a first round that reduces nothing already counts.
   let prevBrokenCount = brokenList(current).length;
+  let prevBroken = brokenList(current);
   let noProgressRounds = 0;
+  let prevCompileErrors = current.compileErrorFiles.length > 0;
 
   for (let round = 1; round <= REPAIR_MAX_ITER; round++) {
     // A red build the classifier could pin to no file at all leaves buildRepairPrompt listing
@@ -566,7 +677,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(testRoot);
+    const before = snapshotTree(writableTree);
     const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
     save("writer-summary.md", writer.text || "（writer 未回傳文字）");
@@ -574,13 +685,13 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     if (writer.status === "spawn-error") {
       return giveUp(
         "runner-spawn-error",
-        "writer 程序未能啟動（spawn 失敗）。這是環境問題，重試不會改善：請確認 opencode CLI 可用，或以 UT_OPENCODE_BIN 指定路徑。",
+        `writer 無法執行（spawn-error）。這是環境問題，重試不會改善：${runnerCannotRunHint()}`,
         round,
       );
     }
 
-    const changed = diffSnapshots(before, snapshotTree(testRoot));
-    const outOfScope = diffSnapshots(protectedBefore, snapshotProtected());
+    const changed = writerChanges(before, snapshotTree(writableTree));
+    const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
@@ -588,18 +699,34 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       save("scope-violations.txt", outOfScope.join("\n"));
       return giveUp(
         "scope-violation",
-        `修復輪 writer 修改了測試範圍以外的檔案：\n${outOfScope.map((f) => `  - ${f}`).join("\n")}\n` +
+        `修復輪 writer 修改了測試範圍以外的檔案：\n${listViolations(outOfScope)}\n` +
           "這些變更「未被還原」——請以 git diff 檢視並自行還原後重跑。",
         round,
       );
     }
     if (changed.length === 0) {
-      return giveUp(
-        "writer-no-op",
-        `修復輪 writer 未變更 ${testRootRel(cfg.mod)} 下任何檔案。常見原因：模型 context 耗盡、` +
-          "非互動模式寫檔被 permission 擋下（見 README Troubleshooting）。",
-        round,
-      );
+      // A writer that looked and found nothing to fix may be right: a test that failed once at the
+      // baseline and passes on a rerun is flaky, not red. When nothing but tests failed, one more
+      // build tells the two apart before the run is ended over a failure that is not there. (A
+      // real LLM facing a flaky test is more likely to "fix" it with a retry or a looser assertion,
+      // which the shrink guard and the reviewer see; this covers the writer that declined.)
+      if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0) {
+        log("writer 沒有改任何檔案——重跑一次建置，確認紅燈是否穩定重現（flaky 測試會在這裡消失）");
+        const recheck = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+        save("recheck-build.log", recheck.raw);
+        if (recheck.clean) {
+          log(`[WARN] 預檢的紅燈重跑後消失，判定為不穩定的測試（flaky）：${current.failingTestClasses.join("、")}——這些測試需要人檢視`);
+          return {
+            success: true,
+            rounds: round,
+            stopReason: "flaky-baseline",
+            remaining: { compileErrorFiles: [], failingTestClasses: [] },
+            report: `預檢時失敗、重跑後通過的測試（flaky）：${current.failingTestClasses.join("、")}`,
+            changedFiles: [...touched].sort(),
+          };
+        }
+      }
+      return giveUp("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), true), round);
     }
 
     const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
@@ -624,6 +751,8 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     save("build.log", current.raw);
     save("build-summary.md", current.summary);
     console.log(current.summary);
+    // A build that never finished locates nothing; carried on, it became "unlocatable" next round.
+    if (current.aborted) return giveUp("build-aborted", `修復後的建置沒有跑完：${current.aborted}`, round);
     if (current.clean) {
       return {
         success: true,
@@ -642,9 +771,29 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     }
     prevFingerprint = fingerprint;
 
-    const brokenCount = brokenList(current).length;
-    noProgressRounds = brokenCount >= prevBrokenCount ? noProgressRounds + 1 : 0;
+    // Progress is fewer red items — or, with the count unchanged or higher, a round that fixed
+    // something while the previous build had compile errors, and whose newly red items the edits
+    // cannot have caused. Compile errors are the only thing that hides red: javac reports flow
+    // errors only once attribution succeeds, tests fail only once the module compiles. Counting
+    // that as "no progress" aborted repairs one round from green. "Fixed A by breaking B" is
+    // still no progress — B edited this round, or B using a helper or base class edited this
+    // round, or any test resource edited: that is the thrash this cut-off exists for.
+    const curItems = brokenList(current);
+    const brokenCount = curItems.length;
+    const editedNow = new Set(changed.map((c) => repoRelTest(cfg.mod, c)));
+    const fixedSome = prevBroken.some((b) => !curItems.includes(b));
+    const newlyBroken = curItems.filter((b) => !prevBroken.includes(b));
+    const revealedOnly =
+      prevCompileErrors &&
+      fixedSome &&
+      newlyBroken.every((b) => {
+        const file = brokenItemFile(cfg.mod, b);
+        return !editedNow.has(file) && !couldBeBrokenBy(file, changed);
+      });
+    prevCompileErrors = current.compileErrorFiles.length > 0;
+    noProgressRounds = brokenCount >= prevBrokenCount && !revealedOnly ? noProgressRounds + 1 : 0;
     prevBrokenCount = brokenCount;
+    prevBroken = curItems;
     if (noProgressRounds >= REPAIR_NO_PROGRESS_ROUNDS) {
       return giveUp(
         "repair-no-progress",
@@ -653,7 +802,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         round,
       );
     }
-    log(`→ 仍有 ${brokenCount} 項紅燈，帶著報告進入下一輪修復`);
+    if (brokenCount > 0) log(`→ 仍有 ${brokenCount} 項紅燈，帶著報告進入下一輪修復`);
   }
   return giveUp(
     "repair-max-iterations",

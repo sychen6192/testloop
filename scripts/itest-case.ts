@@ -42,6 +42,7 @@ class ScriptedRunner implements AgentRunner {
     this.reviewCalls++;
     if (!a) return { text: "{}", status: "ok", toolCallCount: 1 };
     if (a.status === "spawn-error") return { text: "", status: "spawn-error" };
+    if (a.status === "timeout") return { text: a.text, status: "timeout", toolCallCount: a.toolCallCount ?? 0 };
     return { text: a.text, status: "ok", toolCallCount: a.toolCallCount ?? 2, outputTokens: 5 };
   }
 }
