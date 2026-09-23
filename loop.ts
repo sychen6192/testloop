@@ -43,7 +43,7 @@ import { createRunner } from "./runners/runner";
 import { orchestrate, repairBaseline, RepairResult } from "./orchestrator";
 import { captureTree, chunk, rollbackTree, RollbackReport } from "./libs/batch";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
-import { describeTestStack, measureTestStack, TestStack } from "./libs/teststack";
+import { describeTestStack, measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
 import { isUtf8Name, measureSourceEncoding, SourceEncoding } from "./libs/encoding";
 import { installShutdownHandlers, onShutdown } from "./libs/shell";
 import { acquireRepoLock } from "./libs/lock";
@@ -246,10 +246,8 @@ async function main() {
   // And the encoding javac reads the sources in (libs/encoding.ts): the pom's, or the platform's,
   // which Maven names in every build log when the pom sets none.
   let sourceEncoding: SourceEncoding | undefined;
-  const measureStack = (buildLog = "") => {
-    const m = measureTestStack(mod, REPO_ROOT, buildLog);
-    if (m) m.javaRelease ??= testStack?.javaRelease;
-    testStack = m ?? testStack;
+  const measureStack = (buildLog = "", since?: number) => {
+    testStack = mergeTestStack(testStack, measureTestStack(mod, REPO_ROOT, buildLog, since));
     sourceEncoding = measureSourceEncoding(mod, REPO_ROOT, buildLog) ?? sourceEncoding;
     fs.writeFileSync(
       path.join(runDir, "project-facts.json"),
@@ -280,6 +278,7 @@ async function main() {
     logFacts();
   } else {
     banner("預檢基準（baseline）");
+    const baselineStartedAt = Date.now();
     const baseline = await runBaseline(buildTool, mod);
     fs.writeFileSync(path.join(runDir, "baseline.md"), baseline.summary);
     fs.writeFileSync(path.join(runDir, "baseline.log"), baseline.raw);
@@ -295,7 +294,7 @@ async function main() {
           `被 signal 終止多半是記憶體不足。詳見 ${path.join(runDir, "baseline.log")}`,
       );
     }
-    measureStack(baseline.raw);
+    measureStack(baseline.raw, baselineStartedAt);
     logFacts();
 
     let clean = baseline.clean;
@@ -601,9 +600,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     const existingTests = batch.map((cls) => ({ cls, tests: findExistingTests(cls, REPO_ROOT) }));
     const conventions = scanTestConventions(path.join(testTree, "java"), REPO_ROOT);
     // Earlier batches' builds leave a surefire classpath behind even when the baseline had none.
-    const measured = measureTestStack(o.mod, REPO_ROOT);
-    if (measured) measured.javaRelease ??= stack?.javaRelease;
-    stack = measured ?? stack;
+    stack = mergeTestStack(stack, measureTestStack(o.mod, REPO_ROOT));
     const start = captureTree(testTree);
     const r = await orchestrate({
       targetClasses: batch,

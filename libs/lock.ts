@@ -49,13 +49,27 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
       return;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") return; // cannot lock: do not block the run
-      let seen = "";
-      let holder: { pid?: number; runDir?: string } = {};
+      let seen: string;
       try {
         seen = fs.readFileSync(lock, "utf8");
+      } catch (err) {
+        // Gone since the create failed: its holder let go, or a takeover removed it. Create again —
+        // read as an empty lock, it was "stale", and the takeover below removed the lock another
+        // run had written in the meantime: two runs held the repo.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return; // unreadable: cannot tell whose it is; do not block the run
+      }
+      // Empty: another run between its create and its write, which takes microseconds. Only one
+      // that stays empty is a crash's leftover.
+      if (seen === "" && !emptyAndOld(lock)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        continue;
+      }
+      let holder: { pid?: number; runDir?: string } = {};
+      try {
         holder = JSON.parse(seen);
       } catch {
-        /* unreadable: treat as stale */
+        /* not a lock this tool wrote whole: stale */
       }
       let alive = false;
       try {
@@ -94,15 +108,16 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
         continue;
       }
       try {
-        let now = "";
+        let now: string | undefined;
         try {
           now = fs.readFileSync(lock, "utf8");
         } catch {
-          /* removed meanwhile: nothing to take over */
+          now = undefined; // removed meanwhile: nothing to take over
         }
-        // An empty `seen` is a lock left empty by a crash between create and write, or one that
-        // vanished before it could be read; a fresh lock written since then never matches it.
-        if (now === seen) fs.rmSync(lock, { force: true });
+        // Still the lock this run judged stale: a stale lock is only ever removed under the
+        // takeover, so one with the same content is the same lock. Except an empty one — another
+        // run's lock is empty for a moment after its create — so that one must still be old.
+        if (now === seen && (seen !== "" || emptyAndOld(lock))) fs.rmSync(lock, { force: true });
       } catch {
         return; // cannot take over a lock we may not remove; run unlocked rather than crash
       } finally {
@@ -113,6 +128,18 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
         }
       }
     }
+  }
+}
+
+// A lock stays empty only between another run's create and its write; seconds of it is a crash.
+const EMPTY_LOCK_STALE_MS = 2000;
+
+function emptyAndOld(lock: string): boolean {
+  try {
+    const st = fs.statSync(lock);
+    return st.size === 0 && Date.now() - st.mtimeMs > EMPTY_LOCK_STALE_MS;
+  } catch {
+    return false;
   }
 }
 

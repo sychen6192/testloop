@@ -51,7 +51,7 @@ export function sourceEncodingFrom(
 export function measureSourceEncoding(mod: ModuleInfo, repoRoot: string, buildLog = ""): SourceEncoding | undefined {
   let pom: { compilerEncoding?: string; sourceEncoding?: string } = {};
   try {
-    const facts = pomFactsFromChain(readPomChain(mod.moduleRoot, repoRoot));
+    const facts = pomFactsFromChain(readPomChain(mod.moduleRoot, repoRoot).map((c) => c.xml));
     pom = { compilerEncoding: facts.compiler.encoding, sourceEncoding: facts.properties["project.build.sourceEncoding"] };
   } catch {
     /* no readable pom: the log may still say */

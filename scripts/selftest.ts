@@ -82,7 +82,7 @@ import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api
 import { acquireRepoLock, repoLockFile } from "../libs/lock";
 import { captureTree, chunk, rollbackTree } from "../libs/batch";
 import { captureNonUtf8Sources, escapeNonAscii, isUtf8Name, repairWriterEncoding, sourceEncodingFrom } from "../libs/encoding";
-import { classpathFromSurefireXml, javaReleaseFromLog, measureTestStack, pomFactsFromChain, stackFromClasspath, stackFromPom } from "../libs/teststack";
+import { canMockStatic, classpathFromSurefireXml, javaReleaseFromLog, measureTestStack, mergeTestStack, pomFactsFromChain, stackFromClasspath, stackFromPom } from "../libs/teststack";
 import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import { classifyEnvFailures, readSurefireXml, isSurefireSummary, crashedTestClasses, unfinishedTestClasses } from "../gates/build";
 import { spawn, spawnSync } from "node:child_process";
@@ -1455,6 +1455,18 @@ class FooTest {
     JSON.stringify(m),
   );
   check("testMetrics：@Disabled 計 1", m.disabled === 1, JSON.stringify(m));
+  const skips = testMetrics(`class T {
+    @Ignore @Test public void a() { assertEquals(1, 2); }
+    @Test(enabled = false) public void b() { assertEquals(1, 2); }
+    @EnabledOnOs(OS.WINDOWS) @Test void c() { assertEquals(1, 2); }
+    @Test void d() { Assume.assumeTrue(false); assertEquals(1, 2); }
+    @Test void e() { assumingThat(false, () -> {}); calc.assumeRate(1); }
+}`);
+  check(
+    "testMetrics：JUnit 4 的 @Ignore、TestNG 的 enabled = false、條件式 @Enabled…、assumeTrue / assumingThat 都算略過標記（assumeRate 這種一般方法不算）",
+    skips.disabled === 5,
+    JSON.stringify(skips),
+  );
 
   const foo = { tests: 4, assertions: 5, disabled: 1 };
   const bar = { tests: 2, assertions: 2, disabled: 0 };
@@ -2651,6 +2663,42 @@ setTimeout(() => process.exit(0), 1500);
     fs.writeFileSync(path.join(finishedRun, "summary.json"), "{}");
     check("repo 鎖：持有者的 run 已寫出 summary.json（pid 被別的程序重用）→ 接手，不得永遠擋住", acquireRepoLock(lockRepo, "new") === undefined);
     stranger.kill("SIGKILL");
+    // An empty lock is another run between its create and its write — never taken over while
+    // young — or, once it has stayed empty for seconds, what a crash between the two left behind.
+    fs.writeFileSync(lockFile, "");
+    acquireRepoLock(lockRepo, "new");
+    check("repo 鎖：剛建立、還沒寫入內容的鎖（另一個 run 正在寫）→ 不接手、不刪", fs.existsSync(lockFile) && fs.readFileSync(lockFile, "utf8") === "");
+    // ...and waited for: once its holder has written it, the lock is held. Spinning through the
+    // attempts instead ran out of them while the holder was still writing — and ran anyway.
+    const midWrite = path.join(lockRepo, "mid-write.ts");
+    const midGo = path.join(lockRepo, "mid-go");
+    fs.writeFileSync(
+      midWrite,
+      `import * as fs from "node:fs";
+import { acquireRepoLock } from ${JSON.stringify(path.join(TESTGEN_ROOT, "libs", "lock.ts"))};
+console.log("READY");
+while (!fs.existsSync(${JSON.stringify(midGo)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+console.log(acquireRepoLock(${JSON.stringify(lockRepo)}, "late") ? "BUSY" : "GOT");
+`,
+    );
+    const late = spawn(tsxBin, [midWrite], { cwd: TESTGEN_ROOT });
+    let lateOut = "";
+    late.stdout?.on("data", (d) => (lateOut += d));
+    const lateDone = new Promise((r) => late.on("exit", r));
+    const lateDeadline = Date.now() + 60_000;
+    while (!lateOut.includes("READY") && Date.now() < lateDeadline) await new Promise((r) => setTimeout(r, 20));
+    fs.writeFileSync(midGo, "");
+    await new Promise((r) => setTimeout(r, 150));
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, runDir: "the run that was writing" }));
+    await lateDone;
+    check("repo 鎖：等寫到一半的鎖寫完 → 看到它被持有（不是耗盡重試次數後照樣執行）", lateOut.includes("BUSY"), lateOut);
+    fs.writeFileSync(lockFile, "");
+    const longAgo = (Date.now() - 30_000) / 1000;
+    fs.utimesSync(lockFile, longAgo, longAgo);
+    check(
+      "repo 鎖：空了好幾秒的鎖（建立後、寫入前當掉）→ 接手",
+      acquireRepoLock(lockRepo, "new") === undefined && fs.readFileSync(lockFile, "utf8").includes(`"pid":${process.pid},`),
+    );
     fs.rmSync(lockRepo, { recursive: true, force: true });
     fs.rmSync(lockFile, { force: true });
   }
@@ -2915,7 +2963,7 @@ console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
 console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt");
 {
   const posix = '<properties>\n<property name="java.version" value="17"/>\n<property name="surefire.test.class.path" value="/r/target/test-classes:/m2/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar:/m2/org/mockito/mockito-core/5.11.0/mockito-core-5.11.0.jar:/m2/org/mockito/mockito-junit-jupiter/5.11.0/mockito-junit-jupiter-5.11.0.jar:/m2/org/assertj/assertj-core/3.25.3/assertj-core-3.25.3.jar"/>\n</properties>';
-  const modern = stackFromClasspath(classpathFromSurefireXml(posix));
+  const modern = stackFromClasspath(classpathFromSurefireXml(posix))!;
   check(
     "surefire classpath（POSIX）→ JUnit 5、Mockito 5（MockitoExtension、inline）、AssertJ",
     modern.source === "surefire" && modern.junit5 === "5.10.2" && modern.junit4 === undefined && modern.mockito === "5.11.0" &&
@@ -2924,34 +2972,80 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
   );
   const win =
     '<property name="surefire.test.class.path" value="C:\\r\\target\\test-classes;C:\\m2\\junit\\junit\\4.12\\junit-4.12.jar;C:\\m2\\org\\mockito\\mockito-core\\2.23.4\\mockito-core-2.23.4.jar;C:\\m2\\org\\hamcrest\\hamcrest-core\\1.3\\hamcrest-core-1.3.jar"/>';
-  const legacy = stackFromClasspath(classpathFromSurefireXml(win));
+  const legacy = stackFromClasspath(classpathFromSurefireXml(win))!;
   check(
-    "surefire classpath（Windows，; 分隔、磁碟機代號含 :）→ 只有 JUnit 4、Mockito 2（沒有 MockitoExtension、沒有 inline）",
-    legacy.junit4 === "4.12" && legacy.junit5 === undefined && legacy.mockito === "2.23.4" &&
-      legacy.mockitoJupiter === false && legacy.mockitoInline === false && legacy.assertj === undefined && legacy.hamcrest === "1.3",
+    "surefire classpath（Windows，; 分隔、磁碟機代號含 :）→ 只有 JUnit 4、Mockito 2（沒有 MockitoExtension、沒有 inline）、只有 hamcrest-core",
+    legacy.junit4 === "4.12" && legacy.junit5 === undefined && legacy.mockito === "2.23.4" && legacy.mockitoJupiter === false &&
+      legacy.mockitoInline === false && legacy.assertj === undefined && legacy.hamcrest === "1.3" && legacy.hamcrestCoreOnly === true,
     JSON.stringify(legacy),
   );
   check(
-    "surefire classpath：mockito-inline jar → 可 mock static（Mockito 4）",
-    stackFromClasspath(["/m/mockito-core-4.11.0.jar", "/m/mockito-inline-4.11.0.jar"]).mockitoInline === true,
+    "surefire 2.20 以前：報告裡的 java.class.path 是 Maven 自己的 boot jar，不是測試 classpath → 不採用",
+    classpathFromSurefireXml('<property name="java.class.path" value="/opt/maven/boot/plexus-classworlds-2.9.0.jar"/>').length === 0,
   );
+  check(
+    "java.class.path 含模組的 test-classes（forkCount=0 等）→ 才當成測試 classpath",
+    classpathFromSurefireXml('<property name="java.class.path" value="/r/target/test-classes:/m/junit-4.13.2.jar"/>').length === 2,
+  );
+  check("classpath 裡沒有任何測試框架 → 當作沒量到（不宣稱「沒有 Mockito」）", stackFromClasspath(["/m/commons-lang3-3.12.0.jar"]) === undefined);
+  check(
+    "surefire classpath：mockito-inline jar → 可 mock final；Mockito 4 有 mockStatic",
+    canMockStatic(stackFromClasspath(["/m/junit-4.13.2.jar", "/m/mockito-core-4.11.0.jar", "/m/mockito-inline-4.11.0.jar"])!),
+  );
+  check(
+    "Mockito 3.3 + inline：能 mock final，不能 mock static（mockStatic 3.4 才有）",
+    !canMockStatic({ source: "surefire", mockito: "3.3.3", mockitoInline: true }) && canMockStatic({ source: "surefire", mockito: "3.4.0", mockitoInline: true }),
+  );
+  check("版本不明（空字串）的 inline 不宣稱能 mock static", !canMockStatic({ source: "pom", mockito: "", mockitoInline: true }));
   check("surefire classpath：屬性值裡的 XML 跳脫字元照樣解開", classpathFromSurefireXml('<property name="surefire.test.class.path" value="/a&amp;b/junit-4.13.2.jar"/>')[0] === "/a&b/junit-4.13.2.jar");
   check("surefire classpath：沒有 classpath 屬性 → 空", classpathFromSurefireXml("<testsuite/>").length === 0);
+  const hamcrest2 = stackFromClasspath(["/m/junit-jupiter-api-5.9.0.jar", "/m/hamcrest-2.2.jar"])!;
+  check("Hamcrest 2（單一 jar）→ 完整 Hamcrest", hamcrest2.hamcrest === "2.2" && !hamcrest2.hamcrestCoreOnly);
 
-  const bootPom = (v: string) =>
+  const bootPom = (v: string, extra = "") =>
     `<project><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>${v}</version><relativePath/></parent>` +
-    "<artifactId>svc</artifactId><properties><java.version>1.8</java.version></properties>" +
+    `<artifactId>svc</artifactId><properties><java.version>1.8</java.version>${extra}</properties>` +
     "<dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency></dependencies></project>";
-  const boot21 = stackFromPom(pomFactsFromChain([bootPom("2.1.4.RELEASE")]));
+  const boot21 = stackFromPom(pomFactsFromChain([bootPom("2.1.4.RELEASE")]))!;
   check(
-    "pom：Spring Boot 2.1 的 starter-test → 推斷只有 JUnit 4（標明是推斷）",
-    boot21?.source === "pom" && boot21.junit4 !== undefined && boot21.junit5 === undefined && !!boot21.inferred?.some((l) => l.includes("只帶 JUnit 4")),
+    "pom：Spring Boot 2.1 → 推斷 JUnit 4.12、Mockito 2.23.4、AssertJ 3.11.1（依 Boot 的版本管理，標明是推斷）",
+    boot21.source === "pom" && boot21.junit4 === "4.12" && boot21.junit5 === undefined && boot21.mockito === "2.23.4" && boot21.assertj === "3.11.1" &&
+      !!boot21.inferred?.some((l) => l.includes("只帶 JUnit 4")),
     JSON.stringify(boot21),
   );
-  const boot23 = stackFromPom(pomFactsFromChain([bootPom("2.3.12.RELEASE")]));
-  check("pom：Spring Boot 2.3 → JUnit 5 與 JUnit 4（vintage）都有", boot23?.junit5 !== undefined && boot23?.junit4 !== undefined, JSON.stringify(boot23));
-  const boot27 = stackFromPom(pomFactsFromChain([bootPom("2.7.18")]));
-  check("pom：Spring Boot 2.7 → 只有 JUnit 5、有 mockito-junit-jupiter", boot27?.junit5 !== undefined && boot27?.junit4 === undefined && boot27?.mockitoJupiter === true, JSON.stringify(boot27));
+  const boot21Prompt = renderTestStack(boot21);
+  check(
+    "prompt（Boot 2.1）：不叫 JUnit 4.12 用 assertThrows；有 AssertJ 就用 assertThatThrownBy；測試要 public",
+    !boot21Prompt.includes("Assert.assertThrows") && boot21Prompt.includes("assertThatThrownBy") && boot21Prompt.includes("public") && frameworkOf(boot21) === "JUnit 4",
+    boot21Prompt,
+  );
+  const boot15 = stackFromPom(pomFactsFromChain([bootPom("1.5.22.RELEASE")]))!;
+  const boot15Prompt = renderTestStack(boot15);
+  check(
+    "pom：Spring Boot 1.5 → Mockito 1.10.19（1.x 的 Matchers 與 org.mockito.runners）",
+    boot15.mockito === "1.10.19" && boot15Prompt.includes("org.mockito.Matchers") && boot15Prompt.includes("org.mockito.runners.MockitoJUnitRunner"),
+    boot15Prompt,
+  );
+  check("pom：Spring Boot 1.3 的 starter-test 沒有 AssertJ", stackFromPom(pomFactsFromChain([bootPom("1.3.8.RELEASE")]))?.assertj === undefined);
+  const boot23 = stackFromPom(pomFactsFromChain([bootPom("2.3.12.RELEASE")]))!;
+  check("pom：Spring Boot 2.3 → JUnit 5 與 JUnit 4.13.2（vintage）都有、Mockito 3.3.3", boot23.junit5 !== undefined && boot23.junit4 === "4.13.2" && boot23.mockito === "3.3.3", JSON.stringify(boot23));
+  const boot27 = stackFromPom(pomFactsFromChain([bootPom("2.7.18")]))!;
+  check("pom：Spring Boot 2.7 → 只有 JUnit 5、有 mockito-junit-jupiter", boot27.junit5 !== undefined && boot27.junit4 === undefined && boot27.mockitoJupiter === true, JSON.stringify(boot27));
+  check("pom：Spring Boot 3.1 → Mockito 5（inline，可 mock static）", canMockStatic(stackFromPom(pomFactsFromChain([bootPom("3.1.12")]))!));
+  check("pom：比對照表新的 Boot（3.5）→ 沿用最後一列的主版本", stackFromPom(pomFactsFromChain([bootPom("3.5.0")]))?.mockito === "5");
+  check(
+    "pom：pom 用屬性覆寫 Boot 管理的版本（junit.version、mockito.version）",
+    (() => {
+      const o = stackFromPom(pomFactsFromChain([bootPom("2.1.4.RELEASE", "<junit.version>4.13.1</junit.version><mockito.version>3.5.13</mockito.version>")]))!;
+      return o.junit4 === "4.13.1" && o.mockito === "3.5.13";
+    })(),
+  );
+  const vintageExcluded = bootPom("2.2.13.RELEASE").replace(
+    "<scope>test</scope>",
+    "<scope>test</scope><exclusions><exclusion><groupId>org.junit.vintage</groupId><artifactId>junit-vintage-engine</artifactId></exclusion></exclusions>",
+  );
+  check("pom：Boot 2.2 排除了 vintage engine → 不說有 JUnit 4", stackFromPom(pomFactsFromChain([vintageExcluded]))?.junit4 === undefined);
+
   const reactorParent =
     "<project><artifactId>parent</artifactId><properties><junit.version>5.9.2</junit.version><maven.compiler.release>11</maven.compiler.release></properties>" +
     "<dependencyManagement><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version></dependency></dependencies></dependencyManagement></project>";
@@ -2966,6 +3060,43 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
     reactor?.junit5 === "5.9.2" && reactor?.junit4 === undefined && reactorFacts.artifactId === "web",
     JSON.stringify(reactor),
   );
+  const withProfiles =
+    "<project><artifactId>p</artifactId><profiles><profile><id>old</id><properties><maven.compiler.release>8</maven.compiler.release></properties>" +
+    "<dependencies><dependency><groupId>org.mockito</groupId><artifactId>mockito-inline</artifactId><version>4.11.0</version></dependency></dependencies></profile></profiles>" +
+    "<properties><maven.compiler.release>17</maven.compiler.release></properties>" +
+    "<dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version></dependency></dependencies></project>";
+  const profileFacts = pomFactsFromChain([withProfiles]);
+  const profileStack = stackFromPom(profileFacts);
+  check(
+    "pom：profile 裡的屬性與相依不算（它啟用與否 pom 看不出來，先讀到還會蓋掉專案自己的值）",
+    profileFacts.properties["maven.compiler.release"] === "17" && profileStack?.mockitoInline === undefined,
+    JSON.stringify({ props: profileFacts.properties, profileStack }),
+  );
+  const corporate = stackFromPom(
+    pomFactsFromChain(["<project><parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId><version>9</version></parent><artifactId>x</artifactId><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId></dependency></dependencies></project>"]),
+  )!;
+  const corporatePrompt = renderTestStack(corporate);
+  check(
+    "pom：只宣告 junit:junit、但繼承 repo 外的公司 parent、沒有既有測試 → 不斷定是 JUnit 4（parent 可能另帶 JUnit 5），並給編譯失敗時的退路",
+    corporate.unknownParent === "corp-parent" && frameworkOf(corporate) === "JUnit 5" && corporatePrompt.includes("corp-parent") &&
+      corporatePrompt.includes("org.junit.jupiter 不存在") && !corporatePrompt.includes("只有"),
+    corporatePrompt || JSON.stringify(corporate),
+  );
+  const corporateUsed = { ...corporate, usage: { junit5: 0, junit4: 7, testng: 0 } };
+  const corporateUsedPrompt = renderTestStack(corporateUsed);
+  check(
+    "pom：同上、但既有測試都是 JUnit 4 → 用 JUnit 4，且不宣稱「沒有 JUnit 5」",
+    frameworkOf(corporateUsed) === "JUnit 4" && corporateUsedPrompt.includes("既有測試都用 JUnit 4") && !corporateUsedPrompt.includes("沒有 JUnit 5"),
+    corporateUsedPrompt,
+  );
+  check(
+    "pom：同上、但既有測試有 JUnit 5 的 → 用 JUnit 5",
+    frameworkOf({ ...corporate, usage: { junit5: 1, junit4: 7, testng: 0 } }) === "JUnit 5",
+  );
+  check(
+    "pom：只宣告 junit:junit、沒有外部 parent → JUnit 4",
+    frameworkOf(stackFromPom(pomFactsFromChain(["<project><artifactId>x</artifactId><dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.12</version></dependency></dependencies></project>"]))) === "JUnit 4",
+  );
 
   const multiLog = [
     "[INFO] --- maven-compiler-plugin:3.11.0:testCompile (default-testCompile) @ common ---",
@@ -2976,41 +3107,93 @@ console.log("\n[25] 測試相依量測（surefire classpath / pom）與 prompt")
     "[INFO] Compiling 3 source files with javac [debug deprecation release 17] to target/test-classes",
   ].join("\n");
   check("編譯 log：語言層級歸屬到目標模組（不是上游模組的 1.8）", javaReleaseFromLog(multiLog, "web") === "17", String(javaReleaseFromLog(multiLog, "web")));
+  check(
+    "編譯 log：level 後面還有 module-path、行首有時間戳 → 照樣讀得到",
+    javaReleaseFromLog("12:00:01 [INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ web ---\n12:00:02 [INFO] Compiling 3 source files with javac [debug release 21 module-path] to target/test-classes", "web") === "21",
+  );
   check("編譯 log：什麼都沒編（up to date）→ 量不到", javaReleaseFromLog("[INFO] Nothing to compile - all classes are up to date", "web") === undefined);
+  check(
+    "mergeTestStack：編譯 log 量到的語言層級不被之後讀 pom 的值蓋掉；classpath 量測不被 pom 讀取取代",
+    (() => {
+      const m = mergeTestStack({ ...modern, javaRelease: "17", javaReleaseFrom: "log" }, { source: "pom", junit4: "4.12", javaRelease: "8", javaReleaseFrom: "pom" })!;
+      return m.source === "surefire" && m.junit5 === "5.10.2" && m.javaRelease === "17";
+    })(),
+  );
 
   const j4 = renderTestStack(legacy);
   check(
-    "prompt：只有 JUnit 4 → 明說不能用 JUnit 5 的寫法、用 MockitoJUnitRunner、沒有 AssertJ",
-    j4.includes("只有 JUnit 4") && j4.includes("@ExtendWith") && j4.includes("MockitoJUnitRunner") && j4.includes("沒有 AssertJ") && frameworkOf(legacy) === "JUnit 4",
+    "prompt：只有 JUnit 4 → 明說不能用 JUnit 5 的寫法、用 MockitoJUnitRunner、沒有 AssertJ、測試要 public",
+    j4.includes("只有") && j4.includes("@ExtendWith") && j4.includes("org.mockito.junit.MockitoJUnitRunner") && j4.includes("沒有 AssertJ") &&
+      j4.includes("public") && frameworkOf(legacy) === "JUnit 4",
     j4,
   );
-  check("prompt：JUnit 4.12 沒有 assertThrows，4.13 才有", j4.includes("沒有 assertThrows") && renderTestStack({ ...legacy, junit4: "4.13.2" }).includes("Assert.assertThrows"));
+  check("prompt：JUnit 4.12 沒有 assertThrows，4.13 才有", j4.includes("assertThrows 要 JUnit 4.13") && renderTestStack({ ...legacy, junit4: "4.13.2" }).includes("Assert.assertThrows"));
   check("prompt：Mockito 2 沒有 mockStatic（不是「編得過、執行時失敗」）", j4.includes("沒有 mockStatic"), j4);
+  check("prompt：只有 hamcrest-core → 說沒有 org.hamcrest.Matchers", j4.includes("沒有 org.hamcrest.Matchers"), j4);
   const m5 = renderTestStack(modern);
-  check("prompt：Mockito 5 → MockitoExtension（提醒 strict stubs）、可 mock static", m5.includes("MockitoExtension") && m5.includes("strict stubs") && m5.includes("可以 mock static"), m5);
+  check("prompt：Mockito 5 → MockitoExtension（提醒 strict stubs）、可 mock static", m5.includes("MockitoExtension") && m5.includes("strict stubs") && m5.includes("mockStatic"), m5);
+  const inline33 = renderTestStack({ source: "surefire", junit5: "5.6.3", mockito: "3.3.3", mockitoJupiter: true, mockitoInline: true });
+  check("prompt：Mockito 3.3 + inline → 能 mock final、沒有 mockStatic", inline33.includes("可以 mock final") && inline33.includes("沒有 mockStatic"), inline33);
   const noJupiter = renderTestStack({ source: "surefire", junit5: "5.9.0", mockito: "3.3.3", mockitoJupiter: false, mockitoInline: false });
   check("prompt：沒有 mockito-junit-jupiter 的 Mockito 3.3 → initMocks（openMocks 是 3.4 才有）", noJupiter.includes("initMocks(this)") && !noJupiter.includes("openMocks"), noJupiter);
+  const ngMixed: typeof modern = { source: "surefire", junit5: "5.10.2", testng: "7.5.1", mockito: "5.11.0", mockitoInline: true, mockitoJupiter: true, usage: { junit5: 1, junit4: 0, testng: 12 } };
+  const ngPrompt = renderTestStack(ngMixed);
+  check(
+    "prompt：TestNG 與 JUnit 並存、既有測試是 TestNG → 用 TestNG，並說明 surefire 只跑一個 provider",
+    frameworkOf(ngMixed) === "TestNG" && ngPrompt.includes("org.testng.annotations.Test") && ngPrompt.includes("provider") && ngPrompt.includes("openMocks"),
+    ngPrompt,
+  );
   const pomOnly = renderTestStack({ source: "pom", junit5: "5.9.2" });
   check("prompt：來自 pom 的清單不宣稱「沒有 AssertJ / Mockito」（多數相依是間接帶進來的）", !pomOnly.includes("沒有 AssertJ") && !pomOnly.includes("沒有 Mockito") && pomOnly.includes("沒列出的不代表沒有"), pomOnly);
-  check("prompt：Java 8 → 列出不能用的語法與 API", renderTestStack({ source: "pom", javaRelease: "8" }).includes("var") && renderTestStack({ source: "pom", javaRelease: "8" }).includes("List.of"));
+  const java8 = renderTestStack({ source: "pom", javaRelease: "8" });
+  check("prompt：Java 8 → 列出不能用的語法與 API（var、List.of、isBlank、Stream.toList…）", ["var", "List.of", "isBlank", "Stream.toList", "text block"].every((w) => java8.includes(w)) && !java8.includes("lambda"), java8);
+  check("prompt：Java 7 → 連 lambda 都不能用", renderTestStack({ source: "pom", javaRelease: "7" }).includes("lambda"));
   check("prompt：Java 21 → 不列限制", !renderTestStack({ source: "pom", javaRelease: "21" }).includes("不能用"));
   check("prompt：量不到 → 不加任何段落、任務行維持 JUnit 5", renderTestStack(undefined) === "" && frameworkOf(undefined) === "JUnit 5");
 
-  // measureTestStack on disk: a surefire report wins over the pom; the pom is the fallback.
+  // measureTestStack on disk: a current surefire report wins over the pom; a stale one does not.
   const mod = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-stack-"));
-  fs.writeFileSync(path.join(mod, "pom.xml"), bootPom("2.1.4.RELEASE"));
   const info = { moduleRoot: mod, moduleRel: "", multiModule: false };
-  const fromPom = measureTestStack(info, mod);
-  check("measureTestStack：沒有 surefire 報告 → 讀 pom（含 java.version 1.8 → 8）", fromPom?.source === "pom" && fromPom.javaRelease === "8", JSON.stringify(fromPom));
-  fs.mkdirSync(path.join(mod, "target", "surefire-reports"), { recursive: true });
-  fs.writeFileSync(path.join(mod, "target", "surefire-reports", "TEST-a.AppTest.xml"), `<testsuite>${posix}</testsuite>`);
-  const fromRun = measureTestStack(info, mod);
-  check("measureTestStack：有 surefire 報告 → 以實際 classpath 為準", fromRun?.source === "surefire" && fromRun.junit5 === "5.10.2", JSON.stringify(fromRun));
+  const report = path.join(mod, "target", "surefire-reports", "TEST-a.AppTest.xml");
+  fs.mkdirSync(path.dirname(report), { recursive: true });
+  fs.writeFileSync(report, `<testsuite>${posix}</testsuite>`);
+  const past = (Date.now() - 60_000) / 1000;
+  fs.utimesSync(report, past, past);
+  fs.writeFileSync(path.join(mod, "pom.xml"), bootPom("2.1.4.RELEASE"));
+  const stale = measureTestStack(info, mod);
+  check("measureTestStack：報告比 pom 舊（pom 之後改過）→ 不採用，退回讀 pom（java.version 1.8 → 8）", stale?.source === "pom" && stale.javaRelease === "8", JSON.stringify(stale));
+  const fresh = measureTestStack(info, mod, "", Date.now() - 120_000);
+  check("measureTestStack：這次建置寫的報告（since 之後）→ 以實際 classpath 為準", fresh?.source === "surefire" && fresh.junit5 === "5.10.2", JSON.stringify(fresh));
+  const now = Date.now() / 1000;
+  fs.utimesSync(report, now, now);
+  check("measureTestStack：沒有 since，但報告比 pom 新 → 採用", measureTestStack(info, mod)?.source === "surefire");
   fs.mkdirSync(path.join(mod, "src", "test", "resources", "mockito-extensions"), { recursive: true });
-  fs.writeFileSync(path.join(mod, "src", "test", "resources", "mockito-extensions", "org.mockito.plugins.MockMaker"), "mock-maker-inline\n");
-  fs.writeFileSync(path.join(mod, "target", "surefire-reports", "TEST-a.AppTest.xml"), `<testsuite>${win}</testsuite>`);
-  check("measureTestStack：mock-maker-inline 開關 → 可 mock static", measureTestStack(info, mod)?.mockitoInline === true);
+  const makerFile = path.join(mod, "src", "test", "resources", "mockito-extensions", "org.mockito.plugins.MockMaker");
+  fs.writeFileSync(makerFile, "mock-maker-subclass\n");
+  check("measureTestStack：Mockito 5 + mock-maker-subclass 開關 → 關掉 inline", measureTestStack(info, mod)?.mockitoInline === false);
+  fs.writeFileSync(makerFile, "mock-maker-inline\n");
+  fs.writeFileSync(report, `<testsuite>${win}</testsuite>`);
+  check("measureTestStack：mock-maker-inline 開關 → 可 mock final", measureTestStack(info, mod)?.mockitoInline === true);
   fs.rmSync(mod, { recursive: true, force: true });
+
+  // Declared JUnit 4 under a parent outside the repo, no usable report: the existing tests decide.
+  const corp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-stack-"));
+  const corpInfo = { moduleRoot: corp, moduleRel: "", multiModule: false };
+  fs.writeFileSync(
+    path.join(corp, "pom.xml"),
+    "<project><parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId><version>9</version></parent><artifactId>x</artifactId>" +
+      "<dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId></dependency></dependencies></project>",
+  );
+  const corpTest = path.join(corp, "src", "test", "java", "a", "OldTest.java");
+  fs.mkdirSync(path.dirname(corpTest), { recursive: true });
+  fs.writeFileSync(corpTest, "package a;\nimport org.junit.Test;\npublic class OldTest { @Test public void x() {} }\n");
+  const corpStack = measureTestStack(corpInfo, corp);
+  check(
+    "measureTestStack：公司 parent 下只宣告 junit:junit → 數既有測試的框架，既有測試是 JUnit 4 就用 JUnit 4",
+    corpStack?.usage?.junit4 === 1 && frameworkOf(corpStack) === "JUnit 4",
+    JSON.stringify(corpStack),
+  );
+  fs.rmSync(corp, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

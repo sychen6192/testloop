@@ -389,7 +389,12 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("最終成功", c.result.success === true);
     check("第 1 輪因 @Disabled 判 FAIL", gates(c)[0] === "writer/test-shrink", gates(c).join(","));
     const fb = c.runRead("iter-1/feedback.md");
-    check("回饋點名 @Disabled 增加", fb.includes("@Disabled 0 → 1"), fb.slice(0, 300));
+    check("回饋點名略過標記增加", fb.includes("略過標記") && fb.includes("0 → 1"), fb.slice(0, 300));
+  },
+
+  "shrink-assumption": (c) => {
+    check("最終成功", c.result.success === true);
+    check("第 1 輪因 assumeTrue(false) 判 FAIL、不進建置", gates(c)[0] === "writer/test-shrink" && c.mvnCalls === 1, `${gates(c).join(",")} mvnCalls=${c.mvnCalls}`);
   },
 
   "shrink-allowed": (c) => {
@@ -975,7 +980,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("最終成功", c.result.success === true, JSON.stringify(c.result.stopReason));
     const p1 = c.runRead("iter-1/prompt.md");
     check("第 1 輪任務行寫 JUnit 4（不是寫死的 JUnit 5）", p1.includes("撰寫單元測試（JUnit 4）"), p1.slice(0, 200));
-    check("第 1 輪：pom 推斷只有 JUnit 4，並標明是推斷", p1.includes("只有 JUnit 4") && p1.includes("由版本推斷"), p1.slice(0, 1500));
+    check("第 1 輪：pom 推斷只有 JUnit 4，並標明是推斷", p1.includes("**只有** JUnit 4") && p1.includes("由版本推斷"), p1.slice(0, 1500));
     check("第 1 輪：Java 8 的限制", p1.includes("Java 語言層級：8"));
     const p2 = c.runRead("iter-2/prompt.md");
     check("第 2 輪改用實際 classpath（JUnit 4.13.2 有 assertThrows、Mockito 2 沒有 mockStatic）", p2.includes("測試 classpath 上實際有的東西") && p2.includes("4.13.2") && p2.includes("沒有 mockStatic"), p2.slice(0, 2000));

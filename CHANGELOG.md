@@ -24,7 +24,14 @@
   的 `surefire.test.class.path` 量出 JUnit 4/5、TestNG、Mockito 版本與能力、AssertJ / Hamcrest，連同
   Java 語言層級（編譯 log 或 pom）寫進 generate / fix / repair prompt；模組還沒跑過測試時退回讀 pom
   （含 Spring Boot 版本推斷，明說是推斷、不宣稱「沒有」），第一次有測試跑過就改用實際 classpath。
-  以真的 Maven 專案驗證：JUnit 5 + Mockito 5 的專案與 JUnit 4.12 + Mockito 2 + surefire 2.22 的老專案都量得對。
+  說成事實的必須是事實，所以只採用可信的 classpath：surefire 2.21 以前的報告記的是 Maven 自己的
+  `java.class.path`（plexus-classworlds），當成測試 classpath 會說出「沒有 Mockito、沒有 AssertJ」；比 pom
+  舊的報告描述的是 pom 改之前的相依，也不採用。讀 pom 時不算 profile 裡的設定，吃 `junit.version` /
+  `mockito.version` 等 Boot 覆寫屬性與 exclusions（Initializr 排除 vintage engine）；繼承 repo 外的公司
+  parent 時不斷定框架，改看既有測試用哪一個。版本不明時不開放需要版本的 API（`mockStatic` 要 inline mock
+  maker 且 Mockito 3.4+、`openMocks` 要 3.4+、JUnit 4 的 `assertThrows` 要 4.13+，Mockito 1.x 的匹配器在
+  `org.mockito.Matchers`）。以真的 Maven 專案驗證：JUnit 5 + Mockito 5 的專案與 JUnit 4.12 + Mockito 2 +
+  surefire 2.22 的老專案都量得對。
   standards 改為「以量到的 classpath 為準」，並補上 `MockitoExtension` 預設 strict stubs 的提醒
   （`UnnecessaryStubbingException` 是 LLM 寫的測試最常見的失敗之一）。結果記在 `project-facts.json`。
 - **原始碼編碼不是 UTF-8 的模組（MS950 等）。** writer 以 UTF-8 寫的中文在 MS950 模組裡依工具鏈有兩種
@@ -94,8 +101,9 @@
   對別人測試的改動，commit 前該看 diff。`UT_REPAIR_BASELINE=0` 回到直接中止，
   `UT_REPAIR_MAX_ITER` 控制輪數。
 - **防掏空 guard**：build gate 分不出「修好失敗的測試」和「刪掉失敗的測試」——兩者都是綠燈。
-  loop 現在在第一輪前量下每個既有測試檔的 `@Test` 數、斷言數與 `@Disabled` 數，任一檔案
-  數量減少或 `@Disabled` 增加，該輪即 FAIL 並把前後數字餵回，不進建置；主迴圈與修復迴圈
+  loop 現在在第一輪前量下每個既有測試檔的 `@Test` 數、斷言數與略過標記數（`@Disabled`、JUnit 4 的
+  `@Ignore`、TestNG 的 `enabled = false`、assumption——`assumeTrue(false)` 讓失敗的測試以「略過」結束，
+  數量卻一個不少），任一檔案數量減少或略過標記增加，該輪即 FAIL 並把前後數字餵回，不進建置；主迴圈與修復迴圈
   共用。刻意用數量不用方法名——standards 要求「方法_情境_預期」命名，writer 補強既有檔案時
   本來就會改名重寫。`UT_ALLOW_TEST_SHRINK=1` 只警告。
 - **writer 範圍 assert**：orchestrator 每輪在 writer 前後對整個 repo 拍快照（扣除目標模組
@@ -110,6 +118,11 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **幾個 run 同時碰到同一個過期的 repo 鎖時，偶爾有兩個都執行。** 接手時讀到的鎖若剛好不存在（上一個
+  接手者刪掉舊鎖、還沒建好新鎖的瞬間），會被當成「空的過期鎖」，接手區段隨後把別的 run 剛寫好的鎖刪掉——
+  兩個 run 都以為自己持有這個 repo，互相把對方的輸出判成 scope-violation。8 個 run 同時搶的壓測約每 8 次
+  出現一次（selftest 也偶爾紅）。現在讀不到的鎖直接重新建立，剛建立、還沒寫入內容的鎖等它寫完，空了好幾秒
+  的才當成當機留下的；修正後 80 次壓測（8 與 16 個 run）沒有一次兩個都執行。
 - **目標類別的順序在不同機器上不一樣。** 資料夾裡的類別依檔案系統的 readdir 順序列出（ext4 是雜湊順序），
   prompt 裡的順序、分批的順序都因此不可重現。現在依路徑排序。
 - **跑到一半「莫名其妙中斷」：實測重現出五個成因，全部修掉。** 以真的 Maven 專案（JUnit 5 +

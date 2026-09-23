@@ -59,7 +59,7 @@ import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
 import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
-import { measureTestStack, TestStack } from "./libs/teststack";
+import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
 import { captureNonUtf8Sources, isUtf8Name, repairWriterEncoding, SourceEncoding } from "./libs/encoding";
 
 export interface OrchestratorConfig {
@@ -86,15 +86,15 @@ export interface OrchestratorConfig {
   sourceEncoding?: SourceEncoding;
 }
 
-// A stack read off the pom is a guess about what is declared. The first build that runs a test
-// records the real classpath, and every prompt after it states that instead.
-function refineTestStack(stack: TestStack | undefined, mod: ModuleInfo, buildLog: string): TestStack | undefined {
-  if (stack?.source === "surefire") return stack;
-  const measured = measureTestStack(mod, REPO_ROOT, buildLog);
-  if (measured?.source !== "surefire") return stack;
-  measured.javaRelease ??= stack?.javaRelease;
-  log("測試相依：已從這次建置的測試 classpath 量得實際的相依，之後的 prompt 以此為準");
-  return measured;
+// Measured again after every build: a stack read off the pom is a guess about what is declared,
+// and the first build that runs a test records the real classpath — which every prompt after it
+// states instead. Only this build's reports count as current (`since`); see measureTestStack.
+function refineTestStack(stack: TestStack | undefined, mod: ModuleInfo, buildLog: string, since: number): TestStack | undefined {
+  const merged = mergeTestStack(stack, measureTestStack(mod, REPO_ROOT, buildLog, since));
+  if (merged?.source === "surefire" && stack?.source !== "surefire") {
+    log("測試相依：已從這次建置的測試 classpath 量得實際的相依，之後的 prompt 以此為準");
+  }
+  return merged;
 }
 
 // Around each writer session in a module whose sources are not UTF-8 (libs/encoding.ts): the
@@ -436,7 +436,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       tolerate: cfg.tolerate,
     });
     save("build.log", build.raw ?? build.report);
-    testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "");
+    testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
       record({
@@ -853,9 +853,10 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       log(`[WARN] UT_ALLOW_TEST_SHRINK=1：修復輪刪減了既有測試（${shrunk.length} 檔），依設定放行`);
     }
 
+    const rebuildStartedAt = Date.now();
     current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
     save("build.log", current.raw);
-    testStack = refineTestStack(testStack, cfg.mod, current.raw);
+    testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
     save("build-summary.md", current.summary);
     console.log(current.summary);
     // A build that never finished locates nothing; carried on, it became "unlocatable" next round.

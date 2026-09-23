@@ -51,7 +51,8 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    scope-violation 中止。）（writer 能改 production
    code = 能把測試「改到會過」= build gate 被架空。這條先前只靠 prompt 勸導，實測 writer
    加一個 method 進 production 後 loop 照樣 gates-passed。）同樣由 script 守的還有既有測試
-   的數量：`@Test` 數、斷言數不得減少、`@Disabled` 不得增加，否則該輪 FAIL 餵回。（writer 能
+   的數量：`@Test` 數、斷言數不得減少、略過標記（`@Disabled`、`@Ignore`、TestNG `enabled = false`、
+   assumption——`assumeTrue(false)` 讓失敗的測試以「略過」結束，數量卻一個不少）不得增加，否則該輪 FAIL 餵回。（writer 能
    刪測試 = 能把失敗「刪到會過」= 同一個洞的另一面。有了這兩道 assert，「修復既有紅燈」才敢
    交給 writer 做——先前否決的理由是修好與掏空在 build gate 眼裡一模一樣，現在分得出來。）
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；

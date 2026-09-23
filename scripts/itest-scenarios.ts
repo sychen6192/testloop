@@ -277,6 +277,25 @@ export const SCENARIOS: Scenario[] = [
     mvn: [GREEN_BUILD],
   },
   {
+    name: "shrink-assumption",
+    desc: "在失敗的既有測試開頭塞 assumeTrue(false)：@Test 與斷言數都沒變，但測試變成「略過」→ 也算掏空",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      {
+        write: {
+          [EXISTING_PATH]: EXISTING_TEST.replace(
+            "assertEquals(5, new Calc().div(5, 1));",
+            "org.junit.jupiter.api.Assumptions.assumeTrue(false);\n        assertEquals(5, new Calc().div(5, 1));",
+          ),
+          [CALC_TEST_PATH]: calcTest(1),
+        },
+      },
+      { write: { [EXISTING_PATH]: EXISTING_TEST, [CALC_TEST_PATH]: calcTest(5) } },
+    ],
+    mvn: [GREEN_BUILD],
+  },
+  {
     name: "shrink-allowed",
     desc: "UT_ALLOW_TEST_SHRINK=1 只警告，照樣進建置",
     entry: "orchestrate",

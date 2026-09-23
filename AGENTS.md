@@ -47,7 +47,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
    gate 的結果都失去意義。第三面是**防掏空**：build gate 分不出「修好失敗的測試」和「刪掉
    失敗的測試」，兩者都是綠燈，所以 `libs/testmetrics.ts` 在第一輪前量下每個既有測試檔的
-   `@Test` 數、斷言數與 `@Disabled` 數，任一檔案數量減少（或 `@Disabled` 增加）該輪即 FAIL
+   `@Test` 數、斷言數與略過標記數（`@Disabled`、`@Ignore`、TestNG `enabled = false`、assumption），
+   任一檔案數量減少（或略過標記增加）該輪即 FAIL
    餵回，不進建置（`UT_ALLOW_TEST_SHRINK=1` 只警告）。刻意用數量不用方法名：standards 要求
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
@@ -168,7 +169,7 @@ libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
-libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防掏空 guard 的量尺）
+libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記

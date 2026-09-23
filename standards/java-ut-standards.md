@@ -39,7 +39,7 @@
   原本由資料庫提供的資料改以 `when(...).thenReturn(...)` 給定
 - 禁止測試之間有順序相依或共享可變靜態狀態
 - 禁止為了讓測試通過而修改 production code
-- 禁止使用 `@Disabled` 略過失敗測試
+- 禁止用 `@Disabled`（JUnit 4 的 `@Ignore`、TestNG 的 `enabled = false`）或 `assumeTrue(false)` 之類的 assumption 略過失敗測試
 - 禁止在測試碼中加入 logging（`@Slf4j`、`log.info(...)`、`System.out.println`）。斷言就是
   測試的輸出，失敗訊息由 assertion library 提供；logging 只會製造噪音，並讓測試多依賴一套
   在 test scope 未必配置正確的機制（例如 Lombok 的 annotation processor 未生效時，
@@ -47,14 +47,14 @@
 
 ## 既有測試違反上述規則時：就地改寫，不得刪除
 你被允許修改既有測試檔，但只能用「改寫」的方式。pipeline 在你動手前已量下每個既有測試檔的
-`@Test` 數、斷言數與 `@Disabled` 數，任一項變差該輪即失敗——對建置而言，「把測試修好」和
+`@Test` 數、斷言數與略過標記數（`@Disabled`、`@Ignore`、`enabled = false`、assumption），任一項變差該輪即失敗——對建置而言，「把測試修好」和
 「把測試刪掉」都是綠燈，這道計數是唯一分得出來的東西。
 
 - **改寫**：保留原本的測試方法與其驗證意圖，只把違規的機制換掉。連資料庫的測試，改成
   `@Mock` 注入資料源、以 stub 回傳值表達原本由 DB 提供的資料
 - **斷言數不得減少**：一個連資料庫撈五筆再逐筆驗證的測試，改成 mock 之後只剩三個斷言，
   會被判定為刪減並讓該輪失敗。缺的驗證要以等價的斷言補回，不是省略
-- **不得**刪除測試方法、整個檔案，或改用 `@Disabled` / 註解掉來「處理」違規
+- **不得**刪除測試方法、整個檔案，或改用 `@Disabled` / `@Ignore` / assumption / 註解掉來「處理」違規
 - 若某個測試的意圖本來就是驗證真實 SQL、schema 或 transaction 行為（那是整合測試，不是
   單元測試的職責），不要硬改成 mock——改成 mock 只會得到一個驗證不到任何東西的空殼。
   原樣保留，並在總結中點名檔案與原因，交由人決定它該搬去哪裡

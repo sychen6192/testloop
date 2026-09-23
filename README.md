@@ -144,7 +144,7 @@ testgen <package 路徑>                  # 端對端執行
 | `UT_REPAIR_MAX_ITER` | 5 | 修復迴圈最大輪數 |
 | `UT_REPAIR_NO_PROGRESS_ROUNDS` | 2 | 連續幾輪紅燈數沒下降就停。stuck 需要兩輪報告完全相同，「修好 A 又弄壞 B」的報告每輪都不一樣卻毫無進展，只有數量抓得到。例外是**揭露**：上一輪有編譯錯誤、這輪修好了一些，而新紅燈都在沒改過、也沒引用這輪改過的類別的檔案裡（改了測試資源則不算），算進展 |
 | `UT_ALLOW_DIRTY_BASELINE` | - | 1 = 修復失敗（或關閉修復）時照樣執行。既有紅燈會標記為 pre-existing 寫進 prompt，**且 build gate 改為「失敗集合不得超出預檢基準」**——既有失敗可以續紅，writer 新弄壞的照樣擋。與 `UT_SKIP_BASELINE` 互斥（沒有基準就沒有可扣除的集合，會直接中止）。預設中止 |
-| `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled）時只警告。預設該輪 FAIL 餵回 |
+| `UT_ALLOW_TEST_SHRINK` | - | 1 = 既有測試檔被刪減（@Test / 斷言變少、新增 @Disabled / @Ignore / `enabled = false` / assumeTrue 之類的略過標記）時只警告。預設該輪 FAIL 餵回 |
 | `UT_TEST_SCOPE` | module | `generated` = 迭代期間只跑目標類別的測試，通過前完整重跑一次驗收。見下節 |
 | `UT_MAX_FEEDBACK_CHARS` | 12000 | 每輪餵回 writer 的失敗報告上限。超過則保留開頭並標明截斷量 |
 | `UT_MAX_FAILURE_BLOCKS` | 5 | 失敗報告中最多引用幾個失敗測試類別的 surefire 明細 |
@@ -244,7 +244,10 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   （實際跑過的，最準），模組還沒有任何測試跑過時退回讀 pom（連同 Spring Boot 版本推斷，prompt 會
   標明是推斷）；writer 的測試第一次跑過之後，後面的 prompt 就改用實際 classpath。量到什麼在 log 的
   「測試相依：」那一行與 `project-facts.json`。只有 JUnit 4 的模組會被告知用 JUnit 4 的寫法，
-  沒有 inline mock maker 時會被告知不能 mock static / final。
+  沒有 inline mock maker 時會被告知不能 mock static / final。surefire 2.21 以前的報告不記錄測試
+  classpath，這時一律讀 pom；pom 繼承 repo 外的公司 parent 時，parent 帶了什麼量不到，loop 不斷定框架，
+  改看既有測試用哪一個。量到的不對時，看 log 那一行寫的來源——`pom 宣告（未經建置確認）` 表示還沒有
+  可採用的 surefire 報告。
 - **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
   MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，
@@ -279,7 +282,8 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   可硬跑（紅燈標記為 pre-existing，但 build gate 每輪仍紅）；`UT_REPAIR_BASELINE=0` 關掉修復
   直接中止。每一輪修復的 prompt / build log 在 `runs/<repo>/<ts>/repair-N/`。
 - **某一輪說「既有測試被刪減」並直接進下一輪。** writer 在既有測試檔裡拿掉了 `@Test` 方法或
-  斷言，或加了 `@Disabled`。對 build gate 來說「修好」和「刪掉」都是綠燈，所以 loop 量數量：
+  斷言，或加了讓測試略過的標記（`@Disabled`、JUnit 4 的 `@Ignore`、TestNG 的 `enabled = false`、
+  `assumeTrue(false)` 之類的 assumption）。對 build gate 來說「修好」和「刪掉」都是綠燈，所以 loop 量數量：
   少了就判該輪 FAIL、把前後數字餵回去要它補回來。改寫、改名都可以，數量不能少。確定是合理
   整併就設 `UT_ALLOW_TEST_SHRINK=1`。
 - **smoke FAIL，或 writer 沒動靜。** provider 未設定，或 model 欄位為空。見「Provider 與

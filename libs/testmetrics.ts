@@ -3,7 +3,7 @@
 // "Fix the failing test" and "delete the failing test" are indistinguishable to the build gate —
 // both turn it green. The count of test methods and assertions is what tells them apart, so the
 // loop measures every pre-existing test file before round 1 and refuses a round in which any of
-// them lost a test, lost an assertion, or gained an @Disabled. Regexes over comment- and
+// them lost a test, lost an assertion, or gained a way to skip one. Regexes over comment- and
 // string-stripped source: an approximation, but a monotone one — a writer cannot remove a test
 // method without the count going down.
 import * as fs from "node:fs";
@@ -21,6 +21,7 @@ function isRegularFile(p: string): boolean {
 export interface TestMetrics {
   tests: number;
   assertions: number;
+  /** Skip markers: a test that does not run, or ends as skipped instead of failed. */
   disabled: number;
 }
 
@@ -40,6 +41,9 @@ function stripCommentsAndStrings(src: string): string {
     .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
 }
 
+const SKIP_MARKERS =
+  /@(?:Disabled|Enabled)\w*|@Ignore\b|\benabled\s*=\s*false\b|\bassum(?:e(?:True|False|That\w*|NotNull|NoException)|ingThat)\s*\(/g;
+
 // Pure.
 export function testMetrics(src: string): TestMetrics {
   const s = stripCommentsAndStrings(src);
@@ -48,7 +52,10 @@ export function testMetrics(src: string): TestMetrics {
     tests: count(/@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b/g),
     // JUnit / AssertJ assert*, Mockito verify*, BDDMockito should(), JUnit fail()
     assertions: count(/\b(?:assert\w*|verify\w*|should|fail)\s*\(/g),
-    disabled: count(/@Disabled\b/g),
+    // Each framework's way to not run a test — JUnit 5's @Disabled and its conditional
+    // @Disabled…/@Enabled… forms, JUnit 4's @Ignore, TestNG's enabled = false — and assumptions,
+    // which end a failing test as skipped: all of them turn a red build green.
+    disabled: count(SKIP_MARKERS),
   };
 }
 
