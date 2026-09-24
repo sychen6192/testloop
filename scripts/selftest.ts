@@ -145,13 +145,18 @@ import { bundleFrom, caSummary, load, sourcePaths } from "../libs/tls";
 
 let passCount = 0;
 let failCount = 0;
+// Repeated at the end: some checks print tens of thousands of lines of build output, and a CI log
+// viewer that shows only the tail would otherwise never show which check failed.
+const failures: string[] = [];
 function check(name: string, cond: boolean, detail = "") {
   if (cond) {
     passCount++;
     console.log(`  [OK] ${name}`);
   } else {
     failCount++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
+    const line = `  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`;
+    failures.push(line);
+    console.log(line);
   }
 }
 
@@ -4432,6 +4437,7 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
 }
 
 // ---------------------------------------------------------------------------
+if (failures.length) console.log(`\n失敗的檢查（${failures.length}）：\n${failures.join("\n")}`);
 console.log(`\n結果：${passCount} passed / ${failCount} failed`);
 if (failCount > 0) process.exit(1);
 console.log("[OK] selftest 全數通過");
