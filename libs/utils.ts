@@ -27,7 +27,19 @@ export function listJavaClasses(target: string, repoRoot: string): string[] {
     }
   };
   walk(target);
-  return out;
+  // readdir order is the file system's (hash order on ext4): sorted, the batches and the order in
+  // the prompt are the same on every machine and every run.
+  return out.sort(portablePathOrder);
+}
+
+/**
+ * Pure: path order that is the same on every platform — compared with "/" separators, since "\"
+ * sorts after digits and capitals where "/" sorts before them, and Windows batched differently.
+ */
+export function portablePathOrder(a: string, b: string): number {
+  const x = a.replace(/\\/g, "/");
+  const y = b.replace(/\\/g, "/");
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 function hasBuildFile(dir: string): boolean {
@@ -251,7 +263,9 @@ export function snapshotTree(root: string, opts: SnapshotOptions = {}): TreeSnap
       } catch {
         continue; // dangling symlink or a file that vanished mid-walk — nothing to compare
       }
-      snap[rel] = `${st.mtimeMs}:${st.size}`;
+      // Whole milliseconds: a time put back through a Date (as the encoding view restores a file
+      // it did not change) loses the fraction, and an untouched file read as changed.
+      snap[rel] = `${Math.floor(st.mtimeMs)}:${st.size}`;
     }
   };
   walk(root);
@@ -282,12 +296,19 @@ export function writerScopeSkip(
   // case-insensitive file system (Windows, macOS) `cd C:\work\shop` for a directory named
   // `Shop` made the writable tree — or the loop's own runs dir — fail to match, and the writer's
   // own tests (or writer-summary.md) were a scope-violation in round 1. realpath gives the
-  // on-disk case; both ends go through it so a symlinked repo path stays consistent.
+  // on-disk case; both ends go through it so a symlinked repo path stays consistent. A path that
+  // does not exist yet (a runs dir before its first run) takes its deepest existing ancestor's:
+  // as typed, a repo reached through a symlink or an 8.3 short name (C:\Users\RUNNER~1) put it
+  // outside the repo.
   const real = (p: string) => {
-    try {
-      return fs.realpathSync.native(p);
-    } catch {
-      return path.resolve(p);
+    const rest: string[] = [];
+    for (let dir = path.resolve(p); ; dir = path.dirname(dir)) {
+      try {
+        return path.join(fs.realpathSync.native(dir), ...rest);
+      } catch {
+        if (path.dirname(dir) === dir) return path.resolve(p);
+        rest.unshift(path.basename(dir));
+      }
     }
   };
   const root = real(repoRoot);

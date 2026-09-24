@@ -15,6 +15,7 @@ import {
 } from "../config";
 import { tail, die, log } from "../libs/log";
 import { clampText, stripAnsi } from "../libs/utils";
+import { codeOnly } from "../libs/javasrc";
 import { shLive } from "../libs/shell";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
 
@@ -49,6 +50,11 @@ export interface BaselineResult {
   // The build never reached a verdict (timed out, or killed by a signal). Not a red module:
   // there is nothing to repair, and the repair loop must not be entered on it.
   aborted?: string;
+  // Green, but tests that had to run did not (see checkTestsRan): failingTestClasses names them,
+  // and the summary says why. There is no build error to quote.
+  notRun?: boolean;
+  // The test classes this build ran in the module — before a writer, the ones it has to keep running.
+  ranTests?: string[];
 }
 
 /** The writer's only writable path, repo-relative, for messages. */
@@ -651,6 +657,9 @@ export async function runBaseline(
   // The repair loop re-runs this after every fix round: same command, same classification,
   // different wording in the log and summary.
   phase: "baseline" | "repair" = "baseline",
+  // Repair only: the tests that ran before it, which a repair must leave running.
+  mustRun?: ExpectedTest[],
+  ranBefore?: string[],
 ): Promise<BaselineResult> {
   const startedAt = Date.now();
   const tag = phase === "repair" ? "修復後建置" : "預檢基準";
@@ -659,7 +668,8 @@ export async function runBaseline(
       ? "修復驗證：重新建置，確認既有紅燈是否清除"
       : "預檢：在 writer 介入前先建置一次，取得既有紅燈基準",
   );
-  const { gate: r, aborted } = await runBuild(tool, mod, { allowZeroTests: true });
+  const { gate: r, aborted, notRun, startedAt: builtAt } = await runBuild(tool, mod, { allowZeroTests: true, mustRun, ranBefore });
+  const ranTests = ranTestClasses(tool, mod, builtAt, r.raw ?? "");
 
   if (aborted) {
     return {
@@ -687,6 +697,22 @@ export async function runBaseline(
       failingTests: [],
       summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
+      ranTests,
+    };
+  }
+  if (notRun) {
+    return {
+      clean: false,
+      compileErrorFiles: [],
+      failingTestClasses: notRun,
+      outOfScope: [],
+      envFailures: [],
+      failureDetail: "",
+      failingTests: [],
+      summary: `${tag}：${r.report}`,
+      raw: r.raw ?? "",
+      notRun: true,
+      ranTests,
     };
   }
 
@@ -767,7 +793,406 @@ export async function runBaseline(
     failingTests,
     summary: lines.join("\n"),
     raw,
+    ranTests,
   };
+}
+
+/** The test classes a build ran in the module: its fresh reports, and surefire's log lines. */
+export function ranTestClasses(tool: BuildTool, mod: ModuleInfo, since: number, out: string): string[] {
+  const check = checkTestsRan(tool, mod, since, out, [], [], true);
+  return check ? [...new Set(check.reported)].sort() : [];
+}
+
+// ─── Were the writer's tests run? ────────────────────────────────────────────
+//
+// A passing build proves that the tests it ran pass — not that the writer's were among them. A
+// JUnit 5 test in a module whose surefire runs the JUnit 4 provider compiles and is never run; so
+// is a JUnit 4 test on a JUnit Platform without the vintage engine, a class whose name surefire's
+// includes do not match, a class disabled as a whole. The build is green, the coverage gate finds
+// the class untested, and nothing says why. Worse, a failing test rewritten into a framework the
+// build does not run turns green with every test still there: the shrink guard counts @Test
+// annotations, and none was lost.
+
+export type TestFramework = "JUnit 5" | "JUnit 4" | "TestNG";
+
+/** A test class a build is expected to run. */
+export interface ExpectedTest {
+  /** Absolute path of its source. */
+  file: string;
+  fqcn: string;
+  framework?: TestFramework;
+  /** Disabled as a whole: @Disabled / @Ignore on the class, or TestNG's @Test(enabled = false). */
+  disabled: boolean;
+  /** The class's own @DisplayName: what surefire's phrased reporters name it by instead of its FQCN. */
+  displayName?: string;
+  /**
+   * "created": the writer's new class — one whose every test was skipped is not run either.
+   * "changed": a class the writer edited that ran before it did. "grown": one it added tests to
+   * that did not run before either. "untouched": a class that ran before the writer, and that
+   * nothing the writer did may stop running.
+   */
+  origin: "created" | "changed" | "grown" | "untouched";
+}
+
+/** Pure: the framework a test source is written for — by the @Test it uses, then by any import. */
+export function testFrameworkOf(code: string): TestFramework | undefined {
+  if (/\bimport\s+org\.junit\.jupiter\.api\.(?:Test|\*)\s*;|@org\.junit\.jupiter\.api\.Test\b/.test(code)) return "JUnit 5";
+  if (/\bimport\s+org\.testng\.annotations\.(?:Test|\*)\s*;|@org\.testng\.annotations\.Test\b/.test(code)) return "TestNG";
+  if (/\bimport\s+org\.junit\.(?:Test|\*)\s*;|@org\.junit\.Test\b/.test(code)) return "JUnit 4";
+  if (/\borg\.junit\.jupiter\./.test(code)) return "JUnit 5";
+  if (/\borg\.testng\./.test(code)) return "TestNG";
+  if (/\borg\.junit\./.test(code)) return "JUnit 4";
+  return undefined;
+}
+
+/**
+ * Pure: the test class a source file declares, when it is one a build runs — test methods in a
+ * concrete top-level class. undefined for helpers, abstract bases, interfaces.
+ */
+export function expectedTestOf(src: string, file: string, origin: ExpectedTest["origin"]): ExpectedTest | undefined {
+  const name = path.basename(file, ".java");
+  if (!file.endsWith(".java") || !/^[\w$]+$/.test(name)) return undefined;
+  const code = codeOnly(src);
+  if (!/@(?:[\w.]+\.)?(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b/.test(code)) return undefined;
+  const decl = new RegExp(
+    `(?:^|[\\s;})])((?:(?:public|protected|private|abstract|static|final|strictfp|sealed|non-sealed)\\s+)*)(class|interface|enum|record)\\s+${name.replace(/\$/g, "\\$")}\\b`,
+  ).exec(code);
+  if (!decl || decl[2] !== "class" || /\babstract\b/.test(decl[1])) return undefined;
+  const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(code)?.[1];
+  // The class's own annotations: after the statement before it (the last import) and before it.
+  const head = code.slice(0, decl.index + 1);
+  const ownStart = Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1;
+  const own = head.slice(ownStart);
+  const disabled = /@(?:[\w.]+\.)?(?:Disabled|Ignore)\b|@(?:[\w.]+\.)?Test\s*\([^)]*\benabled\s*=\s*false/.test(own);
+  // Its text is a string literal, which codeOnly blanked: read at the same place in the source.
+  const shown = /@(?:[\w.]+\.)?DisplayName\s*\(\s*"((?:[^"\\\n]|\\.)*)"\s*\)/.exec(src.slice(ownStart, decl.index + 1))?.[1];
+  return {
+    file,
+    fqcn: pkg ? `${pkg}.${name}` : name,
+    framework: testFrameworkOf(code),
+    disabled,
+    ...(shown ? { displayName: shown.replace(/\\(["\\])/g, "$1") } : {}),
+    origin,
+  };
+}
+
+/**
+ * Pure: the simple names surefire's default includes run — Test*, *Test, *TestCase, and *Tests
+ * from 2.20 (2.12.4, what Maven 3.8 binds when the pom names no version, does not run CalcTests).
+ * An unknown version is taken as a recent one.
+ */
+export function includedByDefault(fqcn: string, surefireVersion?: string): boolean {
+  const simple = fqcn.split(".").pop() ?? "";
+  if (/^Test|Test$|TestCase$/.test(simple)) return true;
+  if (!/Tests$/.test(simple)) return false;
+  const m = /^(\d+)\.(\d+)/.exec(surefireVersion ?? "");
+  return !m || Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 20);
+}
+
+export interface RanCheck {
+  /** Every class the build reported running (outer class names), in the module or its log. */
+  reported: string[];
+  /** Expected classes this build did not run. */
+  notRun: ExpectedTest[];
+  /** Classes created this run whose every test was skipped. */
+  allSkipped: Array<{ test: ExpectedTest; tests: number }>;
+  /** The classes this build did run in the module, with the framework their source is written for. */
+  ran: Array<{ fqcn: string; framework?: TestFramework }>;
+  /** When this build ran nothing else: the classes that ran before the writer, the same way. */
+  ranBefore: Array<{ fqcn: string; framework?: TestFramework }>;
+  /** The surefire version the build log shows, for what its default includes are. */
+  surefireVersion?: string;
+}
+
+// A class ran when something names it: its own report (TEST-<fqcn>.xml, <fqcn>.txt, with a
+// reportNameSuffix or for a @Nested class after it), a suite report's test cases (TestNG writes one
+// TEST-TestSuite.xml for everything), or surefire's "Running <fqcn>" line.
+const names = (fqcn: string, name: string) => name === fqcn || name.startsWith(`${fqcn}$`) || name.startsWith(`${fqcn}-`);
+// A display name as reported: surefire writes a file name in the platform's encoding, so a
+// non-ASCII @DisplayName arrives as "?"s — and a source in MS950 read as UTF-8 does not decode. Runs
+// of anything not ASCII (or "?") compare as one "?": loose, and only ever turns "not run" into "ran".
+const skeleton = (s: string) => s.replace(/(?:[^\x00-\x7f]|\?)+/g, "?").trim();
+const shownAs = (t: ExpectedTest, name: string) => !!t.displayName && skeleton(name) === skeleton(t.displayName);
+
+/** Pure: the classes a surefire console log says it ran. */
+export function classesRunInLog(out: string): string[] {
+  const found = new Set<string>();
+  for (const m of out.matchAll(/(?:\bRunning|\s--?\sin)\s+([\w.$]+)\s*$/gm)) found.add(m[1]);
+  return [...found];
+}
+
+// "tests" and "skipped" of each report of a class: XML attributes, or the .txt summary line.
+function skippedCounts(dir: string, files: string[]): { tests: number; skipped: number } {
+  let tests = 0;
+  let skipped = 0;
+  const xml = files.filter((f) => f.endsWith(".xml"));
+  for (const f of xml.length ? xml : files) {
+    let text = "";
+    try {
+      const fd = fs.openSync(path.join(dir, f), "r");
+      try {
+        const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size));
+        fs.readSync(fd, buf, 0, buf.length, 0);
+        text = buf.toString("utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      continue;
+    }
+    const tag = /<testsuite\b[^>]*>/.exec(text)?.[0];
+    if (tag) {
+      tests += Number(attr(tag, "tests")) || 0;
+      skipped += Number(attr(tag, "skipped")) || 0;
+      continue;
+    }
+    const line = /Tests run:\s*(\d+),.*?Skipped:\s*(\d+)/.exec(text);
+    if (line) {
+      tests += Number(line[1]);
+      skipped += Number(line[2]);
+    }
+  }
+  return { tests, skipped };
+}
+
+/**
+ * Which of `expected` this build ran. undefined when that cannot be told: the build left no
+ * report of its own in the module and its log names no test class, yet says tests ran — reports
+ * disabled or written elsewhere, where "not run" would fail every round of a module the check
+ * simply cannot see.
+ */
+export function checkTestsRan(
+  tool: BuildTool,
+  mod: ModuleInfo,
+  since: number,
+  out: string,
+  expected: ExpectedTest[],
+  // Classes known to have run before the writer: which frameworks run here, when this build
+  // (scoped to the writer's classes) ran nothing else to tell by.
+  ranBefore: string[] = [],
+  // Also every class a report names inside it, not only by its file name: a JUnit 4 suite's members.
+  members = false,
+): RanCheck | undefined {
+  const dir = tool === "maven" ? surefireDirOf(mod.moduleRoot) : path.join(mod.moduleRoot, "build", "test-results", "test");
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    /* no reports at all */
+  }
+  // Maven leaves earlier builds' reports in place; gradle deletes them before each run, and an
+  // up-to-date test task (nothing changed since) keeps reports that still hold.
+  const reports = entries.filter((f) => {
+    if (!/^TEST-.+\.xml$/.test(f) && !(tool === "maven" && isSurefireSummary(f))) return false;
+    if (tool !== "maven") return true;
+    try {
+      return fs.statSync(path.join(dir, f)).mtimeMs >= since;
+    } catch {
+      return false;
+    }
+  });
+  const reportOf = new Map<string, string[]>();
+  for (const f of reports) {
+    const cls = f.endsWith(".xml") ? f.slice("TEST-".length, -".xml".length) : f.slice(0, -".txt".length);
+    reportOf.set(cls, [...(reportOf.get(cls) ?? []), f]);
+  }
+  const testRoot = path.join(mod.moduleRoot, "src", "test", "java");
+  const sourceOf = (name: string) => path.join(testRoot, ...name.replace(/[$-].*$/, "").split(".")) + ".java";
+  const isClass = (name: string) => fs.existsSync(sourceOf(name));
+  // The log covers the whole reactor: only this module's classes say anything about this module.
+  const logged = tool === "maven" ? classesRunInLog(out).filter(isClass) : [];
+  const seen = [...reportOf.keys(), ...logged];
+  // A suite report (TestNG's one TEST-TestSuite.xml, a JUnit 4 suite class) names its classes inside.
+  let inside: string[] | undefined;
+  const scanInside = () => {
+    if (inside) return inside;
+    inside = [];
+    for (const f of reports.filter((r) => r.endsWith(".xml"))) {
+      try {
+        const xml = readSurefireXml(path.join(dir, f));
+        for (const m of xml.matchAll(/<testsuite\b[^>]*?\bname="([^"]*)"|<testcase\b[^>]*?\bclassname="([^"]*)"/g)) inside.push(unescapeXml(m[1] ?? m[2]));
+      } catch {
+        /* unreadable: not evidence either way */
+      }
+    }
+    return inside;
+  };
+  if (!seen.some(isClass)) {
+    if (reports.length) {
+      // Reports that name no test class of the module — named by @DisplayName (surefire's
+      // usePhrasedFileName), or a suite's — unless the cases inside do: "cannot see", not "did not run".
+      if (!scanInside().some(isClass)) return undefined;
+    } else {
+      // Nothing names a class: only surefire saying it ran nothing tells "nothing ran" from
+      // "cannot see" (reports disabled or written elsewhere, a quiet log).
+      const none = tool === "maven" && (countTestsRun(out) === 0 || /\bNo tests (?:to run|were executed)\b/.test(out));
+      if (!none) return undefined;
+    }
+  }
+  const ranAs = (t: ExpectedTest, n: string) => names(t.fqcn, n) || shownAs(t, n);
+  let notRun = expected.filter((t) => !seen.some((n) => ranAs(t, n)));
+  if (notRun.length && reports.length) notRun = notRun.filter((t) => !scanInside().some((n) => ranAs(t, n)));
+  // A class listed by name only (it ran before the writer): what its source says, for the report.
+  notRun = notRun.map((t) => {
+    if (t.framework) return t;
+    try {
+      const read = expectedTestOf(fs.readFileSync(t.file, "latin1"), t.file, t.origin);
+      return read ? { ...t, framework: read.framework, disabled: read.disabled } : t;
+    } catch {
+      return t;
+    }
+  });
+  const allSkipped: RanCheck["allSkipped"] = [];
+  for (const t of expected) {
+    if (t.origin !== "created" || notRun.some((n) => n.fqcn === t.fqcn)) continue;
+    const files = [...reportOf].filter(([n]) => names(t.fqcn, n)).flatMap(([, f]) => f);
+    if (!files.length) continue;
+    const { tests, skipped } = skippedCounts(dir, files);
+    if (tests > 0 && skipped >= tests) allSkipped.push({ test: t, tests });
+  }
+  // What ran, and in which framework — read only when something did not run. A suite report names
+  // its classes inside: TestNG's one TEST-TestSuite.xml, a JUnit 4 suite's members.
+  const outer = new Set(seen.map((n) => n.replace(/[$-].*$/, "")));
+  if (members || reports.some((f) => f.endsWith(".xml") && !isClass(f.slice("TEST-".length, -".xml".length)))) {
+    for (const n of scanInside()) if (isClass(n)) outer.add(n.replace(/[$-].*$/, ""));
+  }
+  // The classes that did not run are no evidence of what runs — before the writer, their source
+  // may have been another framework.
+  const frameworksOf = (classes: Iterable<string>) => {
+    const found: RanCheck["ran"] = [];
+    for (const fqcn of [...classes].sort()) {
+      if (notRun.some((t) => t.fqcn === fqcn) || allSkipped.some((a) => a.test.fqcn === fqcn)) continue;
+      if (found.length >= 200) break;
+      let src: string;
+      try {
+        src = fs.readFileSync(sourceOf(fqcn), "latin1");
+      } catch {
+        continue; // another module's, or not a class (TestNG's "TestSuite")
+      }
+      found.push({ fqcn, framework: testFrameworkOf(codeOnly(src)) });
+    }
+    return found;
+  };
+  const reporting = notRun.length > 0 || allSkipped.length > 0;
+  const ran = reporting ? frameworksOf(outer) : [];
+  return {
+    reported: [...outer],
+    notRun,
+    allSkipped,
+    ran,
+    ranBefore: reporting && !ran.length ? frameworksOf(ranBefore) : [],
+    surefireVersion: surefireVersionOf(out),
+  };
+}
+
+const HOW_TO_WRITE: Record<TestFramework, string> = {
+  "JUnit 4": "JUnit 4（org.junit.Test、org.junit.Assert；測試類別與 @Test 方法都要 public）",
+  "JUnit 5": "JUnit 5（org.junit.jupiter.api.Test、org.junit.jupiter.api.Assertions）",
+  TestNG: "TestNG（org.testng.annotations.Test、org.testng.Assert）",
+};
+
+const MAX_NOT_RUN_LISTED = 20;
+
+/** How a not-run report starts: a caller that frames it (the final verification) can tell it apart. */
+export const NOT_RUN_HEADER = "編譯與測試都通過，但";
+
+/** Pure: the surefire version in a build log ("--- surefire:3.2.5:test", "maven-surefire-plugin:2.22.2:test"). */
+export function surefireVersionOf(out: string): string | undefined {
+  return /--- (?:maven-)?surefire(?:-plugin)?:([^:\s]+):test\b/.exec(out)?.[1];
+}
+
+/** Pure: the failure report for tests the build did not run; null when every one of them ran. */
+export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null {
+  if (!check.notRun.length && !check.allSkipped.length) return null;
+  const fw = (t: ExpectedTest) => (t.framework ? `（${t.framework} 寫法）` : "");
+  const WHAT: Record<ExpectedTest["origin"], string> = {
+    created: "你新寫的測試類別，這次建置沒有執行它",
+    changed: "你改過的測試類別，改之前有被執行，這次沒有",
+    grown: "你在這個既有類別裡加了測試，但這個模組的建置沒有執行它（writer 介入前也沒有）——加在這裡的測試不會被執行",
+    untouched: "既有的測試類別，writer 介入前有被執行，這次沒有——你的變更讓它不再被執行（例如測試資源裡的設定、共用的基底類別）",
+  };
+  const listed = [
+    ...check.notRun.map((t) => `  - ${t.fqcn}${fw(t)}：${WHAT[t.origin]}`),
+    ...check.allSkipped.map(({ test, tests }) => `  - ${test.fqcn}：你新寫的測試類別，${tests} 個測試全部被略過（skipped）`),
+  ];
+  const lines = [
+    `${NOT_RUN_HEADER}有 ${listed.length} 個該執行的測試類別沒有真的被執行——沒被執行的測試不算數，本輪判 FAIL：`,
+    ...listed.slice(0, MAX_NOT_RUN_LISTED),
+    ...(listed.length > MAX_NOT_RUN_LISTED ? [`  …另 ${listed.length - MAX_NOT_RUN_LISTED} 個`] : []),
+  ];
+  // Which frameworks do run here: this build's other classes, or failing that the ones that ran
+  // before the writer.
+  const evidence = check.ran.length ? check.ran : check.ranBefore;
+  const counts = new Map<string, number>();
+  for (const r of evidence) counts.set(r.framework ?? "框架不明", (counts.get(r.framework ?? "框架不明") ?? 0) + 1);
+  const tally = [...counts].map(([k, v]) => `${k} 寫法 ${v} 個`).join("、");
+  lines.push(
+    check.ran.length
+      ? `這次建置在本模組執行了 ${check.ran.length} 個測試類別：${tally}。`
+      : check.ranBefore.length
+        ? `這次建置在本模組沒有執行其他測試類別；writer 介入前的建置執行的是：${tally}。`
+        : "這次建置在本模組沒有執行任何其他測試類別。",
+  );
+  // The framework to rewrite in: the one most of what runs here is written in.
+  const runs = [...counts].filter(([k]) => k !== "框架不明").sort((a, b) => b[1] - a[1]).map(([k]) => k as TestFramework);
+  const example = evidence.find((r) => r.framework)?.fqcn ?? evidence[0]?.fqcn;
+  lines.push("原因與修法：");
+  const unexplained: string[] = [];
+  for (const t of check.notRun.slice(0, MAX_NOT_RUN_LISTED)) {
+    const causes: string[] = [];
+    if (t.framework && runs.length && !runs.includes(t.framework)) {
+      causes.push(
+        `它是 ${t.framework} 寫法，而本模組被執行的測試都是 ${runs.join("、")} 寫法——這個模組的建置不執行 ${t.framework} 測試。` +
+          `改用 ${HOW_TO_WRITE[runs[0]]}寫`,
+      );
+    }
+    if (tool === "maven" && !includedByDefault(t.fqcn, check.surefireVersion)) {
+      causes.push(
+        `類名不符 surefire${check.surefireVersion ? ` ${check.surefireVersion}` : ""} 預設的 includes（Test*、*Test、*TestCase；*Tests 要 2.20 以後）` +
+          "——改成以 Test 結尾的名字（模組若在 pom 自訂了 includes，以 pom 為準）",
+      );
+    }
+    if (t.disabled) causes.push("類別層級被停用（@Disabled / @Ignore / @Test(enabled = false)）——拿掉它");
+    if (!causes.length && t.origin === "untouched") unexplained.push(t.fqcn);
+    else if (!causes.length) {
+      causes.push(
+        "從原始碼看不出原因：可能是 surefire 的 includes/excludes、測試框架的 provider 或 engine、類別或方法的可見性（private 的 @Test 不會被執行）" +
+          (example ? `——對照本模組有被執行的 ${example} 的寫法` : ""),
+      );
+    }
+    lines.push(...causes.map((c) => `  - ${t.fqcn}：${c}`));
+  }
+  // Classes nobody touched stopped running together, for one reason: say it once.
+  if (unexplained.length) {
+    lines.push(
+      `  - ${unexplained.length === 1 ? unexplained[0] : `上面 ${unexplained.length} 個既有類別`}本身沒被改過：看看這輪改了哪些共用的東西——` +
+        "測試資源（junit-platform.properties、META-INF/services 底下的設定）、基底類別、suite 設定",
+    );
+  }
+  for (const { test } of check.allSkipped.slice(0, MAX_NOT_RUN_LISTED)) {
+    lines.push(
+      `  - ${test.fqcn}：測試全部被略過——檢查 assumption（assumeTrue / assumeFalse / assumingThat）、@Disabled / @Ignore、@EnabledIf… 之類的條件，單元測試不該依環境略過`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Pure: the reactor's last module was never built — SKIPPED in the reactor summary. With
+ * `-pl <module> -am` the target module is built last, after everything it depends on, so this is
+ * the target module left out because an upstream one failed first.
+ */
+export function targetModuleSkipped(out: string): boolean {
+  const at = out.lastIndexOf("Reactor Summary");
+  if (at < 0) return false;
+  let last: string | undefined;
+  for (const line of out.slice(at).split(/\r?\n/).slice(1)) {
+    // A module's line has dot leaders ("web ........ SKIPPED"); "BUILD FAILURE" after the block does not.
+    const m = /\.{2,}\s*(SUCCESS|FAILURE|SKIPPED)\b(?:\s*\[[^\]]*\])?\s*$/.exec(line);
+    if (m && /\[INFO\]/.test(line)) last = m[1];
+    else if (last && /-{8,}|BUILD (?:SUCCESS|FAILURE)/.test(line)) break;
+  }
+  return last === "SKIPPED";
 }
 
 // Pure: last "Tests run: N" in the maven stream = the Results-block aggregate.
@@ -809,7 +1234,15 @@ function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string 
   );
 }
 
-type BuildOptions = { allowZeroTests?: boolean; onlyTests?: string[]; tolerate?: string[] };
+type BuildOptions = {
+  allowZeroTests?: boolean;
+  onlyTests?: string[];
+  tolerate?: string[];
+  // Test classes the build must have run for its green to count: see checkTestsRan.
+  mustRun?: ExpectedTest[];
+  // The classes that ran before the writer, for the report's "which frameworks run here".
+  ranBefore?: string[];
+};
 
 export async function runBuildAndTests(
   tool: BuildTool,
@@ -832,7 +1265,7 @@ async function runBuild(
   tool: BuildTool,
   mod: ModuleInfo,
   opts: BuildOptions,
-): Promise<{ gate: GateResult; aborted?: string }> {
+): Promise<{ gate: GateResult; aborted?: string; notRun?: string[]; startedAt: number }> {
   const isWin = process.platform === "win32";
   // Taken before the build so stale reports from an earlier round can be told apart.
   const startedAt = Date.now();
@@ -863,7 +1296,7 @@ async function runBuild(
       // applied to the upstream modules, where those classes do not exist, and surefire
       // would fail the reactor for finding nothing to run.
       ...(opts.onlyTests?.length
-        ? [`-Dtest=${opts.onlyTests.join(",")}`, "-Dsurefire.failIfNoSpecifiedTests=false"]
+        ? [`-Dtest=${opts.onlyTests.flatMap((n) => [n, `${n}$*`]).join(",")}`, "-Dsurefire.failIfNoSpecifiedTests=false"]
         : []),
       "test",
       ...MAVEN_EXTRA_ARGS,
@@ -897,20 +1330,36 @@ async function runBuild(
         raw: r.out,
       },
       aborted: `建置/測試逾時（UT_BUILD_TIMEOUT_MS=${BUILD_TIMEOUT_MS}ms），已終止程序樹${stuckIn}`,
+      startedAt,
     };
   }
   if (r.signal) {
     const why =
       `建置程序被 ${r.signal} 終止，沒有跑完——這不是編譯或測試失敗。` +
       (r.signal === "SIGKILL" ? "常見原因：記憶體不足被 OOM killer 收掉（dmesg 可查）。" : "");
-    return { gate: { passed: false, report: why, raw: r.out }, aborted: why };
+    return { gate: { passed: false, report: why, raw: r.out }, aborted: why, startedAt };
   }
+
+  // Green counts only with the tests that had to run among those that did.
+  const notRun = (): { gate: GateResult; notRun: string[]; startedAt: number } | null => {
+    const unrun = notRunReport(tool, mod, startedAt, r.out, opts.mustRun, opts.ranBefore);
+    return unrun && { gate: { passed: false, report: unrun.report, raw: r.out }, notRun: unrun.classes, startedAt };
+  };
 
   if (r.code === 0) {
     const zeroReport =
       ALLOW_ZERO_TESTS || opts.allowZeroTests ? null : detectZeroTests(tool, mod, r.out);
-    if (zeroReport) return { gate: { passed: false, report: zeroReport, raw: r.out } };
-    return { gate: { passed: true, report: "編譯與測試全數通過。", raw: r.out } };
+    const unrun = notRun();
+    // Nothing ran at all: that first, and then why the writer's own classes were not among it.
+    if (zeroReport) {
+      return {
+        gate: { passed: false, report: unrun ? `${zeroReport}\n\n${unrun.gate.report}` : zeroReport, raw: r.out },
+        notRun: unrun?.notRun,
+        startedAt,
+      };
+    }
+    if (unrun) return unrun;
+    return { gate: { passed: true, report: "編譯與測試全數通過。", raw: r.out }, startedAt };
   }
 
   // Dirty-baseline subtraction: the gate's promise weakens from "the module is green" to
@@ -919,8 +1368,18 @@ async function runBuild(
   let broke = "";
   if (opts.tolerate?.length && tool === "maven") {
     const v = subtractTolerated(r.out, failingSuites(mod.moduleRoot, startedAt), opts.tolerate);
-    if (v.pass) {
+    // Failures that were there before are all there is — but the reactor stopped at them, before
+    // the target module: nothing the writer wrote was compiled, let alone run.
+    const skipped = targetModuleSkipped(r.out);
+    if (skipped) {
+      log("[dirty-baseline] 不予扣除：上游模組失敗，reactor 在目標模組之前就停了");
+      broke = "\n上游模組的失敗讓 Maven 停在上游，目標模組沒有被建置——writer 的測試沒有被編譯、也沒有被執行，這不能算通過。\n";
+    }
+    if (v.pass && !skipped) {
+      const unrun = notRun();
+      if (unrun) return unrun;
       return {
+        startedAt,
         gate: {
           passed: true,
           report:
@@ -955,5 +1414,27 @@ async function runBuild(
         `編譯或測試失敗（exit=${r.code}）。${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
       raw: r.out,
     },
+    startedAt,
   };
+}
+
+// The ran check as the gate uses it: the report and the classes it names, or null when every one
+// ran — or when the build left nothing to tell by, which is said in the log instead.
+function notRunReport(
+  tool: BuildTool,
+  mod: ModuleInfo,
+  since: number,
+  out: string,
+  mustRun: ExpectedTest[] | undefined,
+  ranBefore: string[] | undefined,
+): { report: string; classes: string[] } | null {
+  if (!mustRun?.length) return null;
+  const check = checkTestsRan(tool, mod, since, out, mustRun, ranBefore);
+  if (!check) {
+    log("[WARN] 無法確認 writer 寫的測試有被執行：這次建置在模組裡沒有留下測試報告，log 也沒有列出執行了哪些測試類別");
+    return null;
+  }
+  const report = renderRanCheck(check, tool);
+  if (!report) return null;
+  return { report, classes: [...check.notRun.map((t) => t.fqcn), ...check.allSkipped.map((a) => a.test.fqcn)] };
 }

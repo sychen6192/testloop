@@ -37,7 +37,7 @@ export function envKnobsInSource(): string[] {
     const re =
       f === "config.ts"
         ? /\bUT_[A-Z0-9_]+/g
-        : /process\.env\.(UT_[A-Z0-9_]+)|process\.env\["(UT_[A-Z0-9_]+)"\]|numEnv\("(UT_[A-Z0-9_]+)"/g;
+        : /process\.env\.(UT_[A-Z0-9_]+)|process\.env\["(UT_[A-Z0-9_]+)"\]|(?:num|int)Env\("(UT_[A-Z0-9_]+)"/g;
     for (const m of src.matchAll(re)) {
       found.add(m[1] ?? m[2] ?? m[3] ?? m[0]);
     }
@@ -60,14 +60,29 @@ export interface MvnStep {
   surefire?: Array<{ cls: string; body: string; module?: string }>;
   /** Surefire XML reports written as TEST-<suite>.xml — the source the gate prefers. */
   surefireXml?: Array<{ suite: string; body: string; module?: string }>;
-  /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. */
-  jacoco?: JacocoSpec;
+  /** Absent = leave jacoco.xml alone, which is how a stale report survives a build. An array
+   *  writes one sourcefile per entry — several target classes in one report. */
+  jacoco?: JacocoSpec | JacocoSpec[];
   /** Which module's target/ the jacoco report lands in; "" is the root. */
   jacocoModule?: string;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
   jacocoAgeMs?: number;
   /** The build is killed by SIGKILL after printing its output (POSIX): the OOM killer. */
   killed?: boolean;
+  /** Files the build writes, repo-relative: compiled test classes, copied test resources. */
+  writeFiles?: Record<string, string>;
+  /** Repo-relative: when this exists, the build prints `failOut` and exits 1 instead — surefire
+   *  running a test class it found in test-classes. */
+  failIfExists?: string;
+  failOut?: string;
+  /** Sends SIGINT to the process that ran the build (the loop), then waits to be killed: Ctrl-C. */
+  interrupt?: boolean;
+  /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
+   *  a rollback cannot put a file back at, whatever its privileges. */
+  pipeDirAt?: string;
+  /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file: the run
+   *  cannot write its build log — a crash in the middle of a batch. */
+  breakRunDir?: boolean;
 }
 
 export interface JacocoSpec {
@@ -105,6 +120,8 @@ export interface Scenario {
   env?: Record<string, string>;
   /** Extra fixture files, repo-relative. */
   extraFiles?: Record<string, string>;
+  /** Files written as raw bytes, after extraFiles — a Big5 source is not a JS string. */
+  extraBytes?: Record<string, number[]>;
   /** Leave the pre-existing test out (nothing for the shrink guard to protect). */
   omitExisting?: boolean;
   /** "multi" builds a reactor with common/core/web and targets web. Default "single". */
@@ -123,6 +140,10 @@ export interface Scenario {
   runsInRepo?: boolean;
   /** entry=loop: another live testgen already holds this repo's lock. */
   lockHeld?: boolean;
+  /** Needs a JDK (the encoding transcoder); skipped where there is none. */
+  jdk?: boolean;
+  /** Runs with no JDK to be found: JAVA_HOME empty, PATH holding only node (POSIX). */
+  noJdk?: boolean;
   mvn: MvnStep[];
 }
 
@@ -140,6 +161,11 @@ export interface ApiTurn {
    * agent a target repo overrode — which the api runner's own write_file can never be.
    */
   sideWrite?: Record<string, string>;
+  /** Ctrl-C while the agent session is running: SIGINT to the run holding the repo's lock. */
+  interrupt?: boolean;
+  /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file while
+   *  this turn is served: whatever the run writes there next fails — a crash mid-round. */
+  breakRunDir?: boolean;
 }
 
 // ─── Fixture contents ────────────────────────────────────────────────────────
@@ -275,7 +301,49 @@ const step = plan[Math.min(n - 1, plan.length - 1)] || { exit: 0, out: "" };
 const vary = (s) => String(s)
   .replace(/{{root}}/g, root)
   .replace(/{{time}}/g, new Date(1767225600000 + n * 1013).toISOString())
-  .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3));
+  .replace(/{{elapsed}}/g, (0.01 + n * 0.003).toFixed(3))
+  .replace(/{{hex}}/g, (0xabc123 + n * 7919).toString(16));
+
+if (step.failIfExists && fs.existsSync(path.join(root, step.failIfExists))) {
+  process.stdout.write(vary(step.failOut || "") + "\\n");
+  process.exit(1);
+}
+for (const [rel, content] of Object.entries(step.writeFiles || {})) {
+  const p = path.join(root, rel);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content);
+}
+if (step.pipeDirAt && process.platform !== "win32") {
+  const p = path.join(root, step.pipeDirAt);
+  fs.rmSync(p, { recursive: true, force: true });
+  fs.mkdirSync(p, { recursive: true });
+  require("child_process").execFileSync("mkfifo", [path.join(p, "pipe")]);
+}
+if (step.breakRunDir) {
+  const found = [];
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const p = path.join(d, e.name);
+      if (/^iter-\\d+$/.test(e.name)) found.push(p); else walk(p);
+    }
+  };
+  walk(path.join(itest, "runs"));
+  found.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  if (found[0]) {
+    fs.rmSync(found[0], { recursive: true, force: true });
+    fs.writeFileSync(found[0], "not a directory any more");
+  }
+}
+// Windows has no SIGINT to deliver — process.kill terminates, and the parent here is cmd.exe, not the
+// loop — so there the step is a plain build, and the scenario's checks stand down.
+if (step.interrupt && process.platform !== "win32") {
+  process.kill(process.ppid, "SIGINT");
+  setTimeout(() => process.exit(0), 60000);
+  return;
+}
 
 const sfDir = (mod) => path.join(root, mod || ".", "target", "surefire-reports");
 if (step.cleanSurefire) {
@@ -298,14 +366,17 @@ for (const r of step.surefireXml || []) {
 }
 
 if (step.jacoco) {
-  const j = step.jacoco;
-  const lines = (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>').join("\\n");
-  const xml = '<?xml version="1.0" encoding="UTF-8"?>\\n' +
-    '<report name="fixture">\\n<package name="' + j.pkg + '">\\n' +
-    '<sourcefile name="' + j.file + '">\\n' + lines + '\\n' +
+  const specs = [].concat(step.jacoco);
+  const sourcefile = (j) =>
+    '<sourcefile name="' + j.file + '">\\n' +
+    (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>').join("\\n") + '\\n' +
     '<counter type="LINE" missed="' + j.line[0] + '" covered="' + j.line[1] + '"/>\\n' +
     '<counter type="BRANCH" missed="' + j.branch[0] + '" covered="' + j.branch[1] + '"/>\\n' +
-    '</sourcefile>\\n</package>\\n</report>\\n';
+    '</sourcefile>\\n';
+  const pkgs = [...new Set(specs.map((j) => j.pkg))];
+  const xml = '<?xml version="1.0" encoding="UTF-8"?>\\n<report name="fixture">\\n' +
+    pkgs.map((p) => '<package name="' + p + '">\\n' + specs.filter((j) => j.pkg === p).map(sourcefile).join("") + '</package>\\n').join("") +
+    '</report>\\n';
   const out = path.join(root, step.jacocoModule || ".", "target", "site", "jacoco", "jacoco.xml");
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, xml);
@@ -598,6 +669,10 @@ export function buildFixture(root: string, sc: Scenario): void {
     if (!sc.omitExisting) write(root, `${TEST_DIR}/ExistingTest.java`, EXISTING_TEST);
   }
   for (const [rel, content] of Object.entries(sc.extraFiles ?? {})) write(root, rel, content);
+  for (const [rel, bytes] of Object.entries(sc.extraBytes ?? {})) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), Buffer.from(bytes));
+  }
 
   // .itest is a dot-directory, so the writer-scope snapshot ignores it — the plan, the call
   // counter and the argv log all change during a run without looking like a scope violation.
@@ -619,6 +694,19 @@ export function buildFixture(root: string, sc: Scenario): void {
 export function gitAvailable(): boolean {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A JDK where the loop looks for one (JAVA_HOME, else PATH): javac and java both answer. */
+export function jdkAvailable(): boolean {
+  const home = process.env.JAVA_HOME;
+  const tool = (name: string) => (home ? path.join(home, "bin", name) : name);
+  try {
+    execFileSync(tool("javac"), ["-version"], { stdio: "ignore" });
+    execFileSync(tool("java"), ["-version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;

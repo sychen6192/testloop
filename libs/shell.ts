@@ -1,7 +1,7 @@
 // Run a child process; stream stdout/stderr line-by-line (prefixed), return the full output.
 // Also owns Windows process spawning (planSpawn / explainSpawnError) for callers that spawn
 // without `shell: true` — the opencode runner and doctor.
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isatty } from "node:tty";
@@ -314,8 +314,13 @@ export function planKill(
 /** True on POSIX: the child must lead its own process group for planKill's group signal. */
 export const DETACH_CHILDREN = process.platform !== "win32";
 
-/** Kills `child` and everything it spawned. Never throws — the caller is already on a sad path. */
-export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
+/**
+ * Kills `child` and everything it spawned. Never throws — the caller is already on a sad path.
+ * `wait`: return only once the tree is gone. POSIX signals already are; Windows' taskkill is a
+ * process of its own, and a shutdown that went on to roll back a batch while it ran raced a writer
+ * that was still writing.
+ */
+export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM", opts: { wait?: boolean } = {}): void {
   const pid = child.pid;
   if (pid === undefined) return;
   // POSIX: the leader having exited says nothing about the rest of its group. A grandchild that
@@ -330,7 +335,8 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
 
   if (plan.via === "taskkill") {
     try {
-      spawn(plan.file, plan.args, { stdio: "ignore", windowsHide: true }).unref();
+      if (opts.wait) spawnSync(plan.file, plan.args, { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+      else spawn(plan.file, plan.args, { stdio: "ignore", windowsHide: true }).unref();
       return;
     } catch (err) {
       logVerbose(`taskkill 啟動失敗，退回直接終止該程序：${String(err)}`);
@@ -373,8 +379,9 @@ export function onShutdown(fn: (reason: string) => void): void {
   shutdownHooks.push(fn);
 }
 
-function killAll(): void {
-  for (const c of liveChildren) killTree(c, "SIGKILL");
+/** Takes down every child process tree still running — a writer, a build — and returns once it has. */
+export function killAll(): void {
+  for (const c of liveChildren) killTree(c, "SIGKILL", { wait: true });
   liveChildren.clear();
 }
 

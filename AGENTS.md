@@ -22,12 +22,15 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 控制流只有兩個檔案，兩者並排於根目錄：
 
 - **`loop.ts`** — entry point：參數驗證、模組偵測、rubric 載入、startup guard、版本戳記、
-  既有測試偵測、預檢基準（baseline）、建立 `runs/<repo 名>/<ts>/`。
+  既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
+  目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
+  `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
+  正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
   2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
-     `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>` 只限縮**執行**，
+     `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>,<同名>$*` 只限縮**執行**，
      並在宣告成功前補一次完整模組重跑當驗收）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
@@ -45,9 +48,24 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    production code」是勸導，這個快照才是 assert——被改過的 production code 會讓後面每個
    gate 的結果都失去意義。第三面是**防掏空**：build gate 分不出「修好失敗的測試」和「刪掉
    失敗的測試」，兩者都是綠燈，所以 `libs/testmetrics.ts` 在第一輪前量下每個既有測試檔的
-   `@Test` 數、斷言數與 `@Disabled` 數，任一檔案數量減少（或 `@Disabled` 增加）該輪即 FAIL
+   `@Test` 數、斷言數與略過標記數（`@Disabled`、`@Ignore`、TestNG `@Test(enabled = false)`、assumption、
+   `abort()`、丟 `SkipException` / `TestAbortedException`、JUnit 5 不執行的 private / static / 有回傳值的
+   `@Test`；在 `libs/javasrc.ts` 清掉註解與字串之後才數，字串裡的 `/*` 不會吃掉後面的測試），以及會自己
+   執行的 `@Test` 數（abstract 類別裡的不算——把失敗的類別改成 abstract，其他數字一個不少），
+   任一檔案數量減少（或略過標記增加）該輪即 FAIL
    餵回，不進建置（`UT_ALLOW_TEST_SHRINK=1` 只警告）。刻意用數量不用方法名：standards 要求
    「方法_情境_預期」命名，writer 補強既有檔案時本來就會改名重寫，追方法名會跟 standards 打架。
+   第四面是**有跑才算**：綠燈只證明「跑到的測試」通過。surefire 2.22 在只有 `junit-jupiter-api` 的模組
+   裡不執行 JUnit 5 測試（BUILD SUCCESS），沒有 vintage engine 的 JUnit Platform 不執行 JUnit 4 測試，
+   類名不符 includes、類別層級停用的也一樣——而把失敗的測試改寫成不會被執行的框架，`@Test` 與斷言一個
+   不少，數量量尺看不出來。所以 build gate 的綠燈另要求（`gates/build.ts` 的 `checkTestsRan`）：writer
+   新寫的測試類別、改過且 writer 介入前有執行的類別、加了測試的既有類別（介入前就沒執行也算——加在
+   不會被執行的類別裡的測試等於沒寫）、以及跑完整模組時**每一個** writer 介入前有執行的類別
+   （`ranAtBaseline`，分批時加上前面批次通過後執行的；測試資源裡的 discovery filter 也擋得到），都要在
+   這次建置的 surefire 報告或 log 的 `Running` 行裡出現；只要求來源仍是可執行的測試類別（沒有測試方法的
+   類別改成 abstract 是對的修法）。writer 新寫而測試全部 skipped 的也不算。類別層級 `@DisplayName` 命名的
+   報告會對回類別；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯會讓每一輪都 FAIL。
+   修復迴圈同樣套用，flaky 確認重跑也是。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
    （`opencode` 預設；`api` 直接打 OpenAI-compatible endpoint、tool loop 自己跑，工具在
@@ -71,7 +89,7 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    **修復迴圈** `orchestrator.ts` 的 `repairBaseline`——同一個 writer、同樣的範圍與防掏空
    guard、同一道建置指令，修到綠才開始產生新測試，修不好才中止，artifacts 在 `repair-N/`；
    `UT_REPAIR_BASELINE=0` 回到直接中止，`UT_ALLOW_DIRTY_BASELINE=1` 帶著紅燈續跑並標記為
-   pre-existing 要求 writer 別碰——**同時把 build gate 的判準從「模組全綠」改為「本輪失敗
+   pre-existing 要求 writer 別碰（紅燈讓 Maven 停在上游、目標模組根本沒被建置時不放行）——**同時把 build gate 的判準從「模組全綠」改為「本輪失敗
    識別集合 ⊆ 預檢基準」**（`gates/build.ts` 的 `subtractTolerated`）。識別是 FQCN + surefire
    的 case name，到方法層級：用類別當識別，writer 在一個已失敗類別裡弄壞的新方法會被一起
    放行。編譯錯誤、以及「紅但定位不到任何失敗測試」一律不扣除（`∅ ⊆ P` 恆真）。與
@@ -92,13 +110,28 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    feedback fingerprint，要求兩輪報告完全相同，而「修好 A 又弄壞 B」每輪報告都不一樣卻毫無
    進展，只有數量看得出來。唯一不算「沒下降」的是**揭露**：上一輪有編譯錯誤（只有它藏得住別的
    紅燈）、這輪修好了一些，而新冒出的紅燈都在這輪沒改過、也沒引用這輪改過的類別的檔案裡（改了
-   測試資源則一律不算揭露）。writer 沒改任何檔案而紅燈只有測試失敗時，先重跑一次建置確認，轉綠
-   即以 `flaky-baseline` 照常開始並點名那些測試。修復以 `scope-violation`、`runner-spawn-error`、
+   測試資源則一律不算揭露）。writer 沒改任何檔案而紅燈只有測試失敗時，先重跑一次建置確認（同樣檢查
+   該跑的有跑），轉綠即以 `flaky-baseline` 照常開始並點名那些測試。修復以 `scope-violation`、`runner-spawn-error`、
    `build-aborted` 結束時，`UT_ALLOW_DIRTY_BASELINE` 也不放行——它只放行「修不好的既有紅燈」）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。
    同理，專案慣例用量的、不用猜的：`libs/conventions.ts` 掃描既有測試得出可見性慣例與
-   class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論。
+   class-symbol 測試套件（`@SelectClasses`/`@SuiteClasses`）的存在，再由 prompt 告知結論；
+   `libs/teststack.ts` 從目標模組 surefire 報告裡的 `surefire.test.class.path` 量出測試相依（JUnit 4/5、
+   Mockito 版本與能否用 MockitoExtension / mock static、AssertJ、Java 語言層級），模組還沒跑過測試時退回
+   讀 pom 並明說是推斷，第一次有測試跑過就改用實際 classpath。JUnit 5 會不會被執行另外量（`jupiterRuns`）：
+   建置 log 說了用哪個 provider（`Using auto detected/configured provider`）就以它為準；沒說時，2.x 上
+   classpath 有 TestNG 則 TestNG provider 優先，只有 API 時 surefire 3.0.0-M4 起自己補 engine、之前的版本不執行
+   （版本讀建置 log；plugin 自己的相依裡要有 `junit-platform-surefire-provider` 才算，只放 engine 不算）。pom 只說宣告了什麼，**不宣稱「只有 JUnit 4」**——JUnit 5 可能是
+   間接帶進來的；唯一例外是 Spring Boot 版本推斷、且沒有其他 repo 外的 parent；`libs/encoding.ts` 量出 javac 讀原始碼的
+   編碼（pom 與 Spring Boot parent、build.gradle，退回建置自己說的平台編碼；都看不到就看原始碼是不是 UTF-8，
+   **不拿 JDK 預設編碼猜**）。非 UTF-8 時另有確定性護欄：
+   每個 agent session 前把 `src/test/java` 的非 ASCII 字元改寫成 `\uXXXX` 的 ASCII 形式（UTF-8 編輯工具會把
+   MS950 的中文默默換掉），session 後沒改的檔照原 bytes 與時間放回，改過的檔沒改的行維持原 bytes、新寫的行
+   由 JDK（`libs/java/Transcode.java`，與 javac 同一套 charset）存成模組編碼；writer 寫進 U+FFFD 或解不開的檔
+   被改到，該輪 FAIL。沒有可用的 JDK（或編碼名稱不明）時退回保守做法：含非 ASCII 的既有檔不讓改，writer 的輸出
+   轉成 `\uXXXX`；writer 自己寫的檔永遠不在保護之列。視圖開著被中斷時照常關閉，被 SIGKILL 的由下一次執行從
+   使用者快取目錄裡的復原日誌放回（`recoverEncodingViews`）。
    測試類別可見性**沒有**放諸四海皆準的規則——JUnit 5 不要求 `public`、Sonar S5786 還會標記它，
    但跨 package 的 class-symbol 套件沒有 `public` 就編不過。禁止在 standards 或 prompt 裡
    寫死任一邊。
@@ -148,7 +181,7 @@ loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基�
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
@@ -160,11 +193,16 @@ libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
-libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / @Disabled 計數（防掏空 guard 的量尺）
+libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
+libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
-libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手）
+libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手；持有者心跳；等不到就視為忙碌）
+libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
+libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
+libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）
+libs/java/Transcode.java  JDK 轉碼器（decode / encode / probe；Java 8 相容，執行時編譯並快取在系統暫存目錄）
 scripts/selftest.ts   純邏輯自測＋架構不變式 assert
 scripts/itest.ts      整合自測 driver（假 mvnw + 腳本化 writer，跑真的 orchestrator 與 gate）
 scripts/itest-lib.ts  整合自測的 fixture 產生器與假 mvnw 原始碼

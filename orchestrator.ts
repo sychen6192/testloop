@@ -39,6 +39,7 @@ import {
   expectedTestPath,
   feedbackFingerprint,
   snapshotTree,
+  TreeSnapshot,
   stripRaw,
   testClassNames,
   writerScopeSkip,
@@ -55,10 +56,21 @@ import {
   PreExistingFailures,
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
-import { collectTestMetrics, findShrunk } from "./libs/testmetrics";
-import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult } from "./gates/build";
+import { collectTestMetrics, findShrunk, MetricsSnapshot, testMetrics } from "./libs/testmetrics";
+import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult, ExpectedTest, expectedTestOf, NOT_RUN_HEADER, ranTestClasses } from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
+import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
+import {
+  closeEncodingView,
+  describeSourceEncoding,
+  EncodingView,
+  measureSourceEncoding,
+  openEncodingView,
+  refineSourceEncoding,
+  SourceEncoding,
+  sourceViews,
+} from "./libs/encoding";
 
 export interface OrchestratorConfig {
   targetClasses: string[];
@@ -78,6 +90,174 @@ export interface OrchestratorConfig {
   // the per-round gate had already accepted, for failures neither of them caused.
   tolerate?: string[];
   conventions?: TestConventions;
+  // Measured by loop.ts from the baseline; see libs/teststack.ts.
+  testStack?: TestStack;
+  // The encoding javac reads the module's sources in; see libs/encoding.ts.
+  sourceEncoding?: SourceEncoding;
+  // The test classes the module's build ran before any writer: from the baseline, or from the
+  // repair that made it green. What a green round must still run; see testsThatMustRun.
+  ranAtBaseline?: string[];
+  // What the writer changed, for a batch that does not pass: see WriterTrace.
+  trace?: WriterTrace;
+}
+
+/**
+ * What a batch runner needs to undo exactly its writer's work — and nothing else: every path under
+ * src/test the writer changed (relative to src/test), recorded the moment each session ends; and,
+ * while a session runs, the tree as it was when the session started. A session cut short — Ctrl-C,
+ * a crash, a request that failed after the first files were written — never reaches the recording,
+ * and its files used to be left in place as somebody else's.
+ */
+export interface WriterTrace {
+  written: Set<string>;
+  inSession?: { root: string; before: TreeSnapshot };
+}
+
+/** The writer's changes so far, those of a session still open (or cut short) included. */
+export function writerChangesSoFar(trace: WriterTrace): Set<string> {
+  if (trace.inSession) {
+    for (const p of diffSnapshots(trace.inSession.before, snapshotTree(trace.inSession.root))) trace.written.add(p);
+  }
+  return trace.written;
+}
+
+/**
+ * The test classes a green build must have run (gates/build.ts checkTestsRan): each one the writer
+ * created; each one it changed that ran before it started; and each one it added tests to, even if
+ * that class never ran — tests added to a JUnit 5 class in a module whose build runs only JUnit 4
+ * are no tests at all. When the build runs the whole module, also every class that ran before the
+ * writer started, touched or not: a round that gets its green by making other tests stop running —
+ * a framework switch, a discovery filter among the test resources — is seen there, whatever it
+ * edited.
+ *
+ * Required only while the source is still a runnable test class: a stale compiled class ran too
+ * and the next compile may drop it, and a class with no test methods that failed "No runnable
+ * methods" is rightly fixed by making it abstract. Making a class with tests abstract is not a way
+ * around this: its tests no longer count as ones that run on their own (TestMetrics.runnable in
+ * libs/testmetrics.ts), and the shrink guard sees the drop.
+ */
+function testsThatMustRun(
+  testRoot: string,
+  written: Iterable<string>,
+  preexisting: MetricsSnapshot,
+  ranBefore: string[] | undefined,
+  wholeModule: boolean,
+): ExpectedTest[] {
+  const before = new Set(ranBefore ?? []);
+  const out = new Map<string, ExpectedTest>();
+  const writtenFiles = new Set<string>();
+  const read = (file: string) => {
+    try {
+      return fs.readFileSync(file, "latin1");
+    } catch {
+      return undefined; // deleted
+    }
+  };
+  for (const rel of written) {
+    if (!rel.endsWith(".java") || rel.startsWith("resources/")) continue;
+    const file = path.join(testRoot, rel);
+    writtenFiles.add(path.resolve(file));
+    const src = read(file);
+    const had = preexisting[rel];
+    const t = src === undefined ? undefined : expectedTestOf(src, file, had ? "changed" : "created");
+    if (!t) continue;
+    if (!had) out.set(t.fqcn, t);
+    else if (before.has(t.fqcn)) out.set(t.fqcn, t);
+    else if (testMetrics(src!).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
+  }
+  if (wholeModule) {
+    for (const fqcn of before) {
+      const file = path.join(testRoot, ...fqcn.split(".")) + ".java";
+      if (out.has(fqcn) || writtenFiles.has(path.resolve(file))) continue; // the writer's: judged above
+      const src = read(file);
+      const t = src === undefined ? undefined : expectedTestOf(src, file, "untouched");
+      if (t) out.set(fqcn, t);
+    }
+  }
+  return [...out.values()];
+}
+
+// Measured again after every build: a stack read off the pom is a guess about what is declared,
+// and the first build that runs a test records the real classpath — which every prompt after it
+// states instead. Only this build's reports count as current (`since`); see measureTestStack.
+function refineTestStack(stack: TestStack | undefined, mod: ModuleInfo, buildLog: string, since: number): TestStack | undefined {
+  const merged = mergeTestStack(stack, measureTestStack(mod, REPO_ROOT, buildLog, since));
+  if (merged?.source === "surefire" && stack?.source !== "surefire") {
+    log("測試相依：已從這次建置的測試 classpath 量得實際的相依，之後的 prompt 以此為準");
+  }
+  return merged;
+}
+
+// Around each agent session in a module whose sources are not UTF-8 (libs/encoding.ts): the test
+// sources are shown as their ASCII view, and afterwards written back in the module's encoding.
+
+const relToRepo = (p: string) => path.relative(REPO_ROOT, p).replace(/\\/g, "/");
+
+/** Repo-relative, for the prompt: the files the session must leave alone. */
+function protectedList(view: EncodingView | undefined): string[] {
+  return view ? [...view.protectedFiles.keys()].map(relToRepo).sort() : [];
+}
+
+// The files the writer has written this run, as the view wants them: absolute test sources.
+// writerChanges() keeps .java paths relative to src/test/java and everything else under resources/.
+function agentSources(testRoot: string, written: Iterable<string>): string[] {
+  return [...written].filter((f) => f.endsWith(".java") && !f.startsWith("resources/")).map((f) => path.join(testRoot, f));
+}
+
+// The target classes as the module's encoding reads them, for the prompt: production code is never
+// put in a view on disk, and an agent tool reads MS950 as mojibake.
+function targetSourceViews(enc: SourceEncoding | undefined, targetClasses: string[]): Array<{ file: string; view: string }> {
+  return sourceViews(enc, targetClasses.map((c) => path.join(REPO_ROOT, c))).map((v) => ({ file: relToRepo(v.file), view: v.view }));
+}
+
+const listFiles = (files: string[]) =>
+  [...files.slice(0, 20).map((f) => `  - ${relToRepo(f)}`), ...(files.length > 20 ? [`  …另 ${files.length - 20} 個`] : [])].join("\n");
+
+/**
+ * Closes the view after a writer session. A failure report when something could not be written
+ * back safely — the round then fails before any build — null otherwise.
+ */
+function encodingViewAfter(view: EncodingView | undefined, save: (name: string, content: string) => void): string | null {
+  if (!view) return null;
+  const r = closeEncodingView(view);
+  const name = view.encoding.name;
+  if (r.converted.length) {
+    log(
+      view.mode === "transcode"
+        ? `[${name}] writer 改寫的 ${r.converted.length} 個測試檔已以 ${name} 存檔（沒改到的行維持原本的內容）`
+        : `[${name}] 無法轉換編碼：writer 寫的 ${r.converted.length} 個測試檔裡的非 ASCII 字元已轉成 \\uXXXX`,
+    );
+    save("encoding-converted.txt", r.converted.map(relToRepo).join("\n"));
+  }
+  const problems: string[] = [];
+  if (r.restored.length) {
+    problems.push(
+      (view.mode === "transcode"
+        ? `以下測試檔不是有效的 ${name}，pipeline 無法安全轉換，`
+        : `以下測試檔含非 ASCII 字元，而 pipeline 無法轉換這個模組的編碼（${name}），`) +
+        `你的工具改它們會破壞裡面的字元，所以已還原成原本的內容。這些檔案不能修改；要補測試時，在同一個 package 另建新的測試類別：\n${listFiles(r.restored)}`,
+    );
+  }
+  if (r.replacement.length) {
+    problems.push(
+      `以下測試檔含有 U+FFFD（在你讀到的檔案裡顯示為 \\ufffd）——那是某個工具用錯的編碼讀檔時就已經遺失的字元，` +
+        `存進測試裡永遠是錯的（pipeline 只以 \\ufffd 存，不會當成原本的字）。請換回實際的字；production 的中文字串以 prompt 裡` +
+        `「目標類別的原始碼」或失敗報告裡的實際值為準：\n${listFiles(r.replacement)}`,
+    );
+  }
+  if (r.failed.length) problems.push(`以下測試檔無法以 ${name} 寫回（既有的已還原，新的保留原樣）：\n${listFiles(r.failed)}`);
+  if (!problems.length) return null;
+  const report = problems.join("\n\n");
+  save("encoding-report.txt", report);
+  log(`[FAIL] writer 的輸出有無法以 ${name} 安全存檔的內容——本輪判 FAIL，不進建置`);
+  return report;
+}
+
+// Measured again after every build: the build log is what says which encoding Maven fell back to.
+function refineEncoding(prev: SourceEncoding | undefined, next: SourceEncoding | undefined): SourceEncoding | undefined {
+  const merged = refineSourceEncoding(prev, next);
+  if (merged && prev?.name !== merged.name) log(`原始碼編碼：${describeSourceEncoding(merged)}`);
+  return merged;
 }
 
 // One row per iteration: which gate the round reached and how it ended.
@@ -102,7 +282,11 @@ export interface OrchestratorResult {
   funnel: IterationRecord[];
   totalOutputTokens?: number;
   finalFeedback?: string;
+  /** The last failed round's gate report as the writer got it, without the stop's own explanation. */
+  lastReport?: string;
   finalVerdict?: ReviewVerdict;
+  /** On success: the test classes the module's last whole-module build ran — for later batches to keep running. */
+  ranTests?: string[];
 }
 
 // What "the agent could not run" means depends on the runner, and so does the fix. Telling an api
@@ -153,8 +337,8 @@ function outOfScopeChanges(before: Record<string, string>, after: Record<string,
 // file (an expected-output fixture under src/test/resources) read as "changed nothing", and the
 // round ended the run as writer-no-op. Paths come back relative to src/test/java for the .java
 // ones, as every artifact and -Dtest derivation expects, and as resources/… otherwise.
-function writerChanges(before: Record<string, string>, after: Record<string, string>): string[] {
-  return diffSnapshots(before, after).map((c) => (c.startsWith("java/") ? c.slice("java/".length) : c));
+function writerChanges(rawChanged: string[]): string[] {
+  return rawChanged.map((c) => (c.startsWith("java/") ? c.slice("java/".length) : c));
 }
 
 // A violation list can be hundreds of paths long when something regenerates a directory; the
@@ -172,6 +356,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   let prevFingerprint: string | null = null;
   let lastVerdict: ReviewVerdict | undefined;
   let lastCov = "（尚未執行覆蓋率檢查）";
+  let testStack = cfg.testStack;
+  let sourceEncoding = cfg.sourceEncoding;
+  // What the last whole-module green build ran; see OrchestratorResult.ranTests.
+  let ranTests: string[] | undefined;
+  // The last gate's report. A round that fails on the encoding never reaches a gate, and what the
+  // gate said before still has to be fixed: it goes along with the encoding report.
+  let gateFeedback: string | null = null;
   const funnel: IterationRecord[] = [];
   let totalOutputTokens: number | undefined;
   const testRoot = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -213,6 +404,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     funnel,
     totalOutputTokens,
     finalFeedback,
+    lastReport: feedback ?? undefined,
     finalVerdict: lastVerdict,
   });
 
@@ -224,7 +416,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const record = (rec: Omit<IterationRecord, "iter">) => funnel.push({ iter, ...rec });
     // A failed round: bound the report, persist it, and stop if it is the same failure as last
     // round (see feedbackFingerprint). Returns the abort result, or null to go on.
-    const failRound = (report: string, stuckMsg: string): OrchestratorResult | null => {
+    const failRound = (report: string, stuckMsg: string, fromGate = true): OrchestratorResult | null => {
+      if (fromGate) gateFeedback = report;
       // Bounded here as well as at the source, so the invariant holds whichever gate wrote
       // the report: the writer never receives more than MAX_FEEDBACK_CHARS *of report*, plus
       // clampText's short truncation notice when it had to cut. The notice is deliberate —
@@ -242,6 +435,12 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 1: generate or fix
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
+    // Taken before the view opens and after it closes: what the round changed, net of the view.
+    const before = snapshotTree(writableTree);
+    if (cfg.trace) cfg.trace.inSession = { root: writableTree, before };
+    const protectedBefore = snapshotProtected();
+    const encView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
+    const targetSources = targetSourceViews(sourceEncoding, cfg.targetClasses);
     const prompt = feedback
       ? buildFixPrompt({
           gateReport: feedback,
@@ -250,6 +449,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           targetClasses: cfg.targetClasses,
           preExisting: cfg.preExisting,
           conventions: cfg.conventions,
+          testStack,
+          sourceEncoding,
+          encodingMode: encView?.mode,
+          lockedFiles: protectedList(encView),
+          targetSources,
         })
       : buildGeneratePrompt({
           targetClasses: cfg.targetClasses,
@@ -257,12 +461,23 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           mod: cfg.mod,
           existingTests: cfg.existingTests,
           conventions: cfg.conventions,
+          testStack,
+          sourceEncoding,
+          encodingMode: encView?.mode,
+          lockedFiles: protectedList(encView),
+          targetSources,
         });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(writableTree);
-    const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
+    const encodingReport = encodingViewAfter(encView, save);
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
+    // Recorded before anything that can end the round: a session that failed after writing (an
+    // expired token on its tenth request) wrote what it wrote.
+    if (cfg.trace) {
+      rawChanged.forEach((f) => cfg.trace!.written.add(f));
+      cfg.trace.inSession = undefined;
+    }
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
     }
@@ -278,7 +493,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       );
     }
 
-    const changed = writerChanges(before, snapshotTree(writableTree));
+    const changed = writerChanges(rawChanged);
     changed.forEach((f) => everWritten.add(f));
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
@@ -300,6 +515,20 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
           `\n（writer 的可寫範圍只有目標模組的 src/test/；production code、建置檔與其他模組一律唯讀。）`,
         iter,
       );
+    }
+
+    // Before the no-op check and the shrink guard: putting a file back can undo the round's only
+    // change, and a restored file has its original counts again.
+    if (encodingReport) {
+      record({ gate: "writer", outcome: "encoding", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      const stop = failRound(
+        gateFeedback ? `${encodingReport}\n\n上一輪 gate 的失敗報告（仍待處理）：\n${gateFeedback}` : encodingReport,
+        "連續兩輪得到相同的編碼問題，判定迴圈卡住，提前結束。",
+        false,
+      );
+      if (stop) return stop;
+      log("→ 帶著編碼報告進入下一輪");
+      continue;
     }
 
     if (changed.length === 0) {
@@ -349,8 +578,13 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const build = await runBuildAndTests(cfg.buildTool, cfg.mod, {
       onlyTests,
       tolerate: cfg.tolerate,
+      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped),
+      ranBefore: cfg.ranAtBaseline,
     });
     save("build.log", build.raw ?? build.report);
+    if (build.passed && !scoped) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, buildStartedAt, build.raw ?? "");
+    testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
+    sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, build.raw ?? ""));
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
     if (!build.passed) {
       record({
@@ -393,10 +627,15 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       log("Step 4/4：依設定跳過 review gate");
     } else {
       log("Step 4/4：執行品質 review gate");
+      // The reviewer reads through the same view: raw MS950 through a UTF-8 tool is mojibake.
+      const reviewView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
       const reviewPrompt = buildReviewPrompt({
         targetClasses: cfg.targetClasses,
         rubric: cfg.rubric,
         mod: cfg.mod,
+        sourceEncoding,
+        encodingMode: reviewView?.mode,
+        targetSources: targetSourceViews(sourceEncoding, cfg.targetClasses),
       });
       save("review-prompt.md", reviewPrompt);
 
@@ -406,14 +645,18 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // which is exactly how one reported run burned four rounds and 52 minutes of model time.
       // So the retries land on the reviewer, and an exhausted retry budget ends the run naming
       // the reviewer rather than blaming the tests.
-      for (let attempt = 1; attempt <= 1 + REVIEW_MAX_RETRIES; attempt++) {
-        verdict = await runReviewGate(cfg.runner, reviewPrompt);
-        save(attempt === 1 ? "verdict.json" : `verdict-attempt-${attempt}.json`, JSON.stringify(verdict, stripRaw, 2));
-        if (verdict.raw) save(attempt === 1 ? "review-raw.txt" : `review-raw-${attempt}.txt`, verdict.raw);
-        if (!isUnparseable(verdict)) break;
-        log(
-          `[WARN] reviewer 輸出無法解析（${verdict.parseError}）——第 ${attempt}/${1 + REVIEW_MAX_RETRIES} 次嘗試`,
-        );
+      try {
+        for (let attempt = 1; attempt <= 1 + REVIEW_MAX_RETRIES; attempt++) {
+          verdict = await runReviewGate(cfg.runner, reviewPrompt);
+          save(attempt === 1 ? "verdict.json" : `verdict-attempt-${attempt}.json`, JSON.stringify(verdict, stripRaw, 2));
+          if (verdict.raw) save(attempt === 1 ? "review-raw.txt" : `review-raw-${attempt}.txt`, verdict.raw);
+          if (!isUnparseable(verdict)) break;
+          log(
+            `[WARN] reviewer 輸出無法解析（${verdict.parseError}）——第 ${attempt}/${1 + REVIEW_MAX_RETRIES} 次嘗試`,
+          );
+        }
+      } finally {
+        if (reviewView) closeEncodingView(reviewView);
       }
       lastVerdict = verdict;
       // A reviewer that cannot run at all is the environment, exactly like a writer that cannot:
@@ -459,10 +702,16 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // skipping it would trade the promise away for the same saving.
       if (scoped) {
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
-        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, { tolerate: cfg.tolerate });
+        const verifyStartedAt = Date.now();
+        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, {
+          tolerate: cfg.tolerate,
+          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
+          ranBefore: cfg.ranAtBaseline,
+        });
         save("final-verify.log", full.raw ?? full.report);
+        if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verifyStartedAt, full.raw ?? "");
         if (!full.passed) {
-          log("[FAIL] 最終驗收：模組其他測試被打壞");
+          log("[FAIL] 最終驗收：完整模組重跑沒有通過");
           record({
             gate: "build",
             outcome: "final-verify-fail",
@@ -470,8 +719,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
             writerOutputTokens: writer.outputTokens,
           });
           const stop = failRound(
-            "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——" +
-              `新測試打壞了既有測試，請修正。\n${full.report}`,
+            (full.report.startsWith(NOT_RUN_HEADER)
+              ? "目標類別的測試本身全部通過，但以完整模組範圍重跑時，有該執行的測試沒有被執行，請修正。\n"
+              : "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——新測試打壞了既有測試，請修正。\n") +
+              full.report,
             "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
           );
           if (stop) return stop;
@@ -496,6 +747,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         funnel,
         totalOutputTokens,
         finalVerdict: verdict,
+        ranTests,
       };
     }
 
@@ -540,6 +792,8 @@ export interface RepairConfig {
   mod: ModuleInfo;
   runDir: string;
   baseline: BaselineResult;
+  testStack?: TestStack;
+  sourceEncoding?: SourceEncoding;
 }
 
 export interface RepairResult {
@@ -554,6 +808,8 @@ export interface RepairResult {
   report: string;
   // Every test file the repair rounds touched — the diff a human should read before committing.
   changedFiles: string[];
+  // On success: the test classes the green build ran — what every later round must keep running.
+  ranTests?: string[];
 }
 
 // A writer-changed path (relative to src/test/java, or resources/…) as a repo-relative path.
@@ -600,6 +856,11 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const originalMetrics = collectTestMetrics(testRoot);
   const touched = new Set<string>();
   let current = cfg.baseline;
+  // What ran before the repair — the failing classes included — has to be running when it is green.
+  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map((c) => c.replace(/\$.*$/, ""))])];
+  let testStack = cfg.testStack;
+  let sourceEncoding = cfg.sourceEncoding;
+  const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
   let prevFingerprint: string | null = null;
 
   const brokenList = (b: BaselineResult) => [
@@ -617,7 +878,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   // order serves both.
   const describe = (b: BaselineResult) =>
     clampText(
-      brokenList(b).length === 0
+      brokenList(b).length === 0 || b.notRun
         ? b.summary
         : `${b.summary}` +
             (b.failureDetail ? `\n失敗明細：${b.failureDetail}` : "") +
@@ -668,18 +929,25 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       fs.writeFileSync(path.join(dir, name), content);
     banner(`修復既有紅燈 第 ${round}/${REPAIR_MAX_ITER} 輪`);
 
+    const before = snapshotTree(writableTree);
+    const protectedBefore = snapshotProtected();
+    const encView = openEncodingView(sourceEncoding, testRootForEncoding, { agentFiles: agentSources(testRootForEncoding, touched) });
     const prompt = buildRepairPrompt({
       brokenFiles: brokenList(current),
       report,
       standards: cfg.standards,
       mod: cfg.mod,
       round,
+      testStack,
+      sourceEncoding,
+      encodingMode: encView?.mode,
+      lockedFiles: protectedList(encView),
     });
     save("prompt.md", prompt);
 
-    const before = snapshotTree(writableTree);
-    const protectedBefore = snapshotProtected();
     const writer = await cfg.runner.runWriter(prompt);
+    const encodingReport = encodingViewAfter(encView, save);
+    const rawChanged = diffSnapshots(before, snapshotTree(writableTree));
     save("writer-summary.md", writer.text || "（writer 未回傳文字）");
     log(`[writer 總結] ${tail(writer.text, 1500)}`);
     if (writer.status === "spawn-error") {
@@ -690,7 +958,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       );
     }
 
-    const changed = writerChanges(before, snapshotTree(writableTree));
+    const changed = writerChanges(rawChanged);
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
@@ -704,15 +972,36 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         round,
       );
     }
+    if (encodingReport) {
+      // The build did not run: its last report still stands, and goes along.
+      report = clampText(`${encodingReport}\n\n上一次建置的失敗報告（仍待處理）：\n${describe(current)}`, MAX_FEEDBACK_CHARS);
+      save("feedback.md", report);
+      const fingerprint = feedbackFingerprint(report);
+      if (prevFingerprint === fingerprint) {
+        return giveUp("stuck", `連續兩輪得到相同的編碼問題，判定迴圈卡住。\n${report}`, round);
+      }
+      prevFingerprint = fingerprint;
+      continue;
+    }
     if (changed.length === 0) {
       // A writer that looked and found nothing to fix may be right: a test that failed once at the
       // baseline and passes on a rerun is flaky, not red. When nothing but tests failed, one more
       // build tells the two apart before the run is ended over a failure that is not there. (A
       // real LLM facing a flaky test is more likely to "fix" it with a retry or a looser assertion,
       // which the shrink guard and the reviewer see; this covers the writer that declined.)
-      if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0) {
+      // Only test failures can be flaky: "did not run" (current.notRun) does not change on a rebuild.
+      // And the rebuild is judged like any repair build, must-run check included: a red build is
+      // not checked for tests that stopped running, so a round that switched the failing test off
+      // while another test failed flakily looked like a flaky red, and turned green here.
+      if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0 && !current.notRun) {
         log("writer 沒有改任何檔案——重跑一次建置，確認紅燈是否穩定重現（flaky 測試會在這裡消失）");
-        const recheck = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+        const recheck = await runBaseline(
+          cfg.buildTool,
+          cfg.mod,
+          "repair",
+          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+          ranBefore,
+        );
         save("recheck-build.log", recheck.raw);
         if (recheck.clean) {
           log(`[WARN] 預檢的紅燈重跑後消失，判定為不穩定的測試（flaky）：${current.failingTestClasses.join("、")}——這些測試需要人檢視`);
@@ -723,8 +1012,16 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
             remaining: { compileErrorFiles: [], failingTestClasses: [] },
             report: `預檢時失敗、重跑後通過的測試（flaky）：${current.failingTestClasses.join("、")}`,
             changedFiles: [...touched].sort(),
+            ranTests: recheck.ranTests,
           };
         }
+        // The rebuild is the module as it now stands, and may say something the writer never saw.
+        if (!recheck.aborted) current = recheck;
+        return giveUp(
+          "writer-no-op",
+          `${noOpReason(writer.status, testRootRel(cfg.mod), true)}\n重跑一次建置確認的結果：\n${recheck.summary}`,
+          round,
+        );
       }
       return giveUp("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), true), round);
     }
@@ -735,7 +1032,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       save("test-shrink.txt", shrinkReport);
       if (!ALLOW_TEST_SHRINK) {
         log(`[FAIL] 修復輪刪減了既有測試（${shrunk.length} 檔）——本輪判 FAIL，不進建置`);
-        report = clampText(shrinkReport, MAX_FEEDBACK_CHARS);
+        report = clampText(`${shrinkReport}\n\n上一次建置的失敗報告（仍待處理）：\n${describe(current)}`, MAX_FEEDBACK_CHARS);
         save("feedback.md", report);
         const fingerprint = feedbackFingerprint(report);
         if (prevFingerprint === fingerprint) {
@@ -747,8 +1044,17 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       log(`[WARN] UT_ALLOW_TEST_SHRINK=1：修復輪刪減了既有測試（${shrunk.length} 檔），依設定放行`);
     }
 
-    current = await runBaseline(cfg.buildTool, cfg.mod, "repair");
+    const rebuildStartedAt = Date.now();
+    current = await runBaseline(
+      cfg.buildTool,
+      cfg.mod,
+      "repair",
+      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+      ranBefore,
+    );
     save("build.log", current.raw);
+    testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
+    sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, current.raw));
     save("build-summary.md", current.summary);
     console.log(current.summary);
     // A build that never finished locates nothing; carried on, it became "unlocatable" next round.
@@ -761,6 +1067,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         remaining: { compileErrorFiles: [], failingTestClasses: [] },
         report: current.summary,
         changedFiles: [...touched].sort(),
+        ranTests: current.ranTests,
       };
     }
     report = describe(current);

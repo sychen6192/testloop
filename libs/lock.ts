@@ -6,9 +6,36 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 
 export interface RepoLockBusy {
+  /** The live holder; absent when the lock could not be settled in time (see LOCK_WAIT_MS). */
   pid?: number;
   runDir?: string;
   lock: string;
+}
+
+// How long to try to settle the lock — past the 2s an empty lock takes to count as a crash's and
+// the 10s a takeover lock does — before calling the repo busy. Giving up used to mean running
+// unlocked: a count of attempts ran out while another run was still between create and write, and
+// both ran.
+export const LOCK_WAIT_MS = 15_000;
+// The holder touches its lock this often, so that a pid that cannot be signalled (EPERM) can still
+// be told apart: a live run's lock is fresh, a dead one's pid reused by another process is not.
+export const LOCK_HEARTBEAT_MS = 30_000;
+// Missed heartbeats before a lock counts as not fresh: a run blocked in synchronous work (a
+// transcoder call, a large tree walk) skips a few.
+const LOCK_FRESH_MS = 5 * LOCK_HEARTBEAT_MS;
+
+/**
+ * Pure: whether a lock's holder is a live run, from what signalling its pid said. EPERM: the pid
+ * belongs to another user. That is a live run when the lock is another user's too — someone else's
+ * run on the same repo path in a shared /tmp — or when it is this user's and still heartbeating:
+ * on Windows a run started elevated cannot be signalled from one that is not. A lock of this user's
+ * that has stopped beating was left by a run whose pid has been reused (Windows reuses them quickly,
+ * often for services); treating it as alive blocked every later run until the lock was deleted.
+ */
+export function holderAlive(signal: string, lockIsThisUsers: boolean, sinceBeatMs: number): boolean {
+  if (signal === "ok") return true;
+  if (signal !== "EPERM") return false; // ESRCH: gone
+  return !lockIsThisUsers || sinceBeatMs < LOCK_FRESH_MS;
 }
 
 /** The lock file for a repo, from its canonical path. */
@@ -26,7 +53,12 @@ export function repoLockFile(canonicalRoot: string): string {
  * another run has the repo, undefined once this run holds the lock (or cannot lock at all:
  * an unwritable temp dir does not block the run).
  */
-export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy | undefined {
+export function acquireRepoLock(
+  repoRoot: string,
+  runDir: string,
+  // For the selftest, which cannot wait a quarter of a minute or half a minute to see either happen.
+  timing: { waitMs: number; heartbeatMs: number } = { waitMs: LOCK_WAIT_MS, heartbeatMs: LOCK_HEARTBEAT_MS },
+): RepoLockBusy | undefined {
   // Canonical path: the same repo reached through a symlink, or as a Windows 8.3 short name,
   // must map to the same lock.
   let canonical = path.resolve(repoRoot);
@@ -36,12 +68,28 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
     /* keep the resolved path */
   }
   const lock = repoLockFile(canonical);
-  for (let attempt = 0; attempt < 50; attempt++) {
+  const ours = () => {
+    try {
+      return JSON.parse(fs.readFileSync(lock, "utf8")).pid === process.pid;
+    } catch {
+      return false;
+    }
+  };
+  for (const deadline = Date.now() + timing.waitMs; Date.now() < deadline; ) {
     try {
       fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, runDir }), { flag: "wx" });
-      process.on("exit", () => {
+      const beat = setInterval(() => {
         try {
-          if (JSON.parse(fs.readFileSync(lock, "utf8")).pid === process.pid) fs.unlinkSync(lock);
+          if (ours()) fs.utimesSync(lock, new Date(), new Date());
+        } catch {
+          /* best effort: a missed beat only matters after several */
+        }
+      }, timing.heartbeatMs);
+      beat.unref();
+      process.on("exit", () => {
+        clearInterval(beat);
+        try {
+          if (ours()) fs.unlinkSync(lock);
         } catch {
           /* already gone */
         }
@@ -49,27 +97,43 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
       return;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") return; // cannot lock: do not block the run
-      let seen = "";
-      let holder: { pid?: number; runDir?: string } = {};
+      let seen: string;
       try {
         seen = fs.readFileSync(lock, "utf8");
+      } catch (err) {
+        // Gone since the create failed: its holder let go, or a takeover removed it. Create again —
+        // read as an empty lock, it was "stale", and the takeover below removed the lock another
+        // run had written in the meantime: two runs held the repo.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return; // unreadable: cannot tell whose it is; do not block the run
+      }
+      // Empty: another run between its create and its write, which takes microseconds. Only one
+      // that stays empty is a crash's leftover.
+      if (seen === "" && !emptyAndOld(lock)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        continue;
+      }
+      let holder: { pid?: number; runDir?: string } = {};
+      try {
         holder = JSON.parse(seen);
       } catch {
-        /* unreadable: treat as stale */
+        /* not a lock this tool wrote whole: stale */
       }
       let alive = false;
-      try {
-        if (holder.pid && holder.pid !== process.pid) {
+      if (holder.pid && holder.pid !== process.pid) {
+        let signal = "ok";
+        try {
           process.kill(holder.pid, 0);
-          alive = true;
+        } catch (err) {
+          signal = (err as NodeJS.ErrnoException).code ?? "error";
         }
-      } catch (err) {
-        // ESRCH: the holder is gone. EPERM: the pid belongs to another user. That is a live run
-        // only when the lock is another user's too — someone else's run on the same repo path in
-        // a shared /tmp. A lock this user wrote was written by a process this user can signal,
-        // so EPERM there means the pid was reused (Windows reuses them quickly, often for
-        // services), and treating it as alive blocked every later run until the lock was deleted.
-        alive = (err as NodeJS.ErrnoException).code === "EPERM" && !writtenByThisUser(lock);
+        let sinceBeat = Infinity;
+        try {
+          sinceBeat = Date.now() - fs.statSync(lock).mtimeMs;
+        } catch {
+          /* gone: not fresh */
+        }
+        alive = holderAlive(signal, writtenByThisUser(lock), sinceBeat);
       }
       // A run that wrote its summary is over, whatever now holds its pid: killed before its exit
       // handler ran, with the pid since given to an unrelated process.
@@ -94,15 +158,16 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
         continue;
       }
       try {
-        let now = "";
+        let now: string | undefined;
         try {
           now = fs.readFileSync(lock, "utf8");
         } catch {
-          /* removed meanwhile: nothing to take over */
+          now = undefined; // removed meanwhile: nothing to take over
         }
-        // An empty `seen` is a lock left empty by a crash between create and write, or one that
-        // vanished before it could be read; a fresh lock written since then never matches it.
-        if (now === seen) fs.rmSync(lock, { force: true });
+        // Still the lock this run judged stale: a stale lock is only ever removed under the
+        // takeover, so one with the same content is the same lock. Except an empty one — another
+        // run's lock is empty for a moment after its create — so that one must still be old.
+        if (now === seen && (seen !== "" || emptyAndOld(lock))) fs.rmSync(lock, { force: true });
       } catch {
         return; // cannot take over a lock we may not remove; run unlocked rather than crash
       } finally {
@@ -113,6 +178,21 @@ export function acquireRepoLock(repoRoot: string, runDir: string): RepoLockBusy 
         }
       }
     }
+  }
+  // Could not settle it in time: another run is mid-create or mid-takeover, again and again. Busy,
+  // with no holder to name.
+  return { lock };
+}
+
+// A lock stays empty only between another run's create and its write; seconds of it is a crash.
+const EMPTY_LOCK_STALE_MS = 2000;
+
+function emptyAndOld(lock: string): boolean {
+  try {
+    const st = fs.statSync(lock);
+    return st.size === 0 && Date.now() - st.mtimeMs > EMPTY_LOCK_STALE_MS;
+  } catch {
+    return false;
   }
 }
 
