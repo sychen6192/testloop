@@ -149,7 +149,8 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
       // What the model was sent — tool results included — for the checks to read.
       fs.appendFileSync(path.join(root, ".itest", "api-requests.jsonl"), `${body.replace(/\n/g, " ")}\n`);
       const turn: ApiTurn = turns[i++] ?? { content: "沒有更多腳本回合了" };
-      if (turn.interrupt) {
+      // POSIX only, as in the fake mvnw: on Windows process.kill terminates the run outright.
+      if (turn.interrupt && process.platform !== "win32") {
         try {
           process.kill(JSON.parse(fs.readFileSync(repoLockPath(root), "utf8")).pid, "SIGINT");
         } catch {

@@ -337,7 +337,9 @@ if (step.breakRunDir) {
     fs.writeFileSync(found[0], "not a directory any more");
   }
 }
-if (step.interrupt) {
+// Windows has no SIGINT to deliver — process.kill terminates, and the parent here is cmd.exe, not the
+// loop — so there the step is a plain build, and the scenario's checks stand down.
+if (step.interrupt && process.platform !== "win32") {
   process.kill(process.ppid, "SIGINT");
   setTimeout(() => process.exit(0), 60000);
   return;

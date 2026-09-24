@@ -4372,16 +4372,23 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
       et("package com.x;\nimport org.junit.Test;\n@RunWith(Parameterized.class)abstract class FooTest { @Test public void a() {} }") === undefined,
   );
 
-  // A class-level @DisplayName under surefire's phrased reporters: the report is named by it — and
-  // a non-ASCII one arrives in the file name as "?"s — while other classes still show by FQCN.
+  // A class-level @DisplayName under surefire's phrased reporters: the report is named by it, while
+  // other classes still show by FQCN. The name is written in the platform's file-name encoding: on
+  // Windows it keeps its Chinese; under a POSIX locale that cannot hold it, it arrives as "?"s — a
+  // character Windows does not allow in a file name at all.
   const shownFile = src("ShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("Calc 加法")\nclass ShownTest { @Test void a() {} }\n');
   const shown = expectedTestOf(fs.readFileSync(shownFile, "utf8"), shownFile, "created")!;
   check("expectedTestOf：讀出類別層級的 @DisplayName", shown.displayName === "Calc 加法", JSON.stringify(shown));
-  report("TEST-com.x.OldTest.xml");
-  report("TEST-Calc ??.xml", '<testsuite name="Calc 加法" tests="1"><testcase name="a" classname="Calc 加法"/></testsuite>');
+  const phrased = ["TEST-Calc 加法.xml", ...(process.platform === "win32" ? [] : ["TEST-Calc ??.xml"])];
   check(
-    "checkTestsRan：以 @DisplayName 命名的報告（檔名裡的中文變成 ?）照樣認得是它，別的類別照常以 FQCN 出現也一樣",
-    checkTestsRan("maven", mi, since, "", [shown])?.notRun.length === 0,
+    "checkTestsRan：以 @DisplayName 命名的報告（檔名保有中文，或在 POSIX locale 下變成 ?）照樣認得是它，別的類別照常以 FQCN 出現也一樣",
+    phrased.every((name) => {
+      for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+      report("TEST-com.x.OldTest.xml");
+      report(name, '<testsuite name="Calc 加法" tests="1"><testcase name="a" classname="Calc 加法"/></testsuite>');
+      return checkTestsRan("maven", mi, since, "", [shown])?.notRun.length === 0;
+    }),
+    phrased.join("、"),
   );
   for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
   // TestNG: one TEST-TestSuite.xml for everything — its classes are what ran, and what to protect.
