@@ -19,13 +19,19 @@ import { planSpawn } from "../libs/shell";
 
 let passCount = 0;
 let failCount = 0;
+// Repeated at the end with the scenario each belongs to, as in the selftest: a CI log viewer that
+// shows only the tail still shows every failure.
+const failures: string[] = [];
+let currentScenario = "";
 function check(name: string, cond: boolean, detail = "") {
   if (cond) {
     passCount++;
     console.log(`  [OK] ${name}`);
   } else {
     failCount++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
+    const line = `  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`;
+    failures.push(`[${currentScenario}]${line.slice(1)}`);
+    console.log(line);
   }
 }
 
@@ -1557,6 +1563,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  currentScenario = "0 環境隔離";
   console.log("[0] 環境隔離：所有 UT_* 旋鈕都必須被釘住");
   const knobs = envKnobsInSource();
   const missing = knobs.filter((k) => !(k in BASE_ENV));
@@ -1576,6 +1583,7 @@ async function main() {
   const haveGit = gitAvailable();
   const haveJdk = jdkAvailable();
   for (const sc of list) {
+    currentScenario = sc.name;
     console.log(`\n[${sc.name}] ${sc.desc}`);
     if (sc.git && !haveGit) {
       console.log("  [SKIP] 找不到 git——這個情境要一個真的 git repo 才測得到 .gitignore 的效果");
@@ -1611,6 +1619,7 @@ async function main() {
     else fs.rmSync(ctx.root, { recursive: true, force: true });
   }
 
+  if (failures.length) console.log(`\n失敗的檢查（${failures.length}）：\n${failures.map((f) => `  ${f.slice(0, 600)}`).join("\n")}`);
   console.log(`\n結果：${passCount} passed / ${failCount} failed`);
   if (failCount > 0) process.exit(1);
   console.log("[OK] itest 全數通過");

@@ -2677,6 +2677,16 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
     fs.symlinkSync(path.join(fsRoot, "Shop"), path.join(fsRoot, "shop-link"));
     const viaLink = writerScopeSkip(fsRoot, path.join(fsRoot, "shop-link"));
     check("writerScopeSkip：模組以不同於磁碟上的路徑（大小寫／symlink）指定 → 可寫範圍仍對得上實際走訪到的目錄", viaLink("Shop/src/test", "test"));
+    // The repo itself reached through another name — a symlink here, an 8.3 short name
+    // (C:\Users\RUNNER~1) on Windows — and the loop's runs dir not created yet.
+    const repoLink = `${fsRoot}-link`;
+    fs.symlinkSync(fsRoot, repoLink);
+    const ownedViaLink = writerScopeSkip(repoLink, repoLink, [path.join(repoLink, "testgen-runs")]);
+    check(
+      "writerScopeSkip：repo 以別的路徑（symlink／Windows 的短檔名）指定、runs 目錄還沒建立 → 仍認得是 loop 自己的",
+      ownedViaLink("testgen-runs", "testgen-runs") && !ownedViaLink("testgen-runs2", "testgen-runs2"),
+    );
+    fs.rmSync(repoLink, { force: true });
   }
   fs.rmSync(fsRoot, { recursive: true, force: true });
 

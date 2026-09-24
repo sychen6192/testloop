@@ -296,12 +296,19 @@ export function writerScopeSkip(
   // case-insensitive file system (Windows, macOS) `cd C:\work\shop` for a directory named
   // `Shop` made the writable tree — or the loop's own runs dir — fail to match, and the writer's
   // own tests (or writer-summary.md) were a scope-violation in round 1. realpath gives the
-  // on-disk case; both ends go through it so a symlinked repo path stays consistent.
+  // on-disk case; both ends go through it so a symlinked repo path stays consistent. A path that
+  // does not exist yet (a runs dir before its first run) takes its deepest existing ancestor's:
+  // as typed, a repo reached through a symlink or an 8.3 short name (C:\Users\RUNNER~1) put it
+  // outside the repo.
   const real = (p: string) => {
-    try {
-      return fs.realpathSync.native(p);
-    } catch {
-      return path.resolve(p);
+    const rest: string[] = [];
+    for (let dir = path.resolve(p); ; dir = path.dirname(dir)) {
+      try {
+        return path.join(fs.realpathSync.native(dir), ...rest);
+      } catch {
+        if (path.dirname(dir) === dir) return path.resolve(p);
+        rest.unshift(path.basename(dir));
+      }
     }
   };
   const root = real(repoRoot);
