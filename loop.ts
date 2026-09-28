@@ -583,6 +583,9 @@ async function main() {
   if (!result.success && result.finalFeedback) {
     console.log(`最後失敗報告：\n${result.finalFeedback}`);
   }
+  if (result.flakyTests?.length) {
+    log(`[WARN] 需要人工處理：這些測試不穩定（建置失敗、重跑通過）：${result.flakyTests.join("、")}`);
+  }
   fs.writeFileSync(
     path.join(runDir, "summary.json"),
     JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [] }, stripRaw, 2),
@@ -615,6 +618,8 @@ interface BatchRecord {
   finalFeedback?: string;
   finalVerdict?: ReviewVerdict;
   rolledBack?: SetAside;
+  /** Tests the writer never touched that failed a build and passed its rebuild. */
+  flakyTests?: string[];
 }
 
 type SetAside = RollbackReport & { rejectedDir: string; outputsRemoved: number };
@@ -631,8 +636,9 @@ let batchRun: BatchRun | undefined;
 
 // Stop reasons that belong to the environment rather than the batch: the next batch would meet them
 // too. A scope violation also leaves files outside src/test changed on disk for a human to look at,
-// and every later batch would be built against them.
-const RUN_STOPS = new Set(["runner-spawn-error", "scope-violation"]);
+// and every later batch would be built against them; another module's test that keeps failing is in
+// every later batch's build.
+const RUN_STOPS = new Set(["runner-spawn-error", "scope-violation", "out-of-scope-failure"]);
 // Failures that come from outside the batch when they repeat — a writer session that never gets to
 // write, a reviewer model that does not answer in JSON. Two batches in a row end the run rather
 // than every remaining batch spending its rounds and builds rediscovering it.
@@ -717,6 +723,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       coverageReport: r.coverageReport,
       finalFeedback: r.finalFeedback,
       finalVerdict: r.finalVerdict,
+      ...(r.flakyTests?.length ? { flakyTests: r.flakyTests } : {}),
     };
     // A scope violation is left exactly as it is: the changes outside src/test are the reason the
     // run stops, and the test files beside them are part of what a human has to look at.
@@ -841,8 +848,9 @@ async function runBatches(o: BatchRunInput): Promise<number> {
 }
 
 // Changes the run left in place, which a human has to look at before anything else.
-function attentionOf(records: Array<Pick<BatchRecord, "batch" | "stopReason" | "dir" | "rolledBack">>): string[] {
+function attentionOf(records: Array<Pick<BatchRecord, "batch" | "stopReason" | "dir" | "rolledBack" | "flakyTests">>): string[] {
   return records.flatMap((r) => [
+    ...(r.flakyTests?.length ? [`第 ${r.batch} 批遇到不穩定的測試（建置失敗、重跑通過）：${r.flakyTests.join("、")}`] : []),
     ...(r.stopReason === "scope-violation" ? [`第 ${r.batch} 批的 writer 改了測試範圍以外的檔案，變更未還原（清單在 ${r.dir}）`] : []),
     ...(r.rolledBack?.failed.length ? [`第 ${r.batch} 批有檔案無法還原：${r.rolledBack.failed.join("、")}`] : []),
     ...(r.rolledBack?.unrestorable.length

@@ -157,6 +157,14 @@
     FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
   同一個資料夾現在 2 批全過（DTO 與進入點略過，`@Builder.Default` 的初始值那行照算）。README 另說明怎麼用
   `lombok.addLombokGeneratedAnnotation` 讓 Sonar 與 IDE 也不算產生的程式碼。
+- **一個不穩定的既有測試就能讓 run 以 `writer-no-op` 結束。** 生成輪次的建置只失敗在 writer 沒碰過的測試時，
+  報告原樣餵回：writer 不去碰那個測試（正確），下一輪就以 `writer-no-op` 結束整個 run；去碰就是在改一個沒壞的
+  測試。現在這種紅燈（失敗全在 writer 這次沒寫過、也沒改過的測試類別，或在別的模組）先重跑一次建置：
+  通過就是不穩定的測試，這一輪照常往下走，結果以 `flakyTests`（分批時進 `attention`）點名要人檢視；
+  仍失敗而在目標模組，回饋明說多半是新測試留下的共享狀態或改過的共用測試檔，要 writer 別改那些測試（writer
+  之後沒再改任何檔時，`writer-no-op` 的說明改為那些測試可能本身就壞了）；仍失敗而在別的模組——writer 影響不到
+  也不能改——以新的 `out-of-scope-failure` 停下並點名，分批時整個 run 停，不再讓 writer 重試到 `stuck`。
+  最終驗收（`UT_TEST_SCOPE=generated`）同樣適用。逾時或被收掉的建置、有編譯錯誤、失敗類別對不到原始檔時不重跑。
 - **pom 寫了 `<append>true</append>` 時，覆蓋率跨建置累加。** `-Djacoco.append=false` 只改預設值，pom 的
   設定蓋過它（實測 JaCoCo 0.8.8：argLine 仍是 `append=true`），於是前幾次建置的覆蓋率全算進這一次——writer
   刪掉的測試、撤回的批次、開發者自己跑過的 `mvn test`。實測：刪掉一個測試後報告仍是 branch 2/2，實際是

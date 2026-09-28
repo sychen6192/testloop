@@ -21,6 +21,7 @@ import {
   SUREFIRE_TXT_BLIND,
   SUREFIRE_XML,
   REACTOR_TEST_FAILURE,
+  MULTI_TARGET_DIR,
   MULTI_TEST_DIR,
   UPSTREAM_TEST_DIR,
   TEST_DIR,
@@ -287,6 +288,20 @@ const GREEN_BUILD = {
   surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }],
   jacoco: JACOCO_GREEN,
 };
+// A build red only in ExistingTest, which the writer never touches: the writer's CalcTest passes.
+// Flaky, as a test that needs a local service fails when it is slow to answer; or broken by the new
+// tests, as one that reads the default Locale fails after a test changed it and left it so.
+const untouchedRed = (message: string) => ({
+  exit: 1,
+  out: TEST_FAILURE("com.x.ExistingTest"),
+  cleanSurefire: true,
+  surefire: [
+    { cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") },
+    { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", message) },
+  ],
+});
+const EXISTING_FLAKY_RED = untouchedRed("Connection refused: localhost:6379");
+const EXISTING_BROKEN_BY_NEW = untouchedRed("expected: <1,5> but was: <1.5>（預設 Locale 被新測試改成 de_DE）");
 
 // A @Data class with a method someone wrote. JaCoCo's lines for it, shaped as the real report is
 // (JaCoCo 0.8.8, Spring Boot 2.7's Lombok): equals / hashCode / toString / setters on the @Data line,
@@ -897,16 +912,125 @@ export const SCENARIOS: Scenario[] = [
     ],
     mvn: [
       GREEN_BUILD, // round 1, scoped
-      {
-        exit: 1, // round 1, full module verification
-        out: TEST_FAILURE("com.x.ExistingTest"),
-        cleanSurefire: true,
-        surefire: [
-          { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", "既有測試被新測試打壞") },
-        ],
-      },
+      EXISTING_BROKEN_BY_NEW, // round 1, full module verification
+      EXISTING_BROKEN_BY_NEW, // round 1, its rebuild: the same red, so not flaky
       GREEN_BUILD, // round 2, scoped
       { ...GREEN_BUILD, jacoco: undefined }, // round 2, full module verification
+    ],
+  },
+  {
+    name: "scoped-final-verify-flaky",
+    desc: "限縮範圍全綠、完整模組重跑時一個 writer 沒碰過的既有測試失敗、再重跑就過 → flaky：照樣通過，不浪費一輪，點名要人檢視",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }],
+    mvn: [
+      GREEN_BUILD, // round 1, scoped
+      EXISTING_FLAKY_RED, // round 1, full module verification
+      { ...GREEN_BUILD, jacoco: undefined, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+    ],
+  },
+  {
+    name: "build-flaky-untouched-test",
+    desc: "建置只失敗在 writer 沒碰過的既有測試、重跑就過 → flaky：同一輪照常往下走，不浪費一輪、不會以 writer-no-op 收場，結果點名要人檢視",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [EXISTING_FLAKY_RED, { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }],
+  },
+  {
+    name: "build-collateral-untouched-test",
+    desc: "建置只失敗在 writer 沒碰過的既有測試、重跑仍失敗 → 被新測試連累：回饋說是 writer 寫的測試留下的共享狀態，要它別改那個既有測試",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [EXISTING_BROKEN_BY_NEW, EXISTING_BROKEN_BY_NEW, GREEN_BUILD],
+  },
+  {
+    name: "build-untouched-broken-no-op",
+    desc: "既有測試重跑仍失敗、writer 判斷不是它造成的而沒有改任何檔 → writer-no-op 收場，但說明是那些既有測試需要人檢視，不是 writer 的 context 或權限",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { text: "ExistingTest 的失敗與我寫的測試無關" }],
+    mvn: [EXISTING_BROKEN_BY_NEW, EXISTING_BROKEN_BY_NEW],
+  },
+  {
+    name: "build-collateral-then-own-red-no-op",
+    desc: "第 1 輪被連累、第 2 輪是 writer 自己的測試紅、第 3 輪 writer 沒改 → writer-no-op 的說明不得沿用第 1 輪「既有測試可能本身壞了」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "5" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }, { text: "改不動了" }],
+    mvn: [
+      EXISTING_BROKEN_BY_NEW,
+      EXISTING_BROKEN_BY_NEW,
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+      },
+    ],
+  },
+  {
+    name: "build-compile-error-with-untouched-red-no-rerun",
+    desc: "writer 的測試編不過，同一次建置裡還有它沒碰過的測試失敗（上游設了 testFailureIgnore 時會這樣）→ 編譯錯誤不會重跑就消失：照常餵回、不重跑，也不把紅燈算到那個既有測試頭上",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...EXISTING_FLAKY_RED, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`) }, GREEN_BUILD],
+  },
+  {
+    name: "build-crash-untouched-flaky",
+    desc: "writer 沒碰過的既有測試，fork 的 JVM 中途結束（surefire 只在 log 點名、沒有報告）、重跑就過 → 一樣判 flaky",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      { exit: 1, out: FORK_CRASH("com.x.ExistingTest"), cleanSurefire: true },
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "build-killed-no-rerun",
+    desc: "建置被 SIGKILL 收掉（OOM），留下的報告只有 writer 沒碰過的既有測試失敗 → 建置沒跑完不重跑：再跑一次多半又是一樣久、一樣被收掉",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...EXISTING_FLAKY_RED, killed: true }, GREEN_BUILD],
+  },
+  {
+    name: "build-unplaceable-failure-no-rerun",
+    desc: "失敗的類別在模組裡找不到原始碼（例如以 @DisplayName 命名的報告）→ 分不出是不是 writer 的，照常餵回、不重跑",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalculatorSpecification"),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalculatorSpecification", body: SUREFIRE_FAIL("com.x.CalculatorSpecification", "expected: <3> but was: <4>") }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-own-test-red-no-rerun",
+    desc: "失敗的有 writer 自己寫的測試（連同一個它沒碰過的）→ 照常餵回，不重跑：重跑只給「全部都不是 writer 碰過的」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") },
+          { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", "Connection refused: localhost:6379") },
+        ],
+      },
+      GREEN_BUILD,
     ],
   },
 
@@ -963,7 +1087,7 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "multimodule-upstream-failure-detail",
-    desc: "上游模組測試失敗時，明細在 common/target 底下——gate 必須讀得到，不能只看目標模組",
+    desc: "上游模組測試失敗、重跑仍失敗：明細在 common/target 底下——gate 必須讀得到；writer 影響不到也不能改它，第 1 輪就停下點名，不再讓 writer 重試到 stuck",
     entry: "orchestrate",
     layout: "multi",
     env: { UT_SKIP_REVIEW: "1" },
@@ -995,6 +1119,63 @@ export const SCENARIOS: Scenario[] = [
             ]),
           },
         ],
+      },
+    ],
+  },
+  {
+    name: "multimodule-upstream-flaky",
+    desc: "上游模組的測試失敗一次、重跑就過 → flaky：同一輪照常往下走，結果點名要人檢視",
+    entry: "orchestrate",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST.replace("package com.x;", "package com.x.web;") } }],
+    mvn: [
+      {
+        exit: 1,
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.common.UtilTest", body: SUREFIRE_FAIL("com.x.common.UtilTest", "Connection refused"), module: "common" }],
+      },
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(4),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [
+          { cls: "com.x.web.CalcTest", body: SUREFIRE_PASS("com.x.web.CalcTest"), module: "web" },
+          { cls: "com.x.common.UtilTest", body: SUREFIRE_PASS("com.x.common.UtilTest"), module: "common" },
+        ],
+        jacoco: { ...JACOCO_GREEN, pkg: "com/x/web" },
+        jacocoModule: "web",
+      },
+    ],
+  },
+  {
+    name: "loop-batches-upstream-broken",
+    desc: "分批時上游模組的測試在第 1 批壞掉、重跑仍壞 → 整個 run 停下（後面每一批的建置都會撞到），點名沒執行的類別",
+    entry: "loop",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [`${MULTI_TARGET_DIR}/Zeta.java`]: ZETA_JAVA.replace("package com.x;", "package com.x.web;") },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: `${MULTI_TEST_DIR}/CalcTest.java`, content: CALC_TEST.replace("package com.x;", "package com.x.web;") } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      {
+        exit: 0, // baseline
+        out: BUILD_SUCCESS(2),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.web.ExistingTest", body: SUREFIRE_PASS("com.x.web.ExistingTest"), module: "web" }],
+      },
+      {
+        exit: 1, // batch 1, round 1, and its rebuild: common's test is down, Maven stops before web
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.common.UtilTest", body: SUREFIRE_FAIL("com.x.common.UtilTest", "Connection refused: db:5432"), module: "common" }],
       },
     ],
   },
@@ -1493,6 +1674,55 @@ export const SCENARIOS: Scenario[] = [
       { content: "已建立 CalcTest.java" },
     ],
     mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }],
+  },
+  {
+    name: "loop-dirty-flaky-not-tolerated",
+    desc: "帶著容忍的紅燈續跑時，一個 writer 沒碰過的測試失敗一次、重跑就過 → 只把它列為不穩定，一直在失敗、被容忍的 LegacyTest 不列",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    extraFiles: { [LEGACY_PATH]: LEGACY_FIXED },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(), // baseline
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          {
+            suite: "com.x.ExistingTest",
+            body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "Connection refused", line: 13 }]),
+          },
+        ],
+      },
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }, // its rebuild
+    ],
+  },
+  {
+    name: "loop-dirty-flaky-method",
+    desc: "容忍 LegacyTest 的一個方法；另一個方法失敗一次、重跑就過 → 類別仍在失敗，但照樣點名它不穩定（不能因為類別還紅就什麼都不說）",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    extraFiles: { [LEGACY_PATH]: LEGACY_FIXED },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(), // baseline
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          {
+            suite: LEGACY,
+            body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE, { nested: "", method: "talks_to_cache", message: "Connection refused", line: 30 }]),
+          },
+        ],
+      },
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }, // its rebuild
+    ],
   },
   {
     name: "loop-dirty-new-failure-blocked",
@@ -2115,6 +2345,40 @@ export const SCENARIOS: Scenario[] = [
         ],
         jacoco: JACOCO_GREETER,
       },
+    ],
+  },
+  {
+    name: "loop-flaky-single-summary",
+    desc: "單一類別：建置只失敗在 writer 沒碰過的既有測試、重跑就過 → 照常通過，SUMMARY 與 summary.json 點名不穩定的測試",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      EXISTING_FLAKY_RED,
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+    ],
+  },
+  {
+    name: "loop-batches-flaky-attention",
+    desc: "分批：第 1 批遇到不穩定的既有測試（重跑就過）→ 兩批照樣通過，summary 的 attention 與該批的紀錄點名它",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      EXISTING_FLAKY_RED, // batch 1
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2
     ],
   },
   {

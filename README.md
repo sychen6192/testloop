@@ -250,12 +250,12 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在
   模組、相依或環境，不在這兩個類別；覆蓋率與 review 的失敗是各類別自己的事，不算）、連續兩批的建置都因為同樣
   的環境/設定問題失敗（Spring context 起不來、連線池初始化失敗——報告點名的是各批自己的測試類別，所以比的是問題
-  的種類，不是文字），或撤回時有檔案放不回去
+  的種類，不是文字）、上游模組的測試失敗而重跑仍失敗（`out-of-scope-failure`，見 Troubleshooting），或撤回時有檔案放不回去
   （多半是防毒軟體或 IDE 鎖住了檔案）——後面的批次也會遇到同樣的事，summary 會列出沒執行的類別。
 - **結果**：`summary.json` 的 `batches` 逐批列出結果、每輪卡在哪個 gate（`funnel`）與 artifacts 目錄，
   `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
-  檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
-  原因是 `runner-spawn-error`、`scope-violation`、`writer-no-op`、`reviewer-unparseable`、
+  檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更、失敗一次重跑就過的不穩定測試）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
+  原因是 `runner-spawn-error`、`scope-violation`、`out-of-scope-failure`、`writer-no-op`、`reviewer-unparseable`、
   `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
   全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
@@ -360,6 +360,18 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   context 仍然吃緊時可再調小。注意跨輪 context 本來就不累積——每輪都是全新 session，
   只帶上一輪的報告，所以 summary 的「writer output tokens 合計」是各輪輸出的加總，
   不是單輪 context 佔用。
+- **log 說「建置失敗在 writer 這次沒有碰過的測試——重跑一次」。** 建置的失敗全都在 writer 這次沒寫過、也沒改過
+  的測試類別（或別的模組）時，loop 會再建置一次，分辨是不穩定的測試還是被新測試連累；以前這種紅燈直接餵回
+  writer，writer 不去碰那個測試（正確）就以 `writer-no-op` 結束整個 run，去碰就是在改一個沒壞的測試。
+  - 重跑通過：是不穩定的測試（flaky）。這一輪照常往下走（覆蓋率、review 用重跑那次的結果），SUMMARY 以 `[WARN]`
+    點名、`summary.json` 的 `flakyTests`（分批時在該批的紀錄與 `attention`），請找時間修掉它。第一次的紅燈留在
+    `build.log`，重跑的在 `build-rerun.log`（最終驗收是 `final-verify-rerun.log`），名單在 `flaky.txt`。
+  - 重跑仍失敗、在目標模組裡：多半是新測試留下的共享狀態（`mockStatic` 沒關、`System.setProperty`、static 欄位、
+    預設 Locale / TimeZone）或它改過的共用測試檔、測試資源。回饋會這樣告訴 writer，並要它別改那些測試；writer
+    之後若沒有再改任何檔案，run 以 `writer-no-op` 結束並說明那些測試可能本身就壞了，需要人看。
+  - 重跑仍失敗、在別的模組：writer 影響不到（上游模組先建置、在自己的 JVM 執行）也不能修改，run 以
+    `out-of-scope-failure` 停下並點名模組與類別；分批時後面的批次也不跑。多半是外部服務、資料庫或環境。
+  建置逾時或被收掉（OOM）、有編譯錯誤、或失敗的類別在模組裡找不到原始碼時不重跑。
 - **覆蓋率永遠略過，或說「報告比本輪建置還舊」。** 模組沒綁 JaCoCo，或 report goal 綁在
   `verify` 而非 `test`——`mvn test` 不會重新產生 `jacoco.xml`，gate 讀到的是上次留下的檔案，
   所以 loop 只信本輪建置之後才寫出的報告。加上 jacoco-maven-plugin，將 prepare-agent 與 report

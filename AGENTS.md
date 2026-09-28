@@ -114,7 +114,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    進展，只有數量看得出來。唯一不算「沒下降」的是**揭露**：上一輪有編譯錯誤（只有它藏得住別的
    紅燈）、這輪修好了一些，而新冒出的紅燈都在這輪沒改過、也沒引用這輪改過的類別的檔案裡（改了
    測試資源則一律不算揭露）。writer 沒改任何檔案而紅燈只有測試失敗時，先重跑一次建置確認（同樣檢查
-   該跑的有跑），轉綠即以 `flaky-baseline` 照常開始並點名那些測試。修復以 `scope-violation`、`runner-spawn-error`、
+   該跑的有跑），轉綠即以 `flaky-baseline` 照常開始並點名那些測試（生成輪次也有對應的一次重跑：建置只失敗在 writer
+   這次沒碰過的測試類別時——綠了是 flaky，照常往下走並記進 `flakyTests`；仍紅而在目標模組，回饋明說是被新測試連累；
+   仍紅而在別的模組，以 `out-of-scope-failure` 停下）。修復以 `scope-violation`、`runner-spawn-error`、
    `build-aborted` 結束時，`UT_ALLOW_DIRTY_BASELINE` 也不放行——它只放行「修不好的既有紅燈」）與
    **既有測試偵測**（`libs/utils.ts` 的 `findExistingTests`，把既有測試檔名直接寫進 prompt，
    防止 writer 另建 `<Class>UnitTest.java` 造成重複）。這兩件事都禁止改成靠 prompt 措辭勸導。

@@ -57,7 +57,19 @@ import {
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
 import { collectTestMetrics, findShrunk, MetricsSnapshot, testMetrics } from "./libs/testmetrics";
-import { runBuildAndTests, runBaseline, summarizeBuildErrors, BaselineResult, ExpectedTest, expectedTestOf, NOT_RUN_HEADER, ranTestClasses } from "./gates/build";
+import {
+  runBuild,
+  runBaseline,
+  summarizeBuildErrors,
+  BaselineResult,
+  BuildOptions,
+  BuildRun,
+  ExpectedTest,
+  expectedTestOf,
+  NOT_RUN_HEADER,
+  ranTestClasses,
+  testOnlyFailures,
+} from "./gates/build";
 import { checkCoverage } from "./gates/coverage";
 import { runReviewGate, isUnparseable, REVIEWER_SPAWN_ERROR } from "./gates/review";
 import { measureTestStack, mergeTestStack, TestStack } from "./libs/teststack";
@@ -275,7 +287,7 @@ export interface OrchestratorResult {
   success: boolean;
   iterations: number;
   // "gates-passed" | "max-iterations" | "runner-spawn-error" | "writer-no-op" | "stuck"
-  // | "scope-violation"
+  // | "scope-violation" | "out-of-scope-failure" (another module's test failed twice in a row)
   stopReason: string;
   targetClasses: string[];
   coverageReport: string;
@@ -287,6 +299,23 @@ export interface OrchestratorResult {
   finalVerdict?: ReviewVerdict;
   /** On success: the test classes the module's last whole-module build ran — for later batches to keep running. */
   ranTests?: string[];
+  /** Test classes the writer never touched that failed a build and passed its rebuild: for a human to look at. */
+  flakyTests?: string[];
+}
+
+/**
+ * The header a red build gets when every failure in it is in a test class the writer has not
+ * touched this run and a rebuild failed the same way: it is not flaky, and the writer's work is
+ * what changed. Without it the report reads as "these tests fail", and the writer goes to fix them.
+ */
+export function collateralHeader(failing: string[], written: string[]): string {
+  const shown = written.length ? written.slice(0, 10).join("、") + (written.length > 10 ? ` 等 ${written.length} 個` : "") : "（無）";
+  return (
+    `失敗的都是你這次沒有寫過、也沒有改過的測試類別：${failing.join("、")}，重跑一次仍然失敗。\n` +
+    "這通常是你寫的測試留下了共享狀態——mockStatic / mockConstruction 沒有關閉、System.setProperty、static 欄位、" +
+    `Locale 或 TimeZone 的預設值——或是你改過的共用測試檔、測試資源影響了它們（你這次改過的檔案：${shown}）。\n` +
+    "請從你寫的測試下手修正，不要修改上面這些類別。\n"
+  );
 }
 
 // What "the agent could not run" means depends on the runner, and so does the fix. Telling an api
@@ -371,6 +400,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   // last round's changes: a round that fixed only a helper left the writer's own test class out of
   // -Dtest, ran zero tests, and got told to create <Class>Test.java — a duplicate.
   const everWritten = new Set<string>();
+  // Untouched test classes that failed a build and passed its rebuild (see recheckUntouched).
+  const flakyTests = new Set<string>();
+  const flakyField = () => (flakyTests.size ? { flakyTests: [...flakyTests].sort() } : {});
+  // The untouched classes the last build failed in twice, when that is what its report was about.
+  let lastCollateral: string[] | undefined;
   // Everything in the repo outside the module's test source set is read-only for the writer.
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
@@ -406,6 +440,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     finalFeedback,
     lastReport: feedback ?? undefined,
     finalVerdict: lastVerdict,
+    ...flakyField(),
   });
 
   for (let iter = 1; iter <= MAX_ITER; iter++) {
@@ -429,6 +464,74 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       if (prevFingerprint === fingerprint) return fail("stuck", `${stuckMsg}\n${feedback}`, iter);
       prevFingerprint = fingerprint;
       return null;
+    };
+
+    // A red build whose every failure is in a test class the writer has not touched this run is
+    // flaky, or collateral — the writer's tests leaving shared state behind. Fed back as it was, a
+    // flaky red cost a round and then the run: the writer rightly changed nothing and the round
+    // ended as writer-no-op, or it went on to "fix" a test that was never broken. One rebuild tells
+    // them apart: green is flaky, and the round goes on with the rebuild's result; red again is the
+    // writer's doing, and the report says so — unless it is in another module, which the writer's
+    // tests cannot reach (the module is built and tested first, in its own JVM) and the writer may
+    // not write to: that red is nobody's here, and the run stops on it. A build that timed out is not
+    // rebuilt, and a failing class this cannot place — a report named by a @DisplayName, a class with
+    // no source file in the module — keeps the report as it is.
+    const untouchedFailures = (b: BuildRun): Array<{ cls: string; module: string }> | undefined => {
+      if (b.gate.passed || b.aborted) return undefined;
+      const failing = testOnlyFailures(cfg.buildTool, cfg.mod, b.startedAt, b.gate.raw ?? "");
+      if (!failing) return undefined;
+      const written = new Set([...everWritten].map((f) => f.replace(/\\/g, "/")));
+      const untouched = failing.every(({ cls, module }) => {
+        if (path.resolve(module) !== path.resolve(cfg.mod.moduleRoot)) return true;
+        const rel = `${cls.split("$")[0].replace(/\./g, "/")}.java`;
+        return !written.has(rel) && fs.existsSync(path.join(testRoot, rel));
+      });
+      return untouched ? failing : undefined;
+    };
+    const names = (failures: Array<{ cls: string }>) => [...new Set(failures.map((f) => f.cls))];
+    const recheckUntouched = async (
+      first: BuildRun,
+      opts: BuildOptions,
+      rerunLog: string,
+    ): Promise<BuildRun & { elsewhere?: string }> => {
+      const suspects = untouchedFailures(first);
+      if (!suspects) return first;
+      log(`建置失敗在 writer 這次沒有碰過的測試（${names(suspects).join("、")}）——重跑一次，分辨是不穩定的測試還是被新測試連累`);
+      const again = await runBuild(cfg.buildTool, cfg.mod, opts);
+      save(rerunLog, again.gate.raw ?? again.gate.report);
+      if (again.gate.passed) {
+        // Those that failed and then did not. Under UT_ALLOW_DIRTY_BASELINE a green gate still has the
+        // tolerated classes failing, and they are not flaky; a class only a method of which came and
+        // went is named all the same.
+        const failingAgain = new Set(names(testOnlyFailures(cfg.buildTool, cfg.mod, again.startedAt, again.gate.raw ?? "") ?? []));
+        const cleared = names(suspects).filter((c) => !failingAgain.has(c));
+        const flaky = cleared.length ? cleared : names(suspects);
+        log(`[WARN] 重跑後通過：${flaky.join("、")} 是不穩定的測試（flaky），需要人檢視`);
+        flaky.forEach((c) => flakyTests.add(c));
+        save("flaky.txt", flaky.join("\n"));
+        return again;
+      }
+      const still = untouchedFailures(again);
+      if (!still) return again;
+      const outside = still.filter((f) => path.resolve(f.module) !== path.resolve(cfg.mod.moduleRoot));
+      if (outside.length) {
+        const where = outside.map((f) => `${path.relative(REPO_ROOT, f.module).replace(/\\/g, "/") || "."} 的 ${f.cls}`);
+        log(`[FAIL] 重跑仍然失敗在目標模組以外的測試（${where.join("、")}）——writer 影響不到、也不能修改它們`);
+        return {
+          ...again,
+          elsewhere:
+            `失敗在目標模組以外的測試：${where.join("、")}，重跑一次仍然失敗。\n` +
+            `writer 只能改 ${testRootRel(cfg.mod)}：影響不到其他模組的測試（它們先建置、在自己的 JVM 裡執行），也沒有權限` +
+            "修改它們，所以不再讓 writer 重試。多半是外部服務、資料庫、時間或環境的問題，或那些測試本來就壞了——請人檢視後重跑。\n" +
+            again.gate.report,
+        };
+      }
+      lastCollateral = names(still);
+      log(`重跑仍然失敗在 writer 沒碰過的測試（${lastCollateral.join("、")}）——不是不穩定，是被這次寫的測試連累`);
+      return {
+        ...again,
+        gate: { ...again.gate, report: `${collateralHeader(lastCollateral, [...everWritten].sort())}\n${again.gate.report}` },
+      };
     };
 
     banner(`第 ${iter}/${MAX_ITER} 輪迭代`);
@@ -536,7 +639,15 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         // A failed gate demanded changes and none arrived — the same gates would fail
         // identically. Common causes: context exhausted, permission-blocked writes.
         record({ gate: "writer", outcome: "no-op", changedFiles: 0 });
-        return fail("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), false), iter);
+        return fail(
+          "writer-no-op",
+          noOpReason(writer.status, testRootRel(cfg.mod), false) +
+            (lastCollateral && writer.status === "ok"
+              ? `\n上一輪失敗的都是 writer 沒有寫過、也沒有改過的測試（${lastCollateral.join("、")}），重跑一次仍然失敗，` +
+                "而 writer 沒有再改任何檔案——這些測試可能本身就壞了（例如跟日期、執行順序或環境有關），請人檢視。"
+              : ""),
+          iter,
+        );
       }
       // Round 1 with no changes can be legitimate (tests already exist); the gates still
       // judge, but the summary must say the tool generated nothing this run.
@@ -569,23 +680,32 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
     // Step 2: hard gate — compile & test
     log("Step 2/4：執行編譯與測試 gate");
-    // The coverage gate only trusts a report written after this instant.
-    const buildStartedAt = Date.now();
     // Whatever the writer just touched counts too: it may have named its file something the
     // expected-path derivation does not predict, and a test that is not in -Dtest never runs.
     const onlyTests = scoped ? testClassNames([...scopeSeed, ...everWritten]) : undefined;
     if (onlyTests) log(`  範圍限縮：-Dtest=${onlyTests.join(",")}`);
-    const build = await runBuildAndTests(cfg.buildTool, cfg.mod, {
+    const buildOpts: BuildOptions = {
       onlyTests,
       tolerate: cfg.tolerate,
       mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped),
       ranBefore: cfg.ranAtBaseline,
-    });
-    save("build.log", build.raw ?? build.report);
+    };
+    lastCollateral = undefined;
+    const firstBuild = await runBuild(cfg.buildTool, cfg.mod, buildOpts);
+    save("build.log", firstBuild.gate.raw ?? firstBuild.gate.report);
+    const built = await recheckUntouched(firstBuild, buildOpts, "build-rerun.log");
+    const build = built.gate;
+    // The coverage gate only trusts a report written after the build that counts started.
+    const buildStartedAt = built.startedAt;
     if (build.passed && !scoped) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, buildStartedAt, build.raw ?? "");
     testStack = refineTestStack(testStack, cfg.mod, build.raw ?? "", buildStartedAt);
     sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, build.raw ?? ""));
     log(build.passed ? "[OK] 編譯與測試 gate：PASS" : "[FAIL] 編譯與測試 gate：FAIL");
+    if (built.elsewhere) {
+      record({ gate: "build", outcome: "out-of-scope-failure", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      save("feedback.md", clampText(built.elsewhere, MAX_FEEDBACK_CHARS));
+      return fail("out-of-scope-failure", clampText(built.elsewhere, MAX_FEEDBACK_CHARS), iter);
+    }
     if (!build.passed) {
       record({
         gate: "build",
@@ -702,14 +822,21 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       // skipping it would trade the promise away for the same saving.
       if (scoped) {
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
-        const verifyStartedAt = Date.now();
-        const full = await runBuildAndTests(cfg.buildTool, cfg.mod, {
+        const verifyOpts: BuildOptions = {
           tolerate: cfg.tolerate,
           mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
           ranBefore: cfg.ranAtBaseline,
-        });
-        save("final-verify.log", full.raw ?? full.report);
-        if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verifyStartedAt, full.raw ?? "");
+        };
+        const firstVerify = await runBuild(cfg.buildTool, cfg.mod, verifyOpts);
+        save("final-verify.log", firstVerify.gate.raw ?? firstVerify.gate.report);
+        const verified = await recheckUntouched(firstVerify, verifyOpts, "final-verify-rerun.log");
+        const full = verified.gate;
+        if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verified.startedAt, full.raw ?? "");
+        if (verified.elsewhere) {
+          record({ gate: "build", outcome: "out-of-scope-failure", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+          save("feedback.md", clampText(verified.elsewhere, MAX_FEEDBACK_CHARS));
+          return fail("out-of-scope-failure", clampText(verified.elsewhere, MAX_FEEDBACK_CHARS), iter);
+        }
         if (!full.passed) {
           log("[FAIL] 最終驗收：完整模組重跑沒有通過");
           record({
@@ -748,6 +875,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         totalOutputTokens,
         finalVerdict: verdict,
         ranTests,
+        ...flakyField(),
       };
     }
 

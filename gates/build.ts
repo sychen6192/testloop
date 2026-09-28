@@ -707,6 +707,32 @@ function collectFailingTestClasses(moduleRoot: string, since: number): string[] 
 }
 
 /**
+ * The test classes a red Maven build failed in, each with the module whose reports name it, when
+ * failing tests are all it failed on: no compile error, and every failure named — in a report
+ * written since `since`, or as a class whose forked JVM crashed (placed in the target module, where
+ * surefire ran it). undefined otherwise, and for gradle. Whether a rebuild can change the verdict
+ * depends on it: a compile error does not come and go, a flaky test does.
+ */
+export function testOnlyFailures(
+  tool: BuildTool,
+  mod: ModuleInfo,
+  since: number,
+  raw: string,
+): Array<{ cls: string; module: string }> | undefined {
+  if (tool !== "maven" || extractCompileErrorFiles(raw, tool).length) return undefined;
+  const suites = failingSuites(mod.moduleRoot, since);
+  const failing = suites.length
+    ? suites.map((s) => ({ cls: s.suite, module: s.dir ? moduleOfSurefireDir(s.dir) : mod.moduleRoot }))
+    : surefireDirs(mod.moduleRoot).flatMap((dir) =>
+        failingReports(dir, since).map((f) => ({ cls: f.replace(/\.txt$/, ""), module: moduleOfSurefireDir(dir) })),
+      );
+  for (const c of crashedTestClasses(raw)) {
+    if (!failing.some((f) => f.cls === c)) failing.push({ cls: c, module: mod.moduleRoot });
+  }
+  return failing.length ? failing : undefined;
+}
+
+/**
  * Baseline pre-check: run the *same* command the build gate will run, before the writer
  * has written anything. A baseline computed with a cheaper command (test-compile, -Dtest=X)
  * is not a baseline — it would miss exactly the failures that later block the gate.
@@ -1297,7 +1323,7 @@ function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string 
   );
 }
 
-type BuildOptions = {
+export type BuildOptions = {
   allowZeroTests?: boolean;
   onlyTests?: string[];
   tolerate?: string[];
@@ -1323,12 +1349,11 @@ export async function runBuildAndTests(
 // out, or killed by a signal (the OOM killer's SIGKILL is the usual one). The gate report says so
 // either way; runBaseline needs the distinction, because an aborted baseline has no failures to
 // locate and was classified as a red module nobody could name, ending in a repair loop that
-// gave up with advice about Lombok.
-async function runBuild(
-  tool: BuildTool,
-  mod: ModuleInfo,
-  opts: BuildOptions,
-): Promise<{ gate: GateResult; aborted?: string; notRun?: string[]; startedAt: number }> {
+// gave up with advice about Lombok. The orchestrator needs it for the same reason: a build that
+// timed out is not one to run again on the chance that it was flaky.
+export type BuildRun = { gate: GateResult; aborted?: string; notRun?: string[]; startedAt: number };
+
+export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOptions = {}): Promise<BuildRun> {
   const isWin = process.platform === "win32";
   // Taken before the build so stale reports from an earlier round can be told apart.
   const startedAt = Date.now();

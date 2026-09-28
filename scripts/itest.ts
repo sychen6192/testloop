@@ -546,7 +546,30 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
       fb.slice(0, 500),
     );
     check("帶到上游模組的 stack frame", fb.includes("UtilTest.java:11"), fb.slice(0, 500));
-    check("相同失敗第 2 輪判 stuck", c.result.stopReason === "stuck", String(c.result.stopReason));
+    check(
+      "重跑仍失敗 → 第 1 輪就以 out-of-scope-failure 停下（writer 影響不到、也不能改上游模組），不再重試到 stuck",
+      c.result.stopReason === "out-of-scope-failure" && c.result.iterations === 1 && c.mvnCalls === 2,
+      JSON.stringify([c.result.stopReason, c.result.iterations, c.mvnCalls]),
+    );
+    check(
+      "說明點名模組與類別、說 writer 影響不到它",
+      String(c.result.finalFeedback).includes("common 的 com.x.common.UtilTest") && String(c.result.finalFeedback).includes("影響不到其他模組的測試"),
+      String(c.result.finalFeedback).slice(0, 500),
+    );
+  },
+
+  "loop-batches-upstream-broken": (c) => {
+    check("exit code 2", c.code === 2, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("整個 run 停在第 1 批", c.result.stopReason === "stopped:out-of-scope-failure", String(c.result.stopReason));
+    const notRun = ((c.result.notRun ?? []) as string[]).map((p) => p.replace(/\\/g, "/"));
+    check("第 2 批（Zeta）列為沒執行", JSON.stringify(notRun) === JSON.stringify([`${"web/src/main/java/com/x/web"}/Zeta.java`]), JSON.stringify(c.result.notRun));
+    check("建置 3 次：預檢、第 1 批的紅燈、它的重跑——第 2 批沒有再撞一次", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "multimodule-upstream-flaky": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：上游紅一次、重跑綠", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+    check("結果點名上游那個不穩定的測試", JSON.stringify(c.result.flakyTests) === '["com.x.common.UtilTest"]', JSON.stringify(c.result.flakyTests));
   },
 
   "multimodule-baseline-outside-scope": (c) => {
@@ -674,7 +697,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("最終成功", c.result.success === true, JSON.stringify(c.result.stopReason));
     check("花了 2 輪", c.result.iterations === 2, String(c.result.iterations));
     check("第 1 輪因最終驗收失敗", gates(c)[0] === "build/final-verify-fail", gates(c).join(","));
-    check("共建置 4 次（每輪限縮 1 次 + 完整 1 次）", c.mvnCalls === 4, `mvnCalls=${c.mvnCalls}`);
+    check("共建置 5 次（每輪限縮 1 次 + 完整 1 次，第 1 輪的完整重跑失敗在沒碰過的測試、再重跑一次確認）", c.mvnCalls === 5, `mvnCalls=${c.mvnCalls}`);
     check("限縮那次帶 -Dtest=CalcTest,CalcTest$*", c.argv[0]?.includes("-Dtest=CalcTest,CalcTest$*"), JSON.stringify(c.argv[0]));
     check(
       "限縮必須同時關掉 failIfNoSpecifiedTests",
@@ -686,7 +709,93 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("final-verify.log 落地", c.runExists("iter-1/final-verify.log"));
     const fb = c.runRead("iter-1/feedback.md");
     check("回饋說明打壞了既有測試", fb.includes("新測試打壞了既有測試"), fb.slice(0, 200));
+    check(
+      "重跑仍失敗 → 回饋點名是 writer 沒碰過的 ExistingTest、要它從自己的測試下手",
+      fb.includes("你這次沒有寫過、也沒有改過的測試類別：com.x.ExistingTest") && fb.includes("不要修改上面這些類別") && c.runExists("iter-1/final-verify-rerun.log"),
+      fb.slice(0, 600),
+    );
+    check("確認重跑也是完整模組（不帶 -Dtest）", !c.argv[2]?.some((a) => a.startsWith("-Dtest=")), JSON.stringify(c.argv[2]));
+    check("不是 flaky：結果不點名不穩定的測試", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
     check("成功那輪也做了完整驗收", c.runExists("iter-2/final-verify.log"));
+  },
+
+  "scoped-final-verify-flaky": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 3 次：限縮、完整（紅）、完整重跑（綠）", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    check("結果點名不穩定的 ExistingTest", JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]', JSON.stringify(c.result.flakyTests));
+    check("紅的那次與重跑都留下 log", c.runExists("iter-1/final-verify.log") && c.runExists("iter-1/final-verify-rerun.log"));
+  },
+
+  "build-flaky-untouched-test": (c) => {
+    check("第 1 輪就通過（重跑轉綠，沒有浪費一輪）", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：第一次紅、重跑綠", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+    check("結果點名不穩定的 ExistingTest", JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]', JSON.stringify(c.result.flakyTests));
+    check(
+      "紅的 build.log、重跑的 build-rerun.log、flaky.txt 都留下",
+      c.runExists("iter-1/build.log") && c.runExists("iter-1/build-rerun.log") && c.runRead("iter-1/flaky.txt").includes("com.x.ExistingTest"),
+    );
+    check("覆蓋率照重跑那次的報告判", c.runRead("iter-1/coverage.txt").includes("PASS"), c.runRead("iter-1/coverage.txt").slice(0, 300));
+  },
+
+  "build-collateral-untouched-test": (c) => {
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 3 次：紅、重跑仍紅、第 2 輪綠", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "回饋點名 writer 沒碰過的 ExistingTest、說明多半是共享狀態，列出 writer 改過的檔、要它別改 ExistingTest",
+      fb.includes("你這次沒有寫過、也沒有改過的測試類別：com.x.ExistingTest") &&
+        fb.includes("共享狀態") &&
+        fb.includes("com/x/CalcTest.java") &&
+        fb.includes("不要修改上面這些類別"),
+      fb.slice(0, 700),
+    );
+    check("回饋仍附上失敗明細", fb.includes("預設 Locale 被新測試改成 de_DE"), fb.slice(0, 900));
+    check("不是 flaky：沒有 flaky.txt、結果不點名", !c.runExists("iter-1/flaky.txt") && c.result.flakyTests === undefined);
+  },
+
+  "build-untouched-broken-no-op": (c) => {
+    check("以 writer-no-op 收場", c.result.success === false && c.result.stopReason === "writer-no-op", String(c.result.stopReason));
+    check(
+      "說明是 writer 沒碰過、重跑仍失敗的測試需要人檢視",
+      String(c.result.finalFeedback).includes("com.x.ExistingTest") && String(c.result.finalFeedback).includes("可能本身就壞了"),
+      String(c.result.finalFeedback).slice(0, 600),
+    );
+  },
+
+  "build-collateral-then-own-red-no-op": (c) => {
+    check("第 3 輪以 writer-no-op 收場", c.result.stopReason === "writer-no-op" && c.result.iterations === 3, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check(
+      "說明不沿用第 1 輪的「既有測試可能本身壞了」——上一輪紅的是 writer 自己的測試",
+      !String(c.result.finalFeedback).includes("可能本身就壞了"),
+      String(c.result.finalFeedback).slice(0, 600),
+    );
+  },
+
+  "build-compile-error-with-untouched-red-no-rerun": (c) => {
+    check("第 2 輪通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：有編譯錯誤就不重跑", c.mvnCalls === 2 && !c.runExists("iter-1/build-rerun.log"), `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "build-crash-untouched-flaky": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("結果點名 JVM 中途結束的 ExistingTest", JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]', JSON.stringify(c.result.flakyTests));
+  },
+
+  "build-killed-no-rerun": (c) => {
+    if (process.platform === "win32") return; // no SIGKILL to deliver
+    check("第 2 輪通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：被收掉的那次不重跑", c.mvnCalls === 2 && !c.runExists("iter-1/build-rerun.log"), `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "build-unplaceable-failure-no-rerun": (c) => {
+    check("第 2 輪通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：找不到原始碼的失敗類別不重跑", c.mvnCalls === 2 && !c.runExists("iter-1/build-rerun.log"), `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "build-own-test-red-no-rerun": (c) => {
+    check("第 2 輪通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("建置 2 次：writer 自己的測試紅了就不重跑", c.mvnCalls === 2, `mvnCalls=${c.mvnCalls}`);
+    check("沒有 build-rerun.log", !c.runExists("iter-1/build-rerun.log"));
   },
 
   "loop-scoped-final-verify-not-run": (c) => {
@@ -1315,6 +1424,48 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("沒有 rejected 目錄", !c.runExists("batch-1-Calc/rejected") && !c.runExists("batch-2-Greeter/rejected"));
     const params = JSON.parse(c.runRead("params.json") || "{}");
     check("params.json 記錄 batchSize", params.batchSize === 1, String(params.batchSize));
+  },
+
+  "loop-dirty-flaky-not-tolerated": (c) => {
+    check("exit code 0（扣除容忍的紅燈、重跑後放行）", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("建置 3 次：預檢、紅、重跑", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+    check(
+      "只列 ExistingTest 為不穩定，被容忍、一直失敗的 LegacyTest 不列",
+      JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]',
+      JSON.stringify(c.result.flakyTests),
+    );
+  },
+
+  "loop-dirty-flaky-method": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check("點名 LegacyTest 不穩定（它的一個方法失敗一次、重跑就過）", JSON.stringify(c.result.flakyTests) === '["com.x.LegacyTest"]', JSON.stringify(c.result.flakyTests));
+  },
+
+  "loop-flaky-single-summary": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    check(
+      "SUMMARY 以 WARN 點名要人檢視",
+      c.stdout.includes("[WARN] 需要人工處理：這些測試不穩定（建置失敗、重跑通過）：com.x.ExistingTest"),
+      c.stdout.slice(-900),
+    );
+    check("summary.json 記下 flakyTests", JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]', JSON.stringify(c.result.flakyTests));
+  },
+
+  "loop-batches-flaky-attention": (c) => {
+    check("exit code 0，兩批都通過", c.code === 0 && c.result.stopReason === "gates-passed", `code=${c.code} ${String(c.result.stopReason)}`);
+    const attention = (c.result.attention ?? []) as string[];
+    check(
+      "attention 點名第 1 批遇到的不穩定測試",
+      attention.some((a) => a === "第 1 批遇到不穩定的測試（建置失敗、重跑通過）：com.x.ExistingTest"),
+      JSON.stringify(attention),
+    );
+    const batches = (c.result.batches ?? []) as Array<{ flakyTests?: string[] }>;
+    check(
+      "第 1 批的紀錄有 flakyTests、第 2 批沒有",
+      JSON.stringify(batches[0]?.flakyTests) === '["com.x.ExistingTest"]' && batches[1]?.flakyTests === undefined,
+      JSON.stringify(batches.map((b) => b.flakyTests)),
+    );
+    check("SUMMARY 也印出來", c.stdout.includes("需要人工處理：第 1 批遇到不穩定的測試"), c.stdout.slice(-900));
   },
 
   "loop-batch-size-covers-all": (c) => {
