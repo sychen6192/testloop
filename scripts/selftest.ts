@@ -152,7 +152,23 @@ import {
   surefireProviderFromLog,
 } from "../libs/teststack";
 import { codeOnly, declarationOnlyLines, decodeUnicodeEscapes } from "../libs/javasrc";
-import { planSpawn, resolveWindowsCommand, findOnPath, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
+import {
+  planSpawn,
+  resolveWindowsCommand,
+  findOnPath,
+  explainSpawnError,
+  planKill,
+  killTree,
+  shLive,
+  assembleCapture,
+  DETACH_CHILDREN,
+  groupAlive,
+  journalChildren,
+  orphanAction,
+  parseStat,
+  processStart,
+  trackForShutdown,
+} from "../libs/shell";
 import { runnerConfigProblems } from "../runners/runner";
 import {
   appendingJacocoExecFiles,
@@ -5349,6 +5365,80 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
   await new Promise((r) => setTimeout(r, 200));
   check("closeJournal：心跳跟著停（不再碰同一個路徑）", fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000);
   fs.rmSync(root, { recursive: true, force: true });
+}
+
+console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）");
+{
+  const stat = (name: string, state: string, pgrp: number, start: number) =>
+    `4242 (${name}) ${state} 1 ${pgrp} ${pgrp} 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 ${start} 7368704 1531`;
+  check("parseStat：狀態、程序群組、啟動時間", JSON.stringify(parseStat(stat("java", "S", 4242, 563817))) === '{"state":"S","pgrp":4242,"start":"563817"}');
+  check(
+    "parseStat：名稱裡有空白與括號也從最後一個「)」算起",
+    JSON.stringify(parseStat(stat("a b) (c", "R", 7, 99))) === '{"state":"R","pgrp":7,"start":"99"}',
+    JSON.stringify(parseStat(stat("a b) (c", "R", 7, 99))),
+  );
+  check("parseStat：不是 stat 的內容 → undefined", parseStat("garbage") === undefined && parseStat("1 (x) S 1") === undefined);
+  const me = processStart(process.pid);
+  if (process.platform === "linux") {
+    check("processStart（Linux，/proc）：自己的啟動時間讀得到、兩次一樣", !!me && me === processStart(process.pid), String(me));
+  }
+  if (process.platform !== "win32") {
+    const viaPs = processStart(process.pid, "darwin");
+    check("processStart（其他 POSIX，ps -o lstart=）：讀得到、兩次一樣", !!viaPs && viaPs === processStart(process.pid, "darwin"), String(viaPs));
+  }
+  check("processStart：Windows 沒有便宜的辦法 → undefined（只點名、不結束）", processStart(process.pid, "win32") === undefined);
+  const done = spawnSync(process.execPath, ["-e", "0"]);
+  check("processStart：已經結束的程序 → undefined", processStart(done.pid ?? 0) === undefined && processStart(0x3ffffffe) === undefined);
+
+  const rec = { pid: 4242, start: "563817", cmd: "mvn test" };
+  check("orphanAction：同一個程序（啟動時間相同）→ 結束它的程序群組", orphanAction(rec, { start: "563817", groupAlive: true }) === "stop");
+  check("orphanAction：pid 被別的程序重用（啟動時間不同）→ 不是它的", orphanAction(rec, { start: "999", groupAlive: true }) === "not-ours");
+  check(
+    "orphanAction：沒記到啟動時間 → 無從確認，不碰還在的程序",
+    orphanAction({ ...rec, start: "" }, { start: "563817", groupAlive: true }) === "not-ours",
+  );
+  check("orphanAction：launcher 已經結束、群組還有成員（fork 出來的 JVM）→ 結束群組", orphanAction(rec, { groupAlive: true }) === "stop");
+  check("orphanAction：都不在了 → gone", orphanAction(rec, { groupAlive: false }) === "gone");
+
+  if (process.platform !== "win32") {
+    // A real process group, and a zombie in it: `sleep 0.1` ends while its parent (which exec'd into
+    // `sleep 30`) never waits for it.
+    const leader = spawn("sh", ["-c", "sleep 0.1 & echo $!; exec sleep 30"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    const zombie = Number(await new Promise<string>((r) => leader.stdout!.once("data", (d) => r(String(d)))));
+    await new Promise((r) => setTimeout(r, 400));
+    check("groupAlive：群組裡還有在跑的程序 → true", groupAlive(leader.pid!), String(leader.pid));
+    if (process.platform === "linux") {
+      let isZombie = false;
+      try {
+        isZombie = / Z /.test(fs.readFileSync(`/proc/${zombie}/stat`, "utf8"));
+      } catch {
+        /* reaped already */
+      }
+      if (isZombie) check("processStart：已經結束、還沒被回收的程序（zombie）→ undefined", processStart(zombie) === undefined);
+    }
+    process.kill(-leader.pid!, "SIGKILL");
+    await new Promise((r) => leader.once("exit", r));
+    await new Promise((r) => setTimeout(r, 200));
+    check("groupAlive：群組的程序都結束了 → false（還沒被回收的也不算）", !groupAlive(leader.pid!), String(leader.pid));
+  }
+
+  // The children journal: a tracked child is on disk while it runs, and off it once it has ended.
+  const jdir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-children-"));
+  const file = path.join(jdir, "children.json");
+  journalChildren(file, { repoRoot: "/repo", host: "box", boot: 1, pid: process.pid, start: me ?? "" });
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { detached: DETACH_CHILDREN, stdio: "ignore" });
+  trackForShutdown(child);
+  const listed = JSON.parse(fs.readFileSync(file, "utf8"));
+  check(
+    "journalChildren：執行中的子程序連同啟動時間寫進紀錄",
+    listed.repoRoot === "/repo" && listed.children.length === 1 && listed.children[0].pid === child.pid &&
+      (process.platform === "win32" || listed.children[0].start === processStart(child.pid!)),
+    JSON.stringify(listed),
+  );
+  await new Promise((r) => child.once("exit", r));
+  check("journalChildren：子程序結束就從紀錄移除", JSON.parse(fs.readFileSync(file, "utf8")).children.length === 0);
+  journalChildren(undefined);
+  fs.rmSync(jdir, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

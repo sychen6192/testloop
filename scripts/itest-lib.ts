@@ -84,6 +84,12 @@ export interface MvnStep {
   interrupt?: boolean;
   /** SIGKILLs the process that ran the build (the loop) — no handler runs (POSIX): the OOM killer. */
   killLoop?: boolean;
+  /** With killLoop: the build goes on for this long after the loop is gone — an orphan, its pid in
+   *  .itest/orphan.pid — then ends by itself. */
+  linger?: number;
+  /** With linger: what lingers is a process the build started in its own process group (surefire's
+   *  forked JVM); the build itself ends at once. */
+  lingerFork?: boolean;
   /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
    *  a rollback cannot put a file back at, whatever its privileges. */
   pipeDirAt?: string;
@@ -171,6 +177,8 @@ export interface Scenario {
     /** Every file of the fixture — the first run's artifacts included — made this much older first: the
      *  first run ended that long ago, and whatever `between` writes happened after it. */
     backdateMs?: number;
+    /** One replacement in a file between the runs (`{{firstRun}}` as in `between`). */
+    rewrite?: { file: string; from: RegExp; to: string };
   };
   mvn: MvnStep[];
 }
@@ -376,7 +384,19 @@ if (step.interrupt && process.platform !== "win32") {
   return;
 }
 if (step.killLoop && process.platform !== "win32") {
+  if (step.linger && step.lingerFork) {
+    const fork = require("child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, " + step.linger + ")"], { stdio: "ignore" });
+    fork.unref();
+    fs.writeFileSync(path.join(itest, "orphan.pid"), String(fork.pid));
+  } else if (step.linger) {
+    fs.writeFileSync(path.join(itest, "orphan.pid"), String(process.pid));
+  }
   process.kill(process.ppid, "SIGKILL");
+  // Nothing is written to stdout from here: the pipe's reader is gone.
+  if (step.linger && !step.lingerFork) {
+    setTimeout(() => process.exit(0), step.linger);
+    return;
+  }
   process.exit(0);
 }
 

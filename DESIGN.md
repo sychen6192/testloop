@@ -18,6 +18,7 @@ loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ �
         │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
         │  測試相依量測（measureTestStack：surefire classpath，退回 pom）與原始碼編碼量測
         │    （measureSourceEncoding：pom，退回 build log 的平台編碼）→ 寫進 prompt
+        │  被強制終止的 run 留下還在跑的子程序 → 先結束（libs/shell.ts children.json）
         │  被強制終止的 run 留下的批次復原日誌 → 先替它撤回（libs/batch.ts，在預檢之前）
         │  接續（libs/resume.ts）：先前已通過、類別與測試都沒變、預檢中照樣通過的類別不再產生
         │  資料夾目標 → 依 UT_BATCH_SIZE 分批，每批一個完整的 orchestrate；
@@ -442,6 +443,18 @@ writer 修改、預檢可能因它而紅，修復迴圈再花幾輪修一個根�
 
 **沒有做的。** 單一類別的 run 沒通過時本來就不撤回（測試留給人決定），被強制終止也一樣，不寫日誌。修復迴圈
 被中斷時也不撤回（與 Ctrl-C 相同）。
+
+**它留下還在跑的子程序。** 子程序在 POSIX 上各自是程序群組的 leader（才能整群結束），所以 run 被 SIGKILL 時
+它們不會跟著死：Maven 連同 surefire fork 的 JVM 會把剩下的幾分鐘跑完，與下一次執行的預檢寫同一個 `target/`；
+opencode 的 session 會繼續寫 `src/test`，跟撤回搶。所以追蹤中的子程序也寫在 run 的 artifacts
+（`children.json`，`libs/shell.ts`）：pid、啟動時間（Linux 讀 `/proc/<pid>/stat`，其他 POSIX 用 `ps -o lstart=`），
+以及 run 本身的 pid 與啟動時間、repo、主機、開機時間。下一次執行在一切之前（編碼視圖、批次撤回都在後面）
+處理它：只看同一個 repo、同一台主機、同一次開機的紀錄；紀錄的主人還是同一個程序（只有繞過 repo 鎖時才可能）
+就不碰；每個子程序只在它還是同一個程序（啟動時間吻合）時結束它的整個群組，launcher 已經不在而群組還有成員
+（fork 出去的 JVM）時也結束——群組 id 在成員還在時不會被發給別人；pid 被別的程序重用（啟動時間不同）就不碰。
+已經結束、等著被回收的程序（zombie，容器的 pid 1 常常不回收）不算還在跑。處理過的紀錄就刪掉：之後那些 pid
+可能是任何人的。Windows 沒有便宜又可靠的方法確認是同一個程序（`taskkill /T` 也找不到已經不在的父程序底下的
+子樹），所以只列出還有程序在用的 pid 請人確認，不自動結束。
 
 ## 已否決方案（防止重新提案）
 

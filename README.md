@@ -255,6 +255,11 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   （多半是你在那之後的手動修改），原樣留著並列在 `rollback.md`。批次正常結束時（通過、撤回、scope-violation）
   日誌就刪掉。沒有這一步時，寫到一半的測試會被下一次執行當成既有測試：防掏空 guard 不准刪它、writer 被要求
   改它、預檢因它而紅。
+  它啟動的建置或 agent session 也不會跟著死：Maven 會繼續跑完（連同 surefire fork 出去的 JVM），和下一次執行的
+  預檢一起寫同一個 `target/`，agent 繼續寫 `src/test`。所以執行中的子程序也記在 artifacts 的 `children.json`
+  （pid 與啟動時間），下一次執行一開始、在撤回之前就把還在跑的結束掉（連同它的程序群組），log 會列出來。只結束
+  確定是同一個程序的：同一台機器、同一次開機、啟動時間吻合——pid 已經被別的程序重用就不碰。Windows 上無法
+  便宜地確認這一點，所以只列出那些 pid 請你自己確認。
 - **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
   變更原樣保留給你檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在

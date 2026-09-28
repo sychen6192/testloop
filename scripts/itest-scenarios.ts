@@ -4,6 +4,7 @@
 // Naming of mvn plans: for entry="orchestrate" the plan is consumed by the build gate alone,
 // so plan[0] is round 1's build. For entry="repair" plan[0] is the baseline pre-check. For
 // entry="loop" plan[0] is the baseline too.
+import { processStart } from "../libs/shell";
 import {
   ApiTurn,
   BUILD_SUCCESS,
@@ -551,6 +552,21 @@ const GREETER_ROUND = {
   ...CALC_BUILD,
   surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"),
   jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+};
+// How each orphan scenario's rerun finds the killed run's children record changed.
+const ORPHAN_REWRITES: Record<string, Partial<NonNullable<Scenario["rerun"]>>> = {
+  "loop-killed-orphan-pid-reused": { rewrite: { file: "{{firstRun}}/children.json", from: /"start":"[^"]*"(?=,"cmd":"[^"]*mvnw)/, to: '"start":"1"' } },
+  "loop-killed-orphan-other-checkout": { rewrite: { file: "{{firstRun}}/children.json", from: /"repoRoot":"[^"]*"/, to: '"repoRoot":"/elsewhere"' } },
+  "loop-killed-orphan-other-host": { rewrite: { file: "{{firstRun}}/children.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
+  "loop-killed-orphan-rebooted": { rewrite: { file: "{{firstRun}}/children.json", from: /"boot":\d+/, to: '"boot":1' } },
+  // This very process — alive, and the same process its start time says — stands in for the run.
+  "loop-killed-orphan-owner-alive": {
+    rewrite: {
+      file: "{{firstRun}}/children.json",
+      from: /"pid":\d+,"start":"[^"]*","children"/,
+      to: `"pid":${process.pid},"start":"${processStart(process.pid) ?? ""}","children"`,
+    },
+  },
 };
 const killedMidWriter = (o: { name: string; desc: string; rerun?: Omit<NonNullable<Scenario["rerun"]>, "api"> }): Scenario => ({
   name: o.name,
@@ -3649,6 +3665,45 @@ export const SCENARIOS: Scenario[] = [
     desc: "日誌還在、但那次執行其實有收尾（有 summary.json）→ 日誌是剩下的，丟掉，不撤回也不改它的 summary",
     rerun: { between: { "{{firstRun}}/summary.json": '{"success":false,"stopReason":"interrupted:SIGHUP"}' } },
   }),
+  ...(
+    [
+      "loop-killed-orphan-build",
+      "loop-killed-orphan-fork",
+      "loop-killed-orphan-pid-reused",
+      "loop-killed-orphan-other-checkout",
+      "loop-killed-orphan-other-host",
+      "loop-killed-orphan-rebooted",
+      "loop-killed-orphan-owner-alive",
+    ] as const
+  ).map(
+    (name): Scenario => ({
+      name,
+      desc: {
+        "loop-killed-orphan-build": "run 在第 2 批的建置途中被 SIGKILL，建置本身還在跑（孤兒）→ 重跑一開始就結束它，再撤回那批、接續",
+        "loop-killed-orphan-fork": "同上，但建置本身已經結束、它 fork 出去的程序（像 surefire 的 JVM）還在它的程序群組裡跑 → 一樣結束",
+        "loop-killed-orphan-pid-reused": "同上，但紀錄裡的啟動時間對不上現在用那個 pid 的程序（pid 被重用）→ 不是它的，不碰",
+        "loop-killed-orphan-other-checkout": "同上，但那份子程序紀錄屬於共用 runs 目錄的另一個 checkout → 不碰",
+        "loop-killed-orphan-other-host": "同上，但紀錄是另一台機器寫的（共用的 runs 目錄）→ 那些 pid 在這台沒有意義，不碰",
+        "loop-killed-orphan-rebooted": "同上，但紀錄是重開機前寫的 → 那些程序不可能還在，現在用那些 pid 的都不是，不碰",
+        "loop-killed-orphan-owner-alive": "同上，但寫紀錄的那次執行其實還活著（繞過了 repo 鎖）→ 它的子程序是它自己的，不碰",
+      }[name],
+      entry: "loop",
+      env: { UT_SKIP_REVIEW: "1" },
+      extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+      api: [...RESUME_WRITE_CALC, KILLED_WRITES, { content: "已建立 GreeterTest.java" }],
+      rerun: {
+        api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+        ...(ORPHAN_REWRITES[name] ?? {}),
+      },
+      mvn: [
+        BASE_EXISTING,
+        CALC_BUILD,
+        { exit: 0, killLoop: true, linger: 60_000, lingerFork: name === "loop-killed-orphan-fork" },
+        CALC_BUILD,
+        GREETER_ROUND,
+      ],
+    }),
+  ),
   {
     name: "loop-killed-mid-build",
     desc: "第 2 批的 writer 已經寫完、run 在建置途中被 SIGKILL → 重跑依日誌記下的 writer 變更撤回",

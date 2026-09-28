@@ -32,7 +32,7 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
   斷電）而沒機會撤回的那批，由下一次執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、`recoverKilledBatches`；
-  DESIGN.md「已採納：替被強制終止的 run 收尾」）。
+  DESIGN.md「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與 agent 也在那之前結束（`stopOrphans`）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
@@ -201,7 +201,7 @@ runners/…             factory（含啟動前的 runner 設定檢查）＋三�
 runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
-libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾
+libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾＋子程序紀錄（children.json：被強制終止時由下一次執行結束留下的建置與 agent）
 libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 逾時覆寫
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / codelessTypeReason / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）

@@ -78,7 +78,16 @@ import {
   refineSourceEncoding,
   SourceEncoding,
 } from "./libs/encoding";
-import { installShutdownHandlers, killAll, onShutdown } from "./libs/shell";
+import {
+  ChildrenJournal,
+  groupAlive,
+  installShutdownHandlers,
+  journalChildren,
+  killAll,
+  onShutdown,
+  orphanAction,
+  processStart,
+} from "./libs/shell";
 import { acquireRepoLock, canonicalRoot, LOCK_HEARTBEAT_MS, LOCK_WAIT_MS } from "./libs/lock";
 import {
   findPass,
@@ -216,6 +225,9 @@ async function main() {
   }
   fs.mkdirSync(runDir, { recursive: true });
   crashRunDir = runDir;
+  // What a run killed outright left running goes first: a build still writing target/, an agent
+  // session still writing src/test, would race everything below (libs/shell.ts).
+  stopOrphans(runDir);
   // A run killed while its test sources were in their ASCII view (libs/encoding.ts) left them so;
   // with the repo locked, nothing else can be using its journal.
   const recovered = recoverEncodingViews(path.join(mod.moduleRoot, "src", "test", "java"));
@@ -225,6 +237,13 @@ async function main() {
   }
   // And a batch a killed run never got to set aside: its writer's half-written tests (libs/batch.ts).
   recoverKilledBatches(runDir);
+  // From here on, this run's children are on disk too, for the next run should this one be killed.
+  journalChildren(path.join(runDir, "children.json"), {
+    repoRoot: canonicalRoot(REPO_ROOT),
+    ...thisHost(),
+    pid: process.pid,
+    start: processStart(process.pid) ?? "",
+  });
   // Ctrl-C, SIGTERM, a hangup on an interactive terminal: the run still leaves a summary that
   // says it was interrupted, rather than a directory that looks like a run still going.
   onShutdown((reason) => {
@@ -1175,6 +1194,70 @@ const pidExists = (pid: number) => {
     return (e as NodeJS.ErrnoException).code === "EPERM";
   }
 };
+
+/**
+ * The children an earlier run of this repo, killed outright, left running (libs/shell.ts): each one
+ * still the same process — its start time the recorded one — is taken down with its process group.
+ * Only on the host and since the boot they were recorded on; a pid that has since been given to
+ * another process is left alone. Windows has no cheap way to tell, so there they are named, not
+ * stopped. Each record is acted on once, then removed: later, its pids may be anyone's.
+ */
+function stopOrphans(runDir: string): void {
+  const here = thisHost();
+  const root = canonicalRoot(REPO_ROOT);
+  let runs: string[] = [];
+  try {
+    runs = fs.readdirSync(RUNS_DIR);
+  } catch {
+    return;
+  }
+  const stopped: string[] = [];
+  const named: string[] = [];
+  for (const id of runs) {
+    const dir = path.join(RUNS_DIR, id);
+    if (path.resolve(dir) === path.resolve(runDir)) continue;
+    const file = path.join(dir, "children.json");
+    let doc: ChildrenJournal;
+    try {
+      doc = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    // Another checkout's, another machine's, or from before a reboot: nothing of it runs here to stop.
+    if (doc.repoRoot !== root || doc.host !== here.host || Math.abs(doc.boot - here.boot) > 2) continue;
+    // The run itself still going — only possible when the repo lock was bypassed: its children are its own.
+    if (doc.pid !== process.pid && doc.start && processStart(doc.pid) === doc.start) continue;
+    for (const c of doc.children ?? []) {
+      if (process.platform === "win32") {
+        if (pidExists(c.pid)) named.push(`pid ${c.pid}（${c.cmd}）`);
+        continue;
+      }
+      if (orphanAction(c, { start: processStart(c.pid), groupAlive: groupAlive(c.pid) }) !== "stop") continue;
+      try {
+        process.kill(-c.pid, "SIGKILL");
+        stopped.push(`pid ${c.pid}（${c.cmd}）`);
+      } catch {
+        /* gone meanwhile */
+      }
+    }
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      /* read-only artifacts: the start times keep a later run from mistaking a reused pid */
+    }
+  }
+  if (stopped.length) {
+    log(`[WARN] 上一次執行被強制終止時留下 ${stopped.length} 個還在跑的子程序（建置或 agent session），已結束它們（連同各自的程序群組）：`);
+    stopped.forEach((p) => log(`  - ${p}`));
+  }
+  if (named.length) {
+    log(
+      `[WARN] 上一次執行被強制終止時啟動的子程序，有 ${named.length} 個 pid 現在還有程序在用——可能是它留下還在跑的建置或 agent，` +
+        "也可能是 pid 被重用（Windows 上無法分辨，所以沒有結束它們）。請在工作管理員確認，是的話結束它們：",
+    );
+    named.forEach((p) => log(`  - ${p}`));
+  }
+}
 
 function recordedBatches(runDir: string): Array<{ batch: number; success: boolean }> {
   try {

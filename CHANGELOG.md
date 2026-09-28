@@ -14,6 +14,9 @@
   `batch-NN-<類別>/inflight/` 留著復原日誌（批次開始時的 `src/test`、建置輸出清單、writer 改過的檔、每 30 秒的
   心跳），下一次對同一個 repo 執行一開始就依它撤回（嘗試的版本保留在 `rejected/`），並補寫那次執行的
   `summary.json`（`killed`）。死後才改過的檔不動；別的 checkout、還活著的執行、已經收尾的執行留下的日誌也不動。
+  它啟動而還在跑的子程序（Maven 連同 surefire fork 的 JVM、opencode session）也不再留著和下一次執行搶同一個
+  `target/` 與 `src/test`：執行中的子程序記在 `children.json`（pid 與啟動時間），下一次執行一開始就結束確定是同一個
+  程序的那些（連同程序群組）；pid 被重用、別台機器、重開機前的紀錄不碰。Windows 上只列出來請人確認。
 - **重跑同一個目標時，接續先前的執行（`UT_RESUME`，預設開啟）。** 資料夾目標一批一個類別、一批幾分鐘到
   半小時；跑到一半被打斷，或有幾批沒過，再跑一次就從第一個類別重來，已通過的幾個小時重做一遍。現在每一批
   通過時把類別原始碼、它的測試檔與那批 writer 寫的其他檔的 sha256、reviewer 的分數與 rubric 記進該次 artifacts

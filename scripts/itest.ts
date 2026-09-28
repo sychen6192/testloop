@@ -380,6 +380,14 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
         age(root);
       }
       const firstRel = path.relative(root, run.runDir);
+      if (sc.rerun.rewrite) {
+        const p = path.join(root, sc.rerun.rewrite.file.replace("{{firstRun}}", firstRel));
+        try {
+          fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(sc.rerun.rewrite.from, sc.rerun.rewrite.to));
+        } catch {
+          /* not there: the checks say what is missing */
+        }
+      }
       for (const [key, content] of Object.entries(sc.rerun.between ?? {})) {
         const rel = key.replace("{{firstRun}}", firstRel);
         const p = path.join(root, rel);
@@ -1740,6 +1748,11 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("src/test 只留通過 gate 的測試", c.exists("src/test/java/com/x/CalcTest.java") && !c.exists("src/test/java/com/x/GreeterTest.java"));
     check("中斷那批的嘗試保留在 rejected/", c.runExists("batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java"));
     check("中斷那批已經撤回：它的復原日誌刪掉", !c.runExists("batch-2-Greeter/inflight") && !c.runExists("batch-1-Calc/inflight"));
+    check(
+      "被中斷時收掉了建置：子程序紀錄是空的（下一次執行不必再找）",
+      JSON.parse(c.runRead("children.json") || '{"children":["missing"]}').children.length === 0,
+      c.runRead("children.json"),
+    );
     check("沒跑的 Zeta 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"), JSON.stringify(c.result.notRun));
   },
 
@@ -2049,6 +2062,44 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
     check("它改過的 ExistingTest.java 也算在撤回裡", (rb.restored ?? []).includes("java/com/x/ExistingTest.java"), JSON.stringify(rb));
   },
+  "loop-killed-orphan-build": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("第一次被終止時，建置本身還在跑（孤兒）", pid > 0, c.read(".itest/orphan.pid"));
+      check("重跑一開始就結束它", pid > 0 && !pidAlive(pid), `pid ${pid} 還在`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+      const stoppedAt = c.stdout.indexOf("還在跑的子程序");
+      const rolledBackAt = c.stdout.indexOf("被強制終止，沒來得及撤回");
+      check(
+        "先結束還在跑的子程序、才撤回那批（還在寫檔的建置或 agent 會跟撤回搶）",
+        stoppedAt >= 0 && rolledBackAt > stoppedAt,
+        `stop@${stoppedAt} rollback@${rolledBackAt}`,
+      );
+      check("處理過的子程序紀錄移除（之後那些 pid 可能是任何人的）", !fs.existsSync(firstRunFile(c, "children.json")));
+      killedRecovered(c, { restored: true });
+      check("這次執行結束時，自己的子程序紀錄是空的", JSON.parse(c.runRead("children.json") || "{}").children?.length === 0, c.runRead("children.json"));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-fork": (c) => {
+    if (process.platform === "win32") return;
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("建置自己結束了，它 fork 出去的程序還在它的程序群組裡", pid > 0, c.read(".itest/orphan.pid"));
+      check("重跑結束了那個程序群組", pid > 0 && !pidAlive(pid), `pid ${pid} 還在`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-pid-reused": (c) => orphanLeftAlone(c, { recordKept: false }),
+  "loop-killed-orphan-other-checkout": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-other-host": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-rebooted": (c) => orphanLeftAlone(c, { recordKept: true }),
+  // Its record is that run's own, still in use: not ours to remove either.
+  "loop-killed-orphan-owner-alive": (c) => orphanLeftAlone(c, { recordKept: true }),
   "loop-killed-mid-build": (c) => {
     if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
     killedRecovered(c, { restored: true });
@@ -2110,6 +2161,46 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
 };
 
 // ─── Killed-run helpers ──────────────────────────────────────────────────────
+
+// Running: there, and not a zombie — a killed orphan waits to be reaped by a pid 1 that may be slow to.
+const pidAlive = (pid: number) => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return !/^[ZX]$/.test(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]);
+  } catch {
+    /* no such process — or no /proc: ask the kernel */
+  }
+  try {
+    process.kill(pid, 0);
+    return process.platform !== "linux";
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+/** The rerun had no business stopping the process the killed run's record names: it is still running. */
+function orphanLeftAlone(c: Ctx, o: { recordKept: boolean }): void {
+  if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+  const pid = Number(c.read(".itest/orphan.pid"));
+  try {
+    check("那個程序沒有被結束：還活著", pid > 0 && pidAlive(pid), `pid ${pid}`);
+    check("沒有說結束了什麼", !c.stdout.includes("還在跑的子程序"), c.stdout.slice(0, 2000));
+    check(
+      o.recordKept ? "不是這次能處理的紀錄（別的 checkout、機器、開機，或主人還活著）：原樣留著" : "看過的紀錄移除（之後那些 pid 可能是任何人的）",
+      fs.existsSync(firstRunFile(c, "children.json")) === o.recordKept,
+    );
+  } finally {
+    stopPid(pid);
+  }
+}
+
+/** A scenario's orphan does not outlive its checks, whatever they found. */
+const stopPid = (pid: number) => {
+  try {
+    if (pid > 0) process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+};
 
 const KILLED_LINE = "the killed writer was here";
 const firstRunFile = (c: Ctx, rel: string) => path.join(c.first?.runDir ?? "/nonexistent", rel);
