@@ -537,6 +537,35 @@ const resumeCalc = (o: {
   mvn: [...(o.mvnFirst ?? [BASE_EXISTING, CALC_BUILD]), ...(o.rerunMvn ?? [CALC_BUILD, CALC_BUILD])],
 });
 
+
+// ── A run killed outright (libs/batch.ts journal, loop.ts recoverKilledBatches) ─────────────────
+// Calc passes as batch 1; batch 2's writer writes GreeterTest and edits ExistingTest, and the run is
+// killed — no handler runs, nothing is set aside. The rerun finds the journal and finishes the job.
+const KILLED_WRITES: ApiTurn = {
+  toolCalls: [
+    { name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } },
+    { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// the killed writer was here\n` } },
+  ],
+};
+const GREETER_ROUND = {
+  ...CALC_BUILD,
+  surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"),
+  jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+};
+const killedMidWriter = (o: { name: string; desc: string; rerun?: Omit<NonNullable<Scenario["rerun"]>, "api"> }): Scenario => ({
+  name: o.name,
+  desc: o.desc,
+  entry: "loop",
+  env: { UT_SKIP_REVIEW: "1" },
+  extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+  api: [...RESUME_WRITE_CALC, KILLED_WRITES, { kill: true }],
+  rerun: {
+    ...o.rerun,
+    api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+  },
+  mvn: [BASE_EXISTING, CALC_BUILD, CALC_BUILD, GREETER_ROUND],
+});
+
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
   {
@@ -3593,6 +3622,50 @@ export const SCENARIOS: Scenario[] = [
         surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest", "com.x.ZetaTest"),
         jacoco: [JACOCO_GREEN, JACOCO_GREETER, JACOCO_ZETA],
       },
+    ],
+  },
+  // ── A run killed outright ──────────────────────────────────────────────────
+  killedMidWriter({
+    name: "loop-killed-mid-writer",
+    desc: "第 2 批的 writer 寫到一半、run 被 SIGKILL（沒有任何收尾）→ 重跑先依復原日誌撤回那批的變更，補寫上一次的 summary，再接續",
+  }),
+  killedMidWriter({
+    name: "loop-killed-edit-after-death",
+    desc: "同上，但 run 死掉之後有人手動改了 ExistingTest.java → 那是死後才改的、不是 writer 的，留著；writer 寫的 GreeterTest 照樣撤回",
+    rerun: { backdateMs: 600_000, between: { [EXISTING_PATH]: `${EXISTING_TEST}// fixed by hand after the crash\n` } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-batch-recorded",
+    desc: "被終止時那批已經記進 batches.json（通過或已撤回）→ 只剩日誌，不再撤回，只補寫 summary",
+    rerun: { between: { "{{firstRun}}/batches.json": '[{"batch":1,"success":true},{"batch":2,"success":true}]' } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-other-checkout",
+    desc: "復原日誌屬於共用 runs 目錄的另一個 checkout（repo 路徑不同）→ 不是這個 repo 的，完全不碰",
+    rerun: { between: { "{{firstRun}}/batch-2-Greeter/inflight/owner.json": '{"repoRoot":"/elsewhere","pid":1}' } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-run-ended",
+    desc: "日誌還在、但那次執行其實有收尾（有 summary.json）→ 日誌是剩下的，丟掉，不撤回也不改它的 summary",
+    rerun: { between: { "{{firstRun}}/summary.json": '{"success":false,"stopReason":"interrupted:SIGHUP"}' } },
+  }),
+  {
+    name: "loop-killed-mid-build",
+    desc: "第 2 批的 writer 已經寫完、run 在建置途中被 SIGKILL → 重跑依日誌記下的 writer 變更撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [...RESUME_WRITE_CALC, KILLED_WRITES, { content: "已建立 GreeterTest.java" }],
+    rerun: {
+      api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      // A test writes into src/test while it runs — then the run is killed.
+      { exit: 0, killLoop: true, writeFiles: { "src/test/resources/written-by-a-test.txt": "output\n" } },
+      CALC_BUILD,
+      GREETER_ROUND,
     ],
   },
 ];

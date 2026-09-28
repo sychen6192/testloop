@@ -96,7 +96,24 @@ import {
 import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { acquireRepoLock, holderAlive, repoLockFile } from "../libs/lock";
-import { batchFailureFingerprint, captureOutputs, captureTree, chunk, removeBatchOutputs, rollbackTree, testOutputDirs } from "../libs/batch";
+import {
+  batchFailureFingerprint,
+  captureOutputs,
+  captureTree,
+  chunk,
+  closeJournal,
+  findJournals,
+  journalCapture,
+  journalOutputs,
+  killedWriterChanges,
+  mayBeRunning,
+  openJournal,
+  removeBatchOutputs,
+  rollbackTree,
+  testOutputDirs,
+  thisHost,
+  traceJournal,
+} from "../libs/batch";
 import {
   closeEncodingView,
   escapeNonAscii,
@@ -5227,6 +5244,110 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
       testClassOf("m/src/test/javax/FooTest.java", "m/src/test/java") === undefined,
   );
   check("testClassOf：模組就是 repo 根", testClassOf("src/test/java/FooTest.java", "src/test/java") === "FooTest");
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日誌）");
+{
+  const here = { host: "box", boot: 29_000_000 };
+  const alive = (pid: number) => pid === 4242;
+  const now = 1_000_000_000_000;
+  const fresh = now - 60_000;
+  const old = now - 10 * 60_000;
+  const stale = 5 * 60_000;
+  check("mayBeRunning：同一台、同一次開機、pid 還在、心跳新鮮 → 可能還在跑", mayBeRunning({ host: "box", boot: 29_000_000, pid: 4242 }, fresh, here, alive, now, stale));
+  check("mayBeRunning：pid 已經不在 → 已經死了", !mayBeRunning({ host: "box", boot: 29_000_000, pid: 4243 }, fresh, here, alive, now, stale));
+  check("mayBeRunning：pid 在但心跳停了很久（pid 被別的程序重用）→ 已經死了", !mayBeRunning({ host: "box", boot: 29_000_000, pid: 4242 }, old, here, alive, now, stale));
+  check(
+    "mayBeRunning：pid 就是自己的（容器裡 pid 從頭編號）→ 那次執行不可能是自己，已經死了",
+    !mayBeRunning({ host: "box", boot: 29_000_000, pid: process.pid }, fresh, here, () => true, now, stale),
+  );
+  check("mayBeRunning：重開機過（開機時間差兩分鐘以上）→ 已經死了", !mayBeRunning({ host: "box", boot: 28_000_000, pid: 4242 }, fresh, here, alive, now, stale));
+  check("mayBeRunning：開機時間的誤差在兩分鐘內 → 同一次開機", mayBeRunning({ host: "box", boot: 29_000_001, pid: 4242 }, fresh, here, alive, now, stale));
+  check("mayBeRunning：沒記開機時間 → 不能拿 pid 判斷，當作已經死了", !mayBeRunning({ host: "box", pid: 4242 }, fresh, here, alive, now, stale));
+  check(
+    "mayBeRunning：別台機器（共用的 runs 目錄）→ 只看心跳：新鮮就可能還在跑，停了就死了",
+    mayBeRunning({ host: "other", boot: 29_000_000, pid: 1 }, fresh, here, alive, now, stale) &&
+      !mayBeRunning({ host: "other", boot: 29_000_000, pid: 1 }, old, here, alive, now, stale),
+  );
+
+  const dead = { trace: { written: ["java/com/x/A.java", "java/com/x/B.java"], session: { "java/com/x/C.java": "1:1", "java/com/x/D.java": "1:1" } }, lastSeen: 5_000 };
+  const nowTree = { "java/com/x/A.java": "2:2", "java/com/x/B.java": "2:2", "java/com/x/C.java": "1:1", "java/com/x/E.java": "3:3" };
+  const mtimes: Record<string, number> = { "java/com/x/A.java": 4_000, "java/com/x/B.java": 5_000 + 60_000 + 1, "java/com/x/E.java": 5_500 };
+  const changed = killedWriterChanges(dead, nowTree, (rel) => mtimes[rel], 60_000);
+  check(
+    "killedWriterChanges：日誌記下的，加上開著的 session 之後的差異（新增的、刪掉的）；死後才改的（超過心跳加寬限）不算",
+    JSON.stringify([...changed].sort()) === JSON.stringify(["java/com/x/A.java", "java/com/x/D.java", "java/com/x/E.java"]),
+    JSON.stringify([...changed].sort()),
+  );
+  check(
+    "killedWriterChanges：沒有開著的 session → 只有日誌記下的",
+    JSON.stringify([...killedWriterChanges({ trace: { written: ["java/X.java"] }, lastSeen: 0 }, nowTree, () => undefined, 0)]) === '["java/X.java"]',
+  );
+
+  // A journal written and read back: what setAside needs, from disk.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-journal-"));
+  const tree = path.join(root, "repo", "src", "test");
+  fs.mkdirSync(path.join(tree, "java", "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "ATest.java"), "class ATest {}");
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "Big.json"), "x".repeat(64));
+  const out = path.join(root, "repo", "target", "test-classes");
+  fs.mkdirSync(path.join(out, "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(out, "com", "x", "ATest.class"), "cafebabe");
+  const cap = captureTree(tree, { file: 32, total: 1024 });
+  const runs = path.join(root, "runs");
+  const runDir = path.join(runs, "2026-01-01T00-00-00-000Z");
+  const batchDir = path.join(runDir, "batch-2-A");
+  const repoRoot = path.join(root, "repo");
+  const handle = openJournal(
+    { repoRoot, pid: 4243, ...thisHost(), runDir, batch: 2, dir: batchDir, targetClasses: ["src/main/java/com/x/A.java"], testTree: tree, treeRel: "src/test" },
+    cap,
+    captureOutputs([out]),
+    50,
+  );
+  const jdir = handle.dir;
+  traceJournal(handle, { written: ["java/com/x/ATest.java"] });
+  // The heartbeat: the journal's time moves while its run lives, and stops once it is closed.
+  const t0 = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(path.join(jdir, "journal.json"), t0, t0);
+  const beatWait = Date.now() + 2_000;
+  while (fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000 && Date.now() < beatWait) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  check("openJournal：心跳在執行期間更新日誌的時間", fs.statSync(path.join(jdir, "journal.json")).mtimeMs > t0.getTime() + 1_000);
+  const found = findJournals(runs, repoRoot, () => false);
+  const d = found.dead[0];
+  check("findJournals：死掉的 run 留下的日誌找得到，連同 writer 的變更", found.dead.length === 1 && d.trace.written[0] === "java/com/x/ATest.java", JSON.stringify(found));
+  const back = d ? journalCapture(d) : undefined;
+  check(
+    "journalCapture：批次開始時的樹原樣讀回（內容、太大沒留的指紋、目錄）",
+    !!back &&
+      back.files.get("java/com/x/ATest.java")?.toString() === "class ATest {}" &&
+      back.files.get("java/com/x/Big.json") === null &&
+      back.fingerprints.get("java/com/x/Big.json") === cap.fingerprints.get("java/com/x/Big.json") &&
+      back.dirs.has("java/com/x") &&
+      back.root === tree,
+  );
+  check("journalOutputs：建置輸出的清單讀回", !!d && [...journalOutputs(d).dirs[0].files].includes("com/x/ATest.class"));
+  check("findJournals：別的 repo 路徑的日誌不理（不算死的、也不丟）", JSON.stringify(findJournals(runs, "/elsewhere", () => false)) === '{"dead":[],"stale":[],"running":0}');
+  check("findJournals：那次執行還活著（pid 在、心跳新鮮）→ 只計數，不動", findJournals(runs, repoRoot, (pid) => pid === 4243).running === 1);
+  fs.writeFileSync(path.join(runDir, "summary.json"), "{}");
+  const ended = findJournals(runs, repoRoot, () => false);
+  check("findJournals：那次執行有 summary.json（有收尾）→ 日誌是剩下的，列為可丟", ended.dead.length === 0 && ended.stale[0] === jdir, JSON.stringify(ended));
+  fs.rmSync(path.join(runDir, "summary.json"));
+  fs.rmSync(path.join(jdir, "journal.json"));
+  const cut = findJournals(runs, repoRoot, () => false);
+  check("findJournals：寫到一半就被終止的日誌（沒有 journal.json）→ 可丟", cut.dead.length === 0 && cut.stale[0] === jdir, JSON.stringify(cut));
+  check("findJournals：寫到一半、但寫它的執行還活著 → 不丟", findJournals(runs, repoRoot, (pid) => pid === 4243).running === 1);
+  fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ version: 99, repoRoot, pid: 4243, runDir }));
+  check("findJournals：別的版本寫的日誌 → 不理", JSON.stringify(findJournals(runs, repoRoot, () => false)) === '{"dead":[],"stale":[],"running":0}');
+  closeJournal(handle);
+  check("closeJournal：日誌目錄刪掉", !fs.existsSync(jdir));
+  fs.mkdirSync(jdir, { recursive: true });
+  fs.writeFileSync(path.join(jdir, "journal.json"), "{}");
+  fs.utimesSync(path.join(jdir, "journal.json"), t0, t0);
+  await new Promise((r) => setTimeout(r, 200));
+  check("closeJournal：心跳跟著停（不再碰同一個路徑）", fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000);
   fs.rmSync(root, { recursive: true, force: true });
 }
 

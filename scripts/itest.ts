@@ -177,6 +177,14 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
           /* no run holds the lock: the checks will say so */
         }
       }
+      // A hard kill, on every platform: Windows' process.kill is TerminateProcess, which is exactly that.
+      if (turn.kill) {
+        try {
+          process.kill(JSON.parse(fs.readFileSync(repoLockPath(root), "utf8")).pid, "SIGKILL");
+        } catch {
+          /* no run holds the lock: the checks will say so */
+        }
+      }
       for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
         fs.writeFileSync(path.join(root, rel), content);
@@ -360,7 +368,20 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
       first = { result: run.result, runDir: run.runDir, code: run.out.code, stdout: run.out.stdout };
       // What the api log holds from here on is the second run's.
       fs.rmSync(path.join(root, ".itest", "api-requests.jsonl"), { force: true });
-      for (const [rel, content] of Object.entries(sc.rerun.between ?? {})) {
+      if (sc.rerun.backdateMs) {
+        const t = (Date.now() - sc.rerun.backdateMs) / 1000;
+        const age = (d: string) => {
+          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            const p = path.join(d, e.name);
+            if (e.isDirectory()) age(p);
+            else if (e.isFile()) fs.utimesSync(p, t, t);
+          }
+        };
+        age(root);
+      }
+      const firstRel = path.relative(root, run.runDir);
+      for (const [key, content] of Object.entries(sc.rerun.between ?? {})) {
+        const rel = key.replace("{{firstRun}}", firstRel);
         const p = path.join(root, rel);
         if (content === null) fs.rmSync(p, { force: true });
         else {
@@ -1590,6 +1611,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("每批各自的 prompt 只含自己的類別", p2.includes("Greeter.java") && !p2.includes("Calc.java"), p2.slice(0, 600));
     check("建置 3 次：預檢 + 第 1 批 + 第 2 批", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
     check("逐批進度落地在 batches.json", c.runRead("batches.json").includes("Greeter.java"));
+    check("兩批都結束了（一批撤回、一批通過）：沒有留下復原日誌", !c.runExists("batch-1-Calc/inflight") && !c.runExists("batch-2-Greeter/inflight"));
   },
 
   "loop-batches-all-pass": (c) => {
@@ -1599,6 +1621,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("兩批都通過、都沒有撤回", b.length === 2 && b.every((x) => x.success === true && !x.rolledBack), JSON.stringify(b));
     check("兩個測試檔都在", c.exists("src/test/java/com/x/CalcTest.java") && c.exists("src/test/java/com/x/GreeterTest.java"));
     check("沒有 rejected 目錄", !c.runExists("batch-1-Calc/rejected") && !c.runExists("batch-2-Greeter/rejected"));
+    check("通過的批次不留復原日誌", !c.runExists("batch-1-Calc/inflight") && !c.runExists("batch-2-Greeter/inflight"));
     const params = JSON.parse(c.runRead("params.json") || "{}");
     check("params.json 記錄 batchSize", params.batchSize === 1, String(params.batchSize));
   },
@@ -1716,6 +1739,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
     check("src/test 只留通過 gate 的測試", c.exists("src/test/java/com/x/CalcTest.java") && !c.exists("src/test/java/com/x/GreeterTest.java"));
     check("中斷那批的嘗試保留在 rejected/", c.runExists("batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java"));
+    check("中斷那批已經撤回：它的復原日誌刪掉", !c.runExists("batch-2-Greeter/inflight") && !c.runExists("batch-1-Calc/inflight"));
     check("沒跑的 Zeta 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"), JSON.stringify(c.result.notRun));
   },
 
@@ -2019,6 +2043,54 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("Calc 的通過紀錄已帶進這次的 passed.json", ledgerOf(c.runDir).some((e) => e.cls === "src/main/java/com/x/Calc.java"));
   },
 
+  // ── A run killed outright ──────────────────────────────────────────────────
+  "loop-killed-mid-writer": (c) => {
+    killedRecovered(c, { restored: true });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check("它改過的 ExistingTest.java 也算在撤回裡", (rb.restored ?? []).includes("java/com/x/ExistingTest.java"), JSON.stringify(rb));
+  },
+  "loop-killed-mid-build": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    killedRecovered(c, { restored: true });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "建置時測試寫進 src/test 的檔不是 writer 的：留著，列為別人的變更",
+      c.exists("src/test/resources/written-by-a-test.txt") && (rb.foreign ?? []).includes("resources/written-by-a-test.txt"),
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-edit-after-death": (c) => {
+    killedRecovered(c, { restored: false });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "rollback.md 說它是那次執行被終止之後才改的",
+      firstRunRead(c, "batch-2-Greeter/rollback.md").includes("在那次執行被終止之後才改過"),
+    );
+    check(
+      "死後才改的 ExistingTest.java 不是 writer 的：留著，列為別人的變更",
+      c.read("src/test/java/com/x/ExistingTest.java").includes("fixed by hand after the crash") &&
+        (rb.foreign ?? []).includes("java/com/x/ExistingTest.java") &&
+        !(rb.restored ?? []).includes("java/com/x/ExistingTest.java"),
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-batch-recorded": (c) => {
+    killedLeftAlone(c);
+    const sum = firstSummary(c);
+    check("仍然補寫 summary：killed，但沒有 inProgress（那批已經有紀錄）", sum?.stopReason === "killed" && !sum?.inProgress, JSON.stringify(sum));
+    check("日誌用完就移除", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  },
+  "loop-killed-other-checkout": (c) => {
+    killedLeftAlone(c);
+    check("另一個 checkout 的日誌原樣留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("也不替它寫 summary", firstSummary(c) === undefined, JSON.stringify(firstSummary(c)));
+  },
+  "loop-killed-run-ended": (c) => {
+    killedLeftAlone(c);
+    check("那次執行自己的 summary 不動", firstSummary(c)?.stopReason === "interrupted:SIGHUP", JSON.stringify(firstSummary(c)));
+    check("剩下的日誌丟掉", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  },
+
   "loop-resume-after-interrupt": (c) => {
     if (process.platform === "win32") return; // the fake build signals the loop by its pid
     check("第一次在第 2 批被 Ctrl-C 中斷", c.first?.result.stopReason === "interrupted:SIGINT", String(c.first?.result.stopReason));
@@ -2036,6 +2108,60 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("三個測試檔都在", ["CalcTest", "GreeterTest", "ZetaTest"].every((t) => c.exists(`src/test/java/com/x/${t}.java`)));
   },
 };
+
+// ─── Killed-run helpers ──────────────────────────────────────────────────────
+
+const KILLED_LINE = "the killed writer was here";
+const firstRunFile = (c: Ctx, rel: string) => path.join(c.first?.runDir ?? "/nonexistent", rel);
+const firstRunRead = (c: Ctx, rel: string) => {
+  try {
+    return fs.readFileSync(firstRunFile(c, rel), "utf8");
+  } catch {
+    return "";
+  }
+};
+const firstSummary = (c: Ctx): Record<string, any> | undefined => {
+  try {
+    return JSON.parse(fs.readFileSync(firstRunFile(c, "summary.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/** The rerun set the killed batch aside from its journal, then went on as usual. */
+function killedRecovered(c: Ctx, o: { restored: boolean }): void {
+  check("第一次執行被強制終止：它自己沒有留下 summary", !c.first?.result.stopReason, JSON.stringify(c.first?.result));
+  const sum = firstSummary(c);
+  check(
+    "重跑替它補寫 summary：stopReason=killed、由這次執行收尾、被終止的是第 2 批",
+    sum?.stopReason === "killed" && sum?.recoveredBy === c.runDir && sum?.inProgress?.batch === 2,
+    JSON.stringify(sum),
+  );
+  const rb = sum?.inProgress?.rolledBack ?? {};
+  check("writer 新增的 GreeterTest.java 移出 src/test", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+  check(
+    "嘗試的版本保留在那批的 rejected/",
+    fs.existsSync(firstRunFile(c, "batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java")),
+  );
+  if (o.restored) {
+    check("writer 改過的 ExistingTest.java 還原成原本的內容", c.read("src/test/java/com/x/ExistingTest.java") === EXISTING_TEST, c.read("src/test/java/com/x/ExistingTest.java"));
+  }
+  check(
+    "rollback.md 寫在那批的 artifacts，說明是被強制終止後由下一次執行撤回的",
+    firstRunRead(c, "batch-2-Greeter/rollback.md").includes("被強制終止"),
+  );
+  check("復原日誌用完就移除", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  check("log 說明撤回了哪一次的哪一批", c.stdout.includes("第 2 批（Greeter）被強制終止"), c.stdout.slice(0, 1500));
+  check("重跑照常接續 Calc、完成 Greeter", c.code === 0 && c.result.success === true && JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', `code=${c.code} ${String(c.result.stopReason)} ${JSON.stringify(c.result.resumed)}\n${c.stdout.slice(-600)}`);
+}
+
+/** The journal was not this rerun's to act on: nothing of the killed batch was undone. */
+function killedLeftAlone(c: Ctx): void {
+  check("被終止那批改過的 ExistingTest.java 沒有被撤回", c.read("src/test/java/com/x/ExistingTest.java").includes(KILLED_LINE));
+  check("沒有撤回：那批沒有 rollback.md", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/rollback.md")));
+  check("沒有說撤回了什麼", !c.stdout.includes("被強制終止"), c.stdout.slice(0, 1500));
+  check("重跑照常完成", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-600)}`);
+}
 
 // ─── Resume helpers ──────────────────────────────────────────────────────────
 

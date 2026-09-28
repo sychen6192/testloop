@@ -123,6 +123,8 @@ export interface OrchestratorConfig {
 export interface WriterTrace {
   written: Set<string>;
   inSession?: { root: string; before: TreeSnapshot };
+  /** Called when either of the above changes: the batch keeps them on disk for a run killed outright. */
+  onChange?: () => void;
 }
 
 /** The writer's changes so far, those of a session still open (or cut short) included. */
@@ -540,7 +542,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
     // Taken before the view opens and after it closes: what the round changed, net of the view.
     const before = snapshotTree(writableTree);
-    if (cfg.trace) cfg.trace.inSession = { root: writableTree, before };
+    if (cfg.trace) {
+      cfg.trace.inSession = { root: writableTree, before };
+      cfg.trace.onChange?.();
+    }
     const protectedBefore = snapshotProtected();
     const encView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
     const targetSources = targetSourceViews(sourceEncoding, cfg.targetClasses);
@@ -580,6 +585,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     if (cfg.trace) {
       rawChanged.forEach((f) => cfg.trace!.written.add(f));
       cfg.trace.inSession = undefined;
+      cfg.trace.onChange?.();
     }
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;

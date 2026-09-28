@@ -18,6 +18,7 @@ loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ �
         │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
         │  測試相依量測（measureTestStack：surefire classpath，退回 pom）與原始碼編碼量測
         │    （measureSourceEncoding：pom，退回 build log 的平台編碼）→ 寫進 prompt
+        │  被強制終止的 run 留下的批次復原日誌 → 先替它撤回（libs/batch.ts，在預檢之前）
         │  接續（libs/resume.ts）：先前已通過、類別與測試都沒變、預檢中照樣通過的類別不再產生
         │  資料夾目標 → 依 UT_BATCH_SIZE 分批，每批一個完整的 orchestrate；
         │    沒通過的批次撤回它對 src/test 的變更（保留在 batch-NN/rejected/）
@@ -406,6 +407,41 @@ production code 上）、連續兩批以同一個 `writer-no-op` 或 `reviewer-u
 
 **沒有做的。** 被 SIGKILL 的 run（沒有機會撤回正在跑的那一批）留在 `src/test` 的半成品不處理：它不在任何紀錄裡，
 那個類別照常重新產生；它讓預檢紅燈時由修復迴圈處理，與以前相同。
+
+## 已採納：替被強制終止的 run 收尾（2026-09-28）
+
+**問題。** 失敗或被中斷（Ctrl-C、SIGTERM、SIGHUP、crash）的批次由執行它的程序撤回——前提是程序活著做完這件事。
+被強制終止的就沒有：OOM killer 的 SIGKILL、`kill -9`、斷電、被取消的 CI job，以及 Windows 關掉主控台視窗
+（Node 收到 SIGHUP 後約 10 秒就被結束，而收尾要先等 `taskkill` 收掉程序樹）。那一批 writer 寫到一半的測試
+留在 `src/test`，下一次執行把它當既有測試：防掏空 guard 不准減少它的 `@Test`、它被當成「既有測試檔」交給
+writer 修改、預檢可能因它而紅，修復迴圈再花幾輪修一個根本沒通過任何 gate 的檔案。
+
+**作法。** 每一批開始時寫一份復原日誌到它的 artifacts（`batch-NN/inflight/`，`libs/batch.ts`）：批次開始時的
+`src/test`（`captureTree` 已經讀進記憶體的內容，照寫一份；太大沒留的只記指紋，與記憶體裡的 capture 同一套限制）、
+建置輸出的清單、以及 writer 目前改過哪些檔與開著的 session 開始時的樹快照（orchestrator 在 session 開始與結束時
+通知，`WriterTrace.onChange`）。程序活著時每 30 秒更新日誌的時間戳（心跳）。批次以任何程序活著的方式結束，日誌
+就刪掉。下一次對同一個 repo 執行，在拿到 repo 鎖、還原編碼視圖之後、預檢之前，找出被終止的 run 留下的日誌，
+用同一個 `setAside` 撤回——撤回的範圍是日誌記下的 writer 變更，加上開著的 session 開始之後的差異——並替那次
+執行補寫 `summary.json`（`killed`）。
+
+**誰的變更。** 撤回只動 writer 改的：最後一次心跳（加一個心跳間隔的寬限）之後才改過的檔，是那次執行死後別人
+改的（多半是開發者的手動修正），原樣留著、列在 `rollback.md`。寬限內的誤判也不會遺失東西：撤回前一律先複製到
+`rejected/`。
+
+**哪些日誌能動。** 日誌記下 repo 的正規化路徑（與 repo 鎖同一個 `canonicalRoot`）、pid、主機名與開機時間。
+別的 repo 路徑（共用 runs 目錄的另一個 checkout）的不碰。持有 repo 鎖時，同一台機器上這個 repo 不會有別的
+執行，但 pid 只在同一台機器、同一次開機才有意義：同一台同一次開機時，pid 還在而且心跳新鮮才當作還活著（pid
+被重用時心跳是舊的）；重開機過就一定已死；別台機器只能等心跳停超過 5 分鐘。那次執行有 `summary.json`（它自己
+收了尾）時，日誌是剩下的，丟掉；日誌寫到一半（沒有 `journal.json`，只有寫在最前面的 owner）而寫它的執行已死，
+也丟掉。
+
+**順序。** 通過的批次先刪日誌、再記進 `passed.json`：兩者之間被終止時兩者都沒有，下一次執行重做那個類別。
+反過來的話，下一次執行會撤回一批通過了所有 gate 的測試。失敗的批次先撤回、再刪日誌：兩者之間被終止時，
+下一次執行照日誌再撤一次，已經還原的檔內容相同、不會再動。那批已經記在 `batches.json` 裡時，日誌只是剩下的，
+不撤回，只補寫 summary。
+
+**沒有做的。** 單一類別的 run 沒通過時本來就不撤回（測試留給人決定），被強制終止也一樣，不寫日誌。修復迴圈
+被中斷時也不撤回（與 Ctrl-C 相同）。
 
 ## 已否決方案（防止重新提案）
 

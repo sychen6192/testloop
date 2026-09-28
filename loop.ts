@@ -35,7 +35,7 @@ import {
 } from "./config";
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
-import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw, codelessTypeReason } from "./libs/utils";
+import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw, codelessTypeReason, snapshotTree } from "./libs/utils";
 import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
@@ -50,11 +50,20 @@ import {
   captureOutputs,
   captureTree,
   chunk,
+  closeJournal,
+  findJournals,
+  journalCapture,
+  JournalHandle,
+  journalOutputs,
+  killedWriterChanges,
+  openJournal,
   OutputCapture,
   removeBatchOutputs,
   rollbackTree,
   RollbackReport,
   testOutputDirs,
+  thisHost,
+  traceJournal,
   TreeCapture,
 } from "./libs/batch";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
@@ -70,7 +79,7 @@ import {
   SourceEncoding,
 } from "./libs/encoding";
 import { installShutdownHandlers, killAll, onShutdown } from "./libs/shell";
-import { acquireRepoLock, LOCK_WAIT_MS } from "./libs/lock";
+import { acquireRepoLock, canonicalRoot, LOCK_HEARTBEAT_MS, LOCK_WAIT_MS } from "./libs/lock";
 import {
   findPass,
   hashFile,
@@ -214,6 +223,8 @@ async function main() {
     log(`[WARN] 上一次執行在轉換編碼途中被終止，已把 ${recovered.length} 個測試檔還原成原本的內容：`);
     recovered.forEach((f) => log(`  - ${path.relative(REPO_ROOT, f)}`));
   }
+  // And a batch a killed run never got to set aside: its writer's half-written tests (libs/batch.ts).
+  recoverKilledBatches(runDir);
   // Ctrl-C, SIGTERM, a hangup on an interactive terminal: the run still leaves a summary that
   // says it was interrupted, rather than a directory that looks like a run still going.
   onShutdown((reason) => {
@@ -837,7 +848,7 @@ interface BatchRun {
   batches: string[][];
   records: BatchRecord[];
   treeRel: string;
-  inFlight?: { index: number; dir: string; start: TreeCapture; outputs: OutputCapture; trace: WriterTrace };
+  inFlight?: { index: number; dir: string; start: TreeCapture; outputs: OutputCapture; trace: WriterTrace; journal?: JournalHandle };
 }
 let batchRun: BatchRun | undefined;
 
@@ -900,7 +911,8 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     const start = captureTree(testTree);
     const outputs = captureOutputs(testOutputDirs(o.mod.moduleRoot, o.buildTool));
     const trace: WriterTrace = { written: new Set<string>() };
-    run.inFlight = { index: i, dir, start, outputs, trace };
+    const journal = openBatchJournal({ runDir: o.runDir, batch: i + 1, dir, targetClasses: batch, testTree, treeRel }, start, outputs, trace);
+    run.inFlight = { index: i, dir, start, outputs, trace, journal };
     const r = await orchestrate({
       targetClasses: batch,
       buildTool: o.buildTool,
@@ -919,6 +931,10 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       ranAtBaseline: ranBefore,
       trace,
     });
+    // A batch that passed is done with its journal before its pass is recorded: killed in between,
+    // the next run finds neither, and the class is written again on top of its tests. The other
+    // order had the next run set aside tests that passed every gate.
+    if (r.success) closeBatchJournal(journal);
     if (r.success && r.ranTests) ranBefore = [...new Set([...(ranBefore ?? []), ...r.ranTests])].sort();
     if (r.success) o.recordPass(batch, trace.written, r.finalVerdict, dir);
     const rec: BatchRecord = {
@@ -937,7 +953,11 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     };
     // A scope violation is left exactly as it is: the changes outside src/test are the reason the
     // run stops, and the test files beside them are part of what a human has to look at.
-    if (!r.success && r.stopReason !== "scope-violation") rec.rolledBack = setAside(dir, start, outputs, treeRel, trace.written);
+    if (!r.success) {
+      if (r.stopReason !== "scope-violation") rec.rolledBack = setAside(dir, start, outputs, treeRel, trace.written);
+      // Set aside — or, a scope violation, left for a human to look at: nothing for a later run to finish.
+      closeBatchJournal(journal);
+    }
     run.inFlight = undefined;
     records.push(rec);
     fs.writeFileSync(path.join(o.runDir, "batches.json"), JSON.stringify(records, stripRaw, 2));
@@ -1079,14 +1099,22 @@ function attentionOf(records: Array<Pick<BatchRecord, "batch" | "stopReason" | "
  * the attempt kept under <batch>/rejected, and the build outputs it left behind removed
  * (libs/batch.ts). undefined when the batch changed nothing.
  */
-function setAside(dir: string, start: TreeCapture, outputs: OutputCapture, treeRel: string, written: Set<string>): SetAside | undefined {
+function setAside(
+  dir: string,
+  start: TreeCapture,
+  outputs: OutputCapture,
+  treeRel: string,
+  written: Set<string>,
+  // Set aside by a later run, for a run that was killed: what it leaves was changed after the kill.
+  killed = false,
+): SetAside | undefined {
   const rejectedDir = path.join(dir, "rejected");
   const rb = rollbackTree(start, rejectedDir, treeRel, written);
   const putBack = [...rb.created, ...rb.restored, ...rb.undeleted];
   const removed = putBack.length ? removeBatchOutputs(outputs, putBack) : [];
   if (!putBack.length && !rb.unrestorable.length && !rb.failed.length && !rb.foreign.length) return undefined;
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "rollback.md"), renderRollback(rb, rejectedDir, treeRel, removed.length));
+  fs.writeFileSync(path.join(dir, "rollback.md"), renderRollback(rb, rejectedDir, treeRel, removed.length, killed));
   log(
     `這批的測試變更已移出 ${treeRel}（新增 ${rb.created.length}、還原 ${rb.restored.length + rb.undeleted.length} 個檔` +
       (removed.length ? `，清掉它留在建置輸出的 ${removed.length} 個檔` : "") +
@@ -1095,8 +1123,128 @@ function setAside(dir: string, start: TreeCapture, outputs: OutputCapture, treeR
   if (rb.unrestorable.length) log(`[WARN] 以下檔案過大、沒有備份，維持這批留下的狀態：${rb.unrestorable.join("、")}`);
   if (rb.notKept.length) log(`[WARN] 以下檔案的嘗試版本沒能保留（已照樣還原）：${rb.notKept.join("、")}`);
   if (rb.failed.length) log(`[FAIL] 以下檔案無法還原：${rb.failed.join("、")}`);
-  if (rb.foreign.length) log(`[WARN] 以下檔案在這批執行期間被 writer 以外的東西改過，沒有撤回：${rb.foreign.join("、")}`);
+  if (rb.foreign.length) log(`[WARN] 以下檔案${foreignWhy(killed)}，沒有撤回：${rb.foreign.join("、")}`);
   return { ...rb, rejectedDir, outputsRemoved: removed.length };
+}
+
+// ─── Runs killed outright ────────────────────────────────────────────────────
+//
+// A batch's journal (libs/batch.ts): written as it starts, gone once it ends in any way the process
+// lives through. One still there belongs to a run that was killed in the middle of that batch, and
+// the next run on the repo — under the repo lock, and once the encoding views are back — sets the
+// batch aside from it, as the killed run would have.
+
+/** The journal of a batch starting; undefined, with a warning, when it cannot be written. */
+function openBatchJournal(
+  j: { runDir: string; batch: number; dir: string; targetClasses: string[]; testTree: string; treeRel: string },
+  start: TreeCapture,
+  outputs: OutputCapture,
+  trace: WriterTrace,
+): JournalHandle | undefined {
+  let journal: JournalHandle;
+  try {
+    journal = openJournal({ ...j, repoRoot: canonicalRoot(REPO_ROOT), pid: process.pid, ...thisHost() }, start, outputs, LOCK_HEARTBEAT_MS);
+  } catch (e) {
+    log(`[WARN] 無法寫入這批的復原日誌（${String(e)}）——程序若被強制終止，下一次執行無法替這批撤回`);
+    return undefined;
+  }
+  trace.onChange = () => {
+    try {
+      traceJournal(journal, { written: [...trace.written], ...(trace.inSession ? { session: trace.inSession.before } : {}) });
+    } catch {
+      /* the journal keeps what it last had: the next run undoes at least that */
+    }
+  };
+  return journal;
+}
+
+function closeBatchJournal(journal: JournalHandle | string | undefined): void {
+  if (!journal) return;
+  try {
+    closeJournal(journal);
+  } catch {
+    /* a later run finds it with its run's summary.json, and throws it away */
+  }
+}
+
+const pidExists = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+function recordedBatches(runDir: string): Array<{ batch: number; success: boolean }> {
+  try {
+    const b = JSON.parse(fs.readFileSync(path.join(runDir, "batches.json"), "utf8"));
+    return Array.isArray(b) ? b : [];
+  } catch {
+    return [];
+  }
+}
+
+function recoverKilledBatches(runDir: string): void {
+  const { dead, stale, running } = findJournals(RUNS_DIR, canonicalRoot(REPO_ROOT), pidExists);
+  for (const j of stale) closeBatchJournal(j);
+  if (running) {
+    log(`[WARN] 有 ${running} 個復原日誌屬於可能還在執行的 testgen（另一台機器共用這個 runs 目錄，且幾分鐘內還有心跳），這次先不處理`);
+  }
+  for (const d of dead) {
+    const j = d.journal;
+    const records = recordedBatches(j.runDir);
+    let rolledBack: SetAside | undefined;
+    // In its run's record: it passed, or was set aside, before the run was killed — only the journal was left.
+    const recorded = records.some((b) => b.batch === j.batch);
+    if (!recorded) {
+      const names = j.targetClasses.map((c) => path.basename(c, ".java")).join("、");
+      log(
+        `[WARN] 上一次執行（${j.runDir}）在第 ${j.batch} 批（${names}）被強制終止，沒來得及撤回這批沒通過 gate 的變更` +
+          `（${new Date(d.lastSeen).toISOString()} 之後就沒有心跳）——這次替它撤回：`,
+      );
+      // What the killed writer changed, less what changed after the run died: that was someone else.
+      const only = killedWriterChanges(
+        d,
+        snapshotTree(j.testTree),
+        (rel) => {
+          try {
+            return fs.statSync(path.join(j.testTree, rel)).mtimeMs;
+          } catch {
+            return undefined;
+          }
+        },
+        2 * LOCK_HEARTBEAT_MS,
+      );
+      try {
+        rolledBack = setAside(j.dir, journalCapture(d), journalOutputs(d), j.treeRel, only, true);
+      } catch (e) {
+        log(`[WARN] 撤回沒有完成（${String(e)}）——復原日誌留著，下一次執行再試：${d.path}`);
+        continue;
+      }
+      if (!rolledBack) log("  （這批沒有留下要撤回的變更）");
+    }
+    // Its run left no summary: without one, its artifacts look like a run still going.
+    try {
+      fs.writeFileSync(
+        path.join(j.runDir, "summary.json"),
+        JSON.stringify(
+          {
+            success: false,
+            stopReason: "killed",
+            recoveredBy: runDir,
+            batches: records,
+            ...(recorded ? {} : { inProgress: { batch: j.batch, targetClasses: j.targetClasses, dir: j.dir, rolledBack: rolledBack ?? null } }),
+          },
+          stripRaw,
+          2,
+        ),
+      );
+    } catch {
+      /* its artifacts are gone or read-only: the rollback is what mattered */
+    }
+    closeBatchJournal(d.path);
+  }
 }
 
 // The interrupt and crash paths: the batch that was cut short is set aside like a failed one — its
@@ -1115,6 +1263,8 @@ function batchShutdownState(): Record<string, unknown> {
       // A writer session the interrupt or the crash cut short: what it wrote so far is its too.
       rolledBack = setAside(f.dir, f.start, f.outputs, run.treeRel, writerChangesSoFar(f.trace)) ?? null;
       if (rolledBack) attention.push(...attentionOf([{ batch: f.index + 1, stopReason: "interrupted", dir: f.dir, rolledBack }]));
+      // Kept when the rollback did not finish: the next run on the repo finishes it from the journal.
+      closeBatchJournal(f.journal);
     } catch (e) {
       rolledBack = { error: String(e) };
       attention.push(`第 ${f.index + 1} 批的撤回沒有完成：${String(e)}`);
@@ -1130,11 +1280,16 @@ function batchShutdownState(): Record<string, unknown> {
   };
 }
 
-function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string, outputsRemoved: number): string {
+const foreignWhy = (killed: boolean) =>
+  killed ? "在那次執行被終止之後才改過（不是那批的 writer 改的）" : "在這批執行期間被 writer 以外的東西改過";
+
+function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string, outputsRemoved: number, killed = false): string {
   const list = (title: string, files: string[]) =>
     files.length ? [`${title}：`, ...files.map((f) => `  - ${treeRel}/${f}`)] : [];
   return [
-    `這批沒有通過所有 gate，它對 ${treeRel} 的變更已撤回，嘗試的版本保留在：`,
+    killed
+      ? `這批在執行途中被強制終止，沒來得及撤回；下一次執行依它的復原日誌撤回了它對 ${treeRel} 的變更，嘗試的版本保留在：`
+      : `這批沒有通過所有 gate，它對 ${treeRel} 的變更已撤回，嘗試的版本保留在：`,
     `  ${rejectedDir}`,
     "（依原本的 repo 相對路徑存放，要採用時整個複製回 repo 即可）",
     "",
@@ -1144,7 +1299,7 @@ function renderRollback(rb: RollbackReport, rejectedDir: string, treeRel: string
     ...list("過大沒有備份、維持這批留下狀態的檔案", rb.unrestorable),
     ...list("嘗試版本沒能保留（已照樣還原）的檔案", rb.notKept),
     ...list("無法還原的檔案（run 因此停止）", rb.failed),
-    ...list("這批執行期間被 writer 以外的東西改過、沒有撤回的檔案", rb.foreign),
+    ...list(`${foreignWhy(killed)}、沒有撤回的檔案`, rb.foreign),
     ...(outputsRemoved
       ? ["", `另清掉這批留在建置輸出（test-classes）的 ${outputsRemoved} 個檔——下一次建置會從還原後的原始碼重新產生。`]
       : []),

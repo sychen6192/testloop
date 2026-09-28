@@ -30,7 +30,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   `UT_RESUME=0` 關閉）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
-  正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
+  正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
+  斷電）而沒機會撤回的那批，由下一次執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、`recoverKilledBatches`；
+  DESIGN.md「已採納：替被強制終止的 run 收尾」）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
@@ -211,7 +213,7 @@ libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL
 libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手；持有者心跳；等不到就視為忙碌）
 libs/resume.ts        接續先前的執行：通過紀錄（passed.json，類別與測試檔的 sha256、判決）的寫入、讀取與比對
-libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
+libs/batch.ts         資料夾目標分批（chunk）＋批次復原日誌（被強制終止時由下一次執行撤回：openJournal / findJournals / killedWriterChanges）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
 libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）
 libs/java/Transcode.java  JDK 轉碼器（decode / encode / probe；Java 8 相容，執行時編譯並快取在系統暫存目錄）

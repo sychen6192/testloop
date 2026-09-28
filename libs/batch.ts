@@ -6,8 +6,10 @@
 // class that could not be made green ended the run for all of them. loop.ts now runs the
 // maker-checker loop per batch; these helpers are the parts of that which are not control flow.
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { BuildTool } from "./types";
+import { diffSnapshots, TreeSnapshot } from "./utils";
 
 /** Pure: consecutive groups of at most `size` items, in order. */
 export function chunk<T>(items: T[], size: number): T[][] {
@@ -332,6 +334,270 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
     });
   }
   return removed.sort();
+}
+
+// ─── The journal of a batch in flight ────────────────────────────────────────
+//
+// A failed or interrupted batch is set aside by the process running it — when it lives to do it. A
+// run killed outright (the OOM killer, a cancelled CI job, a power cut, a Windows console closed
+// with more to undo than the ten seconds Windows waits) left its writer's half-written tests in
+// src/test, and the next run took them for existing tests: kept by the shrink guard, handed to the
+// writer as the file to edit, the baseline red on them. So while a batch runs, what its rollback
+// needs is on disk: the tree it started from, its build outputs' listing, what its writer has changed
+// and the tree as the open session found it. The next run on the repo finishes the job
+// (loop.ts recoverKilledBatches); a batch that ends in any other way removes its journal.
+
+const JOURNAL_VERSION = 1;
+/** Under the batch's artifacts directory. */
+export const JOURNAL_DIR = "inflight";
+
+/** Where a process runs: its pid means something only on the same host, since the same boot. */
+export interface JournalHost {
+  host: string;
+  /** Boot time, in minutes since the epoch. */
+  boot: number;
+}
+
+export function thisHost(): JournalHost {
+  return { host: os.hostname(), boot: Math.round((Date.now() / 1000 - os.uptime()) / 60) };
+}
+
+export interface BatchJournal extends JournalHost {
+  version: number;
+  /** Canonical (libs/lock.ts canonicalRoot): another checkout sharing the runs directory is not ours to undo. */
+  repoRoot: string;
+  pid: number;
+  runDir: string;
+  batch: number;
+  /** The batch's artifacts. */
+  dir: string;
+  targetClasses: string[];
+  /** The test tree, absolute, and as the run shows it (repo-relative). */
+  testTree: string;
+  treeRel: string;
+  capture: { kept: string[]; tooLarge: Record<string, string>; dirs: string[] };
+  outputs: Array<{ dir: string; files: string[] }>;
+}
+
+/** What the writer has changed so far (relative to the test tree), and the tree as its open session found it. */
+export interface JournalTrace {
+  written: string[];
+  session?: TreeSnapshot;
+}
+
+function writeAtomic(file: string, text: string): void {
+  fs.writeFileSync(`${file}.tmp`, text);
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+/** An open journal: its directory, and the heartbeat that keeps its time current while the run lives. */
+export interface JournalHandle {
+  dir: string;
+  beat: ReturnType<typeof setInterval>;
+}
+
+/**
+ * Writes a batch's journal as the batch starts, and starts its heartbeat. Whose it is goes first and
+ * journal.json last: a journal without journal.json was cut short while being written, and the
+ * owner file says whether it is this repo's to throw away. `beatMs`: for the selftest.
+ */
+export function openJournal(
+  j: Omit<BatchJournal, "version" | "capture" | "outputs">,
+  capture: TreeCapture,
+  outputs: OutputCapture,
+  beatMs: number,
+): JournalHandle {
+  const dir = path.join(j.dir, JOURNAL_DIR);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ repoRoot: j.repoRoot, pid: j.pid, host: j.host, boot: j.boot }));
+  const kept: string[] = [];
+  const tooLarge: Record<string, string> = {};
+  for (const [rel, buf] of capture.files) {
+    if (!buf) {
+      tooLarge[rel] = capture.fingerprints.get(rel) ?? "";
+      continue;
+    }
+    const dest = path.join(dir, "start", rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, buf);
+    kept.push(rel);
+  }
+  const journal: BatchJournal = {
+    version: JOURNAL_VERSION,
+    ...j,
+    capture: { kept, tooLarge, dirs: [...capture.dirs] },
+    outputs: outputs.dirs.map((d) => ({ dir: d.dir, files: [...d.files] })),
+  };
+  writeAtomic(path.join(dir, "journal.json"), JSON.stringify(journal));
+  // The run is alive: what the next run compares a change's time against, once this one is killed.
+  const beat = setInterval(() => {
+    const now = new Date();
+    try {
+      fs.utimesSync(path.join(dir, "journal.json"), now, now);
+    } catch {
+      /* gone: the batch has ended */
+    }
+  }, beatMs);
+  beat.unref();
+  return { dir, beat };
+}
+
+/** Records what the writer has changed so far; a session that is open says so. */
+export function traceJournal(h: JournalHandle, trace: JournalTrace): void {
+  writeAtomic(path.join(h.dir, "trace.json"), JSON.stringify(trace));
+}
+
+/** The batch has ended in a way its run lived through: nothing left for a later run to finish. */
+export function closeJournal(h: JournalHandle | string): void {
+  if (typeof h !== "string") clearInterval(h.beat);
+  fs.rmSync(typeof h === "string" ? h : h.dir, { recursive: true, force: true });
+}
+
+export interface DeadBatch {
+  /** The journal's directory. */
+  path: string;
+  journal: BatchJournal;
+  trace: JournalTrace;
+  /** When the run was last known alive: the journal's heartbeat, or its last trace. */
+  lastSeen: number;
+}
+
+const mtimeOrZero = (p: string) => {
+  try {
+    return fs.statSync(p).mtimeMs;
+  } catch {
+    return 0;
+  }
+};
+
+/**
+ * Pure: whether the run that wrote a journal may still be running. The caller holds the repo lock,
+ * so a run of this repo on this machine cannot be — but a pid is only worth asking about on the host
+ * and since the boot it was written on (a machine that rebooted has no run from before), and a run on
+ * another host sharing the runs directory (a volume mounted into two containers) is dead only once it
+ * has stopped beating. `alive(pid)`: whether a process with that pid exists here.
+ */
+export function mayBeRunning(
+  owner: Partial<JournalHost> & { pid?: number },
+  lastSeen: number,
+  here: JournalHost,
+  alive: (pid: number) => boolean,
+  now: number,
+  staleAfterMs: number,
+): boolean {
+  const fresh = now - lastSeen < staleAfterMs;
+  if (owner.host !== here.host) return fresh;
+  if (owner.boot === undefined || Math.abs(owner.boot - here.boot) > 2) return false;
+  return owner.pid !== process.pid && alive(owner.pid ?? -1) && fresh;
+}
+
+/**
+ * The journals this repo's earlier runs left under `runsDir`: batches whose run ended without
+ * setting them aside (see mayBeRunning). Journals whose run did end (it has a summary.json) and
+ * journals cut short are this repo's to throw away: `stale` lists them. Another checkout's journals
+ * are left alone, and so are those of a run that may still be going: `running` counts them.
+ */
+export function findJournals(
+  runsDir: string,
+  repoRoot: string,
+  alive: (pid: number) => boolean,
+  here: JournalHost = thisHost(),
+  now = Date.now(),
+  staleAfterMs = 5 * 60_000,
+): { dead: DeadBatch[]; stale: string[]; running: number } {
+  const dead: DeadBatch[] = [];
+  const stale: string[] = [];
+  let running = 0;
+  const list = (d: string) => {
+    try {
+      return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    } catch {
+      return [];
+    }
+  };
+  for (const run of list(runsDir)) {
+    for (const batch of list(path.join(runsDir, run)).filter((b) => b.startsWith("batch-"))) {
+      const dir = path.join(runsDir, run, batch, JOURNAL_DIR);
+      let owner: Partial<JournalHost> & { repoRoot?: string; pid?: number };
+      try {
+        owner = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf8"));
+      } catch {
+        continue; // none, or not this tool's: not ours to judge
+      }
+      if (owner.repoRoot !== repoRoot) continue;
+      let journal: BatchJournal;
+      try {
+        journal = JSON.parse(fs.readFileSync(path.join(dir, "journal.json"), "utf8"));
+      } catch {
+        // Cut short while being written — or still being written, by a run that is alive.
+        if (mayBeRunning(owner, mtimeOrZero(path.join(dir, "owner.json")), here, alive, now, staleAfterMs)) running++;
+        else stale.push(dir);
+        continue;
+      }
+      if (journal.version !== JOURNAL_VERSION) continue;
+      const lastSeen = Math.max(mtimeOrZero(path.join(dir, "journal.json")), mtimeOrZero(path.join(dir, "trace.json")));
+      if (mayBeRunning(journal, lastSeen, here, alive, now, staleAfterMs)) {
+        running++;
+        continue;
+      }
+      if (fs.existsSync(path.join(journal.runDir, "summary.json"))) {
+        stale.push(dir);
+        continue;
+      }
+      let trace: JournalTrace = { written: [] };
+      try {
+        trace = JSON.parse(fs.readFileSync(path.join(dir, "trace.json"), "utf8"));
+      } catch {
+        /* no writer session had ended or begun */
+      }
+      dead.push({ path: dir, journal, trace, lastSeen });
+    }
+  }
+  return { dead, stale, running };
+}
+
+/** The tree a dead batch started from, as setAside takes it. */
+export function journalCapture(d: DeadBatch): TreeCapture {
+  const files = new Map<string, Buffer | null>();
+  const fingerprints = new Map<string, string>();
+  for (const rel of d.journal.capture.kept) {
+    try {
+      files.set(rel, fs.readFileSync(path.join(d.path, "start", rel)));
+    } catch {
+      files.set(rel, null); // lost from the journal: a change to it can only be reported
+    }
+  }
+  for (const [rel, fp] of Object.entries(d.journal.capture.tooLarge)) {
+    files.set(rel, null);
+    fingerprints.set(rel, fp);
+  }
+  return { root: d.journal.testTree, files, fingerprints, dirs: new Set(d.journal.capture.dirs) };
+}
+
+export function journalOutputs(d: DeadBatch): OutputCapture {
+  return { dirs: d.journal.outputs.map((o) => ({ dir: o.dir, files: new Set(o.files) })) };
+}
+
+/**
+ * Pure: what a killed batch's writer changed — what its journal recorded, and what differs from
+ * the tree its open session started with — less what changed after the run was last seen alive
+ * (with `slackMs` for the heartbeat's interval): that was someone else, after it died, and stays.
+ * `mtimeOf` gives a file's modification time now; undefined when it is gone.
+ */
+export function killedWriterChanges(
+  d: Pick<DeadBatch, "trace" | "lastSeen">,
+  now: TreeSnapshot,
+  mtimeOf: (rel: string) => number | undefined,
+  slackMs: number,
+): Set<string> {
+  const changed = new Set(d.trace.written);
+  if (d.trace.session) for (const rel of diffSnapshots(d.trace.session, now)) changed.add(rel);
+  for (const rel of [...changed]) {
+    const m = mtimeOf(rel);
+    if (m !== undefined && m > d.lastSeen + slackMs) changed.delete(rel);
+  }
+  return changed;
 }
 
 // ─── Across batches ──────────────────────────────────────────────────────────

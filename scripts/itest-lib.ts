@@ -82,6 +82,8 @@ export interface MvnStep {
   failOut?: string;
   /** Sends SIGINT to the process that ran the build (the loop), then waits to be killed: Ctrl-C. */
   interrupt?: boolean;
+  /** SIGKILLs the process that ran the build (the loop) — no handler runs (POSIX): the OOM killer. */
+  killLoop?: boolean;
   /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
    *  a rollback cannot put a file back at, whatever its privileges. */
   pipeDirAt?: string;
@@ -163,8 +165,12 @@ export interface Scenario {
     api?: ApiTurn[];
     /** On top of the scenario's env. */
     env?: Record<string, string>;
-    /** Files written (a string) or deleted (null) between the two runs, repo-relative. */
+    /** Files written (a string) or deleted (null) between the two runs, repo-relative; `{{firstRun}}` in a
+     *  path is the first run's artifacts directory. */
     between?: Record<string, string | null>;
+    /** Every file of the fixture — the first run's artifacts included — made this much older first: the
+     *  first run ended that long ago, and whatever `between` writes happened after it. */
+    backdateMs?: number;
   };
   mvn: MvnStep[];
 }
@@ -185,6 +191,8 @@ export interface ApiTurn {
   sideWrite?: Record<string, string>;
   /** Ctrl-C while the agent session is running: SIGINT to the run holding the repo's lock. */
   interrupt?: boolean;
+  /** The run holding the repo's lock is SIGKILLed while this turn is served: no handler runs, nothing is undone. */
+  kill?: boolean;
   /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file while
    *  this turn is served: whatever the run writes there next fails — a crash mid-round. */
   breakRunDir?: boolean;
@@ -366,6 +374,10 @@ if (step.interrupt && process.platform !== "win32") {
   process.kill(process.ppid, "SIGINT");
   setTimeout(() => process.exit(0), 60000);
   return;
+}
+if (step.killLoop && process.platform !== "win32") {
+  process.kill(process.ppid, "SIGKILL");
+  process.exit(0);
 }
 
 const sfDir = (mod) => path.join(root, mod || ".", "target", "surefire-reports");

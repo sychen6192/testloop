@@ -247,6 +247,14 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 - **中途按 Ctrl-C（或 crash）**：正在跑的那一批比照失敗批次撤回——它的測試還沒通過任何 gate。writer 的
   session 還沒結束就被打斷（或 session 途中的請求失敗，例如 token 過期）時，它已經寫的檔一樣算它的、一樣撤回。
   `summary.json` 的 `inProgress` 是被中斷的那一批，`notRun` 是還沒輪到的類別。
+- **程序被強制終止**（OOM killer、`kill -9`、斷電、CI job 被取消、Windows 關掉主控台視窗而收尾超過約 10 秒）：
+  沒有機會撤回正在跑的那一批。所以每一批執行期間都在自己的 artifacts 留著一份復原日誌
+  （`batch-NN-<類別>/inflight/`：批次開始時的 `src/test`、建置輸出的清單、writer 改過哪些檔，外加每 30 秒一次的心跳）。
+  下一次對同一個 repo 執行時，一開始就依日誌把那批撤回——和 Ctrl-C 時一樣，嘗試的版本保留在 `rejected/`——
+  並替那次執行補寫 `summary.json`（`stopReason: "killed"`）。最後一次心跳之後才改過的檔不是 writer 的
+  （多半是你在那之後的手動修改），原樣留著並列在 `rollback.md`。批次正常結束時（通過、撤回、scope-violation）
+  日誌就刪掉。沒有這一步時，寫到一半的測試會被下一次執行當成既有測試：防掏空 guard 不准刪它、writer 被要求
+  改它、預檢因它而紅。
 - **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
   變更原樣保留給你檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在
