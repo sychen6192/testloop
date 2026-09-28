@@ -120,7 +120,7 @@ import {
   surefireVersionFromLog,
   surefireProviderFromLog,
 } from "../libs/teststack";
-import { codeOnly, declarationOnlyLines } from "../libs/javasrc";
+import { codeOnly, declarationOnlyLines, decodeUnicodeEscapes } from "../libs/javasrc";
 import { planSpawn, resolveWindowsCommand, findOnPath, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import { runnerConfigProblems } from "../runners/runner";
 import {
@@ -141,6 +141,7 @@ import {
   unfinishedTestClasses,
 } from "../gates/build";
 import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { envKnobsInSource, TESTGEN_ROOT } from "./itest-lib";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
@@ -565,6 +566,24 @@ console.log("\n[9] planSpawn / resolveWindowsCommand / buildInvocation（Windows
     findOnPath("opencode", env, "win32") === shim,
     String(findOnPath("opencode", env, "win32")),
   );
+  {
+    // What libuv finds when planSpawn falls back to the bare name: a quoted PATH entry, the current
+    // directory's .exe. A preflight that refuses those refuses a run that would have started.
+    const exeDir = path.join(tmp, "with space");
+    fs.mkdirSync(exeDir, { recursive: true });
+    fs.writeFileSync(path.join(exeDir, "oc.exe"), "MZ");
+    const cwdDir = path.join(tmp, "cwd");
+    fs.mkdirSync(cwdDir, { recursive: true });
+    fs.writeFileSync(path.join(cwdDir, "local.exe"), "MZ");
+    const quoted = { PATH: `${path.join(tmp, "nope")};"${exeDir}"`, PATHEXT: ".COM;.EXE;.BAT;.CMD" } as NodeJS.ProcessEnv;
+    check(
+      "findOnPath（win32）：PATH 裡加了引號的目錄照找；目前目錄的 .exe 也算（libuv 先找那裡）；哪裡都沒有 → undefined",
+      findOnPath("oc", quoted, "win32", cwdDir) === path.join(exeDir, "oc.exe") &&
+        findOnPath("local", quoted, "win32", cwdDir) === path.join(cwdDir, "local.exe") &&
+        findOnPath("nowhere", quoted, "win32", cwdDir) === undefined,
+      String(findOnPath("oc", quoted, "win32", cwdDir)),
+    );
+  }
   if (process.platform !== "win32") {
     const bin = path.join(tmp, "posix-bin");
     fs.mkdirSync(path.join(bin, "dir-named-oc"), { recursive: true });
@@ -2673,6 +2692,50 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
       codelessTypeReason("public class Cli { public static void main(String[] args) { SpringApplication.run(Cli.class, args); } }") === null,
   );
   check("codelessTypeReason：註解裡的 interface 字樣不算", codelessTypeReason("// this interface is old\npublic class A { void f() {} }") === null);
+  check(
+    "codelessTypeReason：MapStruct 的 mapper（abstract 類別或 interface）→ 保留：對應與 expression 就是邏輯",
+    codelessTypeReason(
+      'import org.mapstruct.Mapper;\nimport org.mapstruct.Mapping;\n@Mapper(componentModel = "spring")\npublic abstract class OrderMapper {\n  @Mapping(target = "status", expression = "java(order.isPaid() ? \\"PAID\\" : \\"OPEN\\")")\n  public abstract OrderDto toDto(Order order);\n}\n',
+    ) === null &&
+      codelessTypeReason("import org.mapstruct.Mapper;\n@Mapper\npublic interface UserMapper {\n  UserDto toDto(User u);\n}\n") === null &&
+      codelessTypeReason("import org.apache.ibatis.annotations.Mapper;\n@Mapper\npublic interface UserDao {\n  User find(long id);\n}\n") !== null,
+  );
+  check(
+    "codelessTypeReason：同一個檔案裡 annotation 型別後面還有別的型別 → 保留；只有 annotation → 略過",
+    codelessTypeReason("@interface Audited {}\npublic class PriceService { public long discounted(long c, int p) { return p > 0 ? c * (100 - p) / 100 : c; } }") === null &&
+      codelessTypeReason("public @interface Audited { String value() default \"\"; }") === "annotation",
+  );
+  check(
+    "codelessTypeReason：main 的參數裡有三元運算、lambda、呼叫 → 是邏輯，保留",
+    [
+      "@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {\n    SpringApplication.run(App.class, args.length == 0 ? DEFAULTS : args).getBean(Importer.class).importAll(args);\n  }\n}",
+      '@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {\n    new SpringApplicationBuilder(App.class).initializers(ctx -> ctx.getEnvironment().setActiveProfiles(System.getenv("P") != null ? "a" : "b")).run(args);\n  }\n}',
+    ].every((c) => codelessTypeReason(c) === null) &&
+      /Spring Boot 進入點/.test(
+        codelessTypeReason(
+          '@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {\n    new SpringApplicationBuilder(App.class).bannerMode(Banner.Mode.OFF).profiles("x", "y").run(args);\n  }\n}',
+        ) ?? "",
+      ),
+  );
+  {
+    // A chain of calls the entry-point pattern cannot match used to backtrack exponentially, about
+    // ×4 for every two calls: 26 calls took 7 s. 26, not more, so a regression fails this in seconds
+    // rather than hanging the run.
+    const chain = `@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {\n    new SpringApplicationBuilder(App.class)${".a(x)".repeat(26)}.run(args); foo();\n  }\n}`;
+    const t0 = Date.now();
+    const r = codelessTypeReason(chain);
+    check("codelessTypeReason：26 個串接呼叫後面還有程式碼 → 保留，而且不會回溯到卡住", r === null && Date.now() - t0 < 500, `${Date.now() - t0} ms`);
+  }
+  check(
+    "codelessTypeReason：\\u000A 在 // 註解裡是換行（javac 先解跳脫），後面的 static 區塊是程式碼 → 保留",
+    codelessTypeReason('public class Cfg2 { // x \\u000A static { System.out.println("static init ran"); }\n private String region; }') === null,
+  );
+  check(
+    "codelessTypeReason：欄位有 Bean Validation 限制（@Pattern、@Size）的 DTO 與 record → 保留：規則要用 Validator 測",
+    codelessTypeReason("import jakarta.validation.constraints.Pattern;\n@Data\npublic class SignUp {\n  @Pattern(regexp = \"[a-z]+\")\n  private String name;\n}\n") === null &&
+      codelessTypeReason("import javax.validation.constraints.*;\npublic record Req(@NotBlank String name, @Size(max = 5) String code) {}\n") === null &&
+      codelessTypeReason("import lombok.NonNull;\n@Data\npublic class Plain {\n  @NonNull private String name;\n}\n") !== null,
+  );
 
   // JaCoCo writes code-less types self-closing. Both parser paths must read that as "nothing to
   // cover", and the <class> fallback must not run on into the next class's counters.
@@ -2725,7 +2788,65 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
   const orderDto =
     "package com.x.dto;\n\nimport java.util.ArrayList;\nimport java.util.List;\nimport lombok.AllArgsConstructor;\nimport lombok.Builder;\nimport lombok.Data;\nimport lombok.NoArgsConstructor;\n\n" +
     "@Data\n@Builder\n@NoArgsConstructor\n@AllArgsConstructor\npublic class OrderDto {\n    private String id;\n    private int quantity;\n    @Builder.Default\n    private List<String> tags = new ArrayList<>();\n}\n";
-  check("declarationOnlyLines：有初始值的欄位是寫出來的程式碼（@Builder.Default 的 tags 那行留著）", !declarationOnlyLines(orderDto).includes(18) && declarationOnlyLines(orderDto).includes(17));
+  check(
+    "declarationOnlyLines：有初始值的欄位是寫出來的程式碼，它上面的註解那行也一樣（@Builder.Default 與 tags 兩行都留著）",
+    !declarationOnlyLines(orderDto).includes(18) && !declarationOnlyLines(orderDto).includes(17),
+    JSON.stringify(declarationOnlyLines(orderDto)),
+  );
+  // javac puts a field's initializer on the line its declaration starts: the first annotation's.
+  // Measured with javac 21 and JaCoCo 0.8.12 — both branches of `level > 2` on line 4, three of
+  // `level > 0 && level < 5` on line 6, nothing on the field lines themselves.
+  const limitsSrc = [
+    "package com.x;",
+    "public class Limits {",
+    '    static int level = Integer.getInteger("level", 0);',
+    "    @Deprecated",
+    "    private final boolean verbose = level > 2;",
+    "    @Deprecated",
+    "    private final boolean enabled = level > 0 && level < 5;",
+    "    public boolean isEnabled() { return enabled; }",
+    "}",
+    "",
+  ].join("\n");
+  const limitsXml =
+    '<report><package name="com/x"><sourcefile name="Limits.java"><line nr="2" mi="0" ci="2" mb="0" cb="0"/><line nr="3" mi="0" ci="6" mb="0" cb="0"/>' +
+    '<line nr="4" mi="2" ci="6" mb="1" cb="1"/><line nr="6" mi="5" ci="6" mb="3" cb="1"/><line nr="8" mi="0" ci="3" mb="0" cb="0"/>' +
+    '<counter type="INSTRUCTION" missed="7" covered="23"/><counter type="BRANCH" missed="4" covered="2"/><counter type="LINE" missed="0" covered="5"/></sourcefile></package></report>';
+  const limits = parseJacocoReport(limitsXml, ["src/main/java/com/x/Limits.java"], MIN, undefined, () => limitsSrc);
+  check(
+    "declarationOnlyLines / parseJacocoReport：註解在有初始值的欄位上方時，初始值的程式碼（含分支）記在註解那行 → 照算，branch 33.3% 照樣 FAIL",
+    JSON.stringify(declarationOnlyLines(limitsSrc)) === "[2]" && !limits.passed && limits.lines[0].includes("branch=33.3%"),
+    [JSON.stringify(declarationOnlyLines(limitsSrc)), ...limits.lines].join(" | "),
+  );
+  check(
+    "declarationOnlyLines：註解跟著它註解的東西——沒有初始值的欄位、型別宣告上方的算；方法上方的不算",
+    JSON.stringify(declarationOnlyLines("class A {\n  @NotNull\n  @Size(max = 5)\n  private String name;\n  @Override\n  public String toString() {\n    return name;\n  }\n}\n")) ===
+      "[1,2,3,4]",
+    JSON.stringify(declarationOnlyLines("class A {\n  @NotNull\n  @Size(max = 5)\n  private String name;\n  @Override\n  public String toString() {\n    return name;\n  }\n}\n")),
+  );
+  // javac ends a line at a lone CR too. Counted on LF alone, every line after one is off by one, and
+  // an excluded number lands on the method below it.
+  const loneCr = "package com.x;\npublic class Calc {\n    /* spec:\r   ... */\n    public int sign(int a) { return a > 0 ? 1 : -1; }\n    private int unused;\n}\n";
+  check(
+    "declarationOnlyLines：單獨的 CR 也是換行（javac 的算法），CR CR LF 是兩行",
+    JSON.stringify(declarationOnlyLines(loneCr)) === "[2,6]" &&
+      JSON.stringify(declarationOnlyLines("class A {\r\r\n  int x;\r\n}\r\n")) === "[1,3]",
+    JSON.stringify([declarationOnlyLines(loneCr), declarationOnlyLines("class A {\r\r\n  int x;\r\n}\r\n")]),
+  );
+  check(
+    "declarationOnlyLines：接續上一行的 `Type name;`（instanceof 的 pattern、分兩行的欄位宣告）不算宣告",
+    JSON.stringify(declarationOnlyLines("class A {\n  boolean f(Object o) {\n    boolean ok = o instanceof\n        String s;\n    return ok;\n  }\n  private final\n      String name;\n}\n")) === "[1]",
+    JSON.stringify(declarationOnlyLines("class A {\n  boolean f(Object o) {\n    boolean ok = o instanceof\n        String s;\n    return ok;\n  }\n  private final\n      String name;\n}\n")),
+  );
+  check(
+    "decodeUnicodeEscapes / declarationOnlyLines：\\uXXXX 照 javac 先解開（偶數個反斜線不是跳脫）；跳脫藏了換行就一行都不排除",
+    decodeUnicodeEscapes("a\\u0041\\\\u0041\\uu0042") === "aA\\\\u0041B" &&
+      JSON.stringify(declarationOnlyLines("class A {\n  // x \\u000A int y;\n  int z;\n}\n")) === "[]" &&
+      JSON.stringify(declarationOnlyLines("class A {\n  String s = \"\\u4e2d\";\n  int z;\n}\n")) === "[1,3]" &&
+      // `\u002f\u002a` opens a comment for javac: the line before it is a declaration, the line in it nothing.
+      JSON.stringify(declarationOnlyLines("class A {\n  int x; \\u002f\\u002a\n  int y = compute();\n  \\u002a\\u002f\n}\n")) === "[1,2]",
+    JSON.stringify(declarationOnlyLines("class A {\n  int x; \\u002f\\u002a\n  int y = compute();\n  \\u002a\\u002f\n}\n")),
+  );
   const stmts = [
     "class A {",
     "  Object f() {",
@@ -3423,8 +3544,28 @@ process.stdin.on("end", () => {
       probs({ kind: "opencode", writerModel: "", reviewerModel: "", apiBaseUrl: "" }, found).length === 0,
   );
   check(
-    "runnerConfigProblems：不認得的 UT_RUNNER（大小寫不同也是）→ 點名，不默默換成 opencode；qwen 不在這裡查",
-    /UT_RUNNER=API/.test(probs({ kind: "API" }).join()) && probs({ kind: "qwen" }, missing).length === 0,
+    "runnerConfigProblems：不認得的 UT_RUNNER → 點名，不默默換成 opencode；qwen 不在這裡查",
+    /UT_RUNNER=openai/.test(probs({ kind: "openai" }).join()) && probs({ kind: "qwen" }, missing).length === 0,
+  );
+  // config.ts reads UT_RUNNER case-blind, and a blank setting is an unset one: `UT_RUNNER=` in .env
+  // is the default runner, and `UT_WRITER_MODEL=` leaves UT_MODEL to apply.
+  const probe = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "testgen-cfg-")), "probe.mts");
+  fs.writeFileSync(
+    probe,
+    `const c = await import(${JSON.stringify(pathToFileURL(path.join(TESTGEN_ROOT, "config.ts")).href)});\n` +
+      "console.log(JSON.stringify([c.RUNNER_KIND, c.WRITER_MODEL, c.REVIEWER_MODEL]));\n",
+  );
+  const tsx = path.join(TESTGEN_ROOT, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+  const readConfig = (env: Record<string, string>) => {
+    const plan = planSpawn(tsx, [probe]);
+    const r = spawnSync(plan.file, plan.args, { cwd: TESTGEN_ROOT, env: { ...process.env, ...env }, encoding: "utf8", windowsVerbatimArguments: plan.windowsVerbatimArguments });
+    return r.stdout.trim().split("\n").pop() ?? r.stderr;
+  };
+  check(
+    "config：UT_RUNNER 不分大小寫、前後空白不算，空白 = 沒設（opencode）；空白的 UT_WRITER_MODEL 讓 UT_MODEL 生效",
+    readConfig({ UT_RUNNER: " API ", UT_WRITER_MODEL: "", UT_MODEL: " m1 ", UT_REVIEWER_MODEL: " r " }) === '["api","m1","r"]' &&
+      readConfig({ UT_RUNNER: "", UT_WRITER_MODEL: "w", UT_MODEL: "", UT_REVIEWER_MODEL: "" }) === '["opencode","w",""]',
+    `${readConfig({ UT_RUNNER: " API ", UT_WRITER_MODEL: "", UT_MODEL: " m1 ", UT_REVIEWER_MODEL: " r " })} ${readConfig({ UT_RUNNER: "", UT_WRITER_MODEL: "w", UT_MODEL: "", UT_REVIEWER_MODEL: "" })}`,
   );
 }
 

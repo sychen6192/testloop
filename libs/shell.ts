@@ -224,16 +224,31 @@ export function resolveWindowsCommand(
 
 /**
  * The file a spawn of `cmd` would run, found without running it; undefined when there is none.
- * Windows resolves as planSpawn does (PATHEXT); elsewhere the first executable file named `cmd` on
- * PATH, or `cmd` itself when it is a path. With no PATH at all the answer is `cmd`: exec then
- * searches a default path this cannot see, so not finding it here would be a guess.
+ * Windows resolves as planSpawn does (PATHEXT), and then as libuv does when planSpawn falls back to
+ * the bare name: PATH entries in quotes, and a .com or .exe in the current directory, which libuv
+ * searches first. Elsewhere the first executable file named `cmd` on PATH, or `cmd` itself when it
+ * is a path. With no PATH at all the answer is `cmd`: exec then searches a default path this cannot
+ * see, so not finding it here would be a guess. Used to refuse a run, so it errs toward finding.
  */
 export function findOnPath(
   cmd: string,
   env: NodeJS.ProcessEnv = process.env,
   platform: string = process.platform,
+  cwd: string = process.cwd(),
 ): string | undefined {
-  if (platform === "win32") return resolveWindowsCommand(cmd, env);
+  if (platform === "win32") {
+    // Read before copying: process.env's PATH is case-blind on Windows ("Path"), a copy of it is not.
+    const unquoted = (env.PATH ?? "")
+      .split(";")
+      .map((d) => d.trim().replace(/^"(.*)"$/, "$1"))
+      .filter(Boolean)
+      .join(";");
+    const bare = !/[\\/]/.test(cmd);
+    return (
+      resolveWindowsCommand(cmd, { PATH: unquoted, PATHEXT: env.PATHEXT }) ??
+      (bare ? [".com", ".exe"].map((ext) => path.join(cwd, cmd + ext)).find((p) => fs.existsSync(p)) : undefined)
+    );
+  }
   if (!cmd.includes("/") && env.PATH === undefined) return cmd;
   const candidates = cmd.includes("/")
     ? [path.resolve(cmd)]

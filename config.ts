@@ -140,12 +140,15 @@ export const SKIP_GUARD = process.env.UT_SKIP_GUARD === "1";
 
 // Runner: opencode (default) | api (direct OpenAI-compatible endpoint, no agent CLI)
 // | qwen (needs the qwen-code SDK installed).
-export const RUNNER_KIND = (process.env.UT_RUNNER ?? "opencode") as "opencode" | "api" | "qwen";
+// Blank means unset, as for every setting; the case does not matter. Anything else is reported by
+// runners/runner.ts before the baseline rather than run as opencode.
+export const RUNNER_KIND = (process.env.UT_RUNNER?.trim().toLowerCase() || "opencode") as "opencode" | "api" | "qwen";
 
 // Models: empty = don't pass --model; the agent .md's model field decides (agent file is SSOT).
 // Env vars only override.
-export const WRITER_MODEL = process.env.UT_WRITER_MODEL ?? process.env.UT_MODEL ?? "";
-export const REVIEWER_MODEL = process.env.UT_REVIEWER_MODEL ?? "";
+// A blank line in .env (`UT_WRITER_MODEL=`) is unset: UT_MODEL still applies.
+export const WRITER_MODEL = process.env.UT_WRITER_MODEL?.trim() || process.env.UT_MODEL?.trim() || "";
+export const REVIEWER_MODEL = process.env.UT_REVIEWER_MODEL?.trim() || "";
 
 // Per-run agent wall-clock timeout (replaces the SDK's maxSessionTurns).
 export const AGENT_TIMEOUT_MS = numEnv("UT_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1000, MAX_TIMER_MS);

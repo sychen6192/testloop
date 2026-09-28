@@ -119,26 +119,62 @@ const DECLARED_ONLY = new RegExp(
 const TYPE_DECLARATION = new RegExp(`^${DECLARATION_MODIFIERS}(?:class|interface|enum|record|@\\s*interface)\\s+[\\w$]+[^{}=;]*\\{?$`);
 
 /**
- * Pure: the 1-based numbers of the lines that hold no code anyone wrote — annotations alone, a
- * field declared without an initializer, a type's declaration. The compiler attributes code to them
- * all the same: Lombok's generated methods to the annotation (@Data's equals and hashCode, a whole
- * @Builder) or to the field (@Getter, @Setter), the implicit default constructor to the type's
+ * Pure: `src` with its Unicode escapes translated, which javac does before anything else: `\u0041`
+ * is an `A`, while `\\u0041` — an even run of backslashes — is no escape. An escaped line break in
+ * a comment ends that comment for javac; read without this, the code after it looks commented out.
+ */
+export function decodeUnicodeEscapes(src: string): string {
+  return src.replace(/(\\+)u+([0-9a-fA-F]{4})/g, (m, bs: string, hex: string) =>
+    bs.length % 2 ? bs.slice(0, -1) + String.fromCharCode(parseInt(hex, 16)) : m,
+  );
+}
+
+// javac's line terminators: CR LF, a lone LF, and a lone CR.
+const LINE_BREAK = /\r\n|\r|\n/;
+
+/**
+ * Pure: the 1-based numbers of the lines that hold no code anyone wrote — a field declared without an
+ * initializer, a type's declaration, and the annotations on either. The compiler attributes code to
+ * them all the same: Lombok's generated methods to the annotation (@Data's equals and hashCode, a
+ * whole @Builder) or to the field (@Getter, @Setter), the implicit default constructor to the type's
  * declaration. Measured on JaCoCo 0.8.8 with Spring Boot 2.7's Lombok: a @Data DTO whose getters,
  * setters, equals, hashCode and toString were all tested showed 40% branch coverage, every missed
  * branch on the @Data line. Coverage that counts those lines asks for tests of code nobody wrote.
  *
- * Only a line matched outright counts: one this cannot read (an identifier outside ASCII, a statement
- * split in an unusual place) stays in the figure.
+ * An annotation's line goes only with what it annotates: javac puts a field's initializer on the
+ * line its declaration starts, which is its first annotation's — `@Deprecated` over
+ * `boolean on = level > 0 && level < 5;` carries both of that expression's branches (measured, javac
+ * 21 and JaCoCo 0.8.12). Only a line matched outright counts: one this cannot read (an identifier
+ * outside ASCII, a declaration continued from the line before) stays in the figure, and a source
+ * whose escapes hide a line break has none excluded — which line javac numbers is not worth a guess.
  */
 export function declarationOnlyLines(src: string): number[] {
-  const code = codeOnly(src);
-  const bare = stripAnnotations(code).split("\n");
-  const lines = code.split("\n");
-  const out: number[] = [];
+  const decoded = decodeUnicodeEscapes(src);
+  if (decoded.split(LINE_BREAK).length !== src.split(LINE_BREAK).length) return [];
+  const code = codeOnly(decoded);
+  const lines = code.split(LINE_BREAK);
+  const bare = stripAnnotations(code).split(LINE_BREAK).map((l) => l.trim());
+  const kind: Array<"blank" | "annotation" | "declaration" | "code"> = [];
   lines.forEach((raw, i) => {
-    if (!raw.trim()) return;
-    const line = bare[i].trim();
-    if (!line || DECLARED_ONLY.test(line) || TYPE_DECLARATION.test(line)) out.push(i + 1);
+    if (!raw.trim()) kind.push("blank");
+    else if (!bare[i]) kind.push("annotation");
+    else if (TYPE_DECLARATION.test(bare[i])) kind.push("declaration");
+    else if (DECLARED_ONLY.test(bare[i])) {
+      // `Type name;` continuing the line before is not a declaration: `o instanceof` / `String s;`.
+      let j = i - 1;
+      while (j >= 0 && kind[j] === "blank") j--;
+      const starts = j < 0 || kind[j] === "annotation" || /[;{}]$/.test(bare[j]);
+      kind.push(starts ? "declaration" : "code");
+    } else kind.push("code");
+  });
+  const out: number[] = [];
+  kind.forEach((k, i) => {
+    if (k === "declaration") out.push(i + 1);
+    else if (k === "annotation") {
+      let j = i + 1;
+      while (j < kind.length && (kind[j] === "blank" || kind[j] === "annotation")) j++;
+      if (kind[j] === "declaration") out.push(i + 1);
+    }
   });
   return out;
 }

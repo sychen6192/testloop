@@ -153,9 +153,14 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    record 標頭是第一行）。實測（JaCoCo 0.8.8、Spring Boot 2.7 的 Lombok）：每個存取方法、equals、hashCode、
    toString 都測了的 `@Data` DTO 是 branch 40%，`@Builder` 的 DTO 測了 builder 是 branch 4%——差的全是沒有人
    寫的分支。照這個數字擋關，就是要 writer 去測產生出來的程式碼：Spring Boot 資料夾實測 4 批只過 1 批，DTO
-   與進入點每批都以 stuck 收場。所以 gate 從逐行資料重算，不計只有註解、沒有初始值的欄位宣告、型別宣告的行
-   （`libs/javasrc.ts` 的 `declarationOnlyLines`：在 lexer 清掉註解與字串、再清掉註解參數之後逐行比對，讀得懂才
-   算——`return x;` 這種兩個字加分號的敘述句、非 ASCII 的名稱、有初始值的欄位都照算），並在報告列出來。
+   與進入點每批都以 stuck 收場。所以 gate 從逐行資料重算，不計沒有初始值的欄位宣告、型別宣告，以及它們上方
+   只有註解的行（`libs/javasrc.ts` 的 `declarationOnlyLines`：先照 javac 解開 `\uXXXX`，在 lexer 清掉註解與字串、
+   再清掉註解參數之後逐行比對，換行照 javac 算——單獨的 CR 也是一行；讀得懂才算——`return x;` 這種兩個字加
+   分號的敘述句、接續上一行的 `Type name;`（`o instanceof` 換行後的 `String s;`）、非 ASCII 的名稱、有初始值的欄位
+   都照算），並在報告列出來。註解那行跟著它註解的東西：javac 把欄位初始值的程式碼記在宣告開頭的那一行，宣告
+   前面有註解時就是註解那行——`@Deprecated` 底下的 `boolean on = level > 0 && level < 5;`，兩個條件的分支都記
+   在 `@Deprecated` 那行（實測 javac 21、JaCoCo 0.8.12）。第一版把所有只有註解的行都當成沒有程式碼，這種欄位
+   的分支就整個消失，gate 比 JaCoCo 自己的數字還寬。
    逐行資料不齊（加總對不上 LINE 計數器、只有 `<class>` 元素）就照 JaCoCo 的數字：拿一半的資料重算比不算
    更糟。寫出來的邏輯沒測到照樣 FAIL，而且未覆蓋行與未覆蓋分支只點名寫出來的行——`if (flag)` 的 flag
    永遠是 true 時那一行每個指令都執行過，只看未覆蓋行 writer 什麼都看不到，所以分支另外列出每行幾個、
@@ -165,7 +170,11 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    的進入點，不開 writer session——測它們是白花一個 session、一次建置與一次 review，進入點還得啟動整個
    Spring context，那是整合測試。分流寫窄：`private` 建構子只有空的或 Sonar 式的 `throw new …` 才算不會
    執行（Jackson 會呼叫 private 的無參數建構子）、`static final` 欄位的初始值要是編譯器折疊的字面常數
-   （`null` 不是，它在 static initializer 裡賦值），讀不懂的一律留著當目標，由上面的重算兜底。
+   （`null` 不是，它在 static initializer 裡賦值）、`main` 呼叫的參數只能是名稱、`App.class` 與字串（三元運算、
+   lambda、呼叫都是邏輯；只允許這幾種也讓比對不會回溯到卡住——舊的寫法 26 個串接呼叫要 7 秒），讀不懂的一律
+   留著當目標，由上面的重算兜底。形狀像沒有邏輯、其實有的也留著：欄位帶 Bean Validation 限制的（`@Pattern`
+   的運算式、`@Size` 的邊界是要用 Validator 測的規則）、MapStruct 的 mapper（實作由註解產生，對應與
+   expression 就是邏輯），以及同一個檔案裡 annotation 型別後面還有別的型別的。
 
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 

@@ -149,9 +149,12 @@
   - 目標分流：只有欄位與常數的類別（`@Data` DTO、JPA entity、常數類別）、只有常數的 enum、沒有本體的 record、
     只有抽象方法與欄位的 abstract 類別、Spring Boot 進入點不當目標，跟只有抽象方法的 interface 一樣列在 log
     與 `params.json` 的 `skippedCodeless`。判斷寫窄：有方法、初始值不是字面常數的欄位、會執行的建構子
-    （含 record 的 compact 建構子、body 不是空的也不是 `throw new …` 的 private 建構子）就留著。
-  - 覆蓋率 gate 從逐行資料重算，不計只有註解、沒有初始值的欄位宣告、型別宣告的行（報告列在「未計入的行」）；
-    寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
+    （含 record 的 compact 建構子、body 不是空的也不是 `throw new …` 的 private 建構子）、`main` 的參數裡有
+    運算或呼叫就留著；欄位帶 Bean Validation 限制的 DTO 與 MapStruct 的 mapper 也留著（interface 形式的
+    MapStruct mapper 以前會被當成只有抽象方法的 interface 略過，一併修正）。
+  - 覆蓋率 gate 從逐行資料重算，不計沒有初始值的欄位宣告、型別宣告與它們上方只有註解的行（報告列在「未計入
+    的行」）；有初始值的欄位上方的註解照算，因為 javac 把初始值的程式碼記在那一行。寫出來的邏輯沒測到照樣
+    FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
   同一個資料夾現在 2 批全過（DTO 與進入點略過，`@Builder.Default` 的初始值那行照算）。README 另說明怎麼用
   `lombok.addLombokGeneratedAnnotation` 讓 Sonar 與 IDE 也不算產生的程式碼。
 - **pom 寫了 `<append>true</append>` 時，覆蓋率跨建置累加。** `-Djacoco.append=false` 只改預設值，pom 的
@@ -163,7 +166,9 @@
   `UT_API_BASE_URL`、PATH 上沒有 opencode 時，run 先跑完預檢建置（重量級模組 8–15 分鐘），第一個 writer
   session 才以 `runner-spawn-error` 失敗；`UT_RUNNER` 打錯字（例如 `API`）則默默改用 opencode。現在在預檢
   建置、執行鎖與 artifacts 之前就中止並列出缺什麼（`UT_SKIP_REVIEW=1` 時不要求 reviewer 的模型），指向
-  doctor 做連線與認證檢查。
+  doctor 做連線與認證檢查；doctor 也會點名不認得的 `UT_RUNNER`。`UT_RUNNER` 改為不分大小寫、空白視同沒設
+  （`.env` 裡留著 `UT_RUNNER=` 就是預設的 opencode），`UT_WRITER_MODEL=` 空白時 `UT_MODEL` 照樣生效。Windows 上
+  找 opencode 的方式跟 libuv 一樣：PATH 裡加了引號的目錄照找、目前目錄的 `.exe` 也算。
 - **repo 鎖在「等不到」時不再照樣執行，Windows 上以系統管理員身分跑的 run 也擋得住。** 取鎖原本以重試次數為限：
   另一個 run 正在建立或接手鎖的那一瞬間，次數用完就當作沒有鎖、照樣執行——兩個 run 一起跑。現在以時間為限
   （15 秒，長過空鎖視為當掉的 2 秒與接手鎖視為當掉的 10 秒），等不到就當作對方在執行，訊息說明原因。持有者

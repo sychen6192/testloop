@@ -21,6 +21,8 @@ export async function createRunner(opts: RunnerOptions = {}): Promise<AgentRunne
   return new OpencodeRunner();
 }
 
+export const RUNNER_KINDS: readonly string[] = ["opencode", "api", "qwen"];
+
 export interface RunnerSettings {
   kind: string;
   apiBaseUrl: string;
@@ -43,8 +45,8 @@ export function runnerConfigProblems(
   lookup: (cmd: string) => string | undefined = findOnPath,
 ): string[] {
   const out: string[] = [];
-  // createRunner starts opencode for anything it does not know: UT_RUNNER=API would run opencode.
-  if (!["opencode", "api", "qwen"].includes(s.kind)) {
+  // createRunner starts opencode for anything it does not know: UT_RUNNER=openai would run opencode.
+  if (!RUNNER_KINDS.includes(s.kind)) {
     out.push(`UT_RUNNER=${s.kind} 不是可用的 runner——只能是 opencode（預設）、api 或 qwen`);
   } else if (s.kind === "api") {
     if (!s.apiBaseUrl) out.push("UT_API_BASE_URL 未設定（例如 Ollama 的 http://localhost:11434/v1、vLLM 的 http://host:8000/v1）");

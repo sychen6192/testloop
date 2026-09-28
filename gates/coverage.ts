@@ -156,7 +156,7 @@ export function parseJacocoReport(
       }
     }
     const excludedNote = excluded.length
-      ? `  未計入的行：${toRanges(excluded)}（只有註解、欄位宣告或型別宣告，上面的程式碼是 Lombok 或編譯器產生的，不是寫出來的邏輯）`
+      ? `  未計入的行：${toRanges(excluded)}（沒有初始值的欄位宣告、型別宣告與它們的註解，上面的程式碼是 Lombok 或編譯器產生的，不是寫出來的邏輯）`
       : "";
     if (line === null && branch === null && excluded.length) {
       lines.push(`- ${simple}: 沒有手寫的可執行程式碼，不列入覆蓋率門檻`, excludedNote);

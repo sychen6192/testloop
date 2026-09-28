@@ -34,8 +34,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
      `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>,<同名>$*` 只限縮**執行**，
      並在宣告成功前補一次完整模組重跑當驗收）
-  3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計只有註解、
-     沒有初始值的欄位宣告、型別宣告的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
+  3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
+     欄位宣告、型別宣告與它們上方只有註解的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
 
 ### 七個必須理解的機制

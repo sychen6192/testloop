@@ -129,7 +129,9 @@ qwen。連線與認證要實際連過才知道，那是 `testgen doctor` 的事�
 `private` 建構子的常數類別）；只有常數的 enum；沒有本體的 record；只有抽象方法與欄位的 abstract 類別；
 `main` 只呼叫 `SpringApplication.run` 的 Spring Boot 進入點（執行它就是啟動整個 Spring context，那是整合測試）。
 測這些是白花一個 writer session 與一次建置，覆蓋率也不會因此有意義。判斷刻意寫窄：有任何方法、初始值不是
-字面常數的欄位、會執行的建構子或 compact 建構子，就留著當目標。目標底下全是這類型別時直接說明並中止。
+字面常數的欄位、會執行的建構子或 compact 建構子、`main` 的參數裡有運算或呼叫，就留著當目標；欄位上有 Bean
+Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapStruct 的 mapper（對應與 expression 就是邏輯）
+也留著。目標底下全是這類型別時直接說明並中止。
 
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
 覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
@@ -373,7 +375,8 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與
   record 的存取方法記在型別宣告那一行。照 JaCoCo 的數字，每個存取方法、equals、hashCode、toString 都測了的
   `@Data` DTO 是 branch 40%（實測 JaCoCo 0.8.8、Spring Boot 2.7）——差的全是沒有人寫的分支，writer 永遠補不
-  滿。所以 gate 從逐行資料重算：只有註解、沒有初始值的欄位宣告、型別宣告的行不計，列在「未計入的行」；
+  滿。所以 gate 從逐行資料重算：沒有初始值的欄位宣告、型別宣告，以及它們上方只有註解的行不計，列在
+  「未計入的行」（有初始值的欄位上方的註解照算——javac 把初始值的程式碼記在宣告開頭那一行，也就是註解那行）；
   寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」與「未覆蓋分支」（每行幾個分支、幾個沒走到）只點名寫出來的行。
   逐行資料不齊時照 JaCoCo 的原始數字。想讓 Sonar 與 IDE 也不算 Lombok 產生的程式碼，在專案根的
   `lombok.config` 加 `lombok.addLombokGeneratedAnnotation = true`：JaCoCo 會略過帶 `@lombok.Generated` 的

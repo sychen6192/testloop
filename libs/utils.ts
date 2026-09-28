@@ -2,7 +2,7 @@
 // snapshot. Mostly pure; the snapshot reads the tree and splitForeignChanges asks git.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { codeOnly, stripAnnotations } from "./javasrc";
+import { codeOnly, decodeUnicodeEscapes, stripAnnotations } from "./javasrc";
 import { execFileSync } from "node:child_process";
 import { ModuleInfo } from "./types";
 
@@ -141,12 +141,22 @@ const LOMBOK_GENERATES =
 // A Spring Boot application's entry point: a main that only hands over to Spring, and for a WAR the
 // configure override that names the sources. Running it starts the whole application context.
 const SPRING_BOOT_APPLICATION = /@\s*(?:[\w$]+\s*\.\s*)*(?:SpringBootApplication|EnableAutoConfiguration)\b/;
+// The arguments a bootstrap call is written with: names, `App.class`, `args`, strings. A ternary, a
+// lambda or a call among them is logic, and the class stays a target.
+const BOOT_ARG = '(?:[\\w$]+(?:\\s*\\.\\s*[\\w$]+)*|"[^"\\n]*")';
+const BOOT_ARGS = `\\(\\s*(?:${BOOT_ARG}(?:\\s*,\\s*${BOOT_ARG})*)?\\s*\\)`;
 const BOOT_MAIN =
   "(?:public\\s+)?static\\s+void\\s+main\\s*\\(\\s*(?:final\\s+)?String\\s*(?:\\[\\s*\\]\\s*[\\w$]+|\\.\\.\\.\\s*[\\w$]+|[\\w$]+\\s*\\[\\s*\\])\\s*\\)" +
-  "\\s*(?:throws\\s+[\\w$.,\\s]+)?\\{\\s*(?:SpringApplication\\s*\\.\\s*run\\s*\\([^;{}]*\\)|new\\s+SpringApplicationBuilder\\s*\\([^;{}]*\\)(?:\\s*\\.\\s*[\\w$]+\\s*\\([^;{}]*\\))*)\\s*;\\s*\\}";
+  `\\s*(?:throws\\s+[\\w$.,\\s]+)?\\{\\s*(?:SpringApplication\\s*\\.\\s*run\\s*${BOOT_ARGS}|new\\s+SpringApplicationBuilder\\s*${BOOT_ARGS}(?:\\s*\\.\\s*[\\w$]+\\s*${BOOT_ARGS})*)\\s*;\\s*\\}`;
 const BOOT_CONFIGURE =
   "(?:public|protected)\\s+SpringApplicationBuilder\\s+configure\\s*\\(\\s*(?:final\\s+)?SpringApplicationBuilder\\s+[\\w$]+\\s*\\)" +
-  "\\s*\\{\\s*return\\s+[\\w$]+\\s*\\.\\s*sources\\s*\\([^;{}]*\\)\\s*;\\s*\\}";
+  `\\s*\\{\\s*return\\s+[\\w$]+\\s*\\.\\s*sources\\s*${BOOT_ARGS}\\s*;\\s*\\}`;
+// MapStruct writes the implementation from the annotations: their mappings and expressions are the
+// logic, and a test of the mapper is how it is checked.
+const MAPSTRUCT = /\borg\s*\.\s*mapstruct\b/;
+// Bean Validation constraints on the fields — a @Pattern's expression, a @Size's bounds — are rules a
+// unit test checks with a Validator.
+const BEAN_VALIDATION = /\b(?:javax|jakarta)\s*\.\s*validation\b|\borg\s*\.\s*hibernate\s*\.\s*validator\b/;
 const BOOT_MAIN_ONLY = new RegExp(`^\\s*(?:${BOOT_MAIN}(?:\\s*${BOOT_CONFIGURE})?|${BOOT_CONFIGURE}\\s*${BOOT_MAIN})\\s*$`);
 
 /**
@@ -169,11 +179,15 @@ const BOOT_MAIN_ONLY = new RegExp(`^\\s*(?:${BOOT_MAIN}(?:\\s*${BOOT_CONFIGURE})
  * toward keeping one, and the coverage gate reads a class with no code left as nothing to cover.
  */
 export function codelessTypeReason(src: string): string | null {
-  const code = codeOnly(src);
+  const code = codeOnly(decodeUnicodeEscapes(src));
   const bare = stripAnnotations(code);
   const decl = /(?:^|[\s;}])(@\s*interface|interface|class|enum|record)\s+([A-Za-z_$][\w$]*)/.exec(bare);
   if (!decl) return null;
-  if (decl[1].startsWith("@")) return "annotation";
+  // Another type after it in the same file is read as nothing here: the file stays a target.
+  if (decl[1].startsWith("@")) {
+    return /\b(?:class|interface|enum|record)\s+[\w$]/.test(bare.slice(decl.index + decl[0].length)) ? null : "annotation";
+  }
+  if (MAPSTRUCT.test(code)) return null;
   const open = bare.indexOf("{", decl.index + decl[0].length);
   if (open < 0) return null;
   const close = bare.lastIndexOf("}");
@@ -195,6 +209,7 @@ export function codelessTypeReason(src: string): string | null {
   // Nested types are read with the rest: their headers go, and their bodies must hold nothing either.
   rest = rest.replace(/\b(?:class|interface|enum)\s+[\w$]+[^{};=()]*\{/g, " ");
   if (/[({=]/.test(rest.replace(/\}/g, " "))) return null;
+  if (BEAN_VALIDATION.test(code)) return null;
   if (decl[1] === "enum") return "enum（只有常數）";
   if (decl[1] === "record") return "record（只有元件——存取方法、equals 等由編譯器產生）";
   if (abstractMethods) return "abstract 類別（只有抽象方法、欄位與常數）";
