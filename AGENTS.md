@@ -33,9 +33,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
   2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
      `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>,<同名>$*` 只限縮**執行**，
-     並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`、
-     Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`；報告以 `<failure>`/`<error>` 元素判定，
-     重跑後通過的 flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止
+     並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`
+     （只算編譯與測試的 goal）、Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`：surefire 在測試
+     跑完後自己印的判定，不含測試自己的輸出；報告以 `<failure>`/`<error>` 元素判定、CDATA 是文字，重跑後通過的
+     flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
      欄位宣告、型別宣告與它們上方只有註解的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）

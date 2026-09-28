@@ -1019,6 +1019,29 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("baseline.md 說明 Maven 為什麼說 BUILD SUCCESS", md.includes("testFailureIgnore") && !md.includes("乾淨"), md.slice(0, 500));
   },
 
+  "loop-baseline-tests-skipped-no-sources": (c) => {
+    check("exit code 0（沒有中止）", c.code === 0, `code=${c.code}\n${c.stderr.slice(-400)}`);
+    check("預檢印 WARN 說明為什麼照常開始", c.stdout.includes("還沒有任何測試原始碼"), c.stdout.slice(-900));
+    check("測試產生了", c.exists("src/test/java/com/x/CalcTest.java"));
+  },
+
+  "loop-gradle-dirty-tolerated": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-700)}`);
+    check(
+      "預檢認出 LegacyTest 的失敗，容忍清單記進 summary.json",
+      JSON.stringify(c.result.toleratedFailures ?? []).includes("com.x.LegacyTest#old_behaviour()"),
+      JSON.stringify(c.result.toleratedFailures),
+    );
+    check("跑的是 gradlew", c.argv.length === 2 && c.argv.every((a) => a.includes("test") && a.includes("--console=plain")), JSON.stringify(c.argv));
+  },
+
+  "loop-gradle-baseline-repair": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-900)}`);
+    check("預檢點名目標模組裡失敗的 LegacyTest（不是範圍外）", c.runRead("baseline.md").includes("com.x.LegacyTest") && !c.runRead("baseline.md").includes("超出 writer 可寫範圍"), c.runRead("baseline.md").slice(0, 600));
+    check("進了修復迴圈、修好了", c.runExists("repair-1/prompt.md") && c.read("src/test/java/com/x/LegacyTest.java").includes("assertEquals(3,"));
+    check("測試產生了", c.exists("src/test/java/com/x/CalcTest.java"));
+  },
+
   "loop-baseline-tests-skipped": (c) => {
     check("die 以 exit 1 結束", c.code === 1, `code=${c.code}`);
     check("stopReason = tests-skipped", c.result.stopReason === "tests-skipped", String(c.result.stopReason));
@@ -1244,6 +1267,40 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("跑的是 gradle 的 test 任務", c.argv[0]?.includes("test") && c.argv[0]?.includes("--console=plain"), JSON.stringify(c.argv[0]));
     const fb = c.runRead("iter-1/feedback.md");
     check("回饋說明是 ignoreFailures、附上失敗原因", fb.includes("ignoreFailures") && fb.includes("nothing was thrown"), fb.slice(0, 700));
+  },
+
+  "build-fail-never-other-plugin-green": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+  },
+
+  "build-error-only-custom-reports": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說明是 testFailureIgnore、附上 NPE", fb.includes("testFailureIgnore") && fb.includes("this.calc"), fb.slice(0, 600));
+  },
+
+  "build-flaky-cdata-green": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+    check("只建置 1 次（沒被當成紅燈重跑）", c.mvnCalls === 1, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "build-own-output-headline-green": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+  },
+
+  "build-quiet-upstream-only": (c) => {
+    check("沒有通過", c.result.success === false, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回報目標模組執行了 0 個測試", fb.includes("0 個測試"), fb.slice(0, 400));
+  },
+
+  "gradle-retry-passed-green": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+  },
+
+  "gradle-up-to-date-failing": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.crashed]));
+    check("回饋附上測試結果裡的失敗", c.runRead("iter-1/feedback.md").includes("nothing was thrown"), c.runRead("iter-1/feedback.md").slice(0, 600));
   },
 
   "build-quiet-green": (c) => {

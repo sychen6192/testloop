@@ -144,20 +144,28 @@
   code 判綠燈，而 surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent pom 或
   `.mvn/maven.config` 常設，好讓 CI 在測試失敗時照樣收報告）下測試失敗照樣 exit 0、BUILD SUCCESS。以真的專案
   重現：writer 的 `CalcTest.div_nonZero_returnsQuotient` 失敗，gate 判 PASS、覆蓋率與 review 也過，整個 run 以
-  gates-passed 結束；預檢也把一個有失敗測試的模組說成「乾淨」。現在 exit 0 時另看 surefire 記下的
-  `There are test failures.`、Maven 最後印的 BUILD 判定與這次建置寫出的 XML 報告：有失敗就是紅燈，回饋與
-  `baseline.md` 說明為什麼 Maven 說成功。`--fail-never`（`-fn`，連編譯錯誤都 exit 0）與 Gradle 的
-  `ignoreFailures = true` 一併處理。`UT_ALLOW_DIRTY_BASELINE` 的扣除照常運作；失敗一次、重跑後通過的測試
-  （`rerunFailingTestsCount`）不算失敗——surefire 2.x 在報告的計數裡記它 `failures="1"`，所以改以 `<failure>` /
-  `<error>` 元素判定，紅燈建置的失敗清單也不再列出它。
+  gates-passed 結束；預檢也把一個有失敗測試的模組說成「乾淨」。現在 exit 0 時另看 surefire 在測試跑完後自己印的
+  判定（`There are test failures.`、fork 逾時、ERROR 級的 Results 總計——3.x 對只有 error 的情況只印總計）與這次
+  建置寫出的 XML 報告：有失敗就是紅燈，回饋與 `baseline.md` 說明為什麼 Maven 說成功。測試自己印出同樣的句子
+  （它跑了一個內嵌建置）、別的 plugin（karma）說的都不算。`--fail-never`（`-fn`）吞掉的失敗只算編譯與測試的
+  goal——copy-resources、checkstyle 這種專案本來就帶著的失敗不是 writer 的事。Gradle 的 `ignoreFailures = true`
+  一併處理，包括 HTML 報告關掉（`See the results at`）、安靜模式、test 任務 up-to-date 什麼都不印（看測試結果本身）；
+  Gradle 以 exit 0 帶過的既有失敗也點得出是哪個測試，修復迴圈與 `UT_ALLOW_DIRTY_BASELINE` 照常可用。失敗一次、重跑
+  後通過的測試（`rerunFailingTestsCount`）不算失敗：surefire 2.x 在報告的計數裡記它 `failures="1"`，3.x 在
+  `<flakyFailure>` 的 CDATA 裡留著原始訊息（`<error code="503">` 之類的字樣），所以改以 `<failure>` / `<error>`
+  元素判定、先把 CDATA 當文字，紅燈建置的失敗清單也不再列出它；Gradle 的 test-retry plugin 把每次重試寫成獨立的
+  test case，同名的測試有一次通過就不算失敗。testFailureIgnore 下 surefire 2.x 的 fork crash
+  也點得出是哪個類別（`Crashed tests:` 那幾行沒有 `[ERROR]` 前綴）。
 - **模組的測試被設定跳過時，run 白燒兩輪再以 stuck 收場。** pom、settings.xml 或 `.mvn/maven.config` 設了
   `skipTests` / `maven.test.skip` 時，每次建置都綠、一個測試都沒執行；gate 叫 writer「建立測試類別」，writer
-  怎麼寫都一樣。現在預檢看到目標模組的 surefire 印 `Tests are skipped.` 就中止（stopReason `tests-skipped`），
+  怎麼寫都一樣。現在預檢看到目標模組的 surefire 印 `Tests are skipped.` 就中止（stopReason `tests-skipped`；
+  模組還沒有任何測試原始碼時只印 WARN、照常開始——以 `<missing>src/test/java</missing>` 啟用 skipTests 的 profile
+  在 writer 寫出測試後就解除），
   說明要設 `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"`（或啟用測試的 profile）；跳過預檢時，gate 的
   回報也改說明這件事。
 - **`.mvn/maven.config`（或 `MAVEN_ARGS`）有 `-q` 時，每一輪都被判成「執行了 0 個測試」。** 安靜模式只印錯誤，
   綠的建置連一行 `Tests run` 都沒有，零測試檢查只看 log，於是每一輪都 FAIL、以 stuck 收場。現在 log 沒有
-  `Tests run` 時改看這次建置寫出的 surefire 報告。
+  `Tests run` 時改看這次建置在目標模組寫出的 surefire 報告（只算目標模組的：上游模組的測試不管目標模組有沒有跑都會跑）。
 - **Spring Boot + Lombok 的資料夾，DTO 與進入點的批次永遠過不了。** JaCoCo 的行號是編譯器給的：Lombok
   產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
   `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行。實測（JaCoCo 0.8.8、

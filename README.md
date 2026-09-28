@@ -329,14 +329,16 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 - **預檢說模組是紅的，但你自己跑 `mvn test` 是 BUILD SUCCESS。** 專案讓 Maven 在測試失敗時照樣成功：
   surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，常設在公司的 parent pom 或
   `.mvn/maven.config`，好讓 CI 在測試失敗時還收得到報告），或 `--fail-never`（`-fn`，連編譯錯誤都照樣
-  exit 0）。Gradle 的 `test { ignoreFailures = true }` 也一樣。loop 不看 exit code，以這次建置寫出的 surefire
-  XML 報告與 Maven 自己的判定為準——只看 exit code 時，writer 寫的失敗測試會被當成通過、整個 run 以
+  exit 0）。Gradle 的 `test { ignoreFailures = true }` 也一樣。loop 不看 exit code，以這次建置寫出的測試報告與
+  surefire、Maven 自己的判定為準——只看 exit code 時，writer 寫的失敗測試會被當成通過、整個 run 以
   `gates-passed` 收場（以真的專案重現過）。log 與 `baseline.md` 會寫明是哪一種。之後照一般的紅燈處理：修復
-  迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試。失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，
-  log 裡的 `Flakes`）不算失敗。
+  迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試（Gradle 也一樣）。`-fn` 下只算編譯與測試的失敗，別的
+  plugin（copy-resources、checkstyle）失敗不算；失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，log 裡的
+  `Flakes`；Gradle 的 test-retry plugin）也不算失敗。
 - **中止，說「目標模組一個測試都沒有執行」（stopReason `tests-skipped`）。** pom、settings.xml 或
   `.mvn/maven.config` 設了 `skipTests` 或 `maven.test.skip`，surefire 只印一行 `Tests are skipped.`——每一輪都
-  一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session。設
+  一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session（模組還沒有任何測試原始碼時例外：
+  以 `<missing>src/test/java</missing>` 啟用 skipTests 的 profile 在 writer 寫出測試後就解除，所以只印 WARN、照常開始）。設
   `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"` 後重跑（命令列的 `-D` 蓋得過 pom 的屬性與
   `.mvn/maven.config`）；pom 在 surefire 的 `<configuration>` 裡直接寫死 `<skipTests>true</skipTests>` 時 `-D` 蓋
   不過，改用啟用測試的 profile（`UT_MAVEN_ARGS="-P<profile>"`）。

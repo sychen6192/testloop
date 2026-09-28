@@ -4823,8 +4823,9 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
   );
   // Maven's exit code is whether it chose to stop. Shapes taken from real surefire 2.22.2 / 3.2.5
   // runs under testFailureIgnore, and Maven 3.9 under -fn.
+  const SF = "[INFO] --- surefire:3.2.5:test (default-test) @ tfi ---";
   const ignoredLog = [
-    "[INFO] --- surefire:3.2.5:test (default-test) @ tfi ---",
+    SF,
     "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.004 s <<< FAILURE! -- in com.x.OtherTest",
     "[INFO] Results:",
     "[ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0",
@@ -4833,28 +4834,84 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     "Please refer to /w/tfi/target/surefire-reports for the individual test results.",
     "[INFO] BUILD SUCCESS",
   ].join("\n");
-  const greenLog = "[INFO] --- surefire:3.2.5:test (default-test) @ tfi ---\n[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS";
+  // surefire 3.x, a test that threw (an error, not a failure): no headline, only the total at ERROR.
+  const errorsOnlyLog = [
+    SF,
+    "[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 0.056 s <<< FAILURE! -- in com.x.NpeTest",
+    "[INFO] Results:",
+    "[ERROR] Errors: ",
+    '[ERROR]   NpeTest.add_works:6 NullPointer Cannot invoke "com.x.Calc.add(int, int)" because "this.calc" is null',
+    "[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0",
+    "[ERROR] ",
+    "Please refer to /tmp/p5v/target/surefire-reports for the individual test results.",
+    "[INFO] BUILD SUCCESS",
+  ].join("\n");
+  const greenLog = `${SF}\n[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS`;
   check(
-    "mavenRedDespiteExit0：testFailureIgnore 下 surefire 記下的「There are test failures.」、fork 逾時（2.x 與 3.x 的措辭）→ 紅，說明是 testFailureIgnore",
+    "mavenRedDespiteExit0：testFailureIgnore 下 surefire 記下的「There are test failures.」、只有 error 時的 Results 總計、fork 逾時（2.x 與 3.x 的措辭）→ 紅，說明是 testFailureIgnore",
     (mavenRedDespiteExit0(ignoredLog, false) ?? "").includes("testFailureIgnore") &&
-      !!mavenRedDespiteExit0("[ERROR] There was a timeout or other error in the fork\n[INFO] BUILD SUCCESS", false) &&
-      !!mavenRedDespiteExit0("[ERROR] There was a timeout in the fork\n[INFO] BUILD SUCCESS", false) &&
-      !!mavenRedDespiteExit0("[ERROR] There are test errors.\n[INFO] BUILD SUCCESS", false),
+      !!mavenRedDespiteExit0(errorsOnlyLog, false) &&
+      !!mavenRedDespiteExit0(`${SF}\n[ERROR] There was a timeout or other error in the fork\n[INFO] BUILD SUCCESS`, false) &&
+      !!mavenRedDespiteExit0(`${SF}\n[ERROR] There was a timeout in the fork\n[INFO] BUILD SUCCESS`, false),
   );
   check(
-    "mavenRedDespiteExit0：綠的建置 → undefined；log 沒說、但這次建置的報告記著失敗 → 紅",
-    mavenRedDespiteExit0(greenLog, false) === undefined && (mavenRedDespiteExit0(greenLog, true) ?? "").includes("testFailureIgnore"),
+    "mavenRedDespiteExit0：surefire 2.12.4 的 Results 總計沒有層級前綴，只有「There are test failures.」那行說了 → 紅",
+    !!mavenRedDespiteExit0(
+      ["[INFO] --- maven-surefire-plugin:2.12.4:test (default-test) @ legacy ---", "Running com.x.OtherTest",
+        "Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 sec <<< FAILURE!", "Results :",
+        "Failed tests:   add_broken(com.x.OtherTest): expected:<3> but was:<2>", "Tests run: 1, Failures: 1, Errors: 0, Skipped: 0",
+        "[ERROR] There are test failures.", "[INFO] BUILD SUCCESS"].join("\n"),
+      false,
+    ),
   );
   check(
-    "mavenRedDespiteExit0：--fail-never 的最後判定是 BUILD FAILURE → 紅；測試裡跑的內嵌建置先印過 BUILD FAILURE、Maven 自己最後說 SUCCESS → 不算；測試自己印的字不帶 [ERROR] → 不算",
-    (mavenRedDespiteExit0("[ERROR] /w/CalcTest.java:[9,9] cannot find symbol\n[INFO] BUILD FAILURE\n[INFO] Total time: 1 s", false) ?? "").includes("--fail-never") &&
-      mavenRedDespiteExit0(`[INFO] BUILD FAILURE\n${greenLog}`, false) === undefined &&
-      mavenRedDespiteExit0(`There are test failures.\n${greenLog}`, false) === undefined,
+    "mavenRedDespiteExit0：綠的建置、只有重跑通過的 flaky（總計在 WARNING）→ undefined；log 沒說、但這次建置的報告記著失敗 → 紅",
+    mavenRedDespiteExit0(greenLog, false) === undefined &&
+      mavenRedDespiteExit0(`${SF}\n[WARNING] Flakes: \n[WARNING] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1\n[INFO] BUILD SUCCESS`, false) === undefined &&
+      (mavenRedDespiteExit0(greenLog, true) ?? "").includes("testFailureIgnore"),
   );
   check(
-    "gradleRedDespiteExit0：ignoreFailures = true 的「There were failing tests」→ 紅；一般輸出 → undefined",
+    "mavenRedDespiteExit0：測試自己印的「There are test failures.」（在它的類別結果那行之前）與別的 plugin（karma）說的 → 不算",
+    mavenRedDespiteExit0(
+      [SF, "[INFO] Running com.x.PrintsTest", "[ERROR] There are test failures.", "[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0",
+        "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.x.PrintsTest", "[INFO] Results:",
+        "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0", "[INFO] BUILD SUCCESS"].join("\n"),
+      false,
+    ) === undefined &&
+      mavenRedDespiteExit0(["[INFO] --- frontend:1.12.1:karma (javascript tests) @ web ---", "[ERROR] There are test failures.", greenLog].join("\n"), false) === undefined,
+  );
+  check(
+    "mavenRedDespiteExit0：安靜模式（-q，沒有 plugin 標頭）的真失敗 → 紅",
+    !!mavenRedDespiteExit0(
+      ["[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 0.040 s <<< FAILURE! -- in com.x.NpeTest", "[ERROR] Errors: ",
+        "[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0", "[ERROR] "].join("\n"),
+      false,
+    ),
+  );
+  const fnCompile = "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile (default-testCompile) on project tfi: Compilation failure";
+  check(
+    "mavenRedDespiteExit0：--fail-never 吞掉的編譯或測試失敗（有沒有 BUILD FAILURE 那行都一樣，-q 不印它）→ 紅；吞掉的是別的 plugin（copy-resources）→ 不算",
+    (mavenRedDespiteExit0(`[ERROR] /w/CalcTest.java:[9,9] cannot find symbol\n[INFO] BUILD FAILURE\n${fnCompile}\n[INFO] Build failures were ignored.`, false) ?? "").includes("--fail-never") &&
+      (mavenRedDespiteExit0(`[ERROR] /w/CalcTest.java:[9,9] cannot find symbol\n${fnCompile}`, false) ?? "").includes("--fail-never") &&
+      !!mavenRedDespiteExit0("[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:2.22.2:test (default-test) on project web: There are test failures.", false) &&
+      mavenRedDespiteExit0(
+        `${greenLog.replace("[INFO] BUILD SUCCESS", "[INFO] BUILD FAILURE")}\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-resources-plugin:3.3.1:copy-resources (always-broken) on project pfn: The parameters 'resources' are missing -> [Help 1]\n[INFO] Build failures were ignored.`,
+        false,
+      ) === undefined,
+  );
+  check(
+    "gradleRedDespiteExit0：「There were failing tests」（report 或 results）、安靜時只有的「N tests completed, M failed」、測試結果記著失敗（up-to-date 什麼都不印）→ 紅；一般輸出 → undefined",
     (gradleRedDespiteExit0("1 test completed, 1 failed\nThere were failing tests. See the report at: file:///w/build/reports/tests/test/index.html\nBUILD SUCCESSFUL in 2s") ?? "").includes("ignoreFailures") &&
-      gradleRedDespiteExit0("BUILD SUCCESSFUL in 2s") === undefined,
+      !!gradleRedDespiteExit0("There were failing tests. See the results at: file:///w/build/test-results/test\nBUILD SUCCESSFUL in 2s") &&
+      !!gradleRedDespiteExit0("2 tests completed, 1 failed") &&
+      !!gradleRedDespiteExit0("> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms", true) &&
+      gradleRedDespiteExit0("BUILD SUCCESSFUL in 2s") === undefined &&
+      gradleRedDespiteExit0("> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms", false) === undefined,
+  );
+  check(
+    "crashedTestClasses：testFailureIgnore 下 surefire 2.x 的 Crashed tests 那幾行沒有 [ERROR] 前綴，照樣點名",
+    JSON.stringify(crashedTestClasses("[ERROR] ExecutionException The forked VM terminated\nCrashed tests:\ncom.x.ExitTest\norg.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated")) ===
+      '["com.x.ExitTest"]',
   );
   {
     // Real reports: surefire 2.22.2 + JUnit 4.12 with rerunFailingTestsCount=2, the test failing once
@@ -4871,6 +4928,43 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     check(
       "suiteRecordsFailure：重跑後通過的不穩定測試（2.x 的 failures=\"1\" 底下只有 <flakyFailure>）→ 不算失敗；@BeforeClass 丟例外 → 算；沒有任何 testcase、只有計數 → 照計數",
       !rec(flaky) && rec(setup) && rec(countersOnly),
+    );
+    // surefire 3.2.5 keeps a flaky attempt's stack trace in CDATA, message and all: an "<error …>" in
+    // it is not an element. A real failure's CDATA can hold the same text and must still be read whole.
+    const cdataFlaky =
+      '<testsuite name="com.x.XmlFlakyTest" tests="2" errors="0" skipped="0" failures="1">\n  <testcase name="rendersOk" classname="com.x.XmlFlakyTest" time="0.0">\n' +
+      '    <flakyFailure message="unexpected response: &lt;error code=&quot;503&quot;&gt;busy&lt;/error&gt;" type="java.lang.AssertionError">\n' +
+      '      <stackTrace><![CDATA[java.lang.AssertionError: unexpected response: <error code="503">busy</error>\n\tat com.x.XmlFlakyTest.rendersOk(XmlFlakyTest.java:9)\n]]></stackTrace>\n' +
+      "    </flakyFailure>\n  </testcase>\n</testsuite>";
+    const cdataReal =
+      '<testsuite name="com.x.XmlTest" tests="1" errors="0" skipped="0" failures="1">\n  <testcase name="renders" classname="com.x.XmlTest" time="0.0">\n' +
+      '    <failure message="bad" type="java.lang.AssertionError"><![CDATA[java.lang.AssertionError: got <error code="503">busy</error>\n\tat com.x.XmlTest.renders(XmlTest.java:9)\n]]></failure>\n' +
+      "  </testcase>\n</testsuite>";
+    // A passing test that printed a JUnit XML snippet: its captured output ends, as text, in the middle.
+    const cdataOutput =
+      '<testsuite name="com.x.ReportTest" tests="1" errors="0" skipped="0" failures="0">\n  <testcase name="parses" classname="com.x.ReportTest" time="0.0">\n' +
+      '    <system-out><![CDATA[read: <testcase name="a"></system-out><error message="boom"/></testcase>\n]]></system-out>\n  </testcase>\n</testsuite>';
+    // Gradle's test-retry plugin, mergeReruns off: each attempt is a test case of its own.
+    const retried = parseSurefireXml(
+      '<testsuite name="com.x.RetryTest" tests="3" skipped="1" failures="1" errors="0">\n  <testcase name="flaky()" classname="com.x.RetryTest" time="0.01">\n' +
+        '    <failure message="first attempt" type="java.lang.AssertionError">java.lang.AssertionError: first attempt\n</failure>\n  </testcase>\n' +
+        '  <testcase name="flaky()" classname="com.x.RetryTest" time="0.01"/>\n  <testcase name="later()" classname="com.x.RetryTest" time="0.0">\n    <skipped/>\n  </testcase>\n</testsuite>',
+    )!;
+    check(
+      "parseSurefireXml：通過的 test case 記在 passed（重試的每一次各是一個 test case；skipped 不算通過）",
+      JSON.stringify(retried.passed) === '["flaky()"]' && retried.cases.length === 1 && retried.cases[0].name === "flaky()",
+      JSON.stringify([retried.passed, retried.cases.map((c) => c.name)]),
+    );
+    const real = parseSurefireXml(cdataReal)!;
+    check(
+      "parseSurefireXml：<flakyFailure> 的 CDATA 裡的 <error …> 不是失敗、測試輸出的 CDATA 裡就算有「</system-out>」字樣後面的 <error …> 也不是；真的 <failure> 的 CDATA 有同樣的字照樣是一個失敗、訊息與位置完整",
+      !rec(cdataFlaky) &&
+        parseSurefireXml(cdataOutput)!.cases.length === 0 &&
+        parseSurefireXml(cdataFlaky)!.cases.length === 0 &&
+        real.cases.length === 1 &&
+        real.cases[0].kind === "failure" &&
+        real.cases[0].frame.includes("XmlTest.java:9"),
+      JSON.stringify(real.cases),
     );
   }
   const sfHeader = (artifact: string, exec = "default-test", legacy = false) =>
