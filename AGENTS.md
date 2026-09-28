@@ -21,8 +21,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
 ## 架構大圖
 控制流只有兩個檔案，兩者並排於根目錄：
 
-- **`loop.ts`** — entry point：參數驗證、模組偵測、rubric 載入、startup guard、版本戳記、
-  既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
+- **`loop.ts`** — entry point：參數驗證、模組偵測、目標分流（沒有需要單元測試的程式碼的型別——DTO、常數類別、
+  只有常數的 enum、沒有本體的 record、Spring Boot 進入點——不當目標，`libs/utils.ts` 的 `codelessTypeReason`）、
+  rubric 載入、runner 設定檢查（預檢建置之前，`runners/runner.ts` 的 `runnerConfigProblems`）、startup guard、
+  版本戳記、既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
@@ -32,7 +34,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
      `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>,<同名>$*` 只限縮**執行**，
      並在宣告成功前補一次完整模組重跑當驗收）
-  3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`
+  3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計只有註解、
+     沒有初始值的欄位宣告、型別宣告的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
 
 ### 七個必須理解的機制
@@ -177,24 +180,24 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 
 ## 目錄結構
 ```
-loop.ts               entry point（參數驗證/rubric 載入/guard/預檢基準/runs 建立/版本戳記）
+loop.ts               entry point（參數驗證/目標分流/rubric 載入/runner 設定檢查/guard/預檢基準/runs 建立/版本戳記）
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
 gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
-gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先）
+gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先；逐行資料齊全時不計只有宣告的行、列出未覆蓋的行與分支）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
-runners/…             factory＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
+runners/…             factory（含啟動前的 runner 設定檢查）＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
 runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
 libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾
 libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 逾時覆寫
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
-libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
+libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / codelessTypeReason / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
-libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）
+libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）＋註解參數清除與只有宣告的行
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記

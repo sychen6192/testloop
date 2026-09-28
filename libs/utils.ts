@@ -2,6 +2,7 @@
 // snapshot. Mostly pure; the snapshot reads the tree and splitForeignChanges asks git.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { codeOnly, stripAnnotations } from "./javasrc";
 import { execFileSync } from "node:child_process";
 import { ModuleInfo } from "./types";
 
@@ -122,34 +123,84 @@ export function feedbackFingerprint(s: string): string {
   );
 }
 
+// A literal a `static final` field can be initialized with and the compiler folds into a constant:
+// no code runs for it. (`null` is not one — it is assigned in the static initializer.)
+const FOLDED_LITERAL =
+  "[-+]?\\s*(?:\"[^\"\\n]*\"|'[^'\\n]*'|(?:0[xX][\\da-fA-F_]+|\\d[\\d_]*(?:\\.[\\d_]*)?(?:[eE][-+]?\\d+)?)[lLfFdD]?|true|false)" +
+  "(?:\\s*\\+\\s*(?:\"[^\"\\n]*\"|'[^'\\n]*'|\\d[\\d_]*[lL]?))*";
+const CONSTANT_FIELD = new RegExp(
+  `(?:\\b(?:public|protected|private|static|final|transient|volatile)\\s+)+[\\w$.]+(?:\\s*<[^;=(){}]*>)?(?:\\s*\\[\\s*\\])*\\s+[\\w$]+\\s*=\\s*${FOLDED_LITERAL}\\s*;`,
+  "g",
+);
+// `throw new IllegalStateException("Utility class");` — the body Sonar asks a utility class's private
+// constructor to have. Its argument is blanked to spaces by codeOnly.
+const PRIVATE_CTOR_THROW = "(?:throw\\s+new\\s+[\\w$.]+\\s*\\([^;{}()]*\\)\\s*;\\s*)";
+// The Lombok annotations that generate a class's methods.
+const LOMBOK_GENERATES =
+  /@\s*(?:lombok\s*\.\s*)?(?:Data|Value|Getter|Setter|Builder|SuperBuilder|EqualsAndHashCode|ToString|With|NoArgsConstructor|AllArgsConstructor|RequiredArgsConstructor)\b/;
+// A Spring Boot application's entry point: a main that only hands over to Spring, and for a WAR the
+// configure override that names the sources. Running it starts the whole application context.
+const SPRING_BOOT_APPLICATION = /@\s*(?:[\w$]+\s*\.\s*)*(?:SpringBootApplication|EnableAutoConfiguration)\b/;
+const BOOT_MAIN =
+  "(?:public\\s+)?static\\s+void\\s+main\\s*\\(\\s*(?:final\\s+)?String\\s*(?:\\[\\s*\\]\\s*[\\w$]+|\\.\\.\\.\\s*[\\w$]+|[\\w$]+\\s*\\[\\s*\\])\\s*\\)" +
+  "\\s*(?:throws\\s+[\\w$.,\\s]+)?\\{\\s*(?:SpringApplication\\s*\\.\\s*run\\s*\\([^;{}]*\\)|new\\s+SpringApplicationBuilder\\s*\\([^;{}]*\\)(?:\\s*\\.\\s*[\\w$]+\\s*\\([^;{}]*\\))*)\\s*;\\s*\\}";
+const BOOT_CONFIGURE =
+  "(?:public|protected)\\s+SpringApplicationBuilder\\s+configure\\s*\\(\\s*(?:final\\s+)?SpringApplicationBuilder\\s+[\\w$]+\\s*\\)" +
+  "\\s*\\{\\s*return\\s+[\\w$]+\\s*\\.\\s*sources\\s*\\([^;{}]*\\)\\s*;\\s*\\}";
+const BOOT_MAIN_ONLY = new RegExp(`^\\s*(?:${BOOT_MAIN}(?:\\s*${BOOT_CONFIGURE})?|${BOOT_CONFIGURE}\\s*${BOOT_MAIN})\\s*$`);
+
 /**
- * Pure: why a Java source has nothing a unit test could execute, or null when it may have code.
+ * Pure: why a Java source has nothing to unit-test, or null when it may have. Such a type is not
+ * given to the writer: a test of it is effort spent on nothing, and a gate that holds it to coverage
+ * or a reviewer that holds it to effectiveness blocks a batch the writer cannot unblock.
  *
- * A service package is typically `FooService` (an interface) beside `FooServiceImpl`. The
- * interface compiles to no executable code at all, so no test can cover it — handing it to the
- * writer as a target spends effort on a pointless test, and a reviewer that expects one can block
- * a round the writer cannot fix. Only two shapes are claimed, both verified against JaCoCo, which
- * writes them with no counters: annotation types, and interfaces whose body declares nothing but
- * abstract methods. Anything with a `{` or `=` in the interface body — a default method, a nested
- * type, a constant, an annotation argument — is left in: this errs toward keeping a target, and
- * the coverage gate already reads a code-less class from the report as nothing to cover.
+ * Nothing to execute: annotation types, and interfaces with only abstract methods (JaCoCo writes both
+ * with no counters). Nothing anyone wrote: a class of fields and annotations — Lombok or the compiler
+ * generates its accessors, equals and constructors — with constants the compiler folds, a private
+ * constructor that keeps it from being instantiated, abstract methods; an enum of constants alone; a
+ * record with no body, whose accessors, equals and constructor the compiler generates.
+ * Measured on JaCoCo 0.8.8 with Spring Boot 2.7's Lombok, a @Data DTO whose every accessor, equals,
+ * hashCode and toString was tested stayed at 40% branch coverage, the rest being generated branches.
+ * And a Spring Boot entry point whose main only calls SpringApplication.run: executing it starts the
+ * application context, which a unit test must not, and there is no logic in it to test otherwise.
+ *
+ * Read with the lexer (codeOnly), annotations removed. Anything else in the body — a method, a
+ * constructor that could run (a record's compact one included), an initializer — keeps the type a target: this errs
+ * toward keeping one, and the coverage gate reads a class with no code left as nothing to cover.
  */
 export function codelessTypeReason(src: string): string | null {
-  const code = src
-    .replace(/"""[\s\S]*?"""/g, '""')
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/\/\/[^\n]*/g, " ")
-    .replace(/"(?:\\.|[^"\\\n])*"/g, '""')
-    .replace(/'(?:\\.|[^'\\\n])*'/g, "''");
-  const decl = /(?:^|[\s;}])(@\s*interface|interface|class|enum|record)\s+[A-Za-z_$][\w$]*/.exec(code);
+  const code = codeOnly(src);
+  const bare = stripAnnotations(code);
+  const decl = /(?:^|[\s;}])(@\s*interface|interface|class|enum|record)\s+([A-Za-z_$][\w$]*)/.exec(bare);
   if (!decl) return null;
   if (decl[1].startsWith("@")) return "annotation";
-  if (decl[1] !== "interface") return null;
-  const open = code.indexOf("{", decl.index + decl[0].length);
+  const open = bare.indexOf("{", decl.index + decl[0].length);
   if (open < 0) return null;
-  const close = code.lastIndexOf("}");
-  const body = code.slice(open + 1, close > open ? close : undefined);
-  return /[{=]/.test(body) ? null : "interface（只有抽象方法）";
+  const close = bare.lastIndexOf("}");
+  const body = bare.slice(open + 1, close > open ? close : undefined);
+  if (decl[1] === "interface") return /[{=]/.test(body) ? null : "interface（只有抽象方法）";
+  if (SPRING_BOOT_APPLICATION.test(code) && BOOT_MAIN_ONLY.test(body)) {
+    return "Spring Boot 進入點（main 只呼叫 SpringApplication.run——要執行它就得啟動 Spring context，那是整合測試的範圍）";
+  }
+  let abstractMethods = 0;
+  let rest = body
+    .replace(CONSTANT_FIELD, (m) => (/\bstatic\b/.test(m) && /\bfinal\b/.test(m) ? " " : m))
+    // Its body empty or Sonar's `throw new IllegalStateException("Utility class")`: anything else
+    // may run — Jackson calls a private no-arg constructor.
+    .replace(new RegExp(`\\bprivate\\s+${decl[2].replace(/\$/g, "\\$")}\\s*\\(\\s*\\)\\s*\\{\\s*${PRIVATE_CTOR_THROW}?\\}`, "g"), " ")
+    .replace(/\babstract\s+[^;{}=()]*\([^;{}()]*\)\s*(?:throws\s+[\w$.,\s]+)?;/g, () => {
+      abstractMethods++;
+      return " ";
+    });
+  // Nested types are read with the rest: their headers go, and their bodies must hold nothing either.
+  rest = rest.replace(/\b(?:class|interface|enum)\s+[\w$]+[^{};=()]*\{/g, " ");
+  if (/[({=]/.test(rest.replace(/\}/g, " "))) return null;
+  if (decl[1] === "enum") return "enum（只有常數）";
+  if (decl[1] === "record") return "record（只有元件——存取方法、equals 等由編譯器產生）";
+  if (abstractMethods) return "abstract 類別（只有抽象方法、欄位與常數）";
+  return LOMBOK_GENERATES.test(code)
+    ? "只有欄位（存取方法、equals 等由 Lombok 產生，沒有手寫的邏輯）"
+    : "只有欄位與常數（沒有手寫的邏輯）";
 }
 
 // Pure: does `fileName` look like an existing test for `className`?

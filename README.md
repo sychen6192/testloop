@@ -120,6 +120,17 @@ testgen <package 路徑>                  # 端對端執行
 起手挑一個依賴最少的簡單 class。退出碼定義：`0` 全數通過、`2` 有目標沒通過（單一類別是迭代用盡；
 分批時是任何一批沒過）、`1` 致命錯誤。
 
+runner 設定不完整時在預檢建置之前就中止、列出缺什麼：api runner 沒設 `UT_API_BASE_URL` 或模型
+（`UT_SKIP_REVIEW=1` 時不需要 reviewer 的模型）、PATH 上找不到 opencode、`UT_RUNNER` 不是 opencode / api /
+qwen。連線與認證要實際連過才知道，那是 `testgen doctor` 的事。
+
+**沒有需要單元測試的程式碼的類別不會變成目標**（列在 log 與 `params.json` 的 `skippedCodeless`）：
+只有抽象方法的 interface、annotation；只有欄位與常數的類別（Lombok 的 `@Data` DTO、JPA entity、
+`private` 建構子的常數類別）；只有常數的 enum；沒有本體的 record；只有抽象方法與欄位的 abstract 類別；
+`main` 只呼叫 `SpringApplication.run` 的 Spring Boot 進入點（執行它就是啟動整個 Spring context，那是整合測試）。
+測這些是白花一個 writer session 與一次建置，覆蓋率也不會因此有意義。判斷刻意寫窄：有任何方法、初始值不是
+字面常數的欄位、會執行的建構子或 compact 建構子，就留著當目標。目標底下全是這類型別時直接說明並中止。
+
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
 覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
 量到的測試相依與原始碼編碼（見下方 Troubleshooting）。資料夾目標分批時，每批在自己的
@@ -131,7 +142,7 @@ testgen <package 路徑>                  # 端對端執行
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
+| `UT_RUNNER` | opencode | opencode、api 或 qwen（其他值在啟動時就中止，不會默默改用 opencode）。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
 | `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數（分批時為每批） |
@@ -354,6 +365,16 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   另外 build gate 固定帶 `-Djacoco.append=false`：JaCoCo agent 預設會把 exec 資料**累加**進
   `target/jacoco.exec`，你自己跑過的 `mvn test` 或上一次 testgen 的覆蓋率會被算進這一輪，
   空測試也能「過」coverage gate。
+- **覆蓋率報告出現「未計入的行」，數字跟 IDE 或 Sonar 看到的不一樣。** JaCoCo 的行號是編譯器給的：Lombok
+  產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
+  `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與
+  record 的存取方法記在型別宣告那一行。照 JaCoCo 的數字，每個存取方法、equals、hashCode、toString 都測了的
+  `@Data` DTO 是 branch 40%（實測 JaCoCo 0.8.8、Spring Boot 2.7）——差的全是沒有人寫的分支，writer 永遠補不
+  滿。所以 gate 從逐行資料重算：只有註解、沒有初始值的欄位宣告、型別宣告的行不計，列在「未計入的行」；
+  寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」與「未覆蓋分支」（每行幾個分支、幾個沒走到）只點名寫出來的行。
+  逐行資料不齊時照 JaCoCo 的原始數字。想讓 Sonar 與 IDE 也不算 Lombok 產生的程式碼，在專案根的
+  `lombok.config` 加 `lombok.addLombokGeneratedAnnotation = true`：JaCoCo 會略過帶 `@lombok.Generated` 的
+  方法（實測 0.8.8：`@Data` DTO 在報告裡變成沒有任何程式碼）。
 - **review gate 一直 REJECT，訊息含「tool calls = 0」。** reviewer 沒讀任何檔案就輸出判決，
   fail-closed 防的是捏造的假 verdict。改用更強的 `UT_REVIEWER_MODEL`。確定要放行設
   `UT_REVIEWER_MUST_READ=0`，或暫時 `UT_SKIP_REVIEW=1` 只跑 hard gate。

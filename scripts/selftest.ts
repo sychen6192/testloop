@@ -120,8 +120,9 @@ import {
   surefireVersionFromLog,
   surefireProviderFromLog,
 } from "../libs/teststack";
-import { codeOnly } from "../libs/javasrc";
-import { planSpawn, resolveWindowsCommand, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
+import { codeOnly, declarationOnlyLines } from "../libs/javasrc";
+import { planSpawn, resolveWindowsCommand, findOnPath, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
+import { runnerConfigProblems } from "../runners/runner";
 import {
   checkTestsRan,
   ranTestClasses,
@@ -554,6 +555,34 @@ console.log("\n[9] planSpawn / resolveWindowsCommand / buildInvocation（Windows
     "resolveWindowsCommand：不存在的指令 → undefined",
     resolveWindowsCommand("definitely-not-installed", env) === undefined,
   );
+
+  // findOnPath: the same answer as the spawn, without the spawn (runnerConfigProblems asks it before the
+  // baseline build whether the opencode CLI is there at all).
+  check(
+    "findOnPath（win32）：照 PATHEXT 找，跟 planSpawn 一樣找到 .cmd",
+    findOnPath("opencode", env, "win32") === shim,
+    String(findOnPath("opencode", env, "win32")),
+  );
+  if (process.platform !== "win32") {
+    const bin = path.join(tmp, "posix-bin");
+    fs.mkdirSync(path.join(bin, "dir-named-oc"), { recursive: true });
+    fs.writeFileSync(path.join(bin, "oc"), "#!/bin/sh\n", { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, "not-exec"), "#!/bin/sh\n", { mode: 0o644 });
+    const penv = { PATH: `${path.join(tmp, "missing")}:${bin}` } as NodeJS.ProcessEnv;
+    check(
+      "findOnPath（POSIX）：PATH 上第一個可執行檔；沒有執行權限的檔、目錄、不存在的都不算；路徑照原樣檢查",
+      findOnPath("oc", penv, "linux") === path.join(bin, "oc") &&
+        findOnPath("not-exec", penv, "linux") === undefined &&
+        findOnPath("dir-named-oc", penv, "linux") === undefined &&
+        findOnPath("nope", penv, "linux") === undefined &&
+        findOnPath(path.join(bin, "oc"), { PATH: "" } as NodeJS.ProcessEnv, "linux") === path.join(bin, "oc") &&
+        findOnPath(path.join(bin, "not-exec"), penv, "linux") === undefined,
+    );
+    check(
+      "findOnPath（POSIX）：沒有 PATH → 不猜（exec 會用看不到的預設路徑），回傳原名",
+      findOnPath("oc", {} as NodeJS.ProcessEnv, "linux") === "oc",
+    );
+  }
 
   // Non-Windows must stay byte-identical to the old behaviour.
   const posix = planSpawn("opencode", ["run", "--agent", "ut-writer", "hi"], "linux");
@@ -2589,7 +2618,58 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
   );
   check("codelessTypeReason：default method → 有程式碼", codelessTypeReason("public interface P { default int two() { return 2; } }") === null);
   check("codelessTypeReason：interface 常數 → 保守視為可能有程式碼", codelessTypeReason("public interface P { java.util.List<String> L = java.util.List.of(); }") === null);
-  check("codelessTypeReason：class / enum / record → null", ["public class A {}", "public enum E { X }", "public record R(int x) {}"].every((c) => codelessTypeReason(c) === null));
+  check(
+    "codelessTypeReason：有邏輯的 class、帶參數的 enum、有 compact 建構子或方法的 record → null（保留為目標）",
+    [
+      "public class A { int twice(int x) { return x * 2; } }",
+      'public enum E { X("x"); private final String v; E(String v) { this.v = v; } }',
+      "public record R(int x) { public R { if (x < 0) throw new IllegalArgumentException(); } }",
+      "public record R(int x) { int twice() { return x * 2; } }",
+      "public class I { static { init(); } }",
+    ].every((c) => codelessTypeReason(c) === null),
+  );
+  check(
+    "codelessTypeReason：沒有本體的 record（含多行的元件與常數）→ 略過",
+    /^record/.test(codelessTypeReason("public record R(int x) {}") ?? "") &&
+      /^record/.test(codelessTypeReason("@JsonInclude(NON_NULL)\npublic record UserResponse(\n    Long id,\n    @NotNull String name\n) {\n    public static final int MAX = 5;\n}\n") ?? ""),
+  );
+  check(
+    "codelessTypeReason：只有欄位的 Lombok DTO（含巢狀 DTO）、空類別、只有常數的 enum → 略過",
+    codelessTypeReason("@Data\npublic class UserDto {\n    private Long id;\n    private String name;\n}") === "只有欄位（存取方法、equals 等由 Lombok 產生，沒有手寫的邏輯）" &&
+      codelessTypeReason("@Data public class Outer { private Inner inner; @Data public static class Inner { private String v; } }") !== null &&
+      codelessTypeReason("public class A {}") !== null &&
+      codelessTypeReason("public enum E { X, Y; }") === "enum（只有常數）",
+  );
+  check(
+    "codelessTypeReason：常數類別（編譯時折疊的字面值、private 建構子——含 Sonar 式丟例外的）→ 略過；非字面值、null、實例欄位的初始值 → 保留",
+    codelessTypeReason('public final class Codes {\n  public static final String A = "a";\n  public static final int B = 2;\n  private Codes() {}\n}') !== null &&
+      codelessTypeReason('public final class Codes { public static final String A = "a"; private Codes() { throw new IllegalStateException("Utility class"); } }') !== null &&
+      codelessTypeReason('public final class P { public static final Pattern X = Pattern.compile("a"); }') === null &&
+      codelessTypeReason("public final class P { public static final String X = null; }") === null &&
+      codelessTypeReason("public class P { private final int max = 5; }") === null,
+  );
+  check(
+    "codelessTypeReason：private 建構子裡有別的程式碼（Jackson 會呼叫它）→ 保留；沒有收尾的註解參數不吃掉後面的程式碼 → 保留",
+    codelessTypeReason("@Data public class Dto { private List<String> items; private Dto() { items = new ArrayList<>(); } }") === null &&
+      codelessTypeReason("@Data public class Dto { private Long id; private Dto() { log(); } }") === null &&
+      codelessTypeReason("@Data public class Dto { @Foo(bar private Long id; int twice(int x) { return x * 2; } }") === null,
+  );
+  check(
+    "codelessTypeReason：只有抽象方法與欄位的 abstract 類別 → 略過",
+    codelessTypeReason("public abstract class B { protected String name; public abstract void run() throws Exception; }") === "abstract 類別（只有抽象方法、欄位與常數）",
+  );
+  check(
+    "codelessTypeReason：Spring Boot 進入點（main 只呼叫 SpringApplication.run，含 WAR 的 configure）→ 略過；多一個 @Bean（在 main 前或後）、或不是 @SpringBootApplication → 保留",
+    /Spring Boot 進入點/.test(codelessTypeReason("@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {\n    SpringApplication.run(App.class, args);\n  }\n}") ?? "") &&
+      /Spring Boot 進入點/.test(
+        codelessTypeReason(
+          '@SpringBootApplication\npublic class App extends SpringBootServletInitializer {\n  @Override\n  protected SpringApplicationBuilder configure(SpringApplicationBuilder b) {\n    return b.sources(App.class);\n  }\n  public static void main(String... args) { new SpringApplicationBuilder(App.class).profiles("x").run(args); }\n}',
+        ) ?? "",
+      ) &&
+      codelessTypeReason("@SpringBootApplication\npublic class App {\n  public static void main(String[] args) { SpringApplication.run(App.class, args); }\n  @Bean Clock clock() { return Clock.systemUTC(); }\n}") === null &&
+      codelessTypeReason("@SpringBootApplication\npublic class App {\n  @Bean Clock clock() { return Clock.systemUTC(); }\n  public static void main(String[] args) { SpringApplication.run(App.class, args); }\n}") === null &&
+      codelessTypeReason("public class Cli { public static void main(String[] args) { SpringApplication.run(Cli.class, args); } }") === null,
+  );
   check("codelessTypeReason：註解裡的 interface 字樣不算", codelessTypeReason("// this interface is old\npublic class A { void f() {} }") === null);
 
   // JaCoCo writes code-less types self-closing. Both parser paths must read that as "nothing to
@@ -2626,6 +2706,193 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
     `<package name="com/b"><sourcefile name="Util.java"><counter type="LINE" missed="0" covered="10"/></sourcefile></package></report>`;
   const np = parseJacocoReport(twoPkgs, ["mod/src/java/com/b/Util.java"], MIN, () => "com/b");
   check("parseJacocoReport：非 src/main/java 佈局以 package 宣告定位，不拿別的 package 的同名檔", np.passed && np.lines[0].includes("100.0%"), np.lines.join(" | "));
+
+  // Code nobody wrote, as JaCoCo 0.8.8 measured it with Spring Boot 2.7's Lombok: @Data's equals and
+  // hashCode on the annotation's line, the getters on the fields' lines.
+  const userDto = "package com.x.dto;\n\nimport lombok.Data;\n\n@Data\npublic class UserDto {\n    private Long id;\n    private String name;\n    private String email;\n}\n";
+  check("declarationOnlyLines：@Data DTO → 註解、型別宣告、沒有初始值的欄位", JSON.stringify(declarationOnlyLines(userDto)) === "[5,6,7,8,9]", JSON.stringify(declarationOnlyLines(userDto)));
+  check(
+    "declarationOnlyLines / codelessTypeReason：CRLF 換行（Windows 上的常態）結果相同",
+    JSON.stringify(declarationOnlyLines(userDto.replace(/\n/g, "\r\n"))) === "[5,6,7,8,9]" &&
+      codelessTypeReason(userDto.replace(/\n/g, "\r\n")) === codelessTypeReason(userDto) &&
+      /Spring Boot 進入點/.test(
+        codelessTypeReason("@SpringBootApplication\r\npublic class App {\r\n  public static void main(String[] args) {\r\n    SpringApplication.run(App.class, args);\r\n  }\r\n}\r\n") ?? "",
+      ),
+    JSON.stringify(declarationOnlyLines(userDto.replace(/\n/g, "\r\n"))),
+  );
+  const orderDto =
+    "package com.x.dto;\n\nimport java.util.ArrayList;\nimport java.util.List;\nimport lombok.AllArgsConstructor;\nimport lombok.Builder;\nimport lombok.Data;\nimport lombok.NoArgsConstructor;\n\n" +
+    "@Data\n@Builder\n@NoArgsConstructor\n@AllArgsConstructor\npublic class OrderDto {\n    private String id;\n    private int quantity;\n    @Builder.Default\n    private List<String> tags = new ArrayList<>();\n}\n";
+  check("declarationOnlyLines：有初始值的欄位是寫出來的程式碼（@Builder.Default 的 tags 那行留著）", !declarationOnlyLines(orderDto).includes(18) && declarationOnlyLines(orderDto).includes(17));
+  const stmts = [
+    "class A {",
+    "  Object f() {",
+    "    return x;",
+    "  }",
+    "  void g() { if (bad) {",
+    "    throw e;",
+    "  } }",
+    "  int y;",
+    "  private final Map<String, List<Integer>> m;",
+    "  @Override public String toString() {",
+    '    return "";',
+    "  }",
+    '  @Table(name = "t",',
+    '      indexes = {})',
+    "  enum E {",
+    "    RED,",
+    "    GREEN;",
+    "  }",
+    "  class B { int z = 5; }",
+    "  private String 名稱;",
+    "}",
+  ].join("\n");
+  check(
+    "declarationOnlyLines：return / throw 這類兩個字加分號的敘述句、方法簽名、enum 常數、一行寫完且有初始值的類別、非 ASCII 的名稱都不算",
+    JSON.stringify(declarationOnlyLines(stmts)) === "[1,8,9,13,14,15]",
+    JSON.stringify(declarationOnlyLines(stmts)),
+  );
+  const lombokXml = (file: string, lines: string, counters: string) =>
+    `<report><package name="com/x/dto"><sourcefile name="${file}">${lines}${counters}</sourcefile></package></report>`;
+  const userDtoXml = lombokXml(
+    "UserDto.java",
+    '<line nr="5" mi="29" ci="117" mb="18" cb="12"/><line nr="7" mi="0" ci="3" mb="0" cb="0"/><line nr="8" mi="0" ci="3" mb="0" cb="0"/><line nr="9" mi="0" ci="3" mb="0" cb="0"/>',
+    '<counter type="INSTRUCTION" missed="29" covered="126"/><counter type="BRANCH" missed="18" covered="12"/><counter type="LINE" missed="0" covered="4"/>',
+  );
+  const dtoTarget = ["src/main/java/com/x/dto/UserDto.java"];
+  const dtoRaw = parseJacocoReport(userDtoXml, dtoTarget, MIN);
+  const dtoOwn = parseJacocoReport(userDtoXml, dtoTarget, MIN, undefined, () => userDto);
+  check("parseJacocoReport：沒有原始碼可讀 → 照 JaCoCo 的數字（@Data 的分支 40% → FAIL）", !dtoRaw.passed && dtoRaw.lines[0].includes("branch=40.0%"), dtoRaw.lines.join(" | "));
+  check(
+    "parseJacocoReport：@Data DTO 的程式碼全在沒有手寫程式碼的行上 → 沒有手寫的可執行程式碼，不列入門檻，並列出未計入的行",
+    dtoOwn.passed && dtoOwn.lines[0].includes("沒有手寫的可執行程式碼") && dtoOwn.lines[1].includes("5, 7-9"),
+    dtoOwn.lines.join(" | "),
+  );
+  const orderXml = lombokXml(
+    "OrderDto.java",
+    '<line nr="10" mi="127" ci="0" mb="24" cb="0"/><line nr="11" mi="17" ci="38" mb="1" cb="1"/><line nr="12" mi="6" ci="0" mb="0" cb="0"/>' +
+      '<line nr="13" mi="0" ci="12" mb="0" cb="0"/><line nr="15" mi="0" ci="3" mb="0" cb="0"/><line nr="16" mi="0" ci="3" mb="0" cb="0"/><line nr="18" mi="0" ci="3" mb="0" cb="0"/>',
+    '<counter type="BRANCH" missed="25" covered="1"/><counter type="LINE" missed="2" covered="5"/>',
+  );
+  const order = parseJacocoReport(orderXml, ["src/main/java/com/x/dto/OrderDto.java"], MIN, undefined, () => orderDto);
+  check(
+    "parseJacocoReport：@Builder DTO（builder 測試實測 line 71% / branch 4%）→ 只算寫出來的初始值那行：100%、沒有分支 → PASS",
+    order.passed && order.lines[0].includes("line=100.0%") && order.lines[0].includes("branch=N/A"),
+    order.lines.join(" | "),
+  );
+  // Measured the same way: a service whose @NonNull field makes @RequiredArgsConstructor's generated
+  // constructor null-check it, on the annotation's line. One test, the not-found path untested.
+  const serviceSrc = [
+    "package com.x.service;",
+    "",
+    "import com.x.dto.UserDto;",
+    "import com.x.repo.UserRepository;",
+    "import lombok.NonNull;",
+    "import lombok.RequiredArgsConstructor;",
+    "import lombok.extern.slf4j.Slf4j;",
+    "import org.springframework.stereotype.Service;",
+    "",
+    "@Slf4j",
+    "@Service",
+    "@RequiredArgsConstructor",
+    "public class UserService {",
+    "    @NonNull",
+    "    private final UserRepository repository;",
+    "",
+    "    public String displayName(Long id) {",
+    "        UserDto user = repository.findById(id).orElse(null);",
+    "        if (user == null) {",
+    '            log.info("user {} not found", id);',
+    '            return "(unknown)";',
+    "        }",
+    "        return user.getName().trim();",
+    "    }",
+    "}",
+    "",
+  ].join("\n");
+  const serviceXml = (unknownTested: boolean) =>
+    '<report><package name="com/x/service"><sourcefile name="UserService.java">' +
+    '<line nr="10" mi="0" ci="4" mb="0" cb="0"/><line nr="12" mi="5" ci="8" mb="1" cb="1"/><line nr="18" mi="0" ci="8" mb="0" cb="0"/>' +
+    (unknownTested
+      ? '<line nr="19" mi="0" ci="2" mb="0" cb="2"/><line nr="20" mi="0" ci="4" mb="0" cb="0"/><line nr="21" mi="0" ci="2" mb="0" cb="0"/>'
+      : '<line nr="19" mi="0" ci="2" mb="1" cb="1"/><line nr="20" mi="4" ci="0" mb="0" cb="0"/><line nr="21" mi="2" ci="0" mb="0" cb="0"/>') +
+    '<line nr="23" mi="0" ci="4" mb="0" cb="0"/>' +
+    (unknownTested
+      ? '<counter type="INSTRUCTION" missed="5" covered="32"/><counter type="BRANCH" missed="1" covered="3"/><counter type="LINE" missed="0" covered="7"/>'
+      : '<counter type="INSTRUCTION" missed="11" covered="26"/><counter type="BRANCH" missed="2" covered="2"/><counter type="LINE" missed="2" covered="5"/>') +
+    "</sourcefile></package></report>";
+  const svcTarget = ["src/main/java/com/x/service/UserService.java"];
+  const svc = parseJacocoReport(serviceXml(false), svcTarget, MIN, undefined, () => serviceSrc);
+  check(
+    "parseJacocoReport：寫出來的邏輯沒測到照樣 FAIL，未覆蓋行只列寫出來的那兩行（不列 @RequiredArgsConstructor 產生的 null 檢查）",
+    !svc.passed && svc.lines[0].includes("line=60.0%") && svc.lines[0].includes("branch=50.0%") && svc.lines[1] === "  未覆蓋行：20-21",
+    svc.lines.join(" | "),
+  );
+  check(
+    "parseJacocoReport：分支不足時列出沒走到的分支在哪一行（只列算進來的 if，不列 Lombok 的 null 檢查），再列未計入的行",
+    svc.lines[2] === "  未覆蓋分支：19（2 個分支有 1 個沒走到）" && svc.lines[3]?.startsWith("  未計入的行：10, 12（"),
+    svc.lines.join(" | "),
+  );
+  const strictBranch = { line: MIN.line, branch: 80 };
+  const svcAllRaw = parseJacocoReport(serviceXml(true), svcTarget, strictBranch);
+  const svcAll = parseJacocoReport(serviceXml(true), svcTarget, strictBranch, undefined, () => serviceSrc);
+  check(
+    "parseJacocoReport：寫出來的每條路都測了 → 100% PASS；照 JaCoCo 的數字卻是 branch 75%，差的那個分支是 Lombok 的 null 檢查",
+    svcAll.passed && svcAll.lines[0].includes("line=100.0%") && svcAll.lines[0].includes("branch=100.0%") && !svcAllRaw.passed && svcAllRaw.lines[0].includes("branch=75.0%"),
+    [...svcAll.lines, ...svcAllRaw.lines].join(" | "),
+  );
+  // `if (flag)` with flag always true: every instruction ran, one branch did not. No line is missed,
+  // so without the branch list the writer is told only a percentage.
+  const flagXml = lombokXml(
+    "Flag.java",
+    '<line nr="3" mi="0" ci="3" mb="0" cb="0"/><line nr="5" mi="0" ci="2" mb="1" cb="1"/><line nr="6" mi="0" ci="4" mb="0" cb="0"/><line nr="8" mi="0" ci="2" mb="0" cb="0"/>',
+    '<counter type="BRANCH" missed="1" covered="1"/><counter type="LINE" missed="0" covered="4"/>',
+  );
+  const flag = parseJacocoReport(flagXml, ["src/main/java/com/x/dto/Flag.java"], MIN);
+  const flagOk = parseJacocoReport(flagXml, ["src/main/java/com/x/dto/Flag.java"], { line: MIN.line, branch: 50 });
+  check(
+    "parseJacocoReport：每行都執行過、只有分支沒走到 → 沒有未覆蓋行可列，改列未覆蓋分支；分支達標時不列",
+    !flag.passed &&
+      flag.lines.length === 2 &&
+      flag.lines[1] === "  未覆蓋分支：5（2 個分支有 1 個沒走到）" &&
+      flagOk.passed &&
+      flagOk.lines.length === 1,
+    [...flag.lines, ...flagOk.lines].join(" | "),
+  );
+  // A record, measured with JDK 21 (--release 17) and JaCoCo 0.8.8: the accessors the compiler
+  // generates sit on the header's first line, even when the components run on over several lines
+  // (equals / hashCode / toString JaCoCo filters itself). One accessor untested: that line is missed.
+  const rangeSrc =
+    "package com.x.rec;\n\npublic record Range(\n        int from,\n        int to\n) {\n    public Range {\n        if (from > to) {\n" +
+    '            throw new IllegalArgumentException("from > to");\n        }\n    }\n}\n';
+  const rangeXml =
+    '<report><package name="com/x/rec"><sourcefile name="Range.java"><line nr="3" mi="3" ci="3" mb="0" cb="0"/><line nr="7" mi="0" ci="8" mb="0" cb="0"/>' +
+    '<line nr="8" mi="0" ci="3" mb="0" cb="2"/><line nr="9" mi="0" ci="5" mb="0" cb="0"/><line nr="11" mi="0" ci="1" mb="0" cb="0"/>' +
+    '<counter type="INSTRUCTION" missed="3" covered="20"/><counter type="BRANCH" missed="0" covered="2"/><counter type="LINE" missed="0" covered="5"/></sourcefile></package></report>';
+  const range = parseJacocoReport(rangeXml, ["src/main/java/com/x/rec/Range.java"], { line: 100, branch: 100 }, undefined, () => rangeSrc);
+  check(
+    "declarationOnlyLines / parseJacocoReport：record 的標頭第一行（多行元件也一樣）列為未計入，compact 建構子的行照算",
+    JSON.stringify(declarationOnlyLines(rangeSrc)) === "[3]" &&
+      range.passed &&
+      range.lines[0].includes("line=100.0%") &&
+      range.lines[1]?.startsWith("  未計入的行：3（"),
+    [JSON.stringify(declarationOnlyLines(rangeSrc)), ...range.lines].join(" | "),
+  );
+  // The per-line data is trusted only when it is all there: one line short of the LINE counter, or
+  // only the <class> element's counters, and the figure is JaCoCo's own.
+  const dtoShort = parseJacocoReport(userDtoXml.replace('covered="4"/>', 'covered="5"/>'), dtoTarget, MIN, undefined, () => userDto);
+  const dtoClassOnly = parseJacocoReport(
+    '<report><package name="com/x/dto"><class name="com/x/dto/UserDto" sourcefilename="UserDto.java"><counter type="BRANCH" missed="18" covered="12"/><counter type="LINE" missed="0" covered="4"/></class></package></report>',
+    dtoTarget,
+    MIN,
+    undefined,
+    () => userDto,
+  );
+  check(
+    "parseJacocoReport：逐行資料不齊（比 LINE 計數器少一行、或只有 <class> 的計數器）→ 不重算，照 JaCoCo 的數字",
+    !dtoShort.passed && dtoShort.lines[0].includes("branch=40.0%") && !dtoClassOnly.passed && dtoClassOnly.lines[0].includes("branch=40.0%"),
+    [...dtoShort.lines, ...dtoClassOnly.lines].join(" | "),
+  );
 
   // --- the repo changes under the snapshot walk ---------------------------------------------
   const fsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-fsrace-"));
@@ -3097,6 +3364,36 @@ process.stdin.on("end", () => {
 // ---------------------------------------------------------------------------
 // 24. Folder targets as batches: splitting, and putting a failed batch's test tree back
 // ---------------------------------------------------------------------------
+{
+  // A runner that cannot start a session is found before the baseline build, not after it.
+  const ok = { kind: "api", apiBaseUrl: "http://h/v1", writerModel: "w", reviewerModel: "r", reviewNeeded: true, opencodeBin: "opencode" };
+  const found = () => "/usr/bin/opencode";
+  const missing = () => undefined;
+  const probs = (over: Partial<typeof ok>, lookup: (c: string) => string | undefined = found) => runnerConfigProblems({ ...ok, ...over }, lookup);
+  check("runnerConfigProblems：api 設定齊全 → 沒有問題", probs({}).length === 0, JSON.stringify(probs({})));
+  check(
+    "runnerConfigProblems：api 缺端點、writer 或 reviewer 的模型 → 各自點名",
+    /UT_API_BASE_URL/.test(probs({ apiBaseUrl: "" }).join()) &&
+      /UT_WRITER_MODEL/.test(probs({ writerModel: "" }).join()) &&
+      /UT_REVIEWER_MODEL/.test(probs({ reviewerModel: "" }).join()) &&
+      probs({ apiBaseUrl: "", writerModel: "", reviewerModel: "" }).length === 3,
+    JSON.stringify(probs({ apiBaseUrl: "", writerModel: "", reviewerModel: "" })),
+  );
+  check(
+    "runnerConfigProblems：UT_SKIP_REVIEW 時不需要 reviewer 的模型",
+    probs({ reviewerModel: "", reviewNeeded: false }).length === 0,
+  );
+  check(
+    "runnerConfigProblems：opencode 找不到 CLI → 點名 UT_OPENCODE_BIN；找得到、或 opencode 的模型沒設（agent 預設）→ 沒有問題",
+    /UT_OPENCODE_BIN/.test(probs({ kind: "opencode" }, missing).join()) &&
+      probs({ kind: "opencode", writerModel: "", reviewerModel: "", apiBaseUrl: "" }, found).length === 0,
+  );
+  check(
+    "runnerConfigProblems：不認得的 UT_RUNNER（大小寫不同也是）→ 點名，不默默換成 opencode；qwen 不在這裡查",
+    /UT_RUNNER=API/.test(probs({ kind: "API" }).join()) && probs({ kind: "qwen" }, missing).length === 0,
+  );
+}
+
 console.log("\n[24] 分批（chunk / captureTree / rollbackTree）");
 {
   check("chunk：依序切成最多 n 個一組", JSON.stringify(chunk([1, 2, 3, 4, 5], 2)) === "[[1,2],[3,4],[5]]");

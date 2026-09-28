@@ -94,7 +94,11 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    回合與逾時預算、重試）約三百行，全部在 runners/ 內，核心一行未動。它同時把原則 2 從
    「設定檔＋guard assert」變成結構：沒定義 bash 工具就沒有 bash 可拿。
 7. **可觀測性**：每輪 artifacts 落盤；startup guard 把「文件契約」變成
-   「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。
+   「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。runner 設定同理，在預檢建置之前檢查：
+   api runner 沒設端點或模型、PATH 上沒有 opencode、`UT_RUNNER` 打錯字（factory 對不認得的值一律啟動
+   opencode）。先前要等預檢建置跑完——重量級整合測試的模組 8–15 分鐘——第一個 writer session 才以
+   runner-spawn-error 失敗。只看設定與檔案系統（`runners/runner.ts` 的 `runnerConfigProblems`）；連線與認證
+   要實際連過才知道，那是 doctor 的事。
 8. **範圍與慣例用量的，不用猜的**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），
    writer 的職責卻只有目標類別。這個落差必須由確定性步驟填平，不能靠 prompt 措辭：
    預檢基準先量出「介入前就存在的紅燈」，既有測試偵測先量出「已經有哪些測試檔」，
@@ -143,6 +147,26 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    模組編碼寫回；被 SIGKILL 來不及處理的，原本的 bytes 在打開視圖之前就寫進使用者自己的快取目錄當復原日誌，
    下一次在同一個 repo 執行時放回。轉碼器與日誌都放在使用者自己的快取目錄、檢查擁有者：共用的 /tmp 裡一個
    預先放好的 `Transcode.class` 就是以執行者身分跑的程式碼。
+   **覆蓋率的量尺也要對準寫出來的程式碼。** JaCoCo 的行號是編譯器給的：Lombok 產生的 equals / hashCode /
+   toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、`@RequiredArgsConstructor` 的建構子（連同
+   `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與 record 的存取方法記在型別宣告那一行（多行的
+   record 標頭是第一行）。實測（JaCoCo 0.8.8、Spring Boot 2.7 的 Lombok）：每個存取方法、equals、hashCode、
+   toString 都測了的 `@Data` DTO 是 branch 40%，`@Builder` 的 DTO 測了 builder 是 branch 4%——差的全是沒有人
+   寫的分支。照這個數字擋關，就是要 writer 去測產生出來的程式碼：Spring Boot 資料夾實測 4 批只過 1 批，DTO
+   與進入點每批都以 stuck 收場。所以 gate 從逐行資料重算，不計只有註解、沒有初始值的欄位宣告、型別宣告的行
+   （`libs/javasrc.ts` 的 `declarationOnlyLines`：在 lexer 清掉註解與字串、再清掉註解參數之後逐行比對，讀得懂才
+   算——`return x;` 這種兩個字加分號的敘述句、非 ASCII 的名稱、有初始值的欄位都照算），並在報告列出來。
+   逐行資料不齊（加總對不上 LINE 計數器、只有 `<class>` 元素）就照 JaCoCo 的數字：拿一半的資料重算比不算
+   更糟。寫出來的邏輯沒測到照樣 FAIL，而且未覆蓋行與未覆蓋分支只點名寫出來的行——`if (flag)` 的 flag
+   永遠是 true 時那一行每個指令都執行過，只看未覆蓋行 writer 什麼都看不到，所以分支另外列出每行幾個、
+   幾個沒走到。
+   更前面一步是**目標分流**（`libs/utils.ts` 的 `codelessTypeReason`）：只有欄位與常數的類別、只有常數的
+   enum、沒有本體的 record、只有抽象方法的 abstract 類別與 interface、`main` 只呼叫 `SpringApplication.run`
+   的進入點，不開 writer session——測它們是白花一個 session、一次建置與一次 review，進入點還得啟動整個
+   Spring context，那是整合測試。分流寫窄：`private` 建構子只有空的或 Sonar 式的 `throw new …` 才算不會
+   執行（Jackson 會呼叫 private 的無參數建構子）、`static final` 欄位的初始值要是編譯器折疊的字面常數
+   （`null` 不是，它在 static initializer 裡賦值），讀不懂的一律留著當目標，由上面的重算兜底。
+
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表

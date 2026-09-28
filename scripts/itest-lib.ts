@@ -93,6 +93,8 @@ export interface JacocoSpec {
   branch: [number, number];
   /** Line numbers to mark as missed, for the uncovered-lines hint. */
   missed?: number[];
+  /** Every line with code, as a real report lists them: [nr, mi, ci, mb, cb]. Replaces `missed`. */
+  lines?: Array<[number, number, number, number, number]>;
 }
 
 /** What the scripted writer does in one round. Paths are repo-relative. */
@@ -369,7 +371,9 @@ if (step.jacoco) {
   const specs = [].concat(step.jacoco);
   const sourcefile = (j) =>
     '<sourcefile name="' + j.file + '">\\n' +
-    (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>').join("\\n") + '\\n' +
+    (j.lines
+      ? j.lines.map(([nr, mi, ci, mb, cb]) => '<line nr="' + nr + '" mi="' + mi + '" ci="' + ci + '" mb="' + mb + '" cb="' + cb + '"/>')
+      : (j.missed || []).map((nr) => '<line nr="' + nr + '" mi="1" ci="0" mb="0" cb="0"/>')).join("\\n") + '\\n' +
     '<counter type="LINE" missed="' + j.line[0] + '" covered="' + j.line[1] + '"/>\\n' +
     '<counter type="BRANCH" missed="' + j.branch[0] + '" covered="' + j.branch[1] + '"/>\\n' +
     '</sourcefile>\\n';

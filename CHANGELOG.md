@@ -8,6 +8,9 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **覆蓋率回饋點名沒走到的分支。** 分支不足時，除了未覆蓋行，另列每行有幾個分支、幾個沒走到
+  （`未覆蓋分支：19（2 個分支有 1 個沒走到）`）。`if (flag)` 的 flag 永遠是 true 時那一行每個指令都執行過，
+  先前 writer 只拿到「branch=50% FAIL」，不知道要補哪一條路。
 - **資料夾目標自動分批（`UT_BATCH_SIZE`，預設 1）。** 目標是資料夾時，所有類別原本交給同一個 writer
   session 寫、同一個 reviewer session 審、共用一份輪數；類別一多就超出模型的 context 與 agent 逾時
   （README 因此建議一次只做一個類別），而且只要一個類別修不綠，整個 run 就停下、其他類別一起卡在半路。
@@ -137,6 +140,25 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **Spring Boot + Lombok 的資料夾，DTO 與進入點的批次永遠過不了。** JaCoCo 的行號是編譯器給的：Lombok
+  產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
+  `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行。實測（JaCoCo 0.8.8、
+  Spring Boot 2.7 的 Lombok）每個存取方法、equals、hashCode、toString 都測了的 `@Data` DTO 是 branch 40%，
+  `@Builder` 的 DTO 是 4%，writer 怎麼補都補不滿；`main` 只呼叫 `SpringApplication.run` 的進入點則要啟動
+  整個 Spring context 才執行得到。一個有 DTO、repository、service、進入點的資料夾因此 4 批只過 1 批。現在：
+  - 目標分流：只有欄位與常數的類別（`@Data` DTO、JPA entity、常數類別）、只有常數的 enum、沒有本體的 record、
+    只有抽象方法與欄位的 abstract 類別、Spring Boot 進入點不當目標，跟只有抽象方法的 interface 一樣列在 log
+    與 `params.json` 的 `skippedCodeless`。判斷寫窄：有方法、初始值不是字面常數的欄位、會執行的建構子
+    （含 record 的 compact 建構子、body 不是空的也不是 `throw new …` 的 private 建構子）就留著。
+  - 覆蓋率 gate 從逐行資料重算，不計只有註解、沒有初始值的欄位宣告、型別宣告的行（報告列在「未計入的行」）；
+    寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
+  同一個資料夾現在 2 批全過（DTO 與進入點略過，`@Builder.Default` 的初始值那行照算）。README 另說明怎麼用
+  `lombok.addLombokGeneratedAnnotation` 讓 Sonar 與 IDE 也不算產生的程式碼。
+- **runner 設定錯誤要等預檢建置跑完才發現。** api runner 沒設 `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` /
+  `UT_API_BASE_URL`、PATH 上沒有 opencode 時，run 先跑完預檢建置（重量級模組 8–15 分鐘），第一個 writer
+  session 才以 `runner-spawn-error` 失敗；`UT_RUNNER` 打錯字（例如 `API`）則默默改用 opencode。現在在預檢
+  建置、執行鎖與 artifacts 之前就中止並列出缺什麼（`UT_SKIP_REVIEW=1` 時不要求 reviewer 的模型），指向
+  doctor 做連線與認證檢查。
 - **repo 鎖在「等不到」時不再照樣執行，Windows 上以系統管理員身分跑的 run 也擋得住。** 取鎖原本以重試次數為限：
   另一個 run 正在建立或接手鎖的那一瞬間，次數用完就當作沒有鎖、照樣執行——兩個 run 一起跑。現在以時間為限
   （15 秒，長過空鎖視為當掉的 2 秒與接手鎖視為當掉的 10 秒），等不到就當作對方在執行，訊息說明原因。持有者

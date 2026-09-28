@@ -14,6 +14,7 @@ import {
   EXISTING_TEST_SHRUNK,
   JACOCO_GREEN,
   JACOCO_RED,
+  JacocoSpec,
   Scenario,
   SUREFIRE_FAIL,
   SUREFIRE_PASS,
@@ -272,6 +273,83 @@ const GREEN_BUILD = {
   jacoco: JACOCO_GREEN,
 };
 
+// A @Data class with a method someone wrote. JaCoCo's lines for it, shaped as the real report is
+// (JaCoCo 0.8.8, Spring Boot 2.7's Lombok): equals / hashCode / toString / setters on the @Data line,
+// the getters on the fields' lines, the hand-written method on its own.
+const MONEY_PATH = "src/main/java/com/x/Money.java";
+const MONEY_JAVA = `package com.x;
+
+import java.math.BigDecimal;
+import lombok.Data;
+
+@Data
+public class Money {
+    private BigDecimal amount;
+    private String currency;
+
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new IllegalArgumentException("currency mismatch");
+        }
+        Money m = new Money();
+        m.setAmount(amount.add(other.amount));
+        m.setCurrency(currency);
+        return m;
+    }
+}
+`;
+const MONEY_TEST_PATH = `${TEST_DIR}/MoneyTest.java`;
+const moneyTest = (withMismatch: boolean) => `package com.x;
+
+import java.math.BigDecimal;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+class MoneyTest {
+    private static Money of(String amount, String currency) {
+        Money m = new Money();
+        m.setAmount(new BigDecimal(amount));
+        m.setCurrency(currency);
+        return m;
+    }
+
+    @Test
+    void plus_sameCurrency_addsAmounts() {
+        assertEquals(new BigDecimal("3"), of("1", "TWD").plus(of("2", "TWD")).getAmount());
+    }
+${withMismatch ? `
+    @Test
+    void plus_differentCurrency_throws() {
+        assertThrows(IllegalArgumentException.class, () -> of("1", "TWD").plus(of("2", "USD")));
+    }
+` : ""}}
+`;
+const moneyJacoco = (throwCovered: boolean): JacocoSpec => ({
+  pkg: "com/x",
+  file: "Money.java",
+  lines: [
+    [6, 40, 60, 20, 6],
+    [8, 0, 3, 0, 0],
+    [9, 0, 3, 0, 0],
+    [12, 0, 6, throwCovered ? 0 : 1, throwCovered ? 2 : 1],
+    [13, throwCovered ? 0 : 5, throwCovered ? 5 : 0, 0, 0],
+    [15, 0, 4, 0, 0],
+    [16, 0, 8, 0, 0],
+    [17, 0, 4, 0, 0],
+    [18, 0, 2, 0, 0],
+  ],
+  line: throwCovered ? [0, 9] : [1, 8],
+  branch: throwCovered ? [20, 8] : [21, 7],
+});
+const MONEY_BUILD = (throwCovered: boolean) => ({
+  exit: 0,
+  out: BUILD_SUCCESS(4),
+  cleanSurefire: true,
+  surefire: ran("com.x.CalcTest", "com.x.MoneyTest"),
+  jacoco: [JACOCO_GREEN, moneyJacoco(throwCovered)],
+});
+
 const LEGACY = "com.x.LegacyTest";
 const LEGACY_PATH = `${TEST_DIR}/LegacyTest.java`;
 const LEGACY_FIXED = `package com.x;
@@ -487,6 +565,27 @@ export const SCENARIOS: Scenario[] = [
       { exit: 0, out: BUILD_SUCCESS(1), cleanSurefire: true, surefire: ran(OLD_STYLE), jacoco: JACOCO_GREEN },
       { exit: 0, out: BUILD_SUCCESS(3), cleanSurefire: true, surefire: ran(OLD_STYLE, "com.x.CalcTest"), jacoco: JACOCO_GREEN },
     ],
+  },
+  {
+    name: "coverage-lombok-generated-lines",
+    desc: "@Data 類別帶一個手寫方法，產生的 equals/hashCode 分支都沒測（JaCoCo 的分支 28.6%）→ 只算寫出來的邏輯，100% 通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [MONEY_PATH]: MONEY_JAVA },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST, [MONEY_TEST_PATH]: moneyTest(true) } }],
+    mvn: [MONEY_BUILD(true)],
+  },
+  {
+    name: "coverage-lombok-real-miss",
+    desc: "同一個 @Data 類別，手寫方法裡丟例外的分支沒測到 → 照樣 FAIL，回饋只點名那一行（不點名 @Data 那行）；補上之後通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [MONEY_PATH]: MONEY_JAVA },
+    writer: [
+      { write: { [CALC_TEST_PATH]: CALC_TEST, [MONEY_TEST_PATH]: moneyTest(false) } },
+      { write: { [MONEY_TEST_PATH]: moneyTest(true) } },
+    ],
+    mvn: [MONEY_BUILD(false), MONEY_BUILD(true)],
   },
   {
     name: "zero-tests",
@@ -1568,6 +1667,32 @@ export const SCENARIOS: Scenario[] = [
     ],
     // JACOCO_GREEN lists Calc.java only, as a report without the interface would.
     mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-nothing-to-test-skipped",
+    desc: "目標資料夾裡有 @Data DTO、Spring Boot 進入點、常數類別（Spring Boot 專案的常態）→ 都略過，不為它們開 writer session、不讓覆蓋率 gate 卡住",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: {
+      "src/main/java/com/x/UserDto.java": "package com.x;\n\nimport lombok.Data;\n\n@Data\npublic class UserDto {\n    private Long id;\n    private String name;\n}\n",
+      "src/main/java/com/x/App.java":
+        "package com.x;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class App {\n    public static void main(String[] args) {\n        SpringApplication.run(App.class, args);\n    }\n}\n",
+      "src/main/java/com/x/Codes.java":
+        'package com.x;\n\npublic final class Codes {\n    public static final String NOT_FOUND = "E404";\n\n    private Codes() {\n        throw new IllegalStateException("Utility class");\n    }\n}\n',
+    },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-runner-misconfigured",
+    desc: "api runner 沒設模型 → 在預檢建置之前就中止並點名缺的設定，不得先跑完建置才在第一個 writer session 失敗",
+    entry: "loop",
+    env: { UT_WRITER_MODEL: "", UT_REVIEWER_MODEL: "" },
+    api: [],
+    mvn: [GREEN_BUILD],
   },
   {
     name: "loop-baseline-env-false-positive",

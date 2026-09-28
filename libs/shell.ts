@@ -222,6 +222,32 @@ export function resolveWindowsCommand(
   return undefined;
 }
 
+/**
+ * The file a spawn of `cmd` would run, found without running it; undefined when there is none.
+ * Windows resolves as planSpawn does (PATHEXT); elsewhere the first executable file named `cmd` on
+ * PATH, or `cmd` itself when it is a path. With no PATH at all the answer is `cmd`: exec then
+ * searches a default path this cannot see, so not finding it here would be a guess.
+ */
+export function findOnPath(
+  cmd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string | undefined {
+  if (platform === "win32") return resolveWindowsCommand(cmd, env);
+  if (!cmd.includes("/") && env.PATH === undefined) return cmd;
+  const candidates = cmd.includes("/")
+    ? [path.resolve(cmd)]
+    : env.PATH!.split(":").map((d) => path.join(d || ".", cmd));
+  return candidates.find((p) => {
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
 // Quotes one argument for cmd.exe: CommandLineToArgvW quoting so the child parses it as a
 // single argument, then `^`-escaping so cmd.exe does not interpret the metacharacters itself.
 function quoteForCmd(arg: string): string {

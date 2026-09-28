@@ -22,6 +22,7 @@ import {
   RUNNER_KIND,
   WRITER_MODEL,
   REVIEWER_MODEL,
+  TESTGEN_ROOT,
   SCORE_THRESHOLDS,
   STRICT_COV,
   ALLOW_ZERO_TESTS,
@@ -39,7 +40,7 @@ import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
 import { detectBuildTool, detectEnvFailures, runBaseline, targetModuleSkipped, writableRel } from "./gates/build";
-import { createRunner } from "./runners/runner";
+import { configuredRunnerProblems, createRunner } from "./runners/runner";
 import { IterationRecord, orchestrate, repairBaseline, RepairResult, WriterTrace, writerChangesSoFar } from "./orchestrator";
 import {
   batchFailureFingerprint,
@@ -96,16 +97,17 @@ async function main() {
   const buildTool = detectBuildTool(mod.moduleRoot);
   const javaFiles = listJavaClasses(absTarget, REPO_ROOT);
   if (javaFiles.length === 0) die(`目標沒有 .java 檔：${absTarget}`);
-  // Types that compile to no executable code are not targets: no test can cover them, so the
-  // coverage gate has nothing to hold the writer to and a reviewer has nothing to review.
+  // Types with nothing to unit-test are not targets (see codelessTypeReason): no code, only code
+  // Lombok or the compiler generated, or an entry point that only starts Spring. A test of them is
+  // effort spent on nothing, and a gate that holds them to coverage blocks a batch it cannot pass.
   const codeless = javaFiles
     .map((cls) => ({ cls, why: codelessTypeReason(fs.readFileSync(path.join(REPO_ROOT, cls), "utf8")) }))
     .filter((c): c is { cls: string; why: string } => c.why !== null);
   const targetClasses = javaFiles.filter((cls) => !codeless.some((c) => c.cls === cls));
   if (targetClasses.length === 0) {
     die(
-      `目標底下只有沒有可執行程式碼的型別（${codeless.map((c) => `${path.basename(c.cls)}：${c.why}`).join("、")}），` +
-        "沒有東西可以寫單元測試。請改指定實作類別（例如 FooServiceImpl.java）或其所在資料夾。",
+      `目標底下沒有需要單元測試的程式碼（${codeless.map((c) => `${path.basename(c.cls)}：${c.why}`).join("、")}）。` +
+        "請改指定有邏輯的類別（例如 FooServiceImpl.java）或其所在資料夾。",
     );
   }
 
@@ -121,7 +123,7 @@ async function main() {
   log(`目標類別 ${targetClasses.length} 個：`);
   targetClasses.forEach((c) => log(`  - ${c}`));
   if (codeless.length) {
-    log(`略過 ${codeless.length} 個沒有可執行程式碼的型別（不產生測試、不列入覆蓋率門檻）：`);
+    log(`略過 ${codeless.length} 個沒有需要單元測試的程式碼的型別（不產生測試）：`);
     codeless.forEach((c) => log(`  - ${c.cls}（${c.why}）`));
   }
 
@@ -165,6 +167,15 @@ async function main() {
       `STRICT_COV=${STRICT_COV ? "on" : "off"}, review_gate=${SKIP_REVIEW ? "關閉" : "開啟"}`,
   );
 
+  // Before the lock and the baseline: a runner that cannot start a session fails the first writer on
+  // the spot, and the baseline of a heavy module takes minutes to get there.
+  const runnerProblems = configuredRunnerProblems(!SKIP_REVIEW);
+  if (runnerProblems.length) {
+    die(
+      `runner 設定不完整，agent session 無法啟動（在預檢建置之前先中止）：\n${runnerProblems.map((p) => `  - ${p}`).join("\n")}\n` +
+        `完整的環境檢查（含連線與認證）：npx tsx ${path.join(TESTGEN_ROOT, "scripts", "doctor.ts")}`,
+    );
+  }
   if (RUNNER_KIND === "opencode") assertAgents();
 
   const runId = new Date().toISOString().replace(/[:.]/g, "-");

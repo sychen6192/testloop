@@ -480,6 +480,22 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
   },
 
+  "coverage-lombok-generated-lines": (c) => {
+    check("一輪通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    const cov = c.runRead("iter-1/coverage.txt");
+    check("Money 只算寫出來的邏輯：100%", /Money\.java: line=100\.0%.*branch=100\.0%.*PASS/.test(cov), cov);
+    check("報告列出未計入的行（@Data、欄位）", cov.includes("未計入的行：6, 8-9"), cov);
+  },
+
+  "coverage-lombok-real-miss": (c) => {
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("第 1 輪卡在覆蓋率 gate", gates(c)[0] === "coverage/fail", gates(c).join(","));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋是寫出來的邏輯的數字（branch 50%）", /Money\.java: line=83\.3%.*branch=50\.0%.*FAIL/.test(fb), fb.slice(0, 600));
+    check("未覆蓋行只點名手寫的那行 13，不點名 @Data 的第 6 行", fb.includes("未覆蓋行：13\n") || /未覆蓋行：13$/m.test(fb), fb.slice(0, 600));
+    check("未覆蓋分支只點名 if 那行 12，不點名 @Data 第 6 行的 20 個", /^ {2}未覆蓋分支：12（2 個分支有 1 個沒走到）$/m.test(fb), fb.slice(0, 600));
+  },
+
   "zero-tests": (c) => {
     check("建置綠燈仍判 FAIL", c.result.success === false);
     const fb = c.runRead("iter-1/feedback.md");
@@ -975,7 +991,34 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     // listJavaClasses keeps the platform separator: backslashes on Windows.
     const targets = ((params.targetClasses ?? []) as string[]).map((p) => p.replace(/\\/g, "/"));
     check("目標只剩實作類別", JSON.stringify(targets) === JSON.stringify(["src/main/java/com/x/Calc.java"]), JSON.stringify(params.targetClasses));
-    check("log 說明為什麼略過", /略過 1 個沒有可執行程式碼的型別/.test(c.stdout), c.stdout.slice(0, 1500));
+    check("log 說明為什麼略過", /略過 1 個沒有需要單元測試的程式碼的型別/.test(c.stdout), c.stdout.slice(0, 1500));
+  },
+
+  "loop-runner-misconfigured": (c) => {
+    check("exit code 非 0", c.code !== 0, `code=${c.code}`);
+    check("沒有跑預檢建置（mvn 0 次）", c.mvnCalls === 0, `mvnCalls=${c.mvnCalls}`);
+    check(
+      "點名缺的兩個設定",
+      c.stderr.includes("UT_WRITER_MODEL 未設定") && c.stderr.includes("UT_REVIEWER_MODEL 未設定") && c.stderr.includes("doctor.ts"),
+      c.stderr.slice(-1200),
+    );
+    check("沒有留下 run 目錄（在鎖與 artifacts 之前就中止）", c.runRead("params.json") === "", c.runRead("params.json").slice(0, 200));
+  },
+
+  "loop-nothing-to-test-skipped": (c) => {
+    check("exit code 0", c.code === 0, `code=${c.code}\n${c.stdout.slice(-600)}`);
+    const params = JSON.parse(c.runRead("params.json") || "{}");
+    const skipped = (params.skippedCodeless ?? []) as Array<{ cls: string; why: string }>;
+    const why = (name: string) => skipped.find((x) => x.cls.replace(/\\/g, "/").endsWith(name))?.why ?? "";
+    check(
+      "DTO、Spring Boot 進入點、常數類別都略過，各有原因",
+      /Lombok/.test(why("UserDto.java")) && /Spring Boot 進入點/.test(why("App.java")) && /常數/.test(why("Codes.java")),
+      JSON.stringify(skipped),
+    );
+    const targets = ((params.targetClasses ?? []) as string[]).map((p) => p.replace(/\\/g, "/"));
+    check("目標只剩有邏輯的 Calc", JSON.stringify(targets) === JSON.stringify(["src/main/java/com/x/Calc.java"]), JSON.stringify(params.targetClasses));
+    check("只有一批：沒有為略過的類別開 writer session", c.result.batches === undefined && c.runExists("iter-1/prompt.md"));
+    check("log 說明略過了哪些", /略過 3 個沒有需要單元測試的程式碼的型別/.test(c.stdout), c.stdout.slice(0, 1500));
   },
 
   "loop-baseline-env-false-positive": (c) => {

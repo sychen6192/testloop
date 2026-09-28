@@ -71,3 +71,74 @@ export function codeOnly(src: string): string {
   }
   return out.join("");
 }
+
+/**
+ * Pure: code-only text (see codeOnly) with every annotation — `@Name` and its argument list, across
+ * lines when it spans them — replaced by spaces, line breaks kept. `@interface`, a declaration
+ * keyword, stays. An argument list that never closes is left as it is: in code that compiles it
+ * always does, and blanking to the end of the file would take the code after it with it.
+ */
+export function stripAnnotations(code: string): string {
+  const out = code.split("");
+  const n = code.length;
+  const name = /@\s*[\w$]+(?:\s*\.\s*[\w$]+)*/y;
+  for (let i = 0; i < n; i++) {
+    if (code[i] !== "@") continue;
+    name.lastIndex = i;
+    const m = name.exec(code);
+    if (!m || /^@\s*interface$/.test(m[0])) continue;
+    let end = i + m[0].length;
+    let k = end;
+    while (k < n && /\s/.test(code[k])) k++;
+    if (code[k] === "(") {
+      let depth = 0;
+      for (; k < n; k++) {
+        if (code[k] === "(") depth++;
+        else if (code[k] === ")" && --depth === 0) break;
+      }
+      if (k >= n) continue; // never closes
+      end = k + 1;
+    }
+    for (let x = i; x < end; x++) if (out[x] !== "\n" && out[x] !== "\r") out[x] = " ";
+    i = end - 1;
+  }
+  return out.join("");
+}
+
+const DECLARATION_MODIFIERS = "(?:(?:public|protected|private|static|final|transient|volatile|abstract|strictfp|sealed|non-sealed)\\s+)*";
+const TYPE_REF =
+  "[\\w$]+(?:\\s*\\.\\s*[\\w$]+)*(?:\\s*<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>)?(?:\\s*\\[\\s*\\])*";
+const DECLARED_NAME = "[\\w$]+(?:\\s*\\[\\s*\\])*";
+// A variable declared without an initializer. Two words and a semicolon is otherwise only a statement
+// that starts with one of these keywords — `return x;` is code.
+const DECLARED_ONLY = new RegExp(
+  `^${DECLARATION_MODIFIERS}(?!(?:return|throw|yield|assert|break|continue|case|default|goto|else|do|new|package|import)\\b)` +
+    `${TYPE_REF}\\s+${DECLARED_NAME}(?:\\s*,\\s*${DECLARED_NAME})*\\s*;$`,
+);
+// A type's declaration, its body opening on the line at most: `public class Foo extends Bar {`.
+const TYPE_DECLARATION = new RegExp(`^${DECLARATION_MODIFIERS}(?:class|interface|enum|record|@\\s*interface)\\s+[\\w$]+[^{}=;]*\\{?$`);
+
+/**
+ * Pure: the 1-based numbers of the lines that hold no code anyone wrote — annotations alone, a
+ * field declared without an initializer, a type's declaration. The compiler attributes code to them
+ * all the same: Lombok's generated methods to the annotation (@Data's equals and hashCode, a whole
+ * @Builder) or to the field (@Getter, @Setter), the implicit default constructor to the type's
+ * declaration. Measured on JaCoCo 0.8.8 with Spring Boot 2.7's Lombok: a @Data DTO whose getters,
+ * setters, equals, hashCode and toString were all tested showed 40% branch coverage, every missed
+ * branch on the @Data line. Coverage that counts those lines asks for tests of code nobody wrote.
+ *
+ * Only a line matched outright counts: one this cannot read (an identifier outside ASCII, a statement
+ * split in an unusual place) stays in the figure.
+ */
+export function declarationOnlyLines(src: string): number[] {
+  const code = codeOnly(src);
+  const bare = stripAnnotations(code).split("\n");
+  const lines = code.split("\n");
+  const out: number[] = [];
+  lines.forEach((raw, i) => {
+    if (!raw.trim()) return;
+    const line = bare[i].trim();
+    if (!line || DECLARED_ONLY.test(line) || TYPE_DECLARATION.test(line)) out.push(i + 1);
+  });
+  return out;
+}
