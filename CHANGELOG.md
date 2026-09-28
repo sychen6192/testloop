@@ -154,6 +154,11 @@
     寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
   同一個資料夾現在 2 批全過（DTO 與進入點略過，`@Builder.Default` 的初始值那行照算）。README 另說明怎麼用
   `lombok.addLombokGeneratedAnnotation` 讓 Sonar 與 IDE 也不算產生的程式碼。
+- **pom 寫了 `<append>true</append>` 時，覆蓋率跨建置累加。** `-Djacoco.append=false` 只改預設值，pom 的
+  設定蓋過它（實測 JaCoCo 0.8.8：argLine 仍是 `append=true`），於是前幾次建置的覆蓋率全算進這一次——writer
+  刪掉的測試、撤回的批次、開發者自己跑過的 `mvn test`。實測：刪掉一個測試後報告仍是 branch 2/2，實際是
+  1/2。現在每次 Maven 建置前刪掉模組的 `target/jacoco.exec`，以及建置 log 裡看到在累加的 exec 檔（只限 repo
+  裡的 `.exec`），並印一行 WARN 說明。
 - **runner 設定錯誤要等預檢建置跑完才發現。** api runner 沒設 `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` /
   `UT_API_BASE_URL`、PATH 上沒有 opencode 時，run 先跑完預檢建置（重量級模組 8–15 分鐘），第一個 writer
   session 才以 `runner-spawn-error` 失敗；`UT_RUNNER` 打錯字（例如 `API`）則默默改用 opencode。現在在預檢

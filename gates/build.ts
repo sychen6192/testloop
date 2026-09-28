@@ -57,6 +57,69 @@ export interface BaselineResult {
   ranTests?: string[];
 }
 
+/**
+ * Pure: the JaCoCo exec files a build's agents append to, from the line jacoco-maven-plugin's
+ * prepare-agent logs — `argLine set to -javaagent:…jacoco…jar=destfile=X,append=true`, the whole
+ * argument quoted when a path has a space, the property name a pom may change. -Djacoco.append=false
+ * only sets the default: a pom's <append>true</append> wins over it, and an agent given no append
+ * option appends. Measured on JaCoCo 0.8.8: with <append>true</append>, a test removed after one
+ * build left the next build's report at the removed test's coverage (branch 2/2 instead of 1/2).
+ */
+export function appendingJacocoExecFiles(out: string): string[] {
+  const files: string[] = [];
+  for (const line of out.split(/\r?\n/)) {
+    if (!/ set to /.test(line)) continue;
+    for (const m of line.matchAll(/"-javaagent:([^"]*)"|-javaagent:(\S+)/g)) {
+      const arg = m[1] ?? m[2];
+      const at = arg.search(/jacoco[^=]*\.jar=/i);
+      if (at < 0) continue;
+      const opts = arg.slice(arg.indexOf("=", at) + 1);
+      const option = (k: string) => new RegExp(`(?:^|,)${k}=([^,]*)`).exec(opts)?.[1];
+      const dest = option("destfile");
+      if (dest && option("append") !== "false") files.push(dest);
+    }
+  }
+  return [...new Set(files)];
+}
+
+// The exec files this run's builds were seen appending to (see appendingJacocoExecFiles), removed
+// before every later build so that each report counts that build alone: the round-1 test the
+// writer since deleted, the rolled-back batch's tests, the developer's own `mvn test`. The module's
+// default target/jacoco.exec goes every time — a build rewrites it anyway unless it appends — so only
+// a destfile configured elsewhere depends on having been seen, which the baseline build does first.
+const appendingExec = new Set<string>();
+
+function clearCoverageData(mod: ModuleInfo): void {
+  for (const f of new Set([path.join(mod.moduleRoot, "target", "jacoco.exec"), ...appendingExec])) {
+    try {
+      fs.rmSync(f, { force: true });
+    } catch (e) {
+      log(`[WARN] 無法刪除 JaCoCo 的 exec 檔 ${f}（${(e as Error).message}）：這次的覆蓋率會含前幾次建置的資料`);
+    }
+  }
+}
+
+/** Pure: the exec files among `files` that are this repo's to remove — `.exec` files inside it. */
+export function ownedExecFiles(files: string[], repoRoot: string): string[] {
+  return files
+    .map((f) => path.resolve(repoRoot, f))
+    .filter((abs) => {
+      const rel = path.relative(repoRoot, abs);
+      return /\.exec$/i.test(abs) && rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+    });
+}
+
+function learnAppendingExec(out: string): void {
+  for (const abs of ownedExecFiles(appendingJacocoExecFiles(out), REPO_ROOT)) {
+    if (appendingExec.has(abs)) continue;
+    appendingExec.add(abs);
+    log(
+      `[WARN] JaCoCo 把覆蓋率累加進 ${path.relative(REPO_ROOT, abs).replace(/\\/g, "/")}（append 不是 false——pom 的設定蓋過了 -Djacoco.append=false）：` +
+        "之後每次建置前先刪掉它，覆蓋率才只算那次建置",
+    );
+  }
+}
+
 /** The writer's only writable path, repo-relative, for messages. */
 export const writableRel = (mod: ModuleInfo) =>
   path.join(mod.moduleRel || ".", "src", "test").replace(/\\/g, "/");
@@ -1290,7 +1353,8 @@ async function runBuild(
       // across builds: a round-1 test that covers nothing inherits the previous run's — or
       // the developer's own — coverage and passes the gate. Measured on the fixture: 2 of 6
       // lines covered reported as 100%. Each build must measure only itself. Harmless when
-      // the module has no JaCoCo.
+      // the module has no JaCoCo. A pom that sets <append> itself wins over this; the exec
+      // files are removed before the build for that (clearCoverageData).
       "-Djacoco.append=false",
       // failIfNoSpecifiedTests=false is required, not cosmetic: with -am the same -Dtest is
       // applied to the upstream modules, where those classes do not exist, and surefire
@@ -1301,7 +1365,9 @@ async function runBuild(
       "test",
       ...MAVEN_EXTRA_ARGS,
     ];
+    clearCoverageData(mod);
     r = await shLive(cmd, args, "[mvn]", cwd, BUILD_TIMEOUT_MS);
+    learnAppendingExec(stripAnsi(r.out));
   } else {
     const wrapper = isWin ? "gradlew.bat" : "gradlew";
     const wrapperAt = fs.existsSync(path.join(REPO_ROOT, wrapper));

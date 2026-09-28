@@ -265,6 +265,21 @@ const verdict = (o: {
     advisories: o.advisories ?? [],
   });
 
+// jacoco-maven-plugin's prepare-agent line when the pom's <append>true</append> wins over
+// -Djacoco.append=false (measured on JaCoCo 0.8.8), and a green build whose agent appends there: a
+// report built on an earlier build's data too reads full coverage.
+const JACOCO_APPENDS = (exec: string) =>
+  `[INFO] argLine set to -javaagent:/m2/org/jacoco/org.jacoco.agent/0.8.8/org.jacoco.agent-0.8.8-runtime.jar=destfile={{root}}/${exec},append=true`;
+const APPENDING_GREEN_BUILD = (exec: string) => ({
+  exit: 0,
+  out: `${JACOCO_APPENDS(exec)}\n${BUILD_SUCCESS(4)}`,
+  cleanSurefire: true,
+  surefire: ran("com.x.CalcTest"),
+  jacoco: JACOCO_GREEN,
+  jacocoExec: exec,
+  jacocoIfStale: JACOCO_GREEN,
+});
+
 const GREEN_BUILD = {
   exit: 0,
   out: BUILD_SUCCESS(4),
@@ -737,6 +752,38 @@ export const SCENARIOS: Scenario[] = [
       { write: { [CALC_TEST_PATH]: calcTest(9) } },
     ],
     mvn: [{ ...GREEN_BUILD, jacoco: JACOCO_RED }],
+  },
+  {
+    name: "coverage-jacoco-append-forced",
+    desc: "pom 以 <append>true</append> 蓋過 -Djacoco.append=false → 第 1 輪的覆蓋率不得算進第 2 輪（writer 刪掉的測試不能還替它過關）",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      { write: { [CALC_TEST_PATH]: calcTest(1) } },
+      // The failing test goes, and with it the only test of div's branch.
+      { write: { [CALC_TEST_PATH]: calcTest(9) } },
+      { write: { [CALC_TEST_PATH]: calcTest(17) } },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: `${JACOCO_APPENDS("target/coverage-reports/jacoco-ut.exec")}\n${TEST_FAILURE()}`,
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+        jacocoExec: "target/coverage-reports/jacoco-ut.exec",
+      },
+      { ...APPENDING_GREEN_BUILD("target/coverage-reports/jacoco-ut.exec"), jacoco: JACOCO_RED },
+      APPENDING_GREEN_BUILD("target/coverage-reports/jacoco-ut.exec"),
+    ],
+  },
+  {
+    name: "coverage-jacoco-exec-left-over",
+    desc: "開發者自己跑過的 mvn test 留下 target/jacoco.exec、pom 又設成累加 → 第一次建置也不得把它算進覆蓋率",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { "target/jacoco.exec": "the developer's own run" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...APPENDING_GREEN_BUILD("target/jacoco.exec"), jacoco: JACOCO_RED }, APPENDING_GREEN_BUILD("target/jacoco.exec")],
   },
   {
     name: "stale-jacoco",

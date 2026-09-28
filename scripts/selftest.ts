@@ -124,6 +124,8 @@ import { codeOnly, declarationOnlyLines } from "../libs/javasrc";
 import { planSpawn, resolveWindowsCommand, findOnPath, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
 import { runnerConfigProblems } from "../runners/runner";
 import {
+  appendingJacocoExecFiles,
+  ownedExecFiles,
   checkTestsRan,
   ranTestClasses,
   targetModuleSkipped,
@@ -2878,6 +2880,38 @@ console.log("\n[23] 中途中斷的成因（失敗分類 / context 縮短 / 沒�
       range.lines[1]?.startsWith("  未計入的行：3（"),
     [JSON.stringify(declarationOnlyLines(rangeSrc)), ...range.lines].join(" | "),
   );
+  // Which exec files a build's JaCoCo agent appends to, from prepare-agent's log line. A pom's
+  // <append>true</append> wins over -Djacoco.append=false; an agent given no append option appends.
+  const agent = "/m2/org/jacoco/org.jacoco.agent/0.8.8/org.jacoco.agent-0.8.8-runtime.jar";
+  check(
+    "appendingJacocoExecFiles：append=true 或沒給 append → 累加；append=false → 不算；別的 agent、別的行不算",
+    JSON.stringify(appendingJacocoExecFiles(`[INFO] argLine set to -javaagent:${agent}=destfile=/w/p/target/jacoco.exec,append=true`)) === '["/w/p/target/jacoco.exec"]' &&
+      JSON.stringify(appendingJacocoExecFiles(`[INFO] argLine set to -javaagent:${agent}=destfile=/w/p/target/jacoco.exec`)) === '["/w/p/target/jacoco.exec"]' &&
+      appendingJacocoExecFiles(`[INFO] argLine set to -javaagent:${agent}=destfile=/w/p/target/jacoco.exec,append=false`).length === 0 &&
+      appendingJacocoExecFiles("[INFO] argLine set to -javaagent:/opt/other-agent.jar=destfile=/x.exec").length === 0 &&
+      appendingJacocoExecFiles(`[INFO] Tests run: 1 -javaagent:${agent}=destfile=/x.exec`).length === 0,
+  );
+  check(
+    "appendingJacocoExecFiles：路徑有空白時整個參數加引號（Windows）、自訂屬性名稱、後面還有別的選項與 JVM 參數",
+    JSON.stringify(
+      appendingJacocoExecFiles(
+        '[INFO] surefireArgLine set to "-javaagent:C:\\Users\\John Doe\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.8\\org.jacoco.agent-0.8.8-runtime.jar=destfile=C:\\work\\my proj\\target\\coverage-reports\\jacoco-ut.exec,append=true" -Xmx1g',
+      ),
+    ) === JSON.stringify(["C:\\work\\my proj\\target\\coverage-reports\\jacoco-ut.exec"]) &&
+      JSON.stringify(appendingJacocoExecFiles(`[INFO] argLine set to -javaagent:${agent}=destfile=/w/p/t/j.exec,append=true,includes=com.x.* -Dfoo=bar`)) === '["/w/p/t/j.exec"]',
+  );
+  {
+    const repo = path.resolve(os.tmpdir(), "owned-repo");
+    const owned = ownedExecFiles(
+      [path.join(repo, "target", "jacoco.exec"), path.join(repo, "..", "shared", "jacoco.exec"), path.join(repo, "target", "app.log"), "/elsewhere/jacoco.exec", path.join(repo + "-other", "x.exec")],
+      repo,
+    );
+    check(
+      "ownedExecFiles：只刪 repo 裡的 .exec——repo 外（上一層、別的目錄、名稱相近的兄弟目錄）與別種檔案不動",
+      JSON.stringify(owned) === JSON.stringify([path.join(repo, "target", "jacoco.exec")]),
+      JSON.stringify(owned),
+    );
+  }
   // The per-line data is trusted only when it is all there: one line short of the LINE counter, or
   // only the <class> element's counters, and the figure is JaCoCo's own.
   const dtoShort = parseJacocoReport(userDtoXml.replace('covered="4"/>', 'covered="5"/>'), dtoTarget, MIN, undefined, () => userDto);

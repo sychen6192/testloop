@@ -480,6 +480,22 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
   },
 
+  "coverage-jacoco-append-forced": (c) => {
+    check("第 3 輪才通過", c.result.success === true && c.result.iterations === 3, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check(
+      "第 2 輪（刪掉 div 的測試）卡在覆蓋率，沒有被第 1 輪留下的覆蓋率放行",
+      gates(c).slice(0, 2).join(",") === "build/fail,coverage/fail",
+      gates(c).join(","),
+    );
+    const warns = c.stdout.split("\n").filter((l) => l.includes("JaCoCo 把覆蓋率累加進 target/coverage-reports/jacoco-ut.exec"));
+    check("說明 exec 檔被設成累加、之後建置前會刪掉（只說一次）", warns.length === 1, c.stdout.slice(-1500));
+  },
+
+  "coverage-jacoco-exec-left-over": (c) => {
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("第 1 輪照實判覆蓋率不足，開發者留下的 exec 沒有灌水", gates(c)[0] === "coverage/fail", gates(c).join(","));
+  },
+
   "coverage-lombok-generated-lines": (c) => {
     check("一輪通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations]));
     const cov = c.runRead("iter-1/coverage.txt");

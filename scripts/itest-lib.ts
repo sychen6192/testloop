@@ -67,6 +67,11 @@ export interface MvnStep {
   jacocoModule?: string;
   /** Backdate the written report, in ms, to simulate a report bound to a later phase. */
   jacocoAgeMs?: number;
+  /** Repo-relative exec file the JaCoCo agent appends to: written at the end of the build. */
+  jacocoExec?: string;
+  /** The report written instead when jacocoExec already existed as the build started — an earlier
+   *  build's coverage merged into this one, as an appending agent does. */
+  jacocoIfStale?: JacocoSpec | JacocoSpec[];
   /** The build is killed by SIGKILL after printing its output (POSIX): the OOM killer. */
   killed?: boolean;
   /** Files the build writes, repo-relative: compiled test classes, copied test resources. */
@@ -300,6 +305,7 @@ fs.writeFileSync(counter, String(n));
 fs.appendFileSync(path.join(itest, "mvn-argv.log"), JSON.stringify(process.argv.slice(2)) + "\\n");
 
 const step = plan[Math.min(n - 1, plan.length - 1)] || { exit: 0, out: "" };
+const staleExec = !!step.jacocoExec && fs.existsSync(path.join(root, step.jacocoExec));
 const vary = (s) => String(s)
   .replace(/{{root}}/g, root)
   .replace(/{{time}}/g, new Date(1767225600000 + n * 1013).toISOString())
@@ -367,8 +373,9 @@ for (const r of step.surefireXml || []) {
   fs.writeFileSync(path.join(d, "TEST-" + r.suite + ".xml"), vary(r.body));
 }
 
-if (step.jacoco) {
-  const specs = [].concat(step.jacoco);
+const jacoco = staleExec && step.jacocoIfStale ? step.jacocoIfStale : step.jacoco;
+if (jacoco) {
+  const specs = [].concat(jacoco);
   const sourcefile = (j) =>
     '<sourcefile name="' + j.file + '">\\n' +
     (j.lines
@@ -388,6 +395,12 @@ if (step.jacoco) {
     const t = (Date.now() - step.jacocoAgeMs) / 1000;
     fs.utimesSync(out, t, t);
   }
+}
+
+if (step.jacocoExec) {
+  const p = path.join(root, step.jacocoExec);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.appendFileSync(p, "execution data of build " + n + "\\n");
 }
 
 process.stdout.write(vary(step.out || "") + "\\n");

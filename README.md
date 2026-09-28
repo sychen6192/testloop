@@ -364,7 +364,10 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   綁到 test phase；或設 `UT_MAVEN_ARGS="jacoco:report"`。要強制擋關則設 `UT_STRICT_COV=1`。
   另外 build gate 固定帶 `-Djacoco.append=false`：JaCoCo agent 預設會把 exec 資料**累加**進
   `target/jacoco.exec`，你自己跑過的 `mvn test` 或上一次 testgen 的覆蓋率會被算進這一輪，
-  空測試也能「過」coverage gate。
+  空測試也能「過」coverage gate。pom 自己寫了 `<append>true</append>`（多模組彙總覆蓋率的舊寫法）時
+  它會蓋過 `-D`，所以每次建置前也會刪掉 exec 檔：模組的 `target/jacoco.exec` 每次都刪，設在別處的
+  （例如 `target/coverage-reports/jacoco-ut.exec`）從建置 log 的 `argLine set to -javaagent:…` 那行認出來
+  之後刪，log 會有一行 `[WARN] JaCoCo 把覆蓋率累加進 …`。只刪 repo 裡的 `.exec` 檔。
 - **覆蓋率報告出現「未計入的行」，數字跟 IDE 或 Sonar 看到的不一樣。** JaCoCo 的行號是編譯器給的：Lombok
   產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
   `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與
