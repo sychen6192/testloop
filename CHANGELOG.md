@@ -8,6 +8,9 @@
 兩者之間的落差先前完全由 prompt 措辭承擔。
 
 ### Added
+- **覆蓋率回饋點名沒走到的分支。** 分支不足時，除了未覆蓋行，另列每行有幾個分支、幾個沒走到
+  （`未覆蓋分支：19（2 個分支有 1 個沒走到）`）。`if (flag)` 的 flag 永遠是 true 時那一行每個指令都執行過，
+  先前 writer 只拿到「branch=50% FAIL」，不知道要補哪一條路。
 - **資料夾目標自動分批（`UT_BATCH_SIZE`，預設 1）。** 目標是資料夾時，所有類別原本交給同一個 writer
   session 寫、同一個 reviewer session 審、共用一份輪數；類別一多就超出模型的 context 與 agent 逾時
   （README 因此建議一次只做一個類別），而且只要一個類別修不綠，整個 run 就停下、其他類別一起卡在半路。
@@ -137,6 +140,69 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **pom 設了 `testFailureIgnore` 時，writer 的失敗測試會以 `gates-passed` 交差。** build gate 以 Maven 的 exit
+  code 判綠燈，而 surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent pom 或
+  `.mvn/maven.config` 常設，好讓 CI 在測試失敗時照樣收報告）下測試失敗照樣 exit 0、BUILD SUCCESS。以真的專案
+  重現：writer 的 `CalcTest.div_nonZero_returnsQuotient` 失敗，gate 判 PASS、覆蓋率與 review 也過，整個 run 以
+  gates-passed 結束；預檢也把一個有失敗測試的模組說成「乾淨」。現在 exit 0 時另看 surefire 在測試跑完後自己印的
+  判定（`There are test failures.`、fork 逾時、ERROR 級的 Results 總計——3.x 對只有 error 的情況只印總計）與這次
+  建置寫出的 XML 報告：有失敗就是紅燈，回饋與 `baseline.md` 說明為什麼 Maven 說成功。測試自己印出同樣的句子
+  （它跑了一個內嵌建置）、別的 plugin（karma）說的都不算。`--fail-never`（`-fn`）吞掉的失敗只算編譯與測試的
+  goal——copy-resources、checkstyle 這種專案本來就帶著的失敗不是 writer 的事。Gradle 的 `ignoreFailures = true`
+  一併處理，包括 HTML 報告關掉（`See the results at`）、安靜模式、test 任務 up-to-date 什麼都不印（看測試結果本身）；
+  Gradle 以 exit 0 帶過的既有失敗也點得出是哪個測試，修復迴圈與 `UT_ALLOW_DIRTY_BASELINE` 照常可用。失敗一次、重跑
+  後通過的測試（`rerunFailingTestsCount`）不算失敗：surefire 2.x 在報告的計數裡記它 `failures="1"`，3.x 在
+  `<flakyFailure>` 的 CDATA 裡留著原始訊息（`<error code="503">` 之類的字樣），所以改以 `<failure>` / `<error>`
+  元素判定、先把 CDATA 當文字，紅燈建置的失敗清單也不再列出它；Gradle 的 test-retry plugin 把每次重試寫成獨立的
+  test case，同名的測試有一次通過就不算失敗。testFailureIgnore 下 surefire 2.x 的 fork crash
+  也點得出是哪個類別（`Crashed tests:` 那幾行沒有 `[ERROR]` 前綴）。
+- **模組的測試被設定跳過時，run 白燒兩輪再以 stuck 收場。** pom、settings.xml 或 `.mvn/maven.config` 設了
+  `skipTests` / `maven.test.skip` 時，每次建置都綠、一個測試都沒執行；gate 叫 writer「建立測試類別」，writer
+  怎麼寫都一樣。現在預檢看到目標模組的 surefire 印 `Tests are skipped.` 就中止（stopReason `tests-skipped`；
+  模組還沒有任何測試原始碼時只印 WARN、照常開始——以 `<missing>src/test/java</missing>` 啟用 skipTests 的 profile
+  在 writer 寫出測試後就解除），
+  說明要設 `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"`（或啟用測試的 profile）；跳過預檢時，gate 的
+  回報也改說明這件事。
+- **`.mvn/maven.config`（或 `MAVEN_ARGS`）有 `-q` 時，每一輪都被判成「執行了 0 個測試」。** 安靜模式只印錯誤，
+  綠的建置連一行 `Tests run` 都沒有，零測試檢查只看 log，於是每一輪都 FAIL、以 stuck 收場。現在 log 沒有
+  `Tests run` 時改看這次建置在目標模組寫出的 surefire 報告（只算目標模組的：上游模組的測試不管目標模組有沒有跑都會跑）。
+- **Spring Boot + Lombok 的資料夾，DTO 與進入點的批次永遠過不了。** JaCoCo 的行號是編譯器給的：Lombok
+  產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
+  `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行。實測（JaCoCo 0.8.8、
+  Spring Boot 2.7 的 Lombok）每個存取方法、equals、hashCode、toString 都測了的 `@Data` DTO 是 branch 40%，
+  `@Builder` 的 DTO 是 4%，writer 怎麼補都補不滿；`main` 只呼叫 `SpringApplication.run` 的進入點則要啟動
+  整個 Spring context 才執行得到。一個有 DTO、repository、service、進入點的資料夾因此 4 批只過 1 批。現在：
+  - 目標分流：只有欄位與常數的類別（`@Data` DTO、JPA entity、常數類別）、只有常數的 enum、沒有本體的 record、
+    只有抽象方法與欄位的 abstract 類別、Spring Boot 進入點不當目標，跟只有抽象方法的 interface 一樣列在 log
+    與 `params.json` 的 `skippedCodeless`。判斷寫窄：有方法、初始值不是字面常數的欄位、會執行的建構子
+    （含 record 的 compact 建構子、body 不是空的也不是 `throw new …` 的 private 建構子）、`main` 的參數裡有
+    運算或呼叫就留著；欄位帶 Bean Validation 限制的 DTO 與 MapStruct 的 mapper 也留著（interface 形式的
+    MapStruct mapper 以前會被當成只有抽象方法的 interface 略過，一併修正）。
+  - 覆蓋率 gate 從逐行資料重算，不計沒有初始值的欄位宣告、型別宣告與它們上方只有註解的行（報告列在「未計入
+    的行」）；有初始值的欄位上方的註解照算，因為 javac 把初始值的程式碼記在那一行。寫出來的邏輯沒測到照樣
+    FAIL，「未覆蓋行」只點名寫出來的行。逐行資料不齊時照 JaCoCo 的原始數字。
+  同一個資料夾現在 2 批全過（DTO 與進入點略過，`@Builder.Default` 的初始值那行照算）。README 另說明怎麼用
+  `lombok.addLombokGeneratedAnnotation` 讓 Sonar 與 IDE 也不算產生的程式碼。
+- **一個不穩定的既有測試就能讓 run 以 `writer-no-op` 結束。** 生成輪次的建置只失敗在 writer 沒碰過的測試時，
+  報告原樣餵回：writer 不去碰那個測試（正確），下一輪就以 `writer-no-op` 結束整個 run；去碰就是在改一個沒壞的
+  測試。現在這種紅燈（失敗全在 writer 這次沒寫過、也沒改過的測試類別，或在別的模組）先重跑一次建置：
+  通過就是不穩定的測試，這一輪照常往下走，結果以 `flakyTests`（分批時進 `attention`）點名要人檢視；
+  仍失敗而在目標模組，回饋明說多半是新測試留下的共享狀態或改過的共用測試檔，要 writer 別改那些測試（writer
+  之後沒再改任何檔時，`writer-no-op` 的說明改為那些測試可能本身就壞了）；仍失敗而在別的模組——writer 影響不到
+  也不能改——以新的 `out-of-scope-failure` 停下並點名，分批時整個 run 停，不再讓 writer 重試到 `stuck`。
+  最終驗收（`UT_TEST_SCOPE=generated`）同樣適用。逾時或被收掉的建置、有編譯錯誤、失敗類別對不到原始檔時不重跑。
+- **pom 寫了 `<append>true</append>` 時，覆蓋率跨建置累加。** `-Djacoco.append=false` 只改預設值，pom 的
+  設定蓋過它（實測 JaCoCo 0.8.8：argLine 仍是 `append=true`），於是前幾次建置的覆蓋率全算進這一次——writer
+  刪掉的測試、撤回的批次、開發者自己跑過的 `mvn test`。實測：刪掉一個測試後報告仍是 branch 2/2，實際是
+  1/2。現在每次 Maven 建置前刪掉模組的 `target/jacoco.exec`，以及建置 log 裡看到在累加的 exec 檔（只限 repo
+  裡的 `.exec`），並印一行 WARN 說明。
+- **runner 設定錯誤要等預檢建置跑完才發現。** api runner 沒設 `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` /
+  `UT_API_BASE_URL`、PATH 上沒有 opencode 時，run 先跑完預檢建置（重量級模組 8–15 分鐘），第一個 writer
+  session 才以 `runner-spawn-error` 失敗；`UT_RUNNER` 打錯字（例如 `API`）則默默改用 opencode。現在在預檢
+  建置、執行鎖與 artifacts 之前就中止並列出缺什麼（`UT_SKIP_REVIEW=1` 時不要求 reviewer 的模型），指向
+  doctor 做連線與認證檢查；doctor 也會點名不認得的 `UT_RUNNER`。`UT_RUNNER` 改為不分大小寫、空白視同沒設
+  （`.env` 裡留著 `UT_RUNNER=` 就是預設的 opencode），`UT_WRITER_MODEL=` 空白時 `UT_MODEL` 照樣生效。Windows 上
+  找 opencode 的方式跟 libuv 一樣：PATH 裡加了引號的目錄照找、目前目錄的 `.exe` 也算。
 - **repo 鎖在「等不到」時不再照樣執行，Windows 上以系統管理員身分跑的 run 也擋得住。** 取鎖原本以重試次數為限：
   另一個 run 正在建立或接手鎖的那一瞬間，次數用完就當作沒有鎖、照樣執行——兩個 run 一起跑。現在以時間為限
   （15 秒，長過空鎖視為當掉的 2 秒與接手鎖視為當掉的 10 秒），等不到就當作對方在執行，訊息說明原因。持有者

@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { MIN_LINE_COV, MIN_BRANCH_COV, STRICT_COV, REPO_ROOT } from "../config";
 import { log } from "../libs/log";
 import { GateResult, ModuleInfo } from "../libs/types";
+import { declarationOnlyLines } from "../libs/javasrc";
 
 const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -35,6 +36,19 @@ export function missedLines(block: string): number[] {
   }
   return out;
 }
+
+// A <sourcefile>'s per-line data: instructions and branches, missed and covered.
+function lineData(block: string): Array<{ nr: number; mi: number; ci: number; mb: number; cb: number }> {
+  return [...block.matchAll(/<line nr="(\d+)" mi="(\d+)" ci="(\d+)" mb="(\d+)" cb="(\d+)"\s*\/>/g)].map((m) => ({
+    nr: Number(m[1]),
+    mi: Number(m[2]),
+    ci: Number(m[3]),
+    mb: Number(m[4]),
+    cb: Number(m[5]),
+  }));
+}
+
+const pct = (missed: number, covered: number) => (covered / Math.max(1, missed + covered)) * 100;
 
 function lastCounterPct(block: string, type: string): number | null {
   const re = new RegExp(`<counter type="${type}" missed="(\\d+)" covered="(\\d+)"/>`, "g");
@@ -82,6 +96,10 @@ export function parseJacocoReport(
   // src/main/java). Without one the whole report is searched, and the first same-named file in
   // any package wins — another package's Util.java answering for this one.
   pkgOf: (cls: string) => string | undefined = () => undefined,
+  // The class's source, for the lines that hold no code anyone wrote (see declarationOnlyLines):
+  // what the compiler attributes to them — Lombok's methods, an implicit constructor — is not held
+  // against the tests. undefined: counted as JaCoCo reports it.
+  sourceOf: (cls: string) => string | undefined = () => undefined,
 ): { passed: boolean; lines: string[] } {
   const lines: string[] = [];
   let allPass = true;
@@ -114,8 +132,36 @@ export function parseJacocoReport(
     // but no LINE counter; its instruction coverage stands in for line coverage rather than the
     // class being waved through as code-less.
     const instr = lastCounterPct(block, "INSTRUCTION");
-    const line = lastCounterPct(block, "LINE") ?? instr;
-    const branch = lastCounterPct(block, "BRANCH");
+    let line = lastCounterPct(block, "LINE") ?? instr;
+    let branch = lastCounterPct(block, "BRANCH");
+    let missed = missedLines(block);
+    // Recounted from the per-line data without the declaration-only lines. Only a <sourcefile> has
+    // that data, only when the class was compiled with line numbers, and only when it is all there:
+    // JaCoCo lists every line that has code, so the lines must add up to its LINE counter.
+    const perLine = lineData(block);
+    const lineCounter = [...block.matchAll(/<counter type="LINE" missed="(\d+)" covered="(\d+)"\/>/g)].pop();
+    const complete = !!lineCounter && perLine.length === Number(lineCounter[1]) + Number(lineCounter[2]);
+    const src = complete ? sourceOf(cls) : undefined;
+    let excluded: number[] = [];
+    let counted = perLine;
+    if (src !== undefined) {
+      const declarationOnly = new Set(declarationOnlyLines(src));
+      excluded = perLine.filter((l) => declarationOnly.has(l.nr)).map((l) => l.nr);
+      if (excluded.length) {
+        counted = perLine.filter((l) => !declarationOnly.has(l.nr));
+        const branches = counted.reduce((a, l) => ({ mb: a.mb + l.mb, cb: a.cb + l.cb }), { mb: 0, cb: 0 });
+        line = counted.length ? pct(counted.filter((l) => l.ci === 0).length, counted.filter((l) => l.ci > 0).length) : null;
+        branch = branches.mb + branches.cb ? pct(branches.mb, branches.cb) : null;
+        missed = counted.filter((l) => l.mi > 0).map((l) => l.nr);
+      }
+    }
+    const excludedNote = excluded.length
+      ? `  未計入的行：${toRanges(excluded)}（沒有初始值的欄位宣告、型別宣告與它們的註解，上面的程式碼是 Lombok 或編譯器產生的，不是寫出來的邏輯）`
+      : "";
+    if (line === null && branch === null && excluded.length) {
+      lines.push(`- ${simple}: 沒有手寫的可執行程式碼，不列入覆蓋率門檻`, excludedNote);
+      continue;
+    }
     if (line === null && branch === null) {
       // JaCoCo analyzed the class and found nothing to execute. There is nothing a test could
       // cover, so there is nothing for this gate to hold the writer to.
@@ -128,15 +174,22 @@ export function parseJacocoReport(
     const lineOk = line === null || line >= min.line;
     const branchOk = branch === null || branch >= min.branch;
     if (!lineOk || !branchOk) allPass = false;
+    const shown = (v: number | null) => (v === null ? "N/A" : `${v.toFixed(1)}%`);
     lines.push(
-      `- ${simple}: line=${line?.toFixed(1) ?? "N/A"}%（門檻 ${min.line}）, ` +
-        `branch=${branch?.toFixed(1) ?? "N/A"}%（門檻 ${min.branch}） ` +
+      `- ${simple}: line=${shown(line)}（門檻 ${min.line}）, ` +
+        `branch=${shown(branch)}（門檻 ${min.branch}） ` +
         `${lineOk && branchOk ? "PASS" : "FAIL"}`,
     );
     if (!lineOk || !branchOk) {
-      const missed = missedLines(block);
       if (missed.length) lines.push(`  未覆蓋行：${toRanges(missed)}`);
     }
+    // A branch not taken often leaves no line unexecuted — `if (flag)` with flag always true runs
+    // every instruction on the if's line — so the lines alone can name nothing to test.
+    const branchMissed = counted.filter((l) => l.mb > 0);
+    if (!branchOk && branchMissed.length) {
+      lines.push(`  未覆蓋分支：${branchMissed.map((l) => `${l.nr}（${l.mb + l.cb} 個分支有 ${l.mb} 個沒走到）`).join(", ")}`);
+    }
+    if (excludedNote) lines.push(excludedNote);
   }
   return { passed: allPass, lines };
 }
@@ -186,14 +239,16 @@ export function checkCoverage(
   }
   log(`解析覆蓋率報告：${xmlPath}`);
   const xml = fs.readFileSync(xmlPath, "utf8");
-  const pkgOf = (cls: string): string | undefined => {
+  // latin1: every byte one character, so the lines are the source's lines whatever its encoding;
+  // what is not ASCII lives in strings and comments, which codeOnly blanks.
+  const sourceOf = (cls: string): string | undefined => {
     try {
-      const src = fs.readFileSync(path.resolve(REPO_ROOT, cls), "utf8");
-      return /^\s*package\s+([\w.]+)\s*;/m.exec(src)?.[1].replace(/\./g, "/");
+      return fs.readFileSync(path.resolve(REPO_ROOT, cls), "latin1");
     } catch {
       return undefined;
     }
   };
-  const { passed, lines } = parseJacocoReport(xml, targetClasses, undefined, pkgOf);
+  const pkgOf = (cls: string) => /^\s*package\s+([\w.]+)\s*;/m.exec(sourceOf(cls) ?? "")?.[1].replace(/\./g, "/");
+  const { passed, lines } = parseJacocoReport(xml, targetClasses, undefined, pkgOf, sourceOf);
   return { passed, report: `覆蓋率檢查（${xmlPath}）：\n${lines.join("\n")}` };
 }

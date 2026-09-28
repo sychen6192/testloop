@@ -22,6 +22,7 @@ import {
   RUNNER_KIND,
   WRITER_MODEL,
   REVIEWER_MODEL,
+  TESTGEN_ROOT,
   SCORE_THRESHOLDS,
   STRICT_COV,
   ALLOW_ZERO_TESTS,
@@ -39,7 +40,7 @@ import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
 import { detectBuildTool, detectEnvFailures, runBaseline, targetModuleSkipped, writableRel } from "./gates/build";
-import { createRunner } from "./runners/runner";
+import { configuredRunnerProblems, createRunner } from "./runners/runner";
 import { IterationRecord, orchestrate, repairBaseline, RepairResult, WriterTrace, writerChangesSoFar } from "./orchestrator";
 import {
   batchFailureFingerprint,
@@ -96,16 +97,17 @@ async function main() {
   const buildTool = detectBuildTool(mod.moduleRoot);
   const javaFiles = listJavaClasses(absTarget, REPO_ROOT);
   if (javaFiles.length === 0) die(`目標沒有 .java 檔：${absTarget}`);
-  // Types that compile to no executable code are not targets: no test can cover them, so the
-  // coverage gate has nothing to hold the writer to and a reviewer has nothing to review.
+  // Types with nothing to unit-test are not targets (see codelessTypeReason): no code, only code
+  // Lombok or the compiler generated, or an entry point that only starts Spring. A test of them is
+  // effort spent on nothing, and a gate that holds them to coverage blocks a batch it cannot pass.
   const codeless = javaFiles
     .map((cls) => ({ cls, why: codelessTypeReason(fs.readFileSync(path.join(REPO_ROOT, cls), "utf8")) }))
     .filter((c): c is { cls: string; why: string } => c.why !== null);
   const targetClasses = javaFiles.filter((cls) => !codeless.some((c) => c.cls === cls));
   if (targetClasses.length === 0) {
     die(
-      `目標底下只有沒有可執行程式碼的型別（${codeless.map((c) => `${path.basename(c.cls)}：${c.why}`).join("、")}），` +
-        "沒有東西可以寫單元測試。請改指定實作類別（例如 FooServiceImpl.java）或其所在資料夾。",
+      `目標底下沒有需要單元測試的程式碼（${codeless.map((c) => `${path.basename(c.cls)}：${c.why}`).join("、")}）。` +
+        "請改指定有邏輯的類別（例如 FooServiceImpl.java）或其所在資料夾。",
     );
   }
 
@@ -121,7 +123,7 @@ async function main() {
   log(`目標類別 ${targetClasses.length} 個：`);
   targetClasses.forEach((c) => log(`  - ${c}`));
   if (codeless.length) {
-    log(`略過 ${codeless.length} 個沒有可執行程式碼的型別（不產生測試、不列入覆蓋率門檻）：`);
+    log(`略過 ${codeless.length} 個沒有需要單元測試的程式碼的型別（不產生測試）：`);
     codeless.forEach((c) => log(`  - ${c.cls}（${c.why}）`));
   }
 
@@ -165,6 +167,15 @@ async function main() {
       `STRICT_COV=${STRICT_COV ? "on" : "off"}, review_gate=${SKIP_REVIEW ? "關閉" : "開啟"}`,
   );
 
+  // Before the lock and the baseline: a runner that cannot start a session fails the first writer on
+  // the spot, and the baseline of a heavy module takes minutes to get there.
+  const runnerProblems = configuredRunnerProblems(!SKIP_REVIEW);
+  if (runnerProblems.length) {
+    die(
+      `runner 設定不完整，agent session 無法啟動（在預檢建置之前先中止）：\n${runnerProblems.map((p) => `  - ${p}`).join("\n")}\n` +
+        `完整的環境檢查（含連線與認證）：npx tsx ${path.join(TESTGEN_ROOT, "scripts", "doctor.ts")}`,
+    );
+  }
   if (RUNNER_KIND === "opencode") assertAgents();
 
   const runId = new Date().toISOString().replace(/[:.]/g, "-");
@@ -329,6 +340,16 @@ async function main() {
         `預檢建置沒有跑完：${baseline.aborted}\n` +
           "這不是既有紅燈，修復迴圈幫不上忙。建置每次都要跑這麼久時請調高 UT_BUILD_TIMEOUT_MS；" +
           `被 signal 終止多半是記憶體不足。詳見 ${path.join(runDir, "baseline.log")}`,
+      );
+    }
+    if (baseline.testsSkipped) {
+      fs.writeFileSync(
+        path.join(runDir, "summary.json"),
+        JSON.stringify({ success: false, stopReason: "tests-skipped", error: baseline.testsSkipped }, null, 2),
+      );
+      die(
+        `預檢時目標模組一個測試都沒有執行——每一輪的建置也都會一樣，writer 寫的測試永遠驗證不了，所以在產生測試之前中止。\n` +
+          `${baseline.testsSkipped}\n詳見 ${path.join(runDir, "baseline.log")}`,
       );
     }
     measureStack(baseline.raw, baselineStartedAt);
@@ -572,6 +593,9 @@ async function main() {
   if (!result.success && result.finalFeedback) {
     console.log(`最後失敗報告：\n${result.finalFeedback}`);
   }
+  if (result.flakyTests?.length) {
+    log(`[WARN] 需要人工處理：這些測試不穩定（建置失敗、重跑通過）：${result.flakyTests.join("、")}`);
+  }
   fs.writeFileSync(
     path.join(runDir, "summary.json"),
     JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [] }, stripRaw, 2),
@@ -604,6 +628,8 @@ interface BatchRecord {
   finalFeedback?: string;
   finalVerdict?: ReviewVerdict;
   rolledBack?: SetAside;
+  /** Tests the writer never touched that failed a build and passed its rebuild. */
+  flakyTests?: string[];
 }
 
 type SetAside = RollbackReport & { rejectedDir: string; outputsRemoved: number };
@@ -620,8 +646,9 @@ let batchRun: BatchRun | undefined;
 
 // Stop reasons that belong to the environment rather than the batch: the next batch would meet them
 // too. A scope violation also leaves files outside src/test changed on disk for a human to look at,
-// and every later batch would be built against them.
-const RUN_STOPS = new Set(["runner-spawn-error", "scope-violation"]);
+// and every later batch would be built against them; another module's test that keeps failing is in
+// every later batch's build.
+const RUN_STOPS = new Set(["runner-spawn-error", "scope-violation", "out-of-scope-failure"]);
 // Failures that come from outside the batch when they repeat — a writer session that never gets to
 // write, a reviewer model that does not answer in JSON. Two batches in a row end the run rather
 // than every remaining batch spending its rounds and builds rediscovering it.
@@ -706,6 +733,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       coverageReport: r.coverageReport,
       finalFeedback: r.finalFeedback,
       finalVerdict: r.finalVerdict,
+      ...(r.flakyTests?.length ? { flakyTests: r.flakyTests } : {}),
     };
     // A scope violation is left exactly as it is: the changes outside src/test are the reason the
     // run stops, and the test files beside them are part of what a human has to look at.
@@ -830,8 +858,9 @@ async function runBatches(o: BatchRunInput): Promise<number> {
 }
 
 // Changes the run left in place, which a human has to look at before anything else.
-function attentionOf(records: Array<Pick<BatchRecord, "batch" | "stopReason" | "dir" | "rolledBack">>): string[] {
+function attentionOf(records: Array<Pick<BatchRecord, "batch" | "stopReason" | "dir" | "rolledBack" | "flakyTests">>): string[] {
   return records.flatMap((r) => [
+    ...(r.flakyTests?.length ? [`第 ${r.batch} 批遇到不穩定的測試（建置失敗、重跑通過）：${r.flakyTests.join("、")}`] : []),
     ...(r.stopReason === "scope-violation" ? [`第 ${r.batch} 批的 writer 改了測試範圍以外的檔案，變更未還原（清單在 ${r.dir}）`] : []),
     ...(r.rolledBack?.failed.length ? [`第 ${r.batch} 批有檔案無法還原：${r.rolledBack.failed.join("、")}`] : []),
     ...(r.rolledBack?.unrestorable.length

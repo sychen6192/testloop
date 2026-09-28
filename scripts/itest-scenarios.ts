@@ -14,16 +14,20 @@ import {
   EXISTING_TEST_SHRUNK,
   JACOCO_GREEN,
   JACOCO_RED,
+  JacocoSpec,
   Scenario,
   SUREFIRE_FAIL,
   SUREFIRE_PASS,
   SUREFIRE_TXT_BLIND,
   SUREFIRE_XML,
   REACTOR_TEST_FAILURE,
+  MULTI_TARGET_DIR,
   MULTI_TEST_DIR,
   UPSTREAM_TEST_DIR,
   TEST_DIR,
   TEST_FAILURE,
+  TEST_FAILURE_IGNORED,
+  TESTS_SKIPPED,
 
   withAnsi,
   UNLOCATABLE_FAILURE,
@@ -264,6 +268,21 @@ const verdict = (o: {
     advisories: o.advisories ?? [],
   });
 
+// jacoco-maven-plugin's prepare-agent line when the pom's <append>true</append> wins over
+// -Djacoco.append=false (measured on JaCoCo 0.8.8), and a green build whose agent appends there: a
+// report built on an earlier build's data too reads full coverage.
+const JACOCO_APPENDS = (exec: string) =>
+  `[INFO] argLine set to -javaagent:/m2/org/jacoco/org.jacoco.agent/0.8.8/org.jacoco.agent-0.8.8-runtime.jar=destfile={{root}}/${exec},append=true`;
+const APPENDING_GREEN_BUILD = (exec: string) => ({
+  exit: 0,
+  out: `${JACOCO_APPENDS(exec)}\n${BUILD_SUCCESS(4)}`,
+  cleanSurefire: true,
+  surefire: ran("com.x.CalcTest"),
+  jacoco: JACOCO_GREEN,
+  jacocoExec: exec,
+  jacocoIfStale: JACOCO_GREEN,
+});
+
 const GREEN_BUILD = {
   exit: 0,
   out: BUILD_SUCCESS(4),
@@ -271,6 +290,158 @@ const GREEN_BUILD = {
   surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }],
   jacoco: JACOCO_GREEN,
 };
+// A build red only in ExistingTest, which the writer never touches: the writer's CalcTest passes.
+// Flaky, as a test that needs a local service fails when it is slow to answer; or broken by the new
+// tests, as one that reads the default Locale fails after a test changed it and left it so.
+const untouchedRed = (message: string) => ({
+  exit: 1,
+  out: TEST_FAILURE("com.x.ExistingTest"),
+  cleanSurefire: true,
+  surefire: [
+    { cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") },
+    { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", message) },
+  ],
+});
+// Gradle with ignoreFailures = true and an existing test failing: the test task says so and succeeds.
+const GRADLE_IGNORED_OUT = (failed: string) =>
+  [
+    "> Task :test",
+    "",
+    failed,
+    "    java.lang.AssertionError at LegacyTest.java:21",
+    "",
+    "3 tests completed, 1 failed",
+    "There were failing tests. See the report at: file://{{root}}/build/reports/tests/test/index.html",
+    "",
+    "BUILD SUCCESSFUL in 2s",
+  ].join("\n");
+const GRADLE_LEGACY_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.x.LegacyTest" tests="2" skipped="0" failures="1" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.05">
+  <properties/>
+  <testcase name="still_fine()" classname="com.x.LegacyTest" time="0.01"/>
+  <testcase name="old_behaviour()" classname="com.x.LegacyTest" time="0.02">
+    <failure message="java.lang.AssertionError: 已知失敗" type="java.lang.AssertionError">java.lang.AssertionError: 已知失敗
+\tat app//com.x.LegacyTest.old_behaviour(LegacyTest.java:21)
+</failure>
+  </testcase>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
+`;
+// Maven 3.9 under --fail-never with the writer's test not compiling: BUILD FAILURE, the failed goal
+// in full, and exit 0.
+const FAIL_NEVER_COMPILE = [
+  "[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ fixture ---",
+  "[ERROR] COMPILATION ERROR : ",
+  `[ERROR] {{root}}/${CALC_TEST_PATH}:[9,9] cannot find symbol`,
+  "  symbol:   variable log",
+  "  location: class com.x.CalcTest",
+  "[INFO] BUILD FAILURE",
+  "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile (default-testCompile) on project fixture: Compilation failure",
+  `[ERROR] {{root}}/${CALC_TEST_PATH}:[9,9] cannot find symbol`,
+  "[INFO] Build failures were ignored.",
+].join("\n");
+// The case a writer's CalcTest fails on, and one an existing test fails on, in surefire XML.
+const WRITER_CASE = { nested: "", method: "div_byZero_throwsIllegalArgument", message: "Expected IllegalArgumentException to be thrown, but nothing was thrown.", line: 17 };
+const EXISTING_CASE = { nested: "", method: "div_byOne_returnsSameValue", message: "Connection refused: localhost:6379", line: 13 };
+const EXISTING_FLAKY_RED = untouchedRed("Connection refused: localhost:6379");
+// Gradle's test-results XML for CalcTest, in the shape Gradle 8 writes it: no CDATA around a
+// failure, the method name with its parentheses.
+const GRADLE_CALC_XML = (failing: boolean) => `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.x.CalcTest" tests="2" skipped="0" failures="${failing ? 1 : 0}" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.05">
+  <properties/>
+  <testcase name="add_twoPositives_returnsSum()" classname="com.x.CalcTest" time="0.01"/>
+  <testcase name="div_byZero_throwsIllegalArgument()" classname="com.x.CalcTest" time="0.02">${
+    failing
+      ? `
+    <failure message="org.opentest4j.AssertionFailedError: Expected IllegalArgumentException to be thrown, but nothing was thrown." type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: Expected IllegalArgumentException to be thrown, but nothing was thrown.
+\tat app//com.x.CalcTest.div_byZero_throwsIllegalArgument(CalcTest.java:17)
+</failure>
+  `
+      : ""
+  }</testcase>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
+`;
+const EXISTING_BROKEN_BY_NEW = untouchedRed("expected: <1,5> but was: <1.5>（預設 Locale 被新測試改成 de_DE）");
+
+// A @Data class with a method someone wrote. JaCoCo's lines for it, shaped as the real report is
+// (JaCoCo 0.8.8, Spring Boot 2.7's Lombok): equals / hashCode / toString / setters on the @Data line,
+// the getters on the fields' lines, the hand-written method on its own.
+const MONEY_PATH = "src/main/java/com/x/Money.java";
+const MONEY_JAVA = `package com.x;
+
+import java.math.BigDecimal;
+import lombok.Data;
+
+@Data
+public class Money {
+    private BigDecimal amount;
+    private String currency;
+
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new IllegalArgumentException("currency mismatch");
+        }
+        Money m = new Money();
+        m.setAmount(amount.add(other.amount));
+        m.setCurrency(currency);
+        return m;
+    }
+}
+`;
+const MONEY_TEST_PATH = `${TEST_DIR}/MoneyTest.java`;
+const moneyTest = (withMismatch: boolean) => `package com.x;
+
+import java.math.BigDecimal;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+class MoneyTest {
+    private static Money of(String amount, String currency) {
+        Money m = new Money();
+        m.setAmount(new BigDecimal(amount));
+        m.setCurrency(currency);
+        return m;
+    }
+
+    @Test
+    void plus_sameCurrency_addsAmounts() {
+        assertEquals(new BigDecimal("3"), of("1", "TWD").plus(of("2", "TWD")).getAmount());
+    }
+${withMismatch ? `
+    @Test
+    void plus_differentCurrency_throws() {
+        assertThrows(IllegalArgumentException.class, () -> of("1", "TWD").plus(of("2", "USD")));
+    }
+` : ""}}
+`;
+const moneyJacoco = (throwCovered: boolean): JacocoSpec => ({
+  pkg: "com/x",
+  file: "Money.java",
+  lines: [
+    [6, 40, 60, 20, 6],
+    [8, 0, 3, 0, 0],
+    [9, 0, 3, 0, 0],
+    [12, 0, 6, throwCovered ? 0 : 1, throwCovered ? 2 : 1],
+    [13, throwCovered ? 0 : 5, throwCovered ? 5 : 0, 0, 0],
+    [15, 0, 4, 0, 0],
+    [16, 0, 8, 0, 0],
+    [17, 0, 4, 0, 0],
+    [18, 0, 2, 0, 0],
+  ],
+  line: throwCovered ? [0, 9] : [1, 8],
+  branch: throwCovered ? [20, 8] : [21, 7],
+});
+const MONEY_BUILD = (throwCovered: boolean) => ({
+  exit: 0,
+  out: BUILD_SUCCESS(4),
+  cleanSurefire: true,
+  surefire: ran("com.x.CalcTest", "com.x.MoneyTest"),
+  jacoco: [JACOCO_GREEN, moneyJacoco(throwCovered)],
+});
 
 const LEGACY = "com.x.LegacyTest";
 const LEGACY_PATH = `${TEST_DIR}/LegacyTest.java`;
@@ -302,6 +473,8 @@ const LEGACY_RED = () => ({
   cleanSurefire: true,
   surefireXml: [{ suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) }],
 });
+/** The same, in a module whose surefire ignores test failures: logged, and the build exits 0. */
+const LEGACY_RED_IGNORED = () => ({ ...LEGACY_RED(), exit: 0, out: TEST_FAILURE_IGNORED(LEGACY) });
 
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
@@ -489,6 +662,27 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    name: "coverage-lombok-generated-lines",
+    desc: "@Data 類別帶一個手寫方法，產生的 equals/hashCode 分支都沒測（JaCoCo 的分支 28.6%）→ 只算寫出來的邏輯，100% 通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [MONEY_PATH]: MONEY_JAVA },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST, [MONEY_TEST_PATH]: moneyTest(true) } }],
+    mvn: [MONEY_BUILD(true)],
+  },
+  {
+    name: "coverage-lombok-real-miss",
+    desc: "同一個 @Data 類別，手寫方法裡丟例外的分支沒測到 → 照樣 FAIL，回饋只點名那一行（不點名 @Data 那行）；補上之後通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [MONEY_PATH]: MONEY_JAVA },
+    writer: [
+      { write: { [CALC_TEST_PATH]: CALC_TEST, [MONEY_TEST_PATH]: moneyTest(false) } },
+      { write: { [MONEY_TEST_PATH]: moneyTest(true) } },
+    ],
+    mvn: [MONEY_BUILD(false), MONEY_BUILD(true)],
+  },
+  {
     name: "zero-tests",
     desc: "BUILD SUCCESS 但 Tests run: 0 → build gate 依 fail-closed 判 FAIL",
     entry: "orchestrate",
@@ -640,6 +834,38 @@ export const SCENARIOS: Scenario[] = [
     mvn: [{ ...GREEN_BUILD, jacoco: JACOCO_RED }],
   },
   {
+    name: "coverage-jacoco-append-forced",
+    desc: "pom 以 <append>true</append> 蓋過 -Djacoco.append=false → 第 1 輪的覆蓋率不得算進第 2 輪（writer 刪掉的測試不能還替它過關）",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [
+      { write: { [CALC_TEST_PATH]: calcTest(1) } },
+      // The failing test goes, and with it the only test of div's branch.
+      { write: { [CALC_TEST_PATH]: calcTest(9) } },
+      { write: { [CALC_TEST_PATH]: calcTest(17) } },
+    ],
+    mvn: [
+      {
+        exit: 1,
+        out: `${JACOCO_APPENDS("target/coverage-reports/jacoco-ut.exec")}\n${TEST_FAILURE()}`,
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+        jacocoExec: "target/coverage-reports/jacoco-ut.exec",
+      },
+      { ...APPENDING_GREEN_BUILD("target/coverage-reports/jacoco-ut.exec"), jacoco: JACOCO_RED },
+      APPENDING_GREEN_BUILD("target/coverage-reports/jacoco-ut.exec"),
+    ],
+  },
+  {
+    name: "coverage-jacoco-exec-left-over",
+    desc: "開發者自己跑過的 mvn test 留下 target/jacoco.exec、pom 又設成累加 → 第一次建置也不得把它算進覆蓋率",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { "target/jacoco.exec": "the developer's own run" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...APPENDING_GREEN_BUILD("target/jacoco.exec"), jacoco: JACOCO_RED }, APPENDING_GREEN_BUILD("target/jacoco.exec")],
+  },
+  {
     name: "stale-jacoco",
     desc: "報告比本輪建置舊 → 視同無報告，UT_STRICT_COV=1 判 FAIL",
     entry: "orchestrate",
@@ -751,17 +977,485 @@ export const SCENARIOS: Scenario[] = [
     ],
     mvn: [
       GREEN_BUILD, // round 1, scoped
-      {
-        exit: 1, // round 1, full module verification
-        out: TEST_FAILURE("com.x.ExistingTest"),
-        cleanSurefire: true,
-        surefire: [
-          { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", "既有測試被新測試打壞") },
-        ],
-      },
+      EXISTING_BROKEN_BY_NEW, // round 1, full module verification
+      EXISTING_BROKEN_BY_NEW, // round 1, its rebuild: the same red, so not flaky
       GREEN_BUILD, // round 2, scoped
       { ...GREEN_BUILD, jacoco: undefined }, // round 2, full module verification
     ],
+  },
+  {
+    name: "scoped-final-verify-flaky",
+    desc: "限縮範圍全綠、完整模組重跑時一個 writer 沒碰過的既有測試失敗、再重跑就過 → flaky：照樣通過，不浪費一輪，點名要人檢視",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_TEST_SCOPE: "generated" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }],
+    mvn: [
+      GREEN_BUILD, // round 1, scoped
+      EXISTING_FLAKY_RED, // round 1, full module verification
+      { ...GREEN_BUILD, jacoco: undefined, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+    ],
+  },
+  {
+    name: "build-flaky-untouched-test",
+    desc: "建置只失敗在 writer 沒碰過的既有測試、重跑就過 → flaky：同一輪照常往下走，不浪費一輪、不會以 writer-no-op 收場，結果點名要人檢視",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [EXISTING_FLAKY_RED, { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }],
+  },
+  {
+    name: "build-collateral-untouched-test",
+    desc: "建置只失敗在 writer 沒碰過的既有測試、重跑仍失敗 → 被新測試連累：回饋說是 writer 寫的測試留下的共享狀態，要它別改那個既有測試",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [EXISTING_BROKEN_BY_NEW, EXISTING_BROKEN_BY_NEW, GREEN_BUILD],
+  },
+  {
+    name: "build-untouched-broken-no-op",
+    desc: "既有測試重跑仍失敗、writer 判斷不是它造成的而沒有改任何檔 → writer-no-op 收場，但說明是那些既有測試需要人檢視，不是 writer 的 context 或權限",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { text: "ExistingTest 的失敗與我寫的測試無關" }],
+    mvn: [EXISTING_BROKEN_BY_NEW, EXISTING_BROKEN_BY_NEW],
+  },
+  {
+    name: "build-collateral-then-own-red-no-op",
+    desc: "第 1 輪被連累、第 2 輪是 writer 自己的測試紅、第 3 輪 writer 沒改 → writer-no-op 的說明不得沿用第 1 輪「既有測試可能本身壞了」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "5" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }, { text: "改不動了" }],
+    mvn: [
+      EXISTING_BROKEN_BY_NEW,
+      EXISTING_BROKEN_BY_NEW,
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") }],
+      },
+    ],
+  },
+  {
+    name: "build-compile-error-with-untouched-red-no-rerun",
+    desc: "writer 的測試編不過，同一次建置裡還有它沒碰過的測試失敗（上游設了 testFailureIgnore 時會這樣）→ 編譯錯誤不會重跑就消失：照常餵回、不重跑，也不把紅燈算到那個既有測試頭上",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...EXISTING_FLAKY_RED, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`) }, GREEN_BUILD],
+  },
+  {
+    name: "build-crash-untouched-flaky",
+    desc: "writer 沒碰過的既有測試，fork 的 JVM 中途結束（surefire 只在 log 點名、沒有報告）、重跑就過 → 一樣判 flaky",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      { exit: 1, out: FORK_CRASH("com.x.ExistingTest"), cleanSurefire: true },
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "build-killed-no-rerun",
+    desc: "建置被 SIGKILL 收掉（OOM），留下的報告只有 writer 沒碰過的既有測試失敗 → 建置沒跑完不重跑：再跑一次多半又是一樣久、一樣被收掉",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ ...EXISTING_FLAKY_RED, killed: true }, GREEN_BUILD],
+  },
+  {
+    name: "build-unplaceable-failure-no-rerun",
+    desc: "失敗的類別在模組裡找不到原始碼（例如以 @DisplayName 命名的報告）→ 分不出是不是 writer 的，照常餵回、不重跑",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalculatorSpecification"),
+        cleanSurefire: true,
+        surefire: [{ cls: "com.x.CalculatorSpecification", body: SUREFIRE_FAIL("com.x.CalculatorSpecification", "expected: <3> but was: <4>") }],
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-own-test-red-no-rerun",
+    desc: "失敗的有 writer 自己寫的測試（連同一個它沒碰過的）→ 照常餵回，不重跑：重跑只給「全部都不是 writer 碰過的」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE(),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_FAIL("com.x.CalcTest", "expected: <3> but was: <4>") },
+          { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", "Connection refused: localhost:6379") },
+        ],
+      },
+      GREEN_BUILD,
+    ],
+  },
+
+  // ── Maven 的 exit code 不是它的判定 ──────────────────────────────────────────
+  {
+    name: "build-test-failure-ignored",
+    desc: "pom 設了 testFailureIgnore：writer 的測試失敗，Maven 仍 exit 0、BUILD SUCCESS → 照樣判紅、把失敗餵回，不能以 gates-passed 收場",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: TEST_FAILURE_IGNORED(),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [WRITER_CASE]) }],
+        jacoco: JACOCO_GREEN,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-test-failure-ignored-reports-only",
+    desc: "exit 0、log 沒有 surefire 的失敗摘要，但這次建置寫的報告記著一個 error（計數是 errors=\"1\"、failures=\"0\"）→ 以報告為準判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(4),
+        cleanSurefire: true,
+        // An error, not a failure: the counters say errors="1", failures="0".
+        surefireXml: [
+          {
+            suite: "com.x.CalcTest",
+            body:
+              '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="com.x.CalcTest" time="0.5" tests="2" errors="1" skipped="0" failures="0">\n' +
+              '  <testcase name="add_twoPositives_returnsSum" classname="com.x.CalcTest" time="0.01"/>\n' +
+              '  <testcase name="div_byZero_throwsIllegalArgument" classname="com.x.CalcTest" time="0.03">\n' +
+              '    <error message="Cannot invoke &quot;com.x.Calc.div(int, int)&quot; because &quot;this.calc&quot; is null" type="java.lang.NullPointerException">' +
+              "<![CDATA[java.lang.NullPointerException: Cannot invoke \"com.x.Calc.div(int, int)\" because \"this.calc\" is null\n" +
+              "\tat com.x.CalcTest.div_byZero_throwsIllegalArgument(CalcTest.java:17)\n]]></error>\n  </testcase>\n</testsuite>\n",
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-test-failure-ignored-flaky",
+    desc: "testFailureIgnore 下只有 writer 沒碰過的既有測試失敗、重跑就過 → 一樣判 flaky、同一輪照常往下走",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: TEST_FAILURE_IGNORED("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest"),
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [EXISTING_CASE]) }],
+        jacoco: JACOCO_GREEN,
+      },
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "build-flaky-rerun-green",
+    desc: "surefire 2.x 的 rerunFailingTestsCount：既有測試失敗一次、重跑通過，建置綠（Flakes: 1），報告的 failures=\"1\" 底下只有 <flakyFailure> → 不得判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ fixture ---",
+          "[ERROR] div_byOne_returnsSameValue(com.x.ExistingTest)  Time elapsed: 0.015 s  <<< FAILURE!",
+          "[WARNING] Flakes: ",
+          "[ERROR]   Run 1: ExistingTest.div_byOne_returnsSameValue:13 Connection refused",
+          "[WARNING] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        surefire: [
+          ...ran("com.x.CalcTest"),
+          // What surefire 2.22 writes into the .txt for it: indistinguishable from a real failure.
+          {
+            cls: "com.x.ExistingTest",
+            body: [
+              "Test set: com.x.ExistingTest",
+              "-------------------------------------------------------------------------------",
+              "Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.092 s <<< FAILURE! - in com.x.ExistingTest",
+              "div_byOne_returnsSameValue(com.x.ExistingTest)  Time elapsed: 0.015 s  <<< FAILURE!",
+              "java.lang.AssertionError: Connection refused",
+            ].join("\n"),
+          },
+        ],
+        surefireXml: [
+          {
+            suite: "com.x.ExistingTest",
+            body:
+              '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="com.x.ExistingTest" time="0.09" tests="3" errors="0" skipped="0" failures="1">\n' +
+              '  <testcase name="add_twoPositives_returnsSum" classname="com.x.ExistingTest" time="0.001"/>\n' +
+              '  <testcase name="div_byOne_returnsSameValue" classname="com.x.ExistingTest" time="0.001">\n' +
+              '    <flakyFailure message="Connection refused" type="java.lang.AssertionError">\n      <stackTrace>java.lang.AssertionError: Connection refused\n</stackTrace>\n    </flakyFailure>\n' +
+              "  </testcase>\n</testsuite>\n",
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-fail-never-compile-error",
+    desc: "--fail-never（.mvn/maven.config 的 -fn）：writer 的測試編不過，Maven 印 BUILD FAILURE 卻 exit 0 → 判紅、餵回的是編譯錯誤，不是「沒有執行任何測試」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ exit: 0, out: FAIL_NEVER_COMPILE, cleanSurefire: true }, GREEN_BUILD],
+  },
+  {
+    name: "build-fail-never-other-plugin-green",
+    desc: "--fail-never 吞掉的是別的 plugin（copy-resources）的失敗、測試全過 → 不是 writer 的事，照常綠燈（專案本來就這樣活著）",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          BUILD_SUCCESS(4).replace("[INFO] BUILD SUCCESS", "[INFO] BUILD FAILURE"),
+          "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-resources-plugin:3.3.1:copy-resources (always-broken) on project fixture: The parameters 'resources', 'outputDirectory' for goal org.apache.maven.plugins:maven-resources-plugin:3.3.1:copy-resources are missing or invalid -> [Help 1]",
+          "[INFO] Build failures were ignored.",
+        ].join("\n"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest"),
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "gradle-test-failure-ignored",
+    desc: "Gradle 的 test 任務設了 ignoreFailures = true：writer 的測試失敗，gradle 仍 exit 0、BUILD SUCCESSFUL → 照樣判紅、把失敗餵回",
+    entry: "orchestrate",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "> Task :test",
+          "",
+          "CalcTest > div_byZero_throwsIllegalArgument() FAILED",
+          "    org.opentest4j.AssertionFailedError at CalcTest.java:17",
+          "",
+          "2 tests completed, 1 failed",
+          "There were failing tests. See the report at: file://{{root}}/build/reports/tests/test/index.html",
+          "",
+          "BUILD SUCCESSFUL in 2s",
+        ].join("\n"),
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(true) },
+        jacoco: JACOCO_GREEN,
+      },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false) },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-quiet-green",
+    desc: ".mvn/maven.config 有 -q：綠的建置什麼都不印（沒有 Tests run）→ 以這次建置的報告為準，不得判成「執行了 0 個測試」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "",
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, []) }],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-error-only-custom-reports",
+    desc: "surefire 3.x、testFailureIgnore、報告寫到自訂目錄：只有 error（測試丟例外）時 log 沒有「There are test failures.」，只有 ERROR 級的 Results 總計 → 照樣判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+          "[INFO] Running com.x.CalcTest",
+          "[ERROR] Tests run: 2, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: {{elapsed}} s <<< FAILURE! -- in com.x.CalcTest",
+          "[ERROR] com.x.CalcTest.div_byZero_throwsIllegalArgument -- Time elapsed: {{elapsed}} s <<< ERROR!",
+          'java.lang.NullPointerException: Cannot invoke "com.x.Calc.div(int, int)" because "this.calc" is null',
+          "[INFO] Results:",
+          "[ERROR] Errors: ",
+          '[ERROR]   CalcTest.div_byZero_throwsIllegalArgument:17 NullPointer Cannot invoke "com.x.Calc.div(int, int)" because "this.calc" is null',
+          "[ERROR] Tests run: 2, Failures: 0, Errors: 1, Skipped: 0",
+          "[ERROR] ",
+          "Please refer to {{root}}/target/test-reports for the individual test results.",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        jacoco: JACOCO_GREEN,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-flaky-cdata-green",
+    desc: "surefire 3.x 重跑後通過的 flaky 測試，報告在 <flakyFailure> 的 CDATA 裡留著「<error code=503>」→ 那不是失敗，不得判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+          "[INFO] Running com.x.ExistingTest",
+          "[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1, Time elapsed: {{elapsed}} s -- in com.x.ExistingTest",
+          "[INFO] Results:",
+          "[WARNING] Flakes: ",
+          "[WARNING] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest"),
+        surefireXml: [
+          {
+            suite: "com.x.ExistingTest",
+            body:
+              '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="com.x.ExistingTest" time="0.06" tests="3" errors="0" skipped="0" failures="1">\n' +
+              '  <testcase name="add_twoPositives_returnsSum" classname="com.x.ExistingTest" time="0.0"/>\n' +
+              '  <testcase name="div_byOne_returnsSameValue" classname="com.x.ExistingTest" time="0.0">\n' +
+              '    <flakyFailure message="unexpected response: &lt;error code=&quot;503&quot;&gt;busy&lt;/error&gt;" type="java.lang.AssertionError">\n' +
+              '      <stackTrace><![CDATA[java.lang.AssertionError: unexpected response: <error code="503">busy</error>\n\tat com.x.ExistingTest.div_byOne_returnsSameValue(ExistingTest.java:13)\n]]></stackTrace>\n' +
+              "    </flakyFailure>\n  </testcase>\n</testsuite>\n",
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-own-output-headline-green",
+    desc: "測試自己印出「[ERROR] There are test failures.」（它跑了一個內嵌建置）、自己通過 → 那是測試的輸出，不是 surefire 的判定，不得判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+          "[INFO] Running com.x.CalcTest",
+          "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0",
+          "[ERROR] There are test failures.",
+          "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in com.x.CalcTest",
+          "[INFO] Results:",
+          "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest"),
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-quiet-upstream-only",
+    desc: "-q、目標模組的測試被跳過（maven.test.skip）、上游模組的測試有跑 → 安靜模式的報告只算目標模組的：一個測試都沒跑，不得放行",
+    entry: "orchestrate",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST.replace("package com.x;", "package com.x.web;") } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "",
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefireXml: [{ suite: "com.x.common.UtilTest", body: SUREFIRE_XML("com.x.common.UtilTest", 1, []), module: "common" }],
+        jacoco: { ...JACOCO_GREEN, pkg: "com/x/web" },
+        jacocoModule: "web",
+      },
+    ],
+  },
+  {
+    name: "gradle-retry-passed-green",
+    desc: "Gradle 的 test-retry plugin：ExistingTest 第一次失敗、重試通過，每一次各寫成一個 test case，建置綠 → 不得判紅",
+    entry: "orchestrate",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 3s",
+        writeFiles: {
+          "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false),
+          "build/test-results/test/TEST-com.x.ExistingTest.xml": `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.x.ExistingTest" tests="3" skipped="0" failures="1" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.05">
+  <properties/>
+  <testcase name="add_twoPositives_returnsSum()" classname="com.x.ExistingTest" time="0.01"/>
+  <testcase name="div_byOne_returnsSameValue()" classname="com.x.ExistingTest" time="0.02">
+    <failure message="java.net.ConnectException: Connection refused" type="java.net.ConnectException">java.net.ConnectException: Connection refused
+</failure>
+  </testcase>
+  <testcase name="div_byOne_returnsSameValue()" classname="com.x.ExistingTest" time="0.02"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
+`,
+        },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "gradle-up-to-date-failing",
+    desc: "Gradle 的 test 任務 up-to-date（什麼都不印），測試結果裡記著失敗（ignoreFailures 下上次就失敗了）→ 照樣判紅",
+    entry: "orchestrate",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "> Task :compileTestJava UP-TO-DATE\n> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms",
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(true) },
+        jacoco: JACOCO_GREEN,
+      },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false) },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-tests-skipped",
+    desc: "沒有預檢、模組的測試被設定跳過（skipTests）→ 回報說明是設定跳過了測試、該設什麼，而不是叫 writer 去建測試類別",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [{ exit: 0, out: TESTS_SKIPPED, cleanSurefire: true }],
   },
 
   {
@@ -817,7 +1511,7 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "multimodule-upstream-failure-detail",
-    desc: "上游模組測試失敗時，明細在 common/target 底下——gate 必須讀得到，不能只看目標模組",
+    desc: "上游模組測試失敗、重跑仍失敗：明細在 common/target 底下——gate 必須讀得到；writer 影響不到也不能改它，第 1 輪就停下點名，不再讓 writer 重試到 stuck",
     entry: "orchestrate",
     layout: "multi",
     env: { UT_SKIP_REVIEW: "1" },
@@ -849,6 +1543,63 @@ export const SCENARIOS: Scenario[] = [
             ]),
           },
         ],
+      },
+    ],
+  },
+  {
+    name: "multimodule-upstream-flaky",
+    desc: "上游模組的測試失敗一次、重跑就過 → flaky：同一輪照常往下走，結果點名要人檢視",
+    entry: "orchestrate",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [`${MULTI_TEST_DIR}/CalcTest.java`]: CALC_TEST.replace("package com.x;", "package com.x.web;") } }],
+    mvn: [
+      {
+        exit: 1,
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.common.UtilTest", body: SUREFIRE_FAIL("com.x.common.UtilTest", "Connection refused"), module: "common" }],
+      },
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(4),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [
+          { cls: "com.x.web.CalcTest", body: SUREFIRE_PASS("com.x.web.CalcTest"), module: "web" },
+          { cls: "com.x.common.UtilTest", body: SUREFIRE_PASS("com.x.common.UtilTest"), module: "common" },
+        ],
+        jacoco: { ...JACOCO_GREEN, pkg: "com/x/web" },
+        jacocoModule: "web",
+      },
+    ],
+  },
+  {
+    name: "loop-batches-upstream-broken",
+    desc: "分批時上游模組的測試在第 1 批壞掉、重跑仍壞 → 整個 run 停下（後面每一批的建置都會撞到），點名沒執行的類別",
+    entry: "loop",
+    layout: "multi",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [`${MULTI_TARGET_DIR}/Zeta.java`]: ZETA_JAVA.replace("package com.x;", "package com.x.web;") },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: `${MULTI_TEST_DIR}/CalcTest.java`, content: CALC_TEST.replace("package com.x;", "package com.x.web;") } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      {
+        exit: 0, // baseline
+        out: BUILD_SUCCESS(2),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.web.ExistingTest", body: SUREFIRE_PASS("com.x.web.ExistingTest"), module: "web" }],
+      },
+      {
+        exit: 1, // batch 1, round 1, and its rebuild: common's test is down, Maven stops before web
+        out: REACTOR_TEST_FAILURE("common", "com.x.common.UtilTest"),
+        cleanSurefire: true,
+        modules: ["web", "common", "core"],
+        surefire: [{ cls: "com.x.common.UtilTest", body: SUREFIRE_FAIL("com.x.common.UtilTest", "Connection refused: db:5432"), module: "common" }],
       },
     ],
   },
@@ -1349,6 +2100,172 @@ export const SCENARIOS: Scenario[] = [
     mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }],
   },
   {
+    name: "loop-dirty-tolerated-failure-ignored",
+    desc: "testFailureIgnore 下每次建置都 exit 0：預檢照樣認出既有失敗、gate 照樣扣除後放行，而且記錄容忍了什麼",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED_IGNORED(),
+      { ...LEGACY_RED_IGNORED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] },
+    ],
+  },
+  {
+    name: "loop-dirty-new-failure-ignored-blocked",
+    desc: "testFailureIgnore 下 writer 弄壞一個新的測試，Maven 仍 exit 0 → 基準沒有的新失敗照樣擋下",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0", UT_MAX_ITER: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED_IGNORED(),
+      {
+        ...LEGACY_RED_IGNORED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          { suite: "com.x.OtherTest", body: SUREFIRE_XML("com.x.OtherTest", 2, [{ nested: "", method: "broken_by_writer", message: "NPE", line: 12 }]) },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-baseline-test-failure-ignored",
+    desc: "testFailureIgnore 下既有測試失敗、Maven exit 0 → 預檢不得說「乾淨」：判紅並說明為什麼 mvn 自己說 BUILD SUCCESS",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_REPAIR_BASELINE: "0" },
+    api: [],
+    mvn: [LEGACY_RED_IGNORED()],
+  },
+  {
+    name: "loop-baseline-tests-skipped",
+    desc: "模組的測試被設定跳過（skipTests／maven.test.skip）→ 預檢就中止、說明要設什麼，不開 writer session 白燒兩輪",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [{ exit: 0, out: TESTS_SKIPPED, cleanSurefire: true }],
+  },
+  {
+    name: "loop-baseline-tests-skipped-no-sources",
+    desc: "測試被跳過、但模組還沒有任何測試原始碼（profile 以 <missing>src/test/java</missing> 啟用 skipTests 的常見寫法）→ 不中止，writer 寫出測試後就會執行",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    omitExisting: true,
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [{ exit: 0, out: TESTS_SKIPPED, cleanSurefire: true }, GREEN_BUILD],
+  },
+  {
+    name: "loop-gradle-dirty-tolerated",
+    desc: "Gradle、ignoreFailures：既有測試失敗、gradle exit 0 → 預檢認得出是哪個測試，UT_ALLOW_DIRTY_BASELINE 照樣容忍它、放行 writer 的綠測試",
+    entry: "loop",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: GRADLE_IGNORED_OUT("LegacyTest > old_behaviour() FAILED"), writeFiles: { "build/test-results/test/TEST-com.x.LegacyTest.xml": GRADLE_LEGACY_XML } },
+      {
+        exit: 0,
+        out: GRADLE_IGNORED_OUT("LegacyTest > old_behaviour() FAILED"),
+        writeFiles: {
+          "build/test-results/test/TEST-com.x.LegacyTest.xml": GRADLE_LEGACY_XML,
+          "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false),
+        },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-gradle-baseline-repair",
+    desc: "Gradle、ignoreFailures：既有的 LegacyTest 失敗、gradle exit 0 → 預檢點得出是目標模組裡的哪個測試，進修復迴圈修好它，之後照常產生測試",
+    entry: "loop",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [LEGACY_PATH]: LEGACY_FIXED.replace("assertEquals(3,", "assertEquals(4,") },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: LEGACY_PATH, content: LEGACY_FIXED } }] },
+      { content: "已修好 LegacyTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: GRADLE_IGNORED_OUT("LegacyTest > old_behaviour() FAILED"), writeFiles: { "build/test-results/test/TEST-com.x.LegacyTest.xml": GRADLE_LEGACY_XML } },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: { "build/test-results/test/TEST-com.x.LegacyTest.xml": GRADLE_LEGACY_XML.replace(/failures="1"/, 'failures="0"').replace(/<failure[\s\S]*?<\/failure>/, "") },
+      },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: {
+          "build/test-results/test/TEST-com.x.LegacyTest.xml": GRADLE_LEGACY_XML.replace(/failures="1"/, 'failures="0"').replace(/<failure[\s\S]*?<\/failure>/, ""),
+          "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false),
+        },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-dirty-flaky-not-tolerated",
+    desc: "帶著容忍的紅燈續跑時，一個 writer 沒碰過的測試失敗一次、重跑就過 → 只把它列為不穩定，一直在失敗、被容忍的 LegacyTest 不列",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    extraFiles: { [LEGACY_PATH]: LEGACY_FIXED },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(), // baseline
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          {
+            suite: "com.x.ExistingTest",
+            body: SUREFIRE_XML("com.x.ExistingTest", 2, [{ nested: "", method: "div_byOne_returnsSameValue", message: "Connection refused", line: 13 }]),
+          },
+        ],
+      },
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }, // its rebuild
+    ],
+  },
+  {
+    name: "loop-dirty-flaky-method",
+    desc: "容忍 LegacyTest 的一個方法；另一個方法失敗一次、重跑就過 → 類別仍在失敗，但照樣點名它不穩定（不能因為類別還紅就什麼都不說）",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    extraFiles: { [LEGACY_PATH]: LEGACY_FIXED },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED(), // baseline
+      {
+        ...LEGACY_RED(),
+        surefireXml: [
+          {
+            suite: LEGACY,
+            body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE, { nested: "", method: "talks_to_cache", message: "Connection refused", line: 30 }]),
+          },
+        ],
+      },
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }, // its rebuild
+    ],
+  },
+  {
     name: "loop-dirty-new-failure-blocked",
     desc: "扣除不等於放水：基準沒有的新失敗照樣擋下",
     entry: "loop",
@@ -1568,6 +2485,32 @@ export const SCENARIOS: Scenario[] = [
     ],
     // JACOCO_GREEN lists Calc.java only, as a report without the interface would.
     mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-nothing-to-test-skipped",
+    desc: "目標資料夾裡有 @Data DTO、Spring Boot 進入點、常數類別（Spring Boot 專案的常態）→ 都略過，不為它們開 writer session、不讓覆蓋率 gate 卡住",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: {
+      "src/main/java/com/x/UserDto.java": "package com.x;\n\nimport lombok.Data;\n\n@Data\npublic class UserDto {\n    private Long id;\n    private String name;\n}\n",
+      "src/main/java/com/x/App.java":
+        "package com.x;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class App {\n    public static void main(String[] args) {\n        SpringApplication.run(App.class, args);\n    }\n}\n",
+      "src/main/java/com/x/Codes.java":
+        'package com.x;\n\npublic final class Codes {\n    public static final String NOT_FOUND = "E404";\n\n    private Codes() {\n        throw new IllegalStateException("Utility class");\n    }\n}\n',
+    },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [GREEN_BUILD, GREEN_BUILD],
+  },
+  {
+    name: "loop-runner-misconfigured",
+    desc: "api runner 沒設模型 → 在預檢建置之前就中止並點名缺的設定，不得先跑完建置才在第一個 writer session 失敗",
+    entry: "loop",
+    env: { UT_WRITER_MODEL: "", UT_REVIEWER_MODEL: "" },
+    api: [],
+    mvn: [GREEN_BUILD],
   },
   {
     name: "loop-baseline-env-false-positive",
@@ -1943,6 +2886,40 @@ export const SCENARIOS: Scenario[] = [
         ],
         jacoco: JACOCO_GREETER,
       },
+    ],
+  },
+  {
+    name: "loop-flaky-single-summary",
+    desc: "單一類別：建置只失敗在 writer 沒碰過的既有測試、重跑就過 → 照常通過，SUMMARY 與 summary.json 點名不穩定的測試",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      EXISTING_FLAKY_RED,
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+    ],
+  },
+  {
+    name: "loop-batches-flaky-attention",
+    desc: "分批：第 1 批遇到不穩定的既有測試（重跑就過）→ 兩批照樣通過，summary 的 attention 與該批的紀錄點名它",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") }, // baseline
+      EXISTING_FLAKY_RED, // batch 1
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, // its rebuild
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: JACOCO_GREETER }, // batch 2
     ],
   },
   {

@@ -80,6 +80,37 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    那些）、類名是否符合 surefire 的 includes（`*Tests` 要 2.20 以後——Maven 3.8 沒指定版本時用的 2.12.4 不跑），
    writer 才知道該改寫成什麼。限縮執行時 `-Dtest` 帶的是 `Name,Name$*`：surefire 3.0.0-M5 以前的 `-Dtest=Name`
    不跑只有 `@Nested` 測試的類別。
+   第四道是**綠燈看報告，不看 exit code**。Maven 的 exit code 說的是它要不要停下來，不是建置有沒有過：
+   surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent 常設，好讓 CI 在測試失敗時照樣
+   收得到報告）下測試失敗照樣 exit 0，`--fail-never` 連編譯錯誤都 exit 0，Gradle 的 `ignoreFailures = true` 也是。
+   以真的專案實測：writer 的測試失敗，gate 判 PASS、run 以 gates-passed 收場；預檢把一個有失敗測試的模組說成乾淨。
+   所以 exit 0 時另看三樣東西（`gates/build.ts` 的 `mavenRedDespiteExit0`）：
+   - surefire 在一次執行的測試跑完之後自己印的判定——`There are test failures.`、fork 逾時，以及 ERROR 級的
+     Results 總計（surefire 3.x 對只有 error、也就是測試丟例外的情況不印前一句，只有總計）。只看每個 surefire
+     執行區段裡最後一個類別結果那行之後的部分：測試自己的輸出在它的類別結果之前，一個跑內嵌建置的測試會印出一模
+     一樣的句子；別的 plugin 的區段也不算（frontend-maven-plugin 的 karma 說同樣的話）。`-q` 沒有區段標頭，整份都算。
+   - `--fail-never` 吞掉的失敗，只算編譯與測試的 goal（`Failed to execute goal …maven-compiler-plugin…` /
+     `…maven-surefire-plugin…`）：copy-resources、checkstyle 這種專案本來就帶著活的失敗不是 writer 的事，算進來會讓
+     原本跑得動的專案在預檢就停下。這行在最後、是 ERROR 級，`-q` 也印。
+   - 這次建置寫出的 XML 報告。看的是 `<failure>` / `<error>` 元素，不是 testsuite 的計數：surefire 2.x 把失敗
+     一次、重跑後通過的測試（`rerunFailingTestsCount`）記成 `failures="1"`，底下只有 `<flakyFailure>`，建置是綠的；
+     .txt 摘要同樣寫 `Failures: 1`，分不出來，所以不採用。找元素之前先把 CDATA 等長換成空白：測試輸出與堆疊都在
+     CDATA 裡，一個 flaky 第一次失敗留下的訊息裡的 `<error code="503">`、測試印出的 `</testcase>` 都是文字。綠建置
+     只讀每份報告開頭的計數，計數不是 0 才完整解析。
+   Gradle 同理，另外還要看測試結果本身：test 任務 up-to-date 時什麼都不印（開發者先跑過一次 `gradle test`，或這輪的
+   修改沒有改到 bytecode），而測試結果目錄只存著最後一次執行的結果。Gradle 以 exit 0 帶過的失敗也從這裡點名，
+   所以預檢照樣修得了、`UT_ALLOW_DIRTY_BASELINE` 照樣容忍得了。test-retry plugin（預設不合併重試）把每次重試寫成
+   獨立的 test case：同名的測試有一次通過就不算失敗，否則重試後通過的綠建置會被判紅。
+   不強制加 `-Dmaven.test.failure.ignore=false`：那會讓 reactor 停在失敗的上游模組，`UT_ALLOW_DIRTY_BASELINE`
+   容忍的上游紅燈就再也建置不到目標模組；讓 Maven 照專案的設定跑完、由報告判定，兩種專案都對。零測試的判斷同理：
+   `-q`（`.mvn/maven.config` 或 `MAVEN_ARGS`）的綠建置一行 `Tests run` 都不印，只看 log 會讓每一輪都判成
+   「執行了 0 個測試」，所以 log 沒說時看這次建置在目標模組寫出的報告——只算目標模組的：`-am` 帶進來的上游模組
+   不管目標模組有沒有跑都會跑，算進來會放行一個連編譯都沒有的回合。
+   反過來，目標模組的測試被設定跳過（`skipTests`、`maven.test.skip`，surefire 只印 `Tests are skipped.`）時預檢就
+   中止（`tests-skipped`）：每一輪都不會執行任何測試，gate 只會叫 writer「建一個測試類別」，燒兩輪後以 stuck 收場。
+   要不要讓測試跑是人的決定（上游模組的測試可能也被一起跳過、而且是壞的），所以只說明要設什麼，不自動覆寫。
+   模組還沒有任何測試原始碼時例外：以 `<missing>src/test/java</missing>` 啟用 skipTests 的 profile 是沒有測試的
+   模組常見的寫法，writer 寫出測試就解除，所以只印 WARN、照常開始。
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；
    agent .md body 只放不變的角色契約。（skill 機制是 description-triggered
    的機率性載入，自動 loop 不能靠機率。）
@@ -94,7 +125,11 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    回合與逾時預算、重試）約三百行，全部在 runners/ 內，核心一行未動。它同時把原則 2 從
    「設定檔＋guard assert」變成結構：沒定義 bash 工具就沒有 bash 可拿。
 7. **可觀測性**：每輪 artifacts 落盤；startup guard 把「文件契約」變成
-   「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。
+   「機器 assert」——writer 拿到 bash 或 reviewer 可寫檔時第一秒炸。runner 設定同理，在預檢建置之前檢查：
+   api runner 沒設端點或模型、PATH 上沒有 opencode、`UT_RUNNER` 打錯字（factory 對不認得的值一律啟動
+   opencode）。先前要等預檢建置跑完——重量級整合測試的模組 8–15 分鐘——第一個 writer session 才以
+   runner-spawn-error 失敗。只看設定與檔案系統（`runners/runner.ts` 的 `runnerConfigProblems`）；連線與認證
+   要實際連過才知道，那是 doctor 的事。
 8. **範圍與慣例用量的，不用猜的**：build gate 的解析度是整個模組（`-am` 之下還含上游模組），
    writer 的職責卻只有目標類別。這個落差必須由確定性步驟填平，不能靠 prompt 措辭：
    預檢基準先量出「介入前就存在的紅燈」，既有測試偵測先量出「已經有哪些測試檔」，
@@ -143,6 +178,46 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    模組編碼寫回；被 SIGKILL 來不及處理的，原本的 bytes 在打開視圖之前就寫進使用者自己的快取目錄當復原日誌，
    下一次在同一個 repo 執行時放回。轉碼器與日誌都放在使用者自己的快取目錄、檢查擁有者：共用的 /tmp 裡一個
    預先放好的 `Transcode.class` 就是以執行者身分跑的程式碼。
+   **覆蓋率的量尺也要對準寫出來的程式碼。** JaCoCo 的行號是編譯器給的：Lombok 產生的 equals / hashCode /
+   toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、`@RequiredArgsConstructor` 的建構子（連同
+   `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與 record 的存取方法記在型別宣告那一行（多行的
+   record 標頭是第一行）。實測（JaCoCo 0.8.8、Spring Boot 2.7 的 Lombok）：每個存取方法、equals、hashCode、
+   toString 都測了的 `@Data` DTO 是 branch 40%，`@Builder` 的 DTO 測了 builder 是 branch 4%——差的全是沒有人
+   寫的分支。照這個數字擋關，就是要 writer 去測產生出來的程式碼：Spring Boot 資料夾實測 4 批只過 1 批，DTO
+   與進入點每批都以 stuck 收場。所以 gate 從逐行資料重算，不計沒有初始值的欄位宣告、型別宣告，以及它們上方
+   只有註解的行（`libs/javasrc.ts` 的 `declarationOnlyLines`：先照 javac 解開 `\uXXXX`，在 lexer 清掉註解與字串、
+   再清掉註解參數之後逐行比對，換行照 javac 算——單獨的 CR 也是一行；讀得懂才算——`return x;` 這種兩個字加
+   分號的敘述句、接續上一行的 `Type name;`（`o instanceof` 換行後的 `String s;`）、非 ASCII 的名稱、有初始值的欄位
+   都照算），並在報告列出來。註解那行跟著它註解的東西：javac 把欄位初始值的程式碼記在宣告開頭的那一行，宣告
+   前面有註解時就是註解那行——`@Deprecated` 底下的 `boolean on = level > 0 && level < 5;`，兩個條件的分支都記
+   在 `@Deprecated` 那行（實測 javac 21、JaCoCo 0.8.12）。第一版把所有只有註解的行都當成沒有程式碼，這種欄位
+   的分支就整個消失，gate 比 JaCoCo 自己的數字還寬。
+   逐行資料不齊（加總對不上 LINE 計數器、只有 `<class>` 元素）就照 JaCoCo 的數字：拿一半的資料重算比不算
+   更糟。寫出來的邏輯沒測到照樣 FAIL，而且未覆蓋行與未覆蓋分支只點名寫出來的行——`if (flag)` 的 flag
+   永遠是 true 時那一行每個指令都執行過，只看未覆蓋行 writer 什麼都看不到，所以分支另外列出每行幾個、
+   幾個沒走到。
+   更前面一步是**目標分流**（`libs/utils.ts` 的 `codelessTypeReason`）：只有欄位與常數的類別、只有常數的
+   enum、沒有本體的 record、只有抽象方法的 abstract 類別與 interface、`main` 只呼叫 `SpringApplication.run`
+   的進入點，不開 writer session——測它們是白花一個 session、一次建置與一次 review，進入點還得啟動整個
+   Spring context，那是整合測試。分流寫窄：`private` 建構子只有空的或 Sonar 式的 `throw new …` 才算不會
+   執行（Jackson 會呼叫 private 的無參數建構子）、`static final` 欄位的初始值要是編譯器折疊的字面常數
+   （`null` 不是，它在 static initializer 裡賦值）、`main` 呼叫的參數只能是名稱、`App.class` 與字串（三元運算、
+   lambda、呼叫都是邏輯；只允許這幾種也讓比對不會回溯到卡住——舊的寫法 26 個串接呼叫要 7 秒），讀不懂的一律
+   留著當目標，由上面的重算兜底。形狀像沒有邏輯、其實有的也留著：欄位帶 Bean Validation 限制的（`@Pattern`
+   的運算式、`@Size` 的邊界是要用 Validator 測的規則）、MapStruct 的 mapper（實作由註解產生，對應與
+   expression 就是邏輯），以及同一個檔案裡 annotation 型別後面還有別的型別的。
+
+   **紅燈是誰的，也用量的。** 生成輪次的建置失敗若全在 writer 這次沒寫過、也沒改過的測試類別（原始碼在模組
+   裡、而且 writer 沒碰過；或在別的模組），就再建置一次。先前這種紅燈原樣餵回：writer 不去碰那個測試是對的，
+   下一輪卻因此以 writer-no-op 結束整個 run；去碰就是在「修」一個沒壞的測試——prompt 說「別改既有測試」攔不住
+   一份點名它失敗的報告。重跑通過是 flaky：這一輪照常往下走（覆蓋率看重跑那次的報告），結果記下 `flakyTests`
+   要人檢視。重跑仍失敗而在目標模組裡，就是 writer 這次的變更連累的（共享狀態、共用的測試檔與資源）——回饋
+   明說，並要它從自己的測試下手。仍失敗而在別的模組，writer 影響不到（上游模組先建置、各自的 JVM）也沒有權限，
+   就以 `out-of-scope-failure` 停下，分批時整個 run 停（後面每一批的建置都會撞到）——與預檢把上游紅燈判為修不動
+   是同一個道理。只重跑一次，而且只在重跑可能改變結論時：逾時或被收掉的建置（再跑多半一樣久）、有編譯錯誤
+   （不會自己消失）、失敗類別對不到原始檔（以 `@DisplayName` 命名的報告——分不出是不是 writer 的）都照舊。
+   修復迴圈早就有同樣的確認重跑（`flaky-baseline`），這是它在生成輪次的對應。
+
    回饋同理有預算：報告是抽取錯誤而非 tail 整份 log，並由 orchestrator 統一 clamp。
 
 ## SSOT 對照表

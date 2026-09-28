@@ -29,6 +29,12 @@ const target = args.find((a) => !a.startsWith("--"));
 const major = Number(process.versions.node.split(".")[0]);
 add(major >= 20 ? "OK" : "FAIL", "node >= 20", `目前 ${process.versions.node}`);
 
+// createRunner starts opencode for a value it does not know; loop.ts refuses one before the baseline.
+const { RUNNER_KINDS } = await import("../runners/runner");
+if (!RUNNER_KINDS.includes(config.RUNNER_KIND)) {
+  add("FAIL", "UT_RUNNER", `${config.RUNNER_KIND} 不是可用的 runner——只能是 opencode（預設）、api 或 qwen`);
+}
+
 if (config.RUNNER_KIND === "api") {
   // 2a. network — the two things that make a corporate network fail silently. Reported
   // before the endpoint check, because they are what the endpoint check is subject to.

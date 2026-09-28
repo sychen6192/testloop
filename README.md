@@ -120,6 +120,19 @@ testgen <package 路徑>                  # 端對端執行
 起手挑一個依賴最少的簡單 class。退出碼定義：`0` 全數通過、`2` 有目標沒通過（單一類別是迭代用盡；
 分批時是任何一批沒過）、`1` 致命錯誤。
 
+runner 設定不完整時在預檢建置之前就中止、列出缺什麼：api runner 沒設 `UT_API_BASE_URL` 或模型
+（`UT_SKIP_REVIEW=1` 時不需要 reviewer 的模型）、PATH 上找不到 opencode、`UT_RUNNER` 不是 opencode / api /
+qwen。連線與認證要實際連過才知道，那是 `testgen doctor` 的事。
+
+**沒有需要單元測試的程式碼的類別不會變成目標**（列在 log 與 `params.json` 的 `skippedCodeless`）：
+只有抽象方法的 interface、annotation；只有欄位與常數的類別（Lombok 的 `@Data` DTO、JPA entity、
+`private` 建構子的常數類別）；只有常數的 enum；沒有本體的 record；只有抽象方法與欄位的 abstract 類別；
+`main` 只呼叫 `SpringApplication.run` 的 Spring Boot 進入點（執行它就是啟動整個 Spring context，那是整合測試）。
+測這些是白花一個 writer session 與一次建置，覆蓋率也不會因此有意義。判斷刻意寫窄：有任何方法、初始值不是
+字面常數的欄位、會執行的建構子或 compact 建構子、`main` 的參數裡有運算或呼叫，就留著當目標；欄位上有 Bean
+Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapStruct 的 mapper（對應與 expression 就是邏輯）
+也留著。目標底下全是這類型別時直接說明並中止。
+
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
 覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
 量到的測試相依與原始碼編碼（見下方 Troubleshooting）。資料夾目標分批時，每批在自己的
@@ -131,7 +144,7 @@ testgen <package 路徑>                  # 端對端執行
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `UT_RUNNER` | opencode | opencode、api 或 qwen。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
+| `UT_RUNNER` | opencode | opencode、api 或 qwen（其他值在啟動時就中止，不會默默改用 opencode）。api 見上一節；qwen 需另裝：`npm i -D @qwen-code/sdk` |
 | `UT_WRITER_MODEL` / `UT_REVIEWER_MODEL` | agent .md 的 model | 以 provider/model 覆蓋 |
 | `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數（分批時為每批） |
@@ -237,12 +250,12 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在
   模組、相依或環境，不在這兩個類別；覆蓋率與 review 的失敗是各類別自己的事，不算）、連續兩批的建置都因為同樣
   的環境/設定問題失敗（Spring context 起不來、連線池初始化失敗——報告點名的是各批自己的測試類別，所以比的是問題
-  的種類，不是文字），或撤回時有檔案放不回去
+  的種類，不是文字）、上游模組的測試失敗而重跑仍失敗（`out-of-scope-failure`，見 Troubleshooting），或撤回時有檔案放不回去
   （多半是防毒軟體或 IDE 鎖住了檔案）——後面的批次也會遇到同樣的事，summary 會列出沒執行的類別。
 - **結果**：`summary.json` 的 `batches` 逐批列出結果、每輪卡在哪個 gate（`funnel`）與 artifacts 目錄，
   `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
-  檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
-  原因是 `runner-spawn-error`、`scope-violation`、`writer-no-op`、`reviewer-unparseable`、
+  檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更、失敗一次重跑就過的不穩定測試）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
+  原因是 `runner-spawn-error`、`scope-violation`、`out-of-scope-failure`、`writer-no-op`、`reviewer-unparseable`、
   `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
   全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
@@ -313,6 +326,25 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   本工具沒碰過的壞檔就能擋掉每一輪。預設會先用同一個 writer 修這些檔（範圍 guard 與防掏空
   guard 全程有效），修到綠才開始產生新測試；修好的檔案會列在 log 與 `repair-summary.md`，
   **那是 writer 對別人測試的改動，commit 前一定要看 diff**。
+- **預檢說模組是紅的，但你自己跑 `mvn test` 是 BUILD SUCCESS。** 專案讓 Maven 在測試失敗時照樣成功：
+  surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，常設在公司的 parent pom 或
+  `.mvn/maven.config`，好讓 CI 在測試失敗時還收得到報告），或 `--fail-never`（`-fn`，連編譯錯誤都照樣
+  exit 0）。Gradle 的 `test { ignoreFailures = true }` 也一樣。loop 不看 exit code，以這次建置寫出的測試報告與
+  surefire、Maven 自己的判定為準——只看 exit code 時，writer 寫的失敗測試會被當成通過、整個 run 以
+  `gates-passed` 收場（以真的專案重現過）。log 與 `baseline.md` 會寫明是哪一種。之後照一般的紅燈處理：修復
+  迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試（Gradle 也一樣）。`-fn` 下只算編譯與測試的失敗，別的
+  plugin（copy-resources、checkstyle）失敗不算；失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，log 裡的
+  `Flakes`；Gradle 的 test-retry plugin）也不算失敗。
+- **中止，說「目標模組一個測試都沒有執行」（stopReason `tests-skipped`）。** pom、settings.xml 或
+  `.mvn/maven.config` 設了 `skipTests` 或 `maven.test.skip`，surefire 只印一行 `Tests are skipped.`——每一輪都
+  一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session（模組還沒有任何測試原始碼時例外：
+  以 `<missing>src/test/java</missing>` 啟用 skipTests 的 profile 在 writer 寫出測試後就解除，所以只印 WARN、照常開始）。設
+  `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"` 後重跑（命令列的 `-D` 蓋得過 pom 的屬性與
+  `.mvn/maven.config`）；pom 在 surefire 的 `<configuration>` 裡直接寫死 `<skipTests>true</skipTests>` 時 `-D` 蓋
+  不過，改用啟用測試的 profile（`UT_MAVEN_ARGS="-P<profile>"`）。
+- **`.mvn/maven.config` 有 `-q`。** 安靜模式只印錯誤：綠的建置什麼都不印，loop 改看這次建置寫出的 surefire 報告
+  判斷有沒有測試執行，照樣能用。但 log 裡的資訊（surefire 版本、provider、平台編碼、JaCoCo 的 `argLine`）也跟著
+  消失，「測試相依」與「原始碼編碼」只能退回讀 pom；能拿掉就拿掉。
 - **中止，說「紅燈全部落在 writer 的可寫範圍之外」。** 預檢抓到的紅燈不在
   `<目標模組>/src/test` 裡——多模組時最常見的是上游模組（`common`、`core`）的測試壞掉，也可能是
   production code 或 `pom.xml`。writer 對這些檔案沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，
@@ -347,13 +379,39 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   context 仍然吃緊時可再調小。注意跨輪 context 本來就不累積——每輪都是全新 session，
   只帶上一輪的報告，所以 summary 的「writer output tokens 合計」是各輪輸出的加總，
   不是單輪 context 佔用。
+- **log 說「建置失敗在 writer 這次沒有碰過的測試——重跑一次」。** 建置的失敗全都在 writer 這次沒寫過、也沒改過
+  的測試類別（或別的模組）時，loop 會再建置一次，分辨是不穩定的測試還是被新測試連累；以前這種紅燈直接餵回
+  writer，writer 不去碰那個測試（正確）就以 `writer-no-op` 結束整個 run，去碰就是在改一個沒壞的測試。
+  - 重跑通過：是不穩定的測試（flaky）。這一輪照常往下走（覆蓋率、review 用重跑那次的結果），SUMMARY 以 `[WARN]`
+    點名、`summary.json` 的 `flakyTests`（分批時在該批的紀錄與 `attention`），請找時間修掉它。第一次的紅燈留在
+    `build.log`，重跑的在 `build-rerun.log`（最終驗收是 `final-verify-rerun.log`），名單在 `flaky.txt`。
+  - 重跑仍失敗、在目標模組裡：多半是新測試留下的共享狀態（`mockStatic` 沒關、`System.setProperty`、static 欄位、
+    預設 Locale / TimeZone）或它改過的共用測試檔、測試資源。回饋會這樣告訴 writer，並要它別改那些測試；writer
+    之後若沒有再改任何檔案，run 以 `writer-no-op` 結束並說明那些測試可能本身就壞了，需要人看。
+  - 重跑仍失敗、在別的模組：writer 影響不到（上游模組先建置、在自己的 JVM 執行）也不能修改，run 以
+    `out-of-scope-failure` 停下並點名模組與類別；分批時後面的批次也不跑。多半是外部服務、資料庫或環境。
+  建置逾時或被收掉（OOM）、有編譯錯誤、或失敗的類別在模組裡找不到原始碼時不重跑。
 - **覆蓋率永遠略過，或說「報告比本輪建置還舊」。** 模組沒綁 JaCoCo，或 report goal 綁在
   `verify` 而非 `test`——`mvn test` 不會重新產生 `jacoco.xml`，gate 讀到的是上次留下的檔案，
   所以 loop 只信本輪建置之後才寫出的報告。加上 jacoco-maven-plugin，將 prepare-agent 與 report
   綁到 test phase；或設 `UT_MAVEN_ARGS="jacoco:report"`。要強制擋關則設 `UT_STRICT_COV=1`。
   另外 build gate 固定帶 `-Djacoco.append=false`：JaCoCo agent 預設會把 exec 資料**累加**進
   `target/jacoco.exec`，你自己跑過的 `mvn test` 或上一次 testgen 的覆蓋率會被算進這一輪，
-  空測試也能「過」coverage gate。
+  空測試也能「過」coverage gate。pom 自己寫了 `<append>true</append>`（多模組彙總覆蓋率的舊寫法）時
+  它會蓋過 `-D`，所以每次建置前也會刪掉 exec 檔：模組的 `target/jacoco.exec` 每次都刪，設在別處的
+  （例如 `target/coverage-reports/jacoco-ut.exec`）從建置 log 的 `argLine set to -javaagent:…` 那行認出來
+  之後刪，log 會有一行 `[WARN] JaCoCo 把覆蓋率累加進 …`。只刪 repo 裡的 `.exec` 檔。
+- **覆蓋率報告出現「未計入的行」，數字跟 IDE 或 Sonar 看到的不一樣。** JaCoCo 的行號是編譯器給的：Lombok
+  產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
+  `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行，隱含的預設建構子與
+  record 的存取方法記在型別宣告那一行。照 JaCoCo 的數字，每個存取方法、equals、hashCode、toString 都測了的
+  `@Data` DTO 是 branch 40%（實測 JaCoCo 0.8.8、Spring Boot 2.7）——差的全是沒有人寫的分支，writer 永遠補不
+  滿。所以 gate 從逐行資料重算：沒有初始值的欄位宣告、型別宣告，以及它們上方只有註解的行不計，列在
+  「未計入的行」（有初始值的欄位上方的註解照算——javac 把初始值的程式碼記在宣告開頭那一行，也就是註解那行）；
+  寫出來的邏輯沒測到照樣 FAIL，「未覆蓋行」與「未覆蓋分支」（每行幾個分支、幾個沒走到）只點名寫出來的行。
+  逐行資料不齊時照 JaCoCo 的原始數字。想讓 Sonar 與 IDE 也不算 Lombok 產生的程式碼，在專案根的
+  `lombok.config` 加 `lombok.addLombokGeneratedAnnotation = true`：JaCoCo 會略過帶 `@lombok.Generated` 的
+  方法（實測 0.8.8：`@Data` DTO 在報告裡變成沒有任何程式碼）。
 - **review gate 一直 REJECT，訊息含「tool calls = 0」。** reviewer 沒讀任何檔案就輸出判決，
   fail-closed 防的是捏造的假 verdict。改用更強的 `UT_REVIEWER_MODEL`。確定要放行設
   `UT_REVIEWER_MUST_READ=0`，或暫時 `UT_SKIP_REVIEW=1` 只跑 hard gate。
