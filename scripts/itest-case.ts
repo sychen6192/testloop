@@ -59,12 +59,13 @@ async function main() {
     REPO_ROOT,
   );
 
+  const buildTool = sc.buildTool ?? "maven";
   let result: unknown;
   if (sc.entry === "repair") {
-    const baseline = await runBaseline("maven", mod);
+    const baseline = await runBaseline(buildTool, mod);
     result = await repairBaseline({
       runner,
-      buildTool: "maven",
+      buildTool,
       standards: "（測試用 standards）",
       mod,
       runDir,
@@ -73,7 +74,7 @@ async function main() {
   } else {
     result = await orchestrate({
       targetClasses,
-      buildTool: "maven",
+      buildTool,
       runner,
       standards: "（測試用 standards）",
       rubric: "（測試用 rubric）",

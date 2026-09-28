@@ -33,7 +33,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
   2. Hard gate：`gates/build.ts` 跑 `mvn -pl <module> -am -DskipITs test`（多模組感知；
      `UT_TEST_SCOPE=generated` 時迭代期間加 `-Dtest=<目標類別的測試>,<同名>$*` 只限縮**執行**，
-     並在宣告成功前補一次完整模組重跑當驗收）
+     並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`、
+     Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`；報告以 `<failure>`/`<error>` 元素判定，
+     重跑後通過的 flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
      欄位宣告、型別宣告與它們上方只有註解的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
@@ -186,7 +188,7 @@ loop.ts               entry point（參數驗證/目標分流/rubric 載入/runn
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋綠燈看報告不看 exit code（testFailureIgnore／-fn／ignoreFailures）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先；逐行資料齊全時不計只有宣告的行、列出未覆蓋的行與分支）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory（含啟動前的 runner 設定檢查）＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）

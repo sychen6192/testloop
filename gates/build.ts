@@ -17,6 +17,7 @@ import { tail, die, log } from "../libs/log";
 import { clampText, stripAnsi } from "../libs/utils";
 import { codeOnly } from "../libs/javasrc";
 import { shLive } from "../libs/shell";
+import { pomFactsFromChain, readPomChain } from "../libs/teststack";
 import { BuildTool, GateResult, ModuleInfo } from "../libs/types";
 
 // What the module already looked like before the writer touched anything.
@@ -55,6 +56,10 @@ export interface BaselineResult {
   notRun?: boolean;
   // The test classes this build ran in the module — before a writer, the ones it has to keep running.
   ranTests?: string[];
+  // Green only because the target module's tests never ran: surefire said "Tests are skipped."
+  // (skipTests or maven.test.skip, from a pom, settings.xml or .mvn/maven.config). Every round's
+  // build would say the same, and no test the writer writes would ever run. Why, and what to set.
+  testsSkipped?: string;
 }
 
 /**
@@ -498,19 +503,38 @@ export function readSurefireXml(file: string): string {
   }
 }
 
+/**
+ * Pure: does this report record a failing test? A <failure> or <error> element under a test case
+ * — a class whose @BeforeAll / @BeforeClass threw included, surefire records it as a case too — and
+ * not the testsuite's counters: surefire 2.x counts a flaky test that passed on a rerun
+ * (rerunFailingTestsCount, JUnit 4) in failures="1" with nothing but a <flakyFailure> under it, on a
+ * green build. The counters decide only for a report that lists no test case at all.
+ */
+export function suiteRecordsFailure(suite: SurefireSuite, xml: string): boolean {
+  return suite.cases.length > 0 || (suite.failures + suite.errors > 0 && !/<testcase\b/.test(xml));
+}
+
+// One report of this build, if it records a failing test.
+function failingSuiteIn(dir: string, f: string): SurefireSuite | null {
+  let suite: SurefireSuite | null = null;
+  let xml = "";
+  try {
+    xml = readSurefireXml(path.join(dir, f));
+    suite = parseSurefireXml(xml);
+  } catch (e) {
+    // Truncated by a crashed JVM, or unreadable — the .txt fallback still applies, but a
+    // failing suite that disappears from the report must at least leave a trace in the log.
+    log(`[WARN] 無法解析 surefire 報告 ${f}：${e instanceof Error ? e.message : String(e)}`);
+  }
+  return suite && suiteRecordsFailure(suite, xml) ? { ...suite, dir } : null;
+}
+
 function failingSuites(moduleRoot: string, since: number): SurefireSuite[] {
   const out: SurefireSuite[] = [];
   for (const dir of surefireDirs(moduleRoot)) {
     for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
-      let suite: SurefireSuite | null = null;
-      try {
-        suite = parseSurefireXml(readSurefireXml(path.join(dir, f)));
-      } catch (e) {
-        // Truncated by a crashed JVM, or unreadable — the .txt fallback still applies, but a
-        // failing suite that disappears from the report must at least leave a trace in the log.
-        log(`[WARN] 無法解析 surefire 報告 ${f}：${e instanceof Error ? e.message : String(e)}`);
-      }
-      if (suite && suite.failures + suite.errors > 0) out.push({ ...suite, dir });
+      const suite = failingSuiteIn(dir, f);
+      if (suite) out.push(suite);
     }
   }
   return out;
@@ -757,7 +781,7 @@ export async function runBaseline(
       ? "修復驗證：重新建置，確認既有紅燈是否清除"
       : "預檢：在 writer 介入前先建置一次，取得既有紅燈基準",
   );
-  const { gate: r, aborted, notRun, startedAt: builtAt } = await runBuild(tool, mod, { allowZeroTests: true, mustRun, ranBefore });
+  const { gate: r, aborted, notRun, ignoredBy, startedAt: builtAt } = await runBuild(tool, mod, { allowZeroTests: true, mustRun, ranBefore });
   const ranTests = ranTestClasses(tool, mod, builtAt, r.raw ?? "");
 
   if (aborted) {
@@ -776,17 +800,24 @@ export async function runBaseline(
   }
 
   if (r.passed) {
+    // Green because nothing ran is not a baseline: every round's build would be the same zero
+    // tests, and the gate would feed the writer "write a test class" until the run ended stuck.
+    const skipped =
+      phase === "baseline" && tool === "maven" && testsSkippedInLog(r.raw ?? "", moduleArtifactId(mod))
+        ? TESTS_SKIPPED_HINT
+        : undefined;
     return {
-      clean: true,
+      clean: !skipped,
       compileErrorFiles: [],
       failingTestClasses: [],
       outOfScope: [],
       envFailures: [],
       failureDetail: "",
       failingTests: [],
-      summary: `${tag}：乾淨（模組可編譯且測試全過）。`,
+      summary: skipped ? `${tag}：${skipped}` : `${tag}：乾淨（模組可編譯且測試全過）。`,
       raw: r.raw ?? "",
       ranTests,
+      testsSkipped: skipped,
     };
   }
   if (notRun) {
@@ -840,6 +871,9 @@ export async function runBaseline(
   const lines = [
     phase === "repair" ? `${tag}：模組仍然是紅的。` : `${tag}：模組在 writer 介入前就已經是紅的。`,
   ];
+  // The operator's own `mvn test` says BUILD SUCCESS on this module; without this line the red
+  // baseline reads as the tool's mistake.
+  if (ignoredBy) lines.push(`（${ignoredBy}；loop 不看 exit code。）`);
   if (compileErrorFiles.length) {
     lines.push(`編譯失敗的檔案（${compileErrorFiles.length}）：`);
     compileErrorFiles.forEach((f) => lines.push(`  - ${f}`));
@@ -1011,24 +1045,30 @@ export function classesRunInLog(out: string): string[] {
 }
 
 // "tests" and "skipped" of each report of a class: XML attributes, or the .txt summary line.
+// The first 64 KB of a report: the testsuite tag and its counters are at the top of the file, and
+// the rest can be hundreds of MB of captured test output. undefined when it cannot be read.
+function readHead(file: string): string | undefined {
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size));
+      fs.readSync(fd, buf, 0, buf.length, 0);
+      return buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 function skippedCounts(dir: string, files: string[]): { tests: number; skipped: number } {
   let tests = 0;
   let skipped = 0;
   const xml = files.filter((f) => f.endsWith(".xml"));
   for (const f of xml.length ? xml : files) {
-    let text = "";
-    try {
-      const fd = fs.openSync(path.join(dir, f), "r");
-      try {
-        const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size));
-        fs.readSync(fd, buf, 0, buf.length, 0);
-        text = buf.toString("utf8");
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch {
-      continue;
-    }
+    const text = readHead(path.join(dir, f));
+    if (text === undefined) continue;
     const tag = /<testsuite\b[^>]*>/.exec(text)?.[0];
     if (tag) {
       tests += Number(attr(tag, "tests")) || 0;
@@ -1284,6 +1324,97 @@ export function targetModuleSkipped(out: string): boolean {
   return last === "SKIPPED";
 }
 
+/**
+ * Pure: why a Maven build that exited 0 is red all the same, or undefined when it is not.
+ *
+ * Maven's exit code says whether it chose to stop, not whether the build passed. With surefire's
+ * testFailureIgnore — the property maven.test.failure.ignore, set in company parents so CI still
+ * collects reports, or in .mvn/maven.config — surefire logs "There are test failures." and the
+ * build exits 0; with --fail-never (-fn) Maven prints BUILD FAILURE over a compile error and exits
+ * 0. Taken at its exit code, the gate passed a writer's failing test and the run ended
+ * gates-passed, and the baseline called a module with a failing test clean (both measured on a
+ * real project). `reported`: this build's own surefire reports record a failure or an error.
+ */
+export function mavenRedDespiteExit0(out: string, reported: boolean): string | undefined {
+  // The last verdict is Maven's own: a test that runs an embedded build may print one earlier.
+  const verdicts = [...out.matchAll(/^\[INFO\] BUILD (SUCCESS|FAILURE)\s*$/gm)];
+  if (verdicts.length && verdicts[verdicts.length - 1][1] === "FAILURE") {
+    return "Maven 印出 BUILD FAILURE，卻以 exit=0 結束（--fail-never／-fn，多半設在 .mvn/maven.config）";
+  }
+  // surefire 2.x says "There was a timeout or other error in the fork", 3.x "There was a timeout in
+  // the fork" — logged instead of failing the build, exactly like failures, when they are ignored.
+  if (reported || /^\[ERROR\] There (?:are test (?:failures|errors)|was a timeout(?: or other error)? in the fork)/m.test(out)) {
+    return (
+      "Maven 以 exit=0、BUILD SUCCESS 結束，但有測試失敗——專案設定了 surefire 的 testFailureIgnore" +
+      "（maven.test.failure.ignore），測試失敗不會讓建置失敗"
+    );
+  }
+  return undefined;
+}
+
+/** Pure: Gradle's counterpart — a test task with ignoreFailures = true logs this and succeeds. */
+export function gradleRedDespiteExit0(out: string): string | undefined {
+  return /There were failing tests\. See the report at/.test(out)
+    ? "Gradle 以 exit=0 結束，但有測試失敗——test 任務設定了 ignoreFailures = true，測試失敗不會讓建置失敗"
+    : undefined;
+}
+
+/**
+ * Pure: were the target module's tests skipped — did every surefire execution Maven ran for it say
+ * "Tests are skipped."? skipTests or maven.test.skip, from the pom, settings.xml or
+ * .mvn/maven.config: the build is green, nothing ran, and nothing the writer writes ever will.
+ * `artifactId` names the module; when the log has no execution for it (or it is unknown), the
+ * module built last — under -pl <module> -am, the target.
+ */
+export function testsSkippedInLog(out: string, artifactId?: string): boolean {
+  const runs: Array<{ artifact: string; skipped: boolean }> = [];
+  let current: { artifact: string; skipped: boolean } | undefined;
+  for (const line of out.split(/\r?\n/)) {
+    const header = /--- \S.*? @ (\S+) ---/.exec(line);
+    if (header) {
+      current = /--- (?:maven-)?surefire(?:-plugin)?:[^:\s]+:test\b/.test(line) ? { artifact: header[1], skipped: false } : undefined;
+      if (current) runs.push(current);
+      continue;
+    }
+    if (current && /^\[INFO\] Tests are skipped\.\s*$/.test(line)) current.skipped = true;
+  }
+  const target = artifactId && runs.some((r) => r.artifact === artifactId) ? artifactId : runs[runs.length - 1]?.artifact;
+  const own = runs.filter((r) => r.artifact === target);
+  return own.length > 0 && own.every((r) => r.skipped);
+}
+
+/** The target module's artifactId, from its pom chain; undefined when the pom cannot be read. */
+function moduleArtifactId(mod: ModuleInfo): string | undefined {
+  try {
+    return pomFactsFromChain(readPomChain(mod.moduleRoot, REPO_ROOT).map((c) => c.xml)).artifactId;
+  } catch {
+    return undefined;
+  }
+}
+
+/** What to tell a human whose module's tests are skipped by its own configuration. */
+export const TESTS_SKIPPED_HINT =
+  "目標模組的測試被跳過（surefire：Tests are skipped.）——pom、settings.xml 或 .mvn/maven.config 設定了 " +
+  "skipTests 或 maven.test.skip。loop 要實際執行測試才驗證得了任何東西，writer 寫的測試在這個設定下永遠不會被執行。\n" +
+  '請設 UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false" 後重跑；若 pom 在 surefire 的 <configuration> ' +
+  "裡直接寫死 <skipTests>true</skipTests>，-D 蓋不過它，請改用啟用測試的 profile（UT_MAVEN_ARGS=\"-P<profile>\"）。";
+
+// The tests this build's reports, anywhere in the reactor, say ran; null when it wrote none. Heads
+// only, as skippedCounts reads them.
+function testsInReports(moduleRoot: string, since: number): number | null {
+  let seen = false;
+  let tests = 0;
+  for (const dir of surefireDirs(moduleRoot)) {
+    for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
+      const tag = /<testsuite\b[^>]*>/.exec(readHead(path.join(dir, f)) ?? "")?.[0];
+      if (!tag) continue;
+      seen = true;
+      tests += Number(attr(tag, "tests")) || 0;
+    }
+  }
+  return seen ? tests : null;
+}
+
 // Pure: last "Tests run: N" in the maven stream = the Results-block aggregate.
 // null = surefire never reported (no tests compiled/ran, or tests were skipped).
 export function countTestsRun(mavenOut: string): number | null {
@@ -1298,10 +1429,18 @@ export function countTestsRun(mavenOut: string): number | null {
 // Maven parses the reactor stdout (with -am, upstream-module tests may inflate the count —
 // errs lenient, never blocks a valid run). Gradle counts the module's TEST-*.xml (best-effort;
 // gradle rewrites its results dir per run).
-function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string): string | null {
+function detectZeroTests(tool: BuildTool, mod: ModuleInfo, out: string, since: number): string | null {
   let detail: string | null = null;
   if (tool === "maven") {
-    const n = countTestsRun(out);
+    // A quiet build (-q in .mvn/maven.config or MAVEN_ARGS) logs errors only: a green one prints no
+    // "Tests run" at all, and every round of it read as zero tests. Its reports still say.
+    const n = countTestsRun(out) ?? testsInReports(mod.moduleRoot, since);
+    // No file the writer can write changes this, so it gets said as it is rather than as advice to
+    // add a test class: the baseline stops on it, this is for a run that skipped the baseline.
+    // Whatever upstream modules ran under -am, the target module's own tests did not.
+    if (testsSkippedInLog(out, moduleArtifactId(mod))) {
+      return `編譯成功，但本輪沒有執行任何測試。${TESTS_SKIPPED_HINT}`;
+    }
     if (n === null) detail = "surefire 未回報任何「Tests run」";
     else if (n === 0) detail = "surefire 回報 Tests run: 0";
   } else {
@@ -1351,7 +1490,10 @@ export async function runBuildAndTests(
 // locate and was classified as a red module nobody could name, ending in a repair loop that
 // gave up with advice about Lombok. The orchestrator needs it for the same reason: a build that
 // timed out is not one to run again on the chance that it was flaky.
-export type BuildRun = { gate: GateResult; aborted?: string; notRun?: string[]; startedAt: number };
+// `ignoredBy` is set when the build exited 0 over failures it was told to ignore (see
+// mavenRedDespiteExit0): red all the same, and a human reading the baseline needs to know why a
+// build they call green is not.
+export type BuildRun = { gate: GateResult; aborted?: string; notRun?: string[]; ignoredBy?: string; startedAt: number };
 
 export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOptions = {}): Promise<BuildRun> {
   const isWin = process.platform === "win32";
@@ -1437,9 +1579,20 @@ export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOpti
     return unrun && { gate: { passed: false, report: unrun.report, raw: r.out }, notRun: unrun.classes, startedAt };
   };
 
-  if (r.code === 0) {
+  // An exit code of 0 is Maven (or Gradle) choosing not to stop, which a project can ask it to do
+  // over failing tests: see mavenRedDespiteExit0. The reports and the tool's own verdict decide.
+  const ignoredBy =
+    r.code !== 0
+      ? undefined
+      : tool === "maven"
+        ? mavenRedDespiteExit0(r.out, reportsRecordFailure(mod.moduleRoot, startedAt))
+        : gradleRedDespiteExit0(r.out);
+  // Not "FAIL" here: under UT_ALLOW_DIRTY_BASELINE the failures may all be tolerated ones.
+  if (ignoredBy) log(`[WARN] ${ignoredBy}——loop 不看 exit code，以測試報告與建置工具自己的判定為準`);
+
+  if (r.code === 0 && !ignoredBy) {
     const zeroReport =
-      ALLOW_ZERO_TESTS || opts.allowZeroTests ? null : detectZeroTests(tool, mod, r.out);
+      ALLOW_ZERO_TESTS || opts.allowZeroTests ? null : detectZeroTests(tool, mod, r.out, startedAt);
     const unrun = notRun();
     // Nothing ran at all: that first, and then why the writer's own classes were not among it.
     if (zeroReport) {
@@ -1502,11 +1655,31 @@ export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOpti
     gate: {
       passed: false,
       report:
-        `編譯或測試失敗（exit=${r.code}）。${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
+        (ignoredBy ? `${ignoredBy}。loop 不看 exit code：這一輪是紅的。` : `編譯或測試失敗（exit=${r.code}）。`) +
+        `${broke}\n錯誤節錄：\n${summarizeBuildErrors(r.out)}\n${failures}`,
       raw: r.out,
     },
+    ignoredBy,
     startedAt,
   };
+}
+
+// Whether this build's own surefire XML reports, anywhere in the reactor, record a failing test. Not
+// the .txt summaries: surefire 2.x writes "Failures: 1 <<< FAILURE!" into one for a flaky test that
+// passed on its rerun, and only the XML tells the two apart. A build with XML reports turned off has
+// surefire's own "There are test failures." to go by.
+// Asked of every green build, so it reads what skippedCounts reads — the head of each report — and
+// parses a whole report only when its counters are not both zero: surefire counts every failing
+// case, and also, in 2.x, the flaky ones.
+function reportsRecordFailure(moduleRoot: string, since: number): boolean {
+  for (const dir of surefireDirs(moduleRoot)) {
+    for (const f of freshFiles(dir, "TEST-", ".xml", since)) {
+      const tag = /<testsuite\b[^>]*>/.exec(readHead(path.join(dir, f)) ?? "")?.[0];
+      if (tag && !(Number(attr(tag, "failures")) || 0) && !(Number(attr(tag, "errors")) || 0)) continue;
+      if (failingSuiteIn(dir, f)) return true;
+    }
+  }
+  return false;
 }
 
 // The ran check as the gate uses it: the report and the classes it names, or null when every one

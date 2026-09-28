@@ -60,6 +60,7 @@ import {
   renderSurefireSuite,
   summarizeBuildErrors,
   surefireHasFailure,
+  suiteRecordsFailure,
 } from "../gates/build";
 import { classVisibility, isClassRefSuite, scanTestConventions } from "../libs/conventions";
 import { loadRubric } from "../libs/rubric";
@@ -129,6 +130,9 @@ import {
   checkTestsRan,
   ranTestClasses,
   targetModuleSkipped,
+  mavenRedDespiteExit0,
+  gradleRedDespiteExit0,
+  testsSkippedInLog,
   classesRunInLog,
   classifyEnvFailures,
   crashedTestClasses,
@@ -4816,6 +4820,80 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     targetModuleSkipped(reactor("SKIPPED")) && !targetModuleSkipped(reactor("FAILURE [  3.0 s]")) && !targetModuleSkipped("[INFO] BUILD SUCCESS") &&
       // no separator line before BUILD FAILURE: that line is not a module's
       targetModuleSkipped("[INFO] Reactor Summary:\n[INFO] common ...... FAILURE\n[INFO] web ....... SKIPPED\n[INFO] BUILD FAILURE"),
+  );
+  // Maven's exit code is whether it chose to stop. Shapes taken from real surefire 2.22.2 / 3.2.5
+  // runs under testFailureIgnore, and Maven 3.9 under -fn.
+  const ignoredLog = [
+    "[INFO] --- surefire:3.2.5:test (default-test) @ tfi ---",
+    "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.004 s <<< FAILURE! -- in com.x.OtherTest",
+    "[INFO] Results:",
+    "[ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0",
+    "[ERROR] There are test failures.",
+    "",
+    "Please refer to /w/tfi/target/surefire-reports for the individual test results.",
+    "[INFO] BUILD SUCCESS",
+  ].join("\n");
+  const greenLog = "[INFO] --- surefire:3.2.5:test (default-test) @ tfi ---\n[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS";
+  check(
+    "mavenRedDespiteExit0：testFailureIgnore 下 surefire 記下的「There are test failures.」、fork 逾時（2.x 與 3.x 的措辭）→ 紅，說明是 testFailureIgnore",
+    (mavenRedDespiteExit0(ignoredLog, false) ?? "").includes("testFailureIgnore") &&
+      !!mavenRedDespiteExit0("[ERROR] There was a timeout or other error in the fork\n[INFO] BUILD SUCCESS", false) &&
+      !!mavenRedDespiteExit0("[ERROR] There was a timeout in the fork\n[INFO] BUILD SUCCESS", false) &&
+      !!mavenRedDespiteExit0("[ERROR] There are test errors.\n[INFO] BUILD SUCCESS", false),
+  );
+  check(
+    "mavenRedDespiteExit0：綠的建置 → undefined；log 沒說、但這次建置的報告記著失敗 → 紅",
+    mavenRedDespiteExit0(greenLog, false) === undefined && (mavenRedDespiteExit0(greenLog, true) ?? "").includes("testFailureIgnore"),
+  );
+  check(
+    "mavenRedDespiteExit0：--fail-never 的最後判定是 BUILD FAILURE → 紅；測試裡跑的內嵌建置先印過 BUILD FAILURE、Maven 自己最後說 SUCCESS → 不算；測試自己印的字不帶 [ERROR] → 不算",
+    (mavenRedDespiteExit0("[ERROR] /w/CalcTest.java:[9,9] cannot find symbol\n[INFO] BUILD FAILURE\n[INFO] Total time: 1 s", false) ?? "").includes("--fail-never") &&
+      mavenRedDespiteExit0(`[INFO] BUILD FAILURE\n${greenLog}`, false) === undefined &&
+      mavenRedDespiteExit0(`There are test failures.\n${greenLog}`, false) === undefined,
+  );
+  check(
+    "gradleRedDespiteExit0：ignoreFailures = true 的「There were failing tests」→ 紅；一般輸出 → undefined",
+    (gradleRedDespiteExit0("1 test completed, 1 failed\nThere were failing tests. See the report at: file:///w/build/reports/tests/test/index.html\nBUILD SUCCESSFUL in 2s") ?? "").includes("ignoreFailures") &&
+      gradleRedDespiteExit0("BUILD SUCCESSFUL in 2s") === undefined,
+  );
+  {
+    // Real reports: surefire 2.22.2 + JUnit 4.12 with rerunFailingTestsCount=2, the test failing once
+    // and then passing (build green, "Flakes: 1"); and a @BeforeClass that throws.
+    const flaky =
+      '<testsuite name="com.x.FlakyTest" time="0.092" tests="2" errors="0" skipped="0" failures="1">\n  <properties>\n  </properties>\n' +
+      '  <testcase name="passesOnSecondTry" classname="com.x.FlakyTest" time="0.001">\n    <flakyFailure message="first attempt fails" type="java.lang.AssertionError">\n' +
+      "      <stackTrace>java.lang.AssertionError: first attempt fails\n\tat com.x.FlakyTest.passesOnSecondTry(FlakyTest.java:13)\n</stackTrace>\n    </flakyFailure>\n  </testcase>\n</testsuite>";
+    const setup =
+      '<testsuite name="com.x.SetupTest" tests="1" errors="1" skipped="0" failures="0">\n  <testcase name="" classname="com.x.SetupTest" time="0.067">\n' +
+      '    <error message="class setup failed" type="java.lang.IllegalStateException"><![CDATA[java.lang.IllegalStateException: class setup failed\n]]></error>\n  </testcase>\n</testsuite>';
+    const countersOnly = '<testsuite name="com.x.GoneTest" tests="3" errors="1" skipped="0" failures="0"></testsuite>';
+    const rec = (xml: string) => suiteRecordsFailure(parseSurefireXml(xml)!, xml);
+    check(
+      "suiteRecordsFailure：重跑後通過的不穩定測試（2.x 的 failures=\"1\" 底下只有 <flakyFailure>）→ 不算失敗；@BeforeClass 丟例外 → 算；沒有任何 testcase、只有計數 → 照計數",
+      !rec(flaky) && rec(setup) && rec(countersOnly),
+    );
+  }
+  const sfHeader = (artifact: string, exec = "default-test", legacy = false) =>
+    legacy ? `[INFO] --- maven-surefire-plugin:2.22.2:test (${exec}) @ ${artifact} ---` : `[INFO] --- surefire:3.2.5:test (${exec}) @ ${artifact} ---`;
+  const SKIP = "[INFO] Tests are skipped.";
+  check(
+    "testsSkippedInLog：目標模組每個 surefire 執行都說 Tests are skipped → true（Maven 3.9 與 3.6 的標頭都認得）",
+    testsSkippedInLog([sfHeader("tfi"), SKIP, "[INFO] BUILD SUCCESS"].join("\n")) &&
+      testsSkippedInLog([sfHeader("web", "default-test", true), SKIP].join("\n"), "web") &&
+      testsSkippedInLog(["[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ tfi ---", "[INFO] Not compiling test sources", sfHeader("tfi"), SKIP].join("\n"), "tfi"),
+  );
+  check(
+    "testsSkippedInLog：-am 帶進來的上游跳過、目標有跑 → false；上游有跑、目標跳過 → true；目標兩個執行只有一個跳過 → false",
+    !testsSkippedInLog([sfHeader("common"), SKIP, sfHeader("web"), "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0"].join("\n"), "web") &&
+      !testsSkippedInLog([sfHeader("common"), SKIP, sfHeader("web"), "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0"].join("\n")) &&
+      testsSkippedInLog([sfHeader("common"), "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0", sfHeader("web"), SKIP].join("\n"), "web") &&
+      !testsSkippedInLog([sfHeader("web"), SKIP, sfHeader("web", "slow-tests"), "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0"].join("\n"), "web"),
+  );
+  check(
+    "testsSkippedInLog：failsafe 的跳過（-DskipITs）不算；沒有 surefire 執行（編譯就失敗）→ false；artifactId 對不到 log（${…}）→ 看最後建置的模組",
+    !testsSkippedInLog(["[INFO] --- failsafe:3.2.5:integration-test (default) @ tfi ---", SKIP, sfHeader("tfi"), "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0"].join("\n"), "tfi") &&
+      !testsSkippedInLog("[ERROR] COMPILATION ERROR :\n[INFO] BUILD FAILURE", "tfi") &&
+      testsSkippedInLog([sfHeader("common"), "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0", sfHeader("web"), SKIP].join("\n"), "${app.name}"),
   );
   check("renderRanCheck：全部都有執行 → null", renderRanCheck({ reported: [], notRun: [], allSkipped: [], ran: [], ranBefore: [] }, "maven") === null);
   check(

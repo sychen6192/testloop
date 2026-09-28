@@ -140,6 +140,24 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **pom 設了 `testFailureIgnore` 時，writer 的失敗測試會以 `gates-passed` 交差。** build gate 以 Maven 的 exit
+  code 判綠燈，而 surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent pom 或
+  `.mvn/maven.config` 常設，好讓 CI 在測試失敗時照樣收報告）下測試失敗照樣 exit 0、BUILD SUCCESS。以真的專案
+  重現：writer 的 `CalcTest.div_nonZero_returnsQuotient` 失敗，gate 判 PASS、覆蓋率與 review 也過，整個 run 以
+  gates-passed 結束；預檢也把一個有失敗測試的模組說成「乾淨」。現在 exit 0 時另看 surefire 記下的
+  `There are test failures.`、Maven 最後印的 BUILD 判定與這次建置寫出的 XML 報告：有失敗就是紅燈，回饋與
+  `baseline.md` 說明為什麼 Maven 說成功。`--fail-never`（`-fn`，連編譯錯誤都 exit 0）與 Gradle 的
+  `ignoreFailures = true` 一併處理。`UT_ALLOW_DIRTY_BASELINE` 的扣除照常運作；失敗一次、重跑後通過的測試
+  （`rerunFailingTestsCount`）不算失敗——surefire 2.x 在報告的計數裡記它 `failures="1"`，所以改以 `<failure>` /
+  `<error>` 元素判定，紅燈建置的失敗清單也不再列出它。
+- **模組的測試被設定跳過時，run 白燒兩輪再以 stuck 收場。** pom、settings.xml 或 `.mvn/maven.config` 設了
+  `skipTests` / `maven.test.skip` 時，每次建置都綠、一個測試都沒執行；gate 叫 writer「建立測試類別」，writer
+  怎麼寫都一樣。現在預檢看到目標模組的 surefire 印 `Tests are skipped.` 就中止（stopReason `tests-skipped`），
+  說明要設 `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"`（或啟用測試的 profile）；跳過預檢時，gate 的
+  回報也改說明這件事。
+- **`.mvn/maven.config`（或 `MAVEN_ARGS`）有 `-q` 時，每一輪都被判成「執行了 0 個測試」。** 安靜模式只印錯誤，
+  綠的建置連一行 `Tests run` 都沒有，零測試檢查只看 log，於是每一輪都 FAIL、以 stuck 收場。現在 log 沒有
+  `Tests run` 時改看這次建置寫出的 surefire 報告。
 - **Spring Boot + Lombok 的資料夾，DTO 與進入點的批次永遠過不了。** JaCoCo 的行號是編譯器給的：Lombok
   產生的 equals / hashCode / toString / setter 記在 `@Data` 那一行、getter 記在欄位那一行、
   `@RequiredArgsConstructor` 的建構子（連同 `@NonNull` 的 null 檢查）記在註解那一行。實測（JaCoCo 0.8.8、

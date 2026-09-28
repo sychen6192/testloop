@@ -80,6 +80,21 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    那些）、類名是否符合 surefire 的 includes（`*Tests` 要 2.20 以後——Maven 3.8 沒指定版本時用的 2.12.4 不跑），
    writer 才知道該改寫成什麼。限縮執行時 `-Dtest` 帶的是 `Name,Name$*`：surefire 3.0.0-M5 以前的 `-Dtest=Name`
    不跑只有 `@Nested` 測試的類別。
+   第四道是**綠燈看報告，不看 exit code**。Maven 的 exit code 說的是它要不要停下來，不是建置有沒有過：
+   surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent 常設，好讓 CI 在測試失敗時照樣
+   收得到報告）下測試失敗照樣 exit 0，`--fail-never` 連編譯錯誤都 exit 0，Gradle 的 `ignoreFailures = true` 也是。
+   以真的專案實測：writer 的測試失敗，gate 判 PASS、run 以 gates-passed 收場；預檢把一個有失敗測試的模組說成乾淨。
+   所以 exit 0 時另看 surefire 記下的 `There are test failures.`、Maven 最後印的 BUILD 判定，以及這次建置寫出的
+   XML 報告（`gates/build.ts` 的 `mavenRedDespiteExit0`）。報告看的是 `<failure>` / `<error>` 元素，不是 testsuite
+   的計數：surefire 2.x 把失敗一次、重跑後通過的測試（`rerunFailingTestsCount`）記成 `failures="1"`，底下只有
+   `<flakyFailure>`，建置是綠的；.txt 摘要同樣寫 `Failures: 1`，分不出來，所以不採用。不強制加
+   `-Dmaven.test.failure.ignore=false`：那會讓 reactor 停在失敗的上游模組，`UT_ALLOW_DIRTY_BASELINE` 容忍的上游
+   紅燈就再也建置不到目標模組；讓 Maven 照專案的設定跑完、由報告判定，兩種專案都對。零測試的判斷同理：
+   `-q`（`.mvn/maven.config` 或 `MAVEN_ARGS`）的綠建置一行 `Tests run` 都不印，只看 log 會讓每一輪都判成
+   「執行了 0 個測試」，所以 log 沒說時看這次建置寫出的報告。
+   反過來，目標模組的測試被設定跳過（`skipTests`、`maven.test.skip`，surefire 只印 `Tests are skipped.`）時預檢就
+   中止（`tests-skipped`）：每一輪都不會執行任何測試，gate 只會叫 writer「建一個測試類別」，燒兩輪後以 stuck 收場。
+   要不要讓測試跑是人的決定（上游模組的測試可能也被一起跳過、而且是壞的），所以只說明要設什麼，不自動覆寫。
 3. **Injection over discovery**：standards / rubric 由 loop 讀檔注入 prompt；
    agent .md body 只放不變的角色契約。（skill 機制是 description-triggered
    的機率性載入，自動 loop 不能靠機率。）

@@ -326,6 +326,23 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   本工具沒碰過的壞檔就能擋掉每一輪。預設會先用同一個 writer 修這些檔（範圍 guard 與防掏空
   guard 全程有效），修到綠才開始產生新測試；修好的檔案會列在 log 與 `repair-summary.md`，
   **那是 writer 對別人測試的改動，commit 前一定要看 diff**。
+- **預檢說模組是紅的，但你自己跑 `mvn test` 是 BUILD SUCCESS。** 專案讓 Maven 在測試失敗時照樣成功：
+  surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，常設在公司的 parent pom 或
+  `.mvn/maven.config`，好讓 CI 在測試失敗時還收得到報告），或 `--fail-never`（`-fn`，連編譯錯誤都照樣
+  exit 0）。Gradle 的 `test { ignoreFailures = true }` 也一樣。loop 不看 exit code，以這次建置寫出的 surefire
+  XML 報告與 Maven 自己的判定為準——只看 exit code 時，writer 寫的失敗測試會被當成通過、整個 run 以
+  `gates-passed` 收場（以真的專案重現過）。log 與 `baseline.md` 會寫明是哪一種。之後照一般的紅燈處理：修復
+  迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試。失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，
+  log 裡的 `Flakes`）不算失敗。
+- **中止，說「目標模組一個測試都沒有執行」（stopReason `tests-skipped`）。** pom、settings.xml 或
+  `.mvn/maven.config` 設了 `skipTests` 或 `maven.test.skip`，surefire 只印一行 `Tests are skipped.`——每一輪都
+  一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session。設
+  `UT_MAVEN_ARGS="-DskipTests=false -Dmaven.test.skip=false"` 後重跑（命令列的 `-D` 蓋得過 pom 的屬性與
+  `.mvn/maven.config`）；pom 在 surefire 的 `<configuration>` 裡直接寫死 `<skipTests>true</skipTests>` 時 `-D` 蓋
+  不過，改用啟用測試的 profile（`UT_MAVEN_ARGS="-P<profile>"`）。
+- **`.mvn/maven.config` 有 `-q`。** 安靜模式只印錯誤：綠的建置什麼都不印，loop 改看這次建置寫出的 surefire 報告
+  判斷有沒有測試執行，照樣能用。但 log 裡的資訊（surefire 版本、provider、平台編碼、JaCoCo 的 `argLine`）也跟著
+  消失，「測試相依」與「原始碼編碼」只能退回讀 pom；能拿掉就拿掉。
 - **中止，說「紅燈全部落在 writer 的可寫範圍之外」。** 預檢抓到的紅燈不在
   `<目標模組>/src/test` 裡——多模組時最常見的是上游模組（`common`、`core`）的測試壞掉，也可能是
   production code 或 `pom.xml`。writer 對這些檔案沒有寫入權，進修復迴圈只會用光輪數才發現寫不了，

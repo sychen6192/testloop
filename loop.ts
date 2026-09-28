@@ -342,6 +342,16 @@ async function main() {
           `被 signal 終止多半是記憶體不足。詳見 ${path.join(runDir, "baseline.log")}`,
       );
     }
+    if (baseline.testsSkipped) {
+      fs.writeFileSync(
+        path.join(runDir, "summary.json"),
+        JSON.stringify({ success: false, stopReason: "tests-skipped", error: baseline.testsSkipped }, null, 2),
+      );
+      die(
+        `預檢時目標模組一個測試都沒有執行——每一輪的建置也都會一樣，writer 寫的測試永遠驗證不了，所以在產生測試之前中止。\n` +
+          `${baseline.testsSkipped}\n詳見 ${path.join(runDir, "baseline.log")}`,
+      );
+    }
     measureStack(baseline.raw, baselineStartedAt);
     logFacts();
     ranAtBaseline = baseline.ranTests;

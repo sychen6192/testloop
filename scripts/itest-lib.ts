@@ -133,6 +133,9 @@ export interface Scenario {
   omitExisting?: boolean;
   /** "multi" builds a reactor with common/core/web and targets web. Default "single". */
   layout?: "single" | "multi";
+  /** "gradle": a single-module Gradle build instead — build.gradle, and the same scripted replay
+   *  as gradlew. entry=orchestrate/repair only. */
+  buildTool?: "maven" | "gradle";
   writer?: WriterAction[];
   review?: ReviewAction[];
   /** For entry=loop: the fake endpoint's scripted turns, consumed in order. */
@@ -410,6 +413,7 @@ process.exit(step.exit);
 `;
 
 export const FAKE_MVNW_CMD = `@echo off\r\nnode "%~dp0mvnw" %*\r\n`;
+export const FAKE_GRADLEW_BAT = `@echo off\r\nnode "%~dp0gradlew" %*\r\n`;
 
 // ─── Maven output templates ──────────────────────────────────────────────────
 
@@ -496,6 +500,38 @@ export const TEST_FAILURE = (cls = "com.x.CalcTest") =>
     "[INFO] Finished at: {{time}}",
     "[ERROR] -> [Help 1]",
   ].join("\n");
+
+/** A failing test surefire was told to ignore (testFailureIgnore): logged at ERROR, and exit 0.
+ *  Shape of surefire 3.2.5 on a real project. */
+export const TEST_FAILURE_IGNORED = (cls = "com.x.CalcTest") =>
+  [
+    "[INFO] Scanning for projects...",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+    `[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s <<< FAILURE! -- in ${cls}`,
+    `[ERROR] ${cls}.div_byZero_throwsIllegalArgument -- Time elapsed: {{elapsed}} s <<< FAILURE!`,
+    "[INFO] Results:",
+    "[ERROR] Failures: ",
+    `[ERROR]   ${cls.split(".").pop()}.div_byZero_throwsIllegalArgument:17`,
+    "[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0",
+    "[ERROR] There are test failures.",
+    "",
+    "Please refer to {{root}}/target/surefire-reports for the individual test results.",
+    "[INFO] BUILD SUCCESS",
+    "[INFO] Total time:  {{elapsed}} s",
+    "[INFO] Finished at: {{time}}",
+  ].join("\n");
+
+/** The module's tests skipped by its own configuration (skipTests, maven.test.skip): green, nothing ran. */
+export const TESTS_SKIPPED = [
+  "[INFO] Scanning for projects...",
+  "[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ fixture ---",
+  "[INFO] Not compiling test sources",
+  "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+  "[INFO] Tests are skipped.",
+  "[INFO] BUILD SUCCESS",
+  "[INFO] Total time:  {{elapsed}} s",
+  "[INFO] Finished at: {{time}}",
+].join("\n");
 
 export const SUREFIRE_FAIL = (cls: string, message: string) =>
   [
@@ -666,12 +702,20 @@ export function buildFixture(root: string, sc: Scenario): void {
   fs.mkdirSync(root, { recursive: true });
 
   const multi = sc.layout === "multi";
-  write(root, "pom.xml", multi ? REACTOR_POM : POM);
   // The fake mvnw is CommonJS; pin it so an ancestor package.json cannot flip it to ESM.
   write(root, "package.json", JSON.stringify({ name: "fixture", type: "commonjs" }, null, 2));
-  write(root, "mvnw", FAKE_MVNW);
-  fs.chmodSync(path.join(root, "mvnw"), 0o755);
-  write(root, "mvnw.cmd", FAKE_MVNW_CMD);
+  if (sc.buildTool === "gradle") {
+    write(root, "settings.gradle", "rootProject.name = 'fixture'\n");
+    write(root, "build.gradle", "plugins { id 'java' }\n");
+    write(root, "gradlew", FAKE_MVNW);
+    fs.chmodSync(path.join(root, "gradlew"), 0o755);
+    write(root, "gradlew.bat", FAKE_GRADLEW_BAT);
+  } else {
+    write(root, "pom.xml", multi ? REACTOR_POM : POM);
+    write(root, "mvnw", FAKE_MVNW);
+    fs.chmodSync(path.join(root, "mvnw"), 0o755);
+    write(root, "mvnw.cmd", FAKE_MVNW_CMD);
+  }
 
   if (multi) {
     for (const m of MULTI_MODULES) write(root, `${m}/pom.xml`, MODULE_POM(m));

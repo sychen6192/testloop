@@ -26,6 +26,8 @@ import {
   UPSTREAM_TEST_DIR,
   TEST_DIR,
   TEST_FAILURE,
+  TEST_FAILURE_IGNORED,
+  TESTS_SKIPPED,
 
   withAnsi,
   UNLOCATABLE_FAILURE,
@@ -300,7 +302,29 @@ const untouchedRed = (message: string) => ({
     { cls: "com.x.ExistingTest", body: SUREFIRE_FAIL("com.x.ExistingTest", message) },
   ],
 });
+// The case a writer's CalcTest fails on, and one an existing test fails on, in surefire XML.
+const WRITER_CASE = { nested: "", method: "div_byZero_throwsIllegalArgument", message: "Expected IllegalArgumentException to be thrown, but nothing was thrown.", line: 17 };
+const EXISTING_CASE = { nested: "", method: "div_byOne_returnsSameValue", message: "Connection refused: localhost:6379", line: 13 };
 const EXISTING_FLAKY_RED = untouchedRed("Connection refused: localhost:6379");
+// Gradle's test-results XML for CalcTest, in the shape Gradle 8 writes it: no CDATA around a
+// failure, the method name with its parentheses.
+const GRADLE_CALC_XML = (failing: boolean) => `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.x.CalcTest" tests="2" skipped="0" failures="${failing ? 1 : 0}" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.05">
+  <properties/>
+  <testcase name="add_twoPositives_returnsSum()" classname="com.x.CalcTest" time="0.01"/>
+  <testcase name="div_byZero_throwsIllegalArgument()" classname="com.x.CalcTest" time="0.02">${
+    failing
+      ? `
+    <failure message="org.opentest4j.AssertionFailedError: Expected IllegalArgumentException to be thrown, but nothing was thrown." type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: Expected IllegalArgumentException to be thrown, but nothing was thrown.
+\tat app//com.x.CalcTest.div_byZero_throwsIllegalArgument(CalcTest.java:17)
+</failure>
+  `
+      : ""
+  }</testcase>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
+`;
 const EXISTING_BROKEN_BY_NEW = untouchedRed("expected: <1,5> but was: <1.5>（預設 Locale 被新測試改成 de_DE）");
 
 // A @Data class with a method someone wrote. JaCoCo's lines for it, shaped as the real report is
@@ -410,6 +434,8 @@ const LEGACY_RED = () => ({
   cleanSurefire: true,
   surefireXml: [{ suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) }],
 });
+/** The same, in a module whose surefire ignores test failures: logged, and the build exits 0. */
+const LEGACY_RED_IGNORED = () => ({ ...LEGACY_RED(), exit: 0, out: TEST_FAILURE_IGNORED(LEGACY) });
 
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
@@ -1032,6 +1058,183 @@ export const SCENARIOS: Scenario[] = [
       },
       GREEN_BUILD,
     ],
+  },
+
+  // ── Maven 的 exit code 不是它的判定 ──────────────────────────────────────────
+  {
+    name: "build-test-failure-ignored",
+    desc: "pom 設了 testFailureIgnore：writer 的測試失敗，Maven 仍 exit 0、BUILD SUCCESS → 照樣判紅、把失敗餵回，不能以 gates-passed 收場",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: TEST_FAILURE_IGNORED(),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [WRITER_CASE]) }],
+        jacoco: JACOCO_GREEN,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-test-failure-ignored-reports-only",
+    desc: "exit 0、log 沒有 surefire 的失敗摘要，但這次建置寫的報告記著一個 error（計數是 errors=\"1\"、failures=\"0\"）→ 以報告為準判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: BUILD_SUCCESS(4),
+        cleanSurefire: true,
+        // An error, not a failure: the counters say errors="1", failures="0".
+        surefireXml: [
+          {
+            suite: "com.x.CalcTest",
+            body:
+              '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="com.x.CalcTest" time="0.5" tests="2" errors="1" skipped="0" failures="0">\n' +
+              '  <testcase name="add_twoPositives_returnsSum" classname="com.x.CalcTest" time="0.01"/>\n' +
+              '  <testcase name="div_byZero_throwsIllegalArgument" classname="com.x.CalcTest" time="0.03">\n' +
+              '    <error message="Cannot invoke &quot;com.x.Calc.div(int, int)&quot; because &quot;this.calc&quot; is null" type="java.lang.NullPointerException">' +
+              "<![CDATA[java.lang.NullPointerException: Cannot invoke \"com.x.Calc.div(int, int)\" because \"this.calc\" is null\n" +
+              "\tat com.x.CalcTest.div_byZero_throwsIllegalArgument(CalcTest.java:17)\n]]></error>\n  </testcase>\n</testsuite>\n",
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+      GREEN_BUILD,
+    ],
+  },
+  {
+    name: "build-test-failure-ignored-flaky",
+    desc: "testFailureIgnore 下只有 writer 沒碰過的既有測試失敗、重跑就過 → 一樣判 flaky、同一輪照常往下走",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: TEST_FAILURE_IGNORED("com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest"),
+        surefireXml: [{ suite: "com.x.ExistingTest", body: SUREFIRE_XML("com.x.ExistingTest", 2, [EXISTING_CASE]) }],
+        jacoco: JACOCO_GREEN,
+      },
+      { ...GREEN_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+    ],
+  },
+  {
+    name: "build-flaky-rerun-green",
+    desc: "surefire 2.x 的 rerunFailingTestsCount：既有測試失敗一次、重跑通過，建置綠（Flakes: 1），報告的 failures=\"1\" 底下只有 <flakyFailure> → 不得判紅",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ fixture ---",
+          "[ERROR] div_byOne_returnsSameValue(com.x.ExistingTest)  Time elapsed: 0.015 s  <<< FAILURE!",
+          "[WARNING] Flakes: ",
+          "[ERROR]   Run 1: ExistingTest.div_byOne_returnsSameValue:13 Connection refused",
+          "[WARNING] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        surefire: [
+          ...ran("com.x.CalcTest"),
+          // What surefire 2.22 writes into the .txt for it: indistinguishable from a real failure.
+          {
+            cls: "com.x.ExistingTest",
+            body: [
+              "Test set: com.x.ExistingTest",
+              "-------------------------------------------------------------------------------",
+              "Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.092 s <<< FAILURE! - in com.x.ExistingTest",
+              "div_byOne_returnsSameValue(com.x.ExistingTest)  Time elapsed: 0.015 s  <<< FAILURE!",
+              "java.lang.AssertionError: Connection refused",
+            ].join("\n"),
+          },
+        ],
+        surefireXml: [
+          {
+            suite: "com.x.ExistingTest",
+            body:
+              '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="com.x.ExistingTest" time="0.09" tests="3" errors="0" skipped="0" failures="1">\n' +
+              '  <testcase name="add_twoPositives_returnsSum" classname="com.x.ExistingTest" time="0.001"/>\n' +
+              '  <testcase name="div_byOne_returnsSameValue" classname="com.x.ExistingTest" time="0.001">\n' +
+              '    <flakyFailure message="Connection refused" type="java.lang.AssertionError">\n      <stackTrace>java.lang.AssertionError: Connection refused\n</stackTrace>\n    </flakyFailure>\n' +
+              "  </testcase>\n</testsuite>\n",
+          },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-fail-never-compile-error",
+    desc: "--fail-never（.mvn/maven.config 的 -fn）：writer 的測試編不過，Maven 印 BUILD FAILURE 卻 exit 0 → 判紅、餵回的是編譯錯誤，不是「沒有執行任何測試」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [{ exit: 0, out: COMPILE_FAILURE(`{{root}}/${CALC_TEST_PATH}`), cleanSurefire: true }, GREEN_BUILD],
+  },
+  {
+    name: "gradle-test-failure-ignored",
+    desc: "Gradle 的 test 任務設了 ignoreFailures = true：writer 的測試失敗，gradle 仍 exit 0、BUILD SUCCESSFUL → 照樣判紅、把失敗餵回",
+    entry: "orchestrate",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: calcTest(1) } }, { write: { [CALC_TEST_PATH]: calcTest(9) } }],
+    mvn: [
+      {
+        exit: 0,
+        out: [
+          "> Task :test",
+          "",
+          "CalcTest > div_byZero_throwsIllegalArgument() FAILED",
+          "    org.opentest4j.AssertionFailedError at CalcTest.java:17",
+          "",
+          "2 tests completed, 1 failed",
+          "There were failing tests. See the report at: file://{{root}}/build/reports/tests/test/index.html",
+          "",
+          "BUILD SUCCESSFUL in 2s",
+        ].join("\n"),
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(true) },
+        jacoco: JACOCO_GREEN,
+      },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false) },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-quiet-green",
+    desc: ".mvn/maven.config 有 -q：綠的建置什麼都不印（沒有 Tests run）→ 以這次建置的報告為準，不得判成「執行了 0 個測試」",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "",
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, []) }],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "build-tests-skipped",
+    desc: "沒有預檢、模組的測試被設定跳過（skipTests）→ 回報說明是設定跳過了測試、該設什麼，而不是叫 writer 去建測試類別",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [{ exit: 0, out: TESTS_SKIPPED, cleanSurefire: true }],
   },
 
   {
@@ -1674,6 +1877,57 @@ export const SCENARIOS: Scenario[] = [
       { content: "已建立 CalcTest.java" },
     ],
     mvn: [LEGACY_RED(), { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] }],
+  },
+  {
+    name: "loop-dirty-tolerated-failure-ignored",
+    desc: "testFailureIgnore 下每次建置都 exit 0：預檢照樣認出既有失敗、gate 照樣扣除後放行，而且記錄容忍了什麼",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED_IGNORED(),
+      { ...LEGACY_RED_IGNORED(), jacoco: JACOCO_GREEN, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_PASS("com.x.CalcTest") }] },
+    ],
+  },
+  {
+    name: "loop-dirty-new-failure-ignored-blocked",
+    desc: "testFailureIgnore 下 writer 弄壞一個新的測試，Maven 仍 exit 0 → 基準沒有的新失敗照樣擋下",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0", UT_MAX_ITER: "1" },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvn: [
+      LEGACY_RED_IGNORED(),
+      {
+        ...LEGACY_RED_IGNORED(),
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          { suite: "com.x.OtherTest", body: SUREFIRE_XML("com.x.OtherTest", 2, [{ nested: "", method: "broken_by_writer", message: "NPE", line: 12 }]) },
+        ],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "loop-baseline-test-failure-ignored",
+    desc: "testFailureIgnore 下既有測試失敗、Maven exit 0 → 預檢不得說「乾淨」：判紅並說明為什麼 mvn 自己說 BUILD SUCCESS",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_REPAIR_BASELINE: "0" },
+    api: [],
+    mvn: [LEGACY_RED_IGNORED()],
+  },
+  {
+    name: "loop-baseline-tests-skipped",
+    desc: "模組的測試被設定跳過（skipTests／maven.test.skip）→ 預檢就中止、說明要設什麼，不開 writer session 白燒兩輪",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: [],
+    mvn: [{ exit: 0, out: TESTS_SKIPPED, cleanSurefire: true }],
   },
   {
     name: "loop-dirty-flaky-not-tolerated",
