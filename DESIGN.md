@@ -18,6 +18,7 @@ loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ �
         │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
         │  測試相依量測（measureTestStack：surefire classpath，退回 pom）與原始碼編碼量測
         │    （measureSourceEncoding：pom，退回 build log 的平台編碼）→ 寫進 prompt
+        │  接續（libs/resume.ts）：先前已通過、類別與測試都沒變、預檢中照樣通過的類別不再產生
         │  資料夾目標 → 依 UT_BATCH_SIZE 分批，每批一個完整的 orchestrate；
         │    沒通過的批次撤回它對 src/test 的變更（保留在 batch-NN/rejected/）
         │
@@ -369,6 +370,42 @@ production code 上）、連續兩批以同一個 `writer-no-op` 或 `reviewer-u
 **不變的部分。** 只有一批時（單一類別，或 `UT_BATCH_SIZE` 不小於類別數）走原本的路徑，artifacts
 版面、summary 形狀、失敗時測試檔留在原處，都與以前相同。分批不改 build gate 的承諾：每批仍是完整
 模組建置（或 `UT_TEST_SCOPE=generated` 時每批通過前的完整驗收）。代價是建置次數隨批數增加，README 說明。
+
+## 已採納：接續先前的執行（2026-09-28）
+
+**問題。** 資料夾目標一批一個類別，每批是幾個 writer / reviewer session 加幾次建置——一批幾分鐘到半小時。
+跑到第二十個類別時被打斷（終端機斷線、筆電睡著、建置吃光記憶體），或跑完有三批沒過，同一個目標再跑一次就
+從第一個類別重來：已經通過的幾個小時重做一遍，writer 還被要求「改進」剛通過所有 gate 的測試。
+
+**作法。** 每一批（或單一類別的 run）通過時，把它通過時的樣子記在該次 artifacts 的 `passed.json`
+（`libs/resume.ts`）：類別原始碼、它的測試檔（`findExistingTests` 的命名慣例）、那批 writer 寫的其他檔
+（不是別的類別的測試——共用 helper、`src/test/resources`），各自的 sha256；reviewer 的分數與 blockers、
+它依據的 rubric 的 sha256。下一次執行在預檢（與修復）之後、分批之前，對每個目標類別找**仍然描述現在這棵樹**
+的最新一筆紀錄，找到了再逐項確認，全部成立才略過：
+
+- **紀錄描述的就是現在**：類別與紀錄裡的每個檔一個 byte 都沒變（當時不存在的仍不存在），也沒有多出當時沒有
+  的測試檔。較舊的紀錄也算：樹回到它通過時的樣子，那次通過就仍然成立。比內容不比 mtime——git checkout、
+  複製 repo 都會改 mtime，內容才是 gate 看過的東西。
+- **建置**：這次的預檢建置（或讓它轉綠的修復）是綠的，而且它的測試類別在這次建置的報告裡——紀錄裡的
+  測試檔，不只是符合命名慣例的那些。預檢紅燈而被 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1`
+  時，沒有東西證明它們現在仍然通過，什麼都不略過；報告對不到任何類別時也一樣。
+- **覆蓋率**：用 coverage gate 自己的 `checkCoverage` 對這次預檢的 JaCoCo 報告重新量，門檻是現在的。
+  別的測試被刪、它呼叫的類別改了，覆蓋率會變，即使紀錄裡的檔都沒動——所以不能沿用當時的數字。沒有這次建置
+  產生的報告時與 gate 的判斷一致（寬鬆模式不檢查、`UT_STRICT_COV=1` 不通過），log 不宣稱「重新量過」。
+- **review**：不重跑 reviewer——那是略過要省下的東西。判決只在它的輸入都沒變時沿用：它讀的類別與測試檔（上一項
+  已比對）、它依據的 rubric；分數交給 `gates/review.ts` 的 `parseVerdict` 以現在的門檻重新判定（pipeline
+  判定，LLM 不算分——與 review gate 同一段程式）。當時 review gate 是關閉的，這次開著就重新產生。
+
+略過的類別不給 writer，紀錄帶進這次的 `passed.json`（下一次就在最新的一次找得到），列在 summary 的
+`resumed`。它們的測試在 `ranAtBaseline` 裡：之後每一批的建置都必須照樣執行它們（ran-check），後面的 writer
+打壞它們就是那一批的紅燈。全部略過時只跑預檢，`stopReason: "already-passed"`、exit 0。
+
+**為什麼預設開啟。** 重跑多半就是為了補完被打斷的那次；略過的每一個類別都經過這次的建置與覆蓋率重新驗證，
+沿用的只有 reviewer 的判決，而它的輸入逐 byte 比對過。最壞的情況是該略過的沒略過——那就是以前的行為。
+要全部重新產生設 `UT_RESUME=0`。
+
+**沒有做的。** 被 SIGKILL 的 run（沒有機會撤回正在跑的那一批）留在 `src/test` 的半成品不處理：它不在任何紀錄裡，
+那個類別照常重新產生；它讓預檢紅燈時由修復迴圈處理，與以前相同。
 
 ## 已否決方案（防止重新提案）
 

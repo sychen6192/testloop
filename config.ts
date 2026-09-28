@@ -83,6 +83,10 @@ export const MAX_ITER = intEnv("UT_MAX_ITER", 5, 1);
 // reliably finish; a whole package in one session outgrew the model's context and the agent
 // timeout, and one class that would not go green ended the run for every other class.
 export const BATCH_SIZE = intEnv("UT_BATCH_SIZE", 1, 1);
+// A class an earlier run of this repo passed every gate for is not written again, as long as the
+// class and its tests are what passed and this run's baseline shows them still passing (libs/resume.ts).
+// An interrupted folder run used to redo every class it had already finished. 0 = write every target.
+export const RESUME = process.env.UT_RESUME !== "0";
 // Upper bound on the failure report fed back to the writer each round. A build log grows with
 // the module, not with the writer's mistake — an unbounded report crowds the model's context
 // out with maven boilerplate and leaves no room to actually fix anything.

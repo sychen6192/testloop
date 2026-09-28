@@ -5,6 +5,7 @@
 // so plan[0] is round 1's build. For entry="repair" plan[0] is the baseline pre-check. For
 // entry="loop" plan[0] is the baseline too.
 import {
+  ApiTurn,
   BUILD_SUCCESS,
   CALC_JAVA,
   CALC_TEST,
@@ -475,6 +476,66 @@ const LEGACY_RED = () => ({
 });
 /** The same, in a module whose surefire ignores test failures: logged, and the build exits 0. */
 const LEGACY_RED_IGNORED = () => ({ ...LEGACY_RED(), exit: 0, out: TEST_FAILURE_IGNORED(LEGACY) });
+
+
+// ── Resuming an earlier run (libs/resume.ts) ─────────────────────────────────
+// Two runs of loop.ts on one fixture: the first passes Calc and records it in passed.json; the rerun
+// either skips Calc or — in every scenario but the plain ones — finds its pass no longer holds.
+const ZETA_TEST_PATH = `${TEST_DIR}/ZetaTest.java`;
+const ZETA_TEST = `package com.x;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class ZetaTest {
+    @Test
+    void twice_positive_doubles() {
+        assertEquals(4, new Zeta().twice(2));
+    }
+}
+`;
+const JACOCO_ZETA = { pkg: "com/x", file: "Zeta.java", line: [0, 2] as [number, number], branch: [0, 2] as [number, number] };
+const JACOCO_GREETER_RED = { pkg: "com/x", file: "Greeter.java", line: [4, 0] as [number, number], branch: [4, 0] as [number, number] };
+/** Before CalcTest exists: only the module's own test runs. */
+const BASE_EXISTING = { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") };
+/** Calc's round: CalcTest and ExistingTest ran, Calc fully covered. Also the rerun's baseline once CalcTest is there. */
+const CALC_BUILD = { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN };
+const RESUME_WRITE_CALC: ApiTurn[] = [
+  { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
+  { content: "已建立 CalcTest.java" },
+];
+/** The rerun's writer, when Calc is written again: a change to the file that is there. */
+const RESUME_REWRITE_CALC: ApiTurn[] = [
+  { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: calcTest(3) } }] },
+  { content: "已更新 CalcTest.java" },
+];
+const REVIEW_CALC = (v: string): ApiTurn[] => [{ toolCalls: [{ name: "read_file", args: { path: CALC_TEST_PATH } }] }, { content: v }];
+const scores9 = (effectiveness: number) =>
+  JSON.stringify({
+    scores: { effectiveness, coverage: 9, independence: 9, readability: 9, fast_reliable: 9, mock_appropriateness: 9 },
+    blockers: [],
+    advisories: [],
+  });
+/** One class, passed by the first run: the rerun's first build is its baseline, then Calc's round if it is written again. */
+const resumeCalc = (o: {
+  name: string;
+  desc: string;
+  env?: Record<string, string>;
+  firstApi?: ApiTurn[];
+  rerun: NonNullable<Scenario["rerun"]>;
+  rerunMvn?: Scenario["mvn"];
+  mvnFirst?: Scenario["mvn"];
+  extraFiles?: Record<string, string>;
+}): Scenario => ({
+  name: o.name,
+  desc: o.desc,
+  entry: "loop",
+  env: { UT_SKIP_REVIEW: "1", ...o.env },
+  extraFiles: o.extraFiles,
+  api: o.firstApi ?? RESUME_WRITE_CALC,
+  rerun: o.rerun,
+  mvn: [...(o.mvnFirst ?? [BASE_EXISTING, CALC_BUILD]), ...(o.rerunMvn ?? [CALC_BUILD, CALC_BUILD])],
+});
 
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
@@ -3316,6 +3377,222 @@ export const SCENARIOS: Scenario[] = [
       { exit: 1, out: COMPILE_FAILURE(`{{root}}/${BROKEN_PATH}`), cleanSurefire: true },
       GREEN_BUILD,
       GREEN_BUILD,
+    ],
+  },
+  // ── Resuming an earlier run ────────────────────────────────────────────────
+  resumeCalc({
+    name: "loop-resume-all-passed",
+    desc: "重跑同一個目標：上次通過的 Calc 沒變、預檢裡它的測試照樣通過、覆蓋率重新量過 → 不再找 writer，exit 0（already-passed）",
+    rerun: { api: [{ content: "不應該有任何 agent 請求" }] },
+    rerunMvn: [CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-test-edited",
+    desc: "上次通過後有人改了 CalcTest.java → 那次的 review 沒看過現在的內容，重新產生",
+    rerun: { between: { [CALC_TEST_PATH]: calcTest(1) }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-source-edited",
+    desc: "上次通過後 Calc.java 改過 → 測試是對著舊的程式寫的，重新產生",
+    rerun: { between: { [PROD_PATH]: CALC_JAVA.replace("public class Calc {", "// changed after the pass\npublic class Calc {") }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-new-test-file",
+    desc: "上次通過後多了一個 CalcUnitTest.java → reviewer 沒看過它，重新產生",
+    rerun: { between: { [`${TEST_DIR}/CalcUnitTest.java`]: CALC_TEST.replace("class CalcTest", "class CalcUnitTest") }, api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.CalcUnitTest", "com.x.ExistingTest") },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.CalcUnitTest", "com.x.ExistingTest") },
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-helper-edited",
+    desc: "上次那批 writer 寫的共用 Support.java 在通過後改過 → Calc 的測試靠它，重新產生",
+    firstApi: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: SUPPORT_PATH, content: "package com.x;\n\nclass Support {\n    static int one() { return 1; }\n}\n" } },
+        ],
+      },
+      { content: "已建立 CalcTest.java 與 Support.java" },
+    ],
+    rerun: {
+      between: { [SUPPORT_PATH]: "package com.x;\n\nclass Support {\n    static int one() { return 2; }\n}\n" },
+      api: RESUME_REWRITE_CALC,
+    },
+  }),
+  resumeCalc({
+    name: "loop-resume-coverage-dropped",
+    desc: "類別與測試都沒變，但這次預檢的 JaCoCo 報告裡 Calc 的覆蓋率低於門檻 → 覆蓋率重新量過才算數，重新產生",
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [{ ...CALC_BUILD, jacoco: JACOCO_RED }, CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-tests-not-run",
+    desc: "CalcTest.java 還在、內容沒變，但這次的預檢建置沒有執行它 → 沒有證據它現在仍然通過，重新產生",
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [{ ...BASE_EXISTING, jacoco: JACOCO_GREEN }, CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-review-threshold-raised",
+    desc: "上次 review 以 8 分通過，這次門檻調成 9 → 判決以現在的門檻重新判定，不過，重新產生",
+    env: { UT_SKIP_REVIEW: "0" },
+    firstApi: [...RESUME_WRITE_CALC, ...REVIEW_CALC(verdict({}))],
+    rerun: { env: { UT_SCORE_THRESHOLDS: '{"effectiveness":9}' }, api: [...RESUME_REWRITE_CALC, ...REVIEW_CALC(scores9(9))] },
+  }),
+  resumeCalc({
+    name: "loop-resume-review-was-skipped",
+    desc: "上次是 UT_SKIP_REVIEW=1 通過的，這次開了 review → 它的測試沒審查過，重新產生",
+    rerun: { env: { UT_SKIP_REVIEW: "0" }, api: [...RESUME_REWRITE_CALC, ...REVIEW_CALC(verdict({}))] },
+  }),
+  resumeCalc({
+    name: "loop-resume-rubric-changed",
+    desc: "上次 review 通過後，repo 換了自己的 rubric → 判決依據不同，重新產生",
+    env: { UT_SKIP_REVIEW: "0" },
+    firstApi: [...RESUME_WRITE_CALC, ...REVIEW_CALC(verdict({}))],
+    rerun: {
+      between: { ".opencode/skills/test-quality-evaluator/references/rubric.md": "# 團隊自己的 rubric\n每個測試都要有邊界值。\n" },
+      api: [...RESUME_REWRITE_CALC, ...REVIEW_CALC(verdict({}))],
+    },
+  }),
+  resumeCalc({
+    name: "loop-resume-review-passed",
+    desc: "上次 review 以 8 分通過、rubric 與門檻都沒變 → 判決重新判定照樣通過，不再找 writer 與 reviewer",
+    env: { UT_SKIP_REVIEW: "0" },
+    firstApi: [...RESUME_WRITE_CALC, ...REVIEW_CALC(verdict({}))],
+    rerun: { api: [{ content: "不應該有任何 agent 請求" }] },
+    rerunMvn: [CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-stale-report-strict",
+    desc: "這次預檢沒有產生 JaCoCo 報告、只剩第一次留下的舊報告，UT_STRICT_COV=1 → 舊報告不算重新量過，重新產生",
+    rerun: { env: { UT_STRICT_COV: "1" }, api: RESUME_REWRITE_CALC },
+    rerunMvn: [{ ...CALC_BUILD, jacoco: undefined }, CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-stale-report-loose",
+    desc: "同上但沒開 UT_STRICT_COV → 覆蓋率 gate 本來就不檢查，照樣接續，但不能說覆蓋率重新量過",
+    rerun: { api: [{ content: "不應該有任何 agent 請求" }] },
+    rerunMvn: [{ ...CALC_BUILD, jacoco: undefined }],
+  }),
+  resumeCalc({
+    name: "loop-resume-ran-unknown",
+    desc: "這次預檢沒有留下任何 surefire 報告（看不出跑了哪些測試類別）→ 無法確認 Calc 的測試有執行，重新產生",
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [{ exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, jacoco: JACOCO_GREEN }, CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-own-test-name",
+    desc: "writer 把 Calc 的測試取名 CalcBehaviourTest.java（不在命名慣例裡）→ 通過紀錄仍記得它，預檢跑過它就照樣接續",
+    firstApi: [
+      { toolCalls: [{ name: "write_file", args: { path: `${TEST_DIR}/CalcBehaviourTest.java`, content: CALC_TEST.replace("class CalcTest", "class CalcBehaviourTest") } }] },
+      { content: "已建立 CalcBehaviourTest.java" },
+    ],
+    rerun: { api: [{ content: "不應該有任何 agent 請求" }] },
+    mvnFirst: [BASE_EXISTING, { ...CALC_BUILD, surefire: ran("com.x.CalcBehaviourTest", "com.x.ExistingTest") }],
+    rerunMvn: [{ ...CALC_BUILD, surefire: ran("com.x.CalcBehaviourTest", "com.x.ExistingTest") }],
+  }),
+  resumeCalc({
+    name: "loop-resume-disabled",
+    desc: "UT_RESUME=0 → 上次通過的也重新產生",
+    rerun: { env: { UT_RESUME: "0" }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-dirty-baseline",
+    desc: "這次預檢是紅的、UT_ALLOW_DIRTY_BASELINE=1 放行 → 無法確認上次通過的測試現在仍然通過，重新產生",
+    rerun: { env: { UT_ALLOW_DIRTY_BASELINE: "1", UT_REPAIR_BASELINE: "0" }, api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+      { ...LEGACY_RED(), jacoco: JACOCO_GREEN, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") },
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-skip-baseline",
+    desc: "這次 UT_SKIP_BASELINE=1 → 沒有預檢建置可以重新確認，上次通過的也重新產生",
+    rerun: { env: { UT_SKIP_BASELINE: "1" }, api: RESUME_REWRITE_CALC },
+    rerunMvn: [CALC_BUILD],
+  }),
+  {
+    name: "loop-resume-batches",
+    desc: "資料夾兩個類別：第一次 Calc 通過、Greeter 沒過 → 重跑只做 Greeter，Calc 的通過紀錄帶進這次的 passed.json",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: {
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+        { content: "已建立 GreeterTest.java" },
+      ],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER_RED] },
+      CALC_BUILD, // the rerun's baseline
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER] },
+    ],
+  },
+  {
+    name: "loop-resume-rerun-interrupted",
+    desc: "重跑略過了 Calc、做 Greeter 時又被 Ctrl-C → 這次的 summary 照樣列出接續了哪些類別",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: {
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+        { content: "已建立 GreeterTest.java" },
+      ],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER_RED] },
+      CALC_BUILD, // the rerun's baseline
+      { exit: 0, interrupt: true },
+    ],
+  },
+  {
+    name: "loop-resume-after-interrupt",
+    desc: "第一次在第 2 批（Greeter）按 Ctrl-C → 重跑略過已通過的 Calc，只做 Greeter 與 Zeta 兩批",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [ZETA_PATH]: ZETA_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: {
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+        { content: "已建立 GreeterTest.java" },
+        { toolCalls: [{ name: "write_file", args: { path: ZETA_TEST_PATH, content: ZETA_TEST } }] },
+        { content: "已建立 ZetaTest.java" },
+      ],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      { exit: 0, interrupt: true },
+      CALC_BUILD, // the rerun's baseline
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER] },
+      {
+        ...CALC_BUILD,
+        surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest", "com.x.ZetaTest"),
+        jacoco: [JACOCO_GREEN, JACOCO_GREETER, JACOCO_ZETA],
+      },
     ],
   },
 ];

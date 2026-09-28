@@ -136,7 +136,8 @@ Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapS
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
 覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
 量到的測試相依與原始碼編碼（見下方 Troubleshooting）。資料夾目標分批時，每批在自己的
-`batch-NN-<類別>/` 底下。
+`batch-NN-<類別>/` 底下。通過所有 gate 的類別記在同層的 `passed.json`，重跑同一個目標時據此接續
+（見「中斷後重跑：接續先前的執行」）。
 
 ## 參數
 
@@ -149,6 +150,7 @@ Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapS
 | `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數（分批時為每批） |
 | `UT_BATCH_SIZE` | 1 | 目標是資料夾時，每批幾個類別。每批是一個完整的 writer → gate 迴圈：新的 session、自己的迭代輪數；沒通過的批次撤回它對 `src/test` 的變更（保留在該批的 `rejected/`），不影響其他批次。見「一次處理整個資料夾」 |
+| `UT_RESUME` | 1 | 0 = 每個目標類別都重新產生。預設會略過先前的執行已通過所有 gate、而且類別與測試檔都沒變的類別——前提是這次的預檢建置照樣跑過它們的測試、覆蓋率重新量過也達標、review 分數以現在的門檻重新判定也通過。見「中斷後重跑：接續先前的執行」 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
@@ -256,12 +258,35 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
   檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更、失敗一次重跑就過的不穩定測試）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
   原因是 `runner-spawn-error`、`scope-violation`、`out-of-scope-failure`、`writer-no-op`、`reviewer-unparseable`、
-  `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
-  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
+  `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`，
+  以及重跑時目標類別都已通過而什麼都不用做的 `already-passed`（exit 0，見下一節）。
+  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`，通過的批次另記進 `passed.json`——
+  重跑同一個目標時，已通過的類別不再產生（見下一節）。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
   驗收。建置很慢的模組建議搭配 `UT_TEST_SCOPE=generated`，或把 `UT_BATCH_SIZE` 調大一些來分攤。
 - 只有一個類別（或 `UT_BATCH_SIZE` 不小於類別數）時就是單一一批，行為與 artifacts 版面都和以前一樣：
   沒通過時測試檔留在原處，由你決定怎麼處理。
+
+### 中斷後重跑：接續先前的執行
+
+同一個目標再跑一次（被中斷、有幾批沒過、或只是想補完），先前已通過所有 gate 的類別**不會再產生一次**。
+每一批（或單一類別的 run）通過時，loop 把它通過時的樣子記在該次 artifacts 的 `passed.json`：類別原始碼、
+它的測試檔、以及那批 writer 寫的其他檔（共用的 helper、`src/test/resources` 裡的檔）的 sha256，reviewer
+的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別：
+
+- **紀錄仍描述現在的樹**：類別與上面那些檔一個 byte 都沒變、沒有多出當時沒有的測試檔（reviewer 沒看過它）；
+  較舊的紀錄也算數——樹回到它通過時的樣子，那次通過就仍然成立。
+- **建置**：這次的預檢建置是綠的（或修復後轉綠），而且確實執行了它的測試。預檢紅燈而以
+  `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1` 時，沒有東西可以證明它們現在仍然通過，全部重新產生。
+- **覆蓋率**：從這次預檢建置的 JaCoCo 報告以現在的門檻重新量——別的測試或它呼叫的類別改了，覆蓋率會變，
+  即使這兩個檔都沒動。
+- **review**：不重跑 reviewer（那正是略過要省下的），但只在它看過的東西都沒變、rubric 也沒換時沿用，
+  而且分數以現在的門檻重新判定；上次是 `UT_SKIP_REVIEW=1` 通過的，這次開了 review 就重新產生。
+
+全部符合才略過，log 以 `[接續]` 開頭列出略過了哪些、依據哪一次；先前通過過但這次要重做的也列出原因。略過的類別
+記進這次的 `passed.json`，也列在 `summary.json` 的 `resumed`；它們的測試之後每一批的建置都必須照樣執行。
+目標類別全都略過時只跑預檢，以 `stopReason: "already-passed"` exit 0。要全部重新產生設 `UT_RESUME=0`；
+刪掉 `runs/<repo>/` 也一樣（紀錄就在裡面）。
 
 ## Troubleshooting
 

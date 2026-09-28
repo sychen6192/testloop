@@ -154,6 +154,18 @@ export interface Scenario {
   jdk?: boolean;
   /** Runs with no JDK to be found: JAVA_HOME empty, PATH holding only node (POSIX). */
   noJdk?: boolean;
+  /**
+   * entry=loop: run loop.ts a second time on the same fixture once the first run has ended — the
+   * same target, run again. The mvn plan carries on where the first run left it; the checks see the
+   * second run, and the first as `first`.
+   */
+  rerun?: {
+    api?: ApiTurn[];
+    /** On top of the scenario's env. */
+    env?: Record<string, string>;
+    /** Files written (a string) or deleted (null) between the two runs, repo-relative. */
+    between?: Record<string, string | null>;
+  };
   mvn: MvnStep[];
 }
 

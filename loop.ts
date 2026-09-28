@@ -31,6 +31,7 @@ import {
   BUILD_TIMEOUT_MS,
   MAVEN_EXTRA_ARGS,
   BATCH_SIZE,
+  RESUME,
 } from "./config";
 import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
@@ -40,6 +41,8 @@ import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
 import { detectBuildTool, detectEnvFailures, runBaseline, targetModuleSkipped, writableRel } from "./gates/build";
+import { checkCoverage, locateJacocoXml, reportIsStale } from "./gates/coverage";
+import { parseVerdict } from "./gates/review";
 import { configuredRunnerProblems, createRunner } from "./runners/runner";
 import { IterationRecord, orchestrate, repairBaseline, RepairResult, WriterTrace, writerChangesSoFar } from "./orchestrator";
 import {
@@ -68,6 +71,17 @@ import {
 } from "./libs/encoding";
 import { installShutdownHandlers, killAll, onShutdown } from "./libs/shell";
 import { acquireRepoLock, LOCK_WAIT_MS } from "./libs/lock";
+import {
+  findPass,
+  hashFile,
+  ledgerEntry,
+  passedEntries,
+  PassedEntry,
+  readLedgers,
+  sha256,
+  testClassOf,
+  writeLedger,
+} from "./libs/resume";
 import { PreExistingFailures } from "./prompts";
 
 async function main() {
@@ -207,7 +221,7 @@ async function main() {
     if (!fs.existsSync(p)) {
       fs.writeFileSync(
         p,
-        JSON.stringify({ success: false, stopReason: `interrupted:${reason}`, ...batchShutdownState() }, stripRaw, 2),
+        JSON.stringify({ success: false, stopReason: `interrupted:${reason}`, ...resumedField(), ...batchShutdownState() }, stripRaw, 2),
       );
     }
   });
@@ -243,6 +257,7 @@ async function main() {
         reviewerModel: REVIEWER_MODEL || "(agent default)",
         maxIter: MAX_ITER,
         batchSize: BATCH_SIZE,
+        resume: RESUME,
         strictCov: STRICT_COV,
         allowZeroTests: ALLOW_ZERO_TESTS,
         skipBaseline: SKIP_BASELINE,
@@ -289,6 +304,11 @@ async function main() {
   // And the encoding javac reads the sources in (libs/encoding.ts): the pom's, or the platform's,
   // which Maven names in every build log when the pom sets none.
   let sourceEncoding: SourceEncoding | undefined;
+  // When the build that left the module green before any writer started — the baseline, or the
+  // repair after it. Its reports are what an earlier run's pass is checked against (libs/resume.ts);
+  // undefined when there was none: the baseline skipped, or red and let through.
+  let greenSince: number | undefined;
+  let noGreenBaseline = "這次沒有跑預檢建置（UT_SKIP_BASELINE=1）";
   const measureStack = (buildLog = "", since?: number) => {
     testStack = mergeTestStack(testStack, measureTestStack(mod, REPO_ROOT, buildLog, since));
     sourceEncoding = refineSourceEncoding(sourceEncoding, measureSourceEncoding(mod, REPO_ROOT, buildLog));
@@ -423,6 +443,8 @@ async function main() {
       );
       die(`修復迴圈以 ${repair.stopReason} 結束，不論 UT_ALLOW_DIRTY_BASELINE 都不能繼續：\n${repair.report}\n詳見 ${runDir}`);
     }
+    if (clean) greenSince = baselineStartedAt;
+    else noGreenBaseline = "這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）";
     if (!clean) {
       // What the writer is told to leave alone: still red after repair AND red before it. A class
       // the repair writer turned red was not pre-existing — telling the writer not to touch it
@@ -523,8 +545,59 @@ async function main() {
     }
   }
 
+  // Classes an earlier run already passed, unchanged since and still passing (libs/resume.ts): not
+  // written again. Their passes go into this run's ledger too, so the next run finds them here.
+  const rubricHash = sha256(effectiveRubric);
+  const passes: PassedEntry[] = [];
+  const saveLedger = () => {
+    try {
+      writeLedger(runDir, passes);
+    } catch (e) {
+      log(`[WARN] 無法寫入通過紀錄（${path.join(runDir, "passed.json")}）：${String(e)}——下一次執行不會接續這些類別`);
+    }
+  };
+  const recordPass = (classes: string[], written: Iterable<string>, verdict: ReviewVerdict | undefined, dir: string) => {
+    const testTree = path.join(mod.moduleRoot, "src", "test");
+    passes.push(
+      ...passedEntries({
+        classes,
+        repoRoot: REPO_ROOT,
+        testsOf: (cls) => findExistingTests(cls, REPO_ROOT),
+        written: [...written].map((w) => path.relative(REPO_ROOT, path.join(testTree, w))),
+        rubric: rubricHash,
+        verdict: verdict ? { scores: verdict.scores, blockers: verdict.blockers } : null,
+        dir,
+        at: new Date().toISOString(),
+      }),
+    );
+    saveLedger();
+  };
+  const resume = RESUME
+    ? resumePassed({ targetClasses, mod, rubricHash, runDir, greenSince, noGreenBaseline, ranAtBaseline })
+    : { resumed: [], redo: [] };
+  if (resume.resumed.length) {
+    resumedClasses = resume.resumed.map(({ cls, entry }) => ({ cls, from: entry.dir, at: entry.at }));
+    passes.push(...resume.resumed.map((r) => ledgerEntry(r.entry)));
+    saveLedger();
+  }
+  const pending = targetClasses.filter((cls) => !resume.resumed.some((r) => r.cls === cls));
+  if (!pending.length) {
+    banner("SUMMARY");
+    log("[OK] 目標類別都已在先前的執行通過所有 gate，而且類別與測試都沒變——這次沒有要產生的測試。要重新產生請設 UT_RESUME=0");
+    fs.writeFileSync(
+      path.join(runDir, "summary.json"),
+      JSON.stringify(
+        { success: true, stopReason: "already-passed", targetClasses: [], resumed: resumedClasses, repair, toleratedFailures: tolerate ?? [] },
+        stripRaw,
+        2,
+      ),
+    );
+    log(`artifacts 已寫入：${runDir}`);
+    process.exit(0);
+  }
+
   // A folder target runs as batches, each its own maker-checker loop; one batch is today's run.
-  const batches = chunk(targetClasses, BATCH_SIZE);
+  const batches = chunk(pending, BATCH_SIZE);
   if (batches.length > 1) {
     const code = await runBatches({
       batches,
@@ -540,15 +613,17 @@ async function main() {
       testStack,
       sourceEncoding,
       ranAtBaseline,
+      recordPass,
     });
     log(`artifacts 已寫入：${runDir}`);
     process.exit(code);
   }
 
   let result;
+  const trace: WriterTrace = { written: new Set<string>() };
   try {
     result = await orchestrate({
-      targetClasses,
+      targetClasses: pending,
       buildTool,
       runner,
       standards,
@@ -556,20 +631,21 @@ async function main() {
       skipReview: SKIP_REVIEW,
       mod,
       runDir,
-      existingTests,
+      existingTests: existingTests.filter((e) => pending.includes(e.cls)),
       preExisting,
       tolerate,
       conventions,
       testStack,
       sourceEncoding,
       ranAtBaseline,
+      trace,
     });
   } catch (e) {
     // A crashed run must still leave a summary — otherwise the artifacts directory
     // is indistinguishable from a run that is still going.
     fs.writeFileSync(
       path.join(runDir, "summary.json"),
-      JSON.stringify({ success: false, stopReason: "crash", error: String(e) }, null, 2),
+      JSON.stringify({ success: false, stopReason: "crash", error: String(e), ...resumedField() }, null, 2),
     );
     throw e;
   }
@@ -579,6 +655,7 @@ async function main() {
     `結果：${result.success ? "[OK] 全部關卡通過" : "[FAIL] 未通過"}` +
       `（迭代 ${result.iterations} 輪，stop=${result.stopReason}）`,
   );
+  for (const r of resumedClasses) log(`  [接續] ${path.basename(r.cls, ".java")}（先前的執行已通過，見 ${r.from}）`);
   console.log(result.coverageReport);
   if (result.totalOutputTokens !== undefined) {
     log(`writer output tokens 合計：${result.totalOutputTokens}`);
@@ -596,12 +673,132 @@ async function main() {
   if (result.flakyTests?.length) {
     log(`[WARN] 需要人工處理：這些測試不穩定（建置失敗、重跑通過）：${result.flakyTests.join("、")}`);
   }
+  if (result.success) recordPass(pending, trace.written, result.finalVerdict, runDir);
   fs.writeFileSync(
     path.join(runDir, "summary.json"),
-    JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [] }, stripRaw, 2),
+    JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [], ...resumedField() }, stripRaw, 2),
   );
   log(`artifacts 已寫入：${runDir}`);
   process.exit(result.success ? 0 : 2);
+}
+
+// ─── Resume ──────────────────────────────────────────────────────────────────
+//
+// See libs/resume.ts: which of the targets an earlier run already passed, and whether that pass
+// still holds. The ledger says what the class and its tests were; the gates here say whether they
+// still pass — the baseline's build and reports, today's coverage and review thresholds.
+
+interface ResumedClass {
+  cls: string;
+  /** The artifacts of the batch (or run) that passed it. */
+  from: string;
+  at: string;
+}
+
+// For the summaries: every one of them, interrupted and crashed ones included, says what was carried over.
+let resumedClasses: ResumedClass[] = [];
+const resumedField = () => (resumedClasses.length ? { resumed: resumedClasses } : {});
+
+function resumePassed(o: {
+  targetClasses: string[];
+  mod: ModuleInfo;
+  rubricHash: string;
+  runDir: string;
+  greenSince?: number;
+  noGreenBaseline: string;
+  ranAtBaseline?: string[];
+}): { resumed: Array<{ cls: string; entry: PassedEntry }>; redo: Array<{ cls: string; why: string }> } {
+  const ledger = readLedgers(RUNS_DIR, o.runDir);
+  const slash = (p: string) => p.replace(/\\/g, "/");
+  const known = o.targetClasses.filter((cls) => ledger.some((e) => e.cls === slash(cls)));
+  if (!known.length) return { resumed: [], redo: [] };
+  if (o.greenSince === undefined) {
+    log(
+      `[接續] ${known.length} 個目標類別在先前的執行通過過，但${o.noGreenBaseline}——` +
+        "無法確認它們的測試現在仍然通過，全部重新產生",
+    );
+    return { resumed: [], redo: [] };
+  }
+  const hashes = new Map<string, string | null>();
+  const hashOf = (rel: string) => {
+    if (!hashes.has(rel)) hashes.set(rel, hashFile(path.join(REPO_ROOT, rel)));
+    return hashes.get(rel) ?? null;
+  };
+  const testRootRel = path.relative(REPO_ROOT, path.join(o.mod.moduleRoot, "src", "test", "java"));
+  const ran = new Set(o.ranAtBaseline ?? []);
+  const redo: Array<{ cls: string; why: string }> = [];
+  const candidates: Array<{ cls: string; entry: PassedEntry }> = [];
+  for (const cls of known) {
+    const tests = findExistingTests(cls, REPO_ROOT);
+    const { entry, mismatch } = findPass(cls, ledger, hashOf, tests);
+    if (!entry) {
+      redo.push({ cls, why: mismatch ?? "沒有相符的通過紀錄" });
+      continue;
+    }
+    // The verdict the reviewer gave, judged again by today's gate: a threshold raised since fails it.
+    if (!SKIP_REVIEW) {
+      if (!entry.verdict) {
+        redo.push({ cls, why: "上次通過時 review gate 是關閉的（UT_SKIP_REVIEW=1），它的測試沒有審查過" });
+        continue;
+      }
+      if (entry.rubric !== o.rubricHash) {
+        redo.push({ cls, why: "review 的 rubric 在上次通過之後改過" });
+        continue;
+      }
+      const v = parseVerdict(JSON.stringify({ scores: entry.verdict.scores, blockers: entry.verdict.blockers, advisories: [] }));
+      if (!v.passed) {
+        const why = [...v.belowThreshold, ...v.blockers].join("、");
+        redo.push({ cls, why: `上次的 review 判決以現在的門檻不通過（${why}）` });
+        continue;
+      }
+    }
+    // Its tests ran in this run's green build — not just compiled, and not left out by a filter. Its
+    // tests are the files it passed with: a test the writer named its own way is one of them too.
+    const classes = Object.keys(entry.files)
+      .map((f) => testClassOf(f, testRootRel))
+      .filter((c): c is string => !!c);
+    if (!ran.size) {
+      redo.push({ cls, why: "這次的預檢建置認不出執行了哪些測試類別（報告關了或寫到別處），無法確認它的測試有執行" });
+      continue;
+    }
+    if (!classes.some((c) => ran.has(c))) {
+      redo.push({ cls, why: `它的測試（${classes.join("、") || "無"}）沒有在這次的預檢建置中執行` });
+      continue;
+    }
+    candidates.push({ cls, entry });
+  }
+  // Coverage, measured again from the green build's report: once for all of them, and class by
+  // class only when some fall short. greenSince is the baseline's start even when a repair made it
+  // green: a red build stops before the report goal, so the newest report is the green build's.
+  const xml = locateJacocoXml(o.mod);
+  const measured = !!xml && !reportIsStale(xml, o.greenSince);
+  let resumed = candidates;
+  if (candidates.length && !checkCoverage(candidates.map((c) => c.cls), o.mod, o.greenSince).passed) {
+    resumed = [];
+    for (const c of candidates) {
+      const cov = checkCoverage([c.cls], o.mod, o.greenSince);
+      if (cov.passed) resumed.push(c);
+      else {
+        const detail = cov.report.split("\n").filter((l) => l.startsWith("- ")).join("；") || cov.report;
+        redo.push({ cls: c.cls, why: `覆蓋率重新量測沒有通過：${detail}` });
+      }
+    }
+  }
+  if (resumed.length) {
+    log(
+      `[接續] ${resumed.length} 個類別在先前的執行已通過所有 gate，這次不再產生——類別與它的測試檔都和當時一樣，` +
+        `這次的預檢建置照樣跑過它們的測試，` +
+        (measured ? "覆蓋率從它的 JaCoCo 報告重新量過" : "（沒有這次建置的 JaCoCo 報告，覆蓋率 gate 本來就不檢查）") +
+        `${SKIP_REVIEW ? "" : "，review 分數以現在的門檻重新判定"}：`,
+    );
+    resumed.forEach((r) => log(`  - ${r.cls}（${r.entry.at} 通過，見 ${r.entry.dir}）`));
+  }
+  if (redo.length) {
+    log("[接續] 先前通過過、但這次要重新產生的類別：");
+    redo.forEach((r) => log(`  - ${r.cls}：${r.why}`));
+  }
+  if (resumed.length) log("（要全部重新產生請設 UT_RESUME=0）");
+  return { resumed, redo };
 }
 
 // ─── Batches ─────────────────────────────────────────────────────────────────
@@ -668,6 +865,8 @@ interface BatchRunInput {
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
   ranAtBaseline?: string[];
+  /** A batch passed: what it passed with goes into this run's ledger (libs/resume.ts). */
+  recordPass: (classes: string[], written: Iterable<string>, verdict: ReviewVerdict | undefined, dir: string) => void;
 }
 
 const lastGate = (funnel: IterationRecord[]) => funnel[funnel.length - 1]?.gate;
@@ -721,6 +920,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       trace,
     });
     if (r.success && r.ranTests) ranBefore = [...new Set([...(ranBefore ?? []), ...r.ranTests])].sort();
+    if (r.success) o.recordPass(batch, trace.written, r.finalVerdict, dir);
     const rec: BatchRecord = {
       batch: i + 1,
       targetClasses: batch,
@@ -815,6 +1015,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
 
   banner("SUMMARY");
   log(`結果：${passed}/${o.batches.length} 批通過（stop=${stopReason}）`);
+  for (const r of resumedClasses) log(`  [接續] ${path.basename(r.cls, ".java")}（先前的執行已通過，見 ${r.from}）`);
   for (const r of records) {
     const names = r.targetClasses.map((c) => path.basename(c, ".java")).join("、");
     log(
@@ -846,6 +1047,7 @@ async function runBatches(o: BatchRunInput): Promise<number> {
         batches: records,
         notRun,
         targetClasses: o.batches.flat(),
+        ...resumedField(),
         totalOutputTokens: tokens,
         repair: o.repair,
         toleratedFailures: o.tolerate ?? [],
@@ -1011,7 +1213,7 @@ function crash(e: unknown): void {
     if (!crashRunDir || fs.existsSync(path.join(crashRunDir, "summary.json"))) return;
     fs.writeFileSync(
       path.join(crashRunDir, "summary.json"),
-      JSON.stringify({ success: false, stopReason: "crash", error: text, ...batchShutdownState() }, stripRaw, 2),
+      JSON.stringify({ success: false, stopReason: "crash", error: text, ...resumedField(), ...batchShutdownState() }, stripRaw, 2),
     );
   });
   die(text);

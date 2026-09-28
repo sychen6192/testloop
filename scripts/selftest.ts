@@ -50,6 +50,19 @@ import {
 } from "../prompts";
 import { testMetrics, findShrunk, collectTestMetrics, runnableTests } from "../libs/testmetrics";
 import {
+  entryMismatch,
+  findPass,
+  hashFile,
+  LEDGER_FILE,
+  ledgerEntry,
+  passedEntries,
+  PassedEntry,
+  readLedgers,
+  sha256,
+  testClassOf,
+  writeLedger,
+} from "../libs/resume";
+import {
   countTestsRun,
   detectEnvFailures,
   failingTestIds,
@@ -5088,6 +5101,133 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
   );
   fs.rmSync(g, { recursive: true, force: true });
   fs.rmSync(m, { recursive: true, force: true });
+}
+
+console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比對）");
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-resume-"));
+  const put = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), content);
+  };
+  const FOO = "m/src/main/java/com/x/Foo.java";
+  const BAR = "m/src/main/java/com/x/Bar.java";
+  const FOO_T = "m/src/test/java/com/x/FooTest.java";
+  const BAR_T = "m/src/test/java/com/x/BarTest.java";
+  const HELPER = "m/src/test/java/com/x/Helper.java";
+  const RES = "m/src/test/resources/data.json";
+  const GONE = "m/src/test/java/com/x/OldFooTest.java";
+  for (const [rel, c] of [[FOO, "class Foo {}"], [BAR, "class Bar {}"], [FOO_T, "class FooTest {}"], [BAR_T, "class BarTest {}"], [HELPER, "class Helper {}"], [RES, "{}"]]) put(rel, c);
+
+  check("hashFile：沒有檔案 → null", hashFile(path.join(root, "nope.java")) === null);
+  check("hashFile：檔案內容的 sha256", hashFile(path.join(root, FOO)) === sha256("class Foo {}"));
+  const dirHash = hashFile(path.join(root, "m"));
+  check("hashFile：讀不了的（目錄）→ 一個誰都對不上的值，不是 null", dirHash !== null && dirHash.startsWith("unreadable:"), String(dirHash));
+
+  const testsOf = (cls: string) => (cls === FOO ? [FOO_T] : cls === BAR ? [BAR_T.replace(/\//g, "\\")] : []);
+  const entries = passedEntries({
+    classes: [FOO, BAR],
+    repoRoot: root,
+    testsOf,
+    written: [FOO_T, BAR_T, HELPER.replace(/\//g, "\\"), RES, GONE],
+    rubric: "r1",
+    verdict: { scores: { effectiveness: 8 }, blockers: [] },
+    dir: "/runs/a/batch-1-Foo",
+    at: "2026-01-01T00:00:00.000Z",
+  });
+  const foo = entries.find((e) => e.cls === FOO)!;
+  const bar = entries.find((e) => e.cls === BAR)!;
+  check(
+    "passedEntries：每個類別記下自己的測試檔與那批寫的共用檔，不含別的類別的測試",
+    JSON.stringify(Object.keys(foo.files)) === JSON.stringify([FOO_T, HELPER, GONE, RES].sort()) &&
+      JSON.stringify(Object.keys(bar.files)) === JSON.stringify([BAR_T, HELPER, GONE, RES].sort()),
+    JSON.stringify([Object.keys(foo.files), Object.keys(bar.files)]),
+  );
+  check("passedEntries：Windows 的反斜線路徑一律存成 /", !JSON.stringify(entries).includes("\\\\"), JSON.stringify(entries).slice(0, 300));
+  check("passedEntries：那批刪掉的檔記成 null（之後也必須不存在）", foo.files[GONE] === null);
+  check("passedEntries：類別與檔案都記內容的 sha256", foo.source === sha256("class Foo {}") && foo.files[FOO_T] === sha256("class FooTest {}"));
+
+  const hashOf = (rel: string) => hashFile(path.join(root, rel));
+  check("entryMismatch：什麼都沒變 → 相符", entryMismatch(foo, hashOf, [FOO_T]) === undefined);
+  put(FOO, "class Foo { int x; }");
+  check("entryMismatch：類別改過 → 說出來", entryMismatch(foo, hashOf, [FOO_T]) === "Foo.java 在上次通過之後改過", String(entryMismatch(foo, hashOf, [FOO_T])));
+  put(FOO, "class Foo {}");
+  put(HELPER, "class Helper { int y; }");
+  check("entryMismatch：那批寫的共用檔改過", entryMismatch(foo, hashOf, [FOO_T]) === `${HELPER} 在上次通過之後改過`, String(entryMismatch(foo, hashOf, [FOO_T])));
+  put(HELPER, "class Helper {}");
+  fs.rmSync(path.join(root, FOO_T));
+  check("entryMismatch：測試檔被刪了", entryMismatch(foo, hashOf, []) === `${FOO_T} 在上次通過之後被刪除`, String(entryMismatch(foo, hashOf, [])));
+  put(FOO_T, "class FooTest {}");
+  put(GONE, "class OldFooTest {}");
+  check("entryMismatch：當時被刪掉的檔又出現了", entryMismatch(foo, hashOf, [FOO_T]) === `${GONE} 在上次通過之後才出現`, String(entryMismatch(foo, hashOf, [FOO_T])));
+  fs.rmSync(path.join(root, GONE));
+  // Two failed reads say nothing about whether the content is the same.
+  const locked = { ...foo, files: { ...foo.files, [HELPER]: "unreadable:EACCES" } };
+  const lockedNow = (rel: string) => (rel === HELPER ? "unreadable:EACCES" : hashOf(rel));
+  check(
+    "entryMismatch：讀不了的檔（兩次都讀不了）也不算沒變",
+    entryMismatch(locked, lockedNow, [FOO_T]) === `${HELPER} 讀不了，無法確認它沒變`,
+    String(entryMismatch(locked, lockedNow, [FOO_T])),
+  );
+  check(
+    "entryMismatch：類別本身讀不了 → 不算沒變",
+    entryMismatch({ ...foo, source: "unreadable:EACCES" }, (rel) => (rel === FOO ? "unreadable:EACCES" : hashOf(rel)), [FOO_T]) ===
+      "Foo.java 讀不了，無法確認它沒變",
+  );
+  const unit = "m/src/test/java/com/x/FooUnitTest.java";
+  check(
+    "entryMismatch：多了一個當時沒有的測試檔（reviewer 沒看過）",
+    entryMismatch(foo, hashOf, [FOO_T, unit]) === `多了上次通過時沒有的測試檔 ${unit}`,
+    String(entryMismatch(foo, hashOf, [FOO_T, unit])),
+  );
+
+  // Newest run first; an older pass counts when the tree is back to what it passed with.
+  const runs = path.join(root, "runs");
+  const older = path.join(runs, "2026-01-01T00-00-00-000Z");
+  const newer = path.join(runs, "2026-02-01T00-00-00-000Z");
+  const broken = path.join(runs, "2026-03-01T00-00-00-000Z");
+  const future = path.join(runs, "2026-04-01T00-00-00-000Z");
+  const current = path.join(runs, "2026-05-01T00-00-00-000Z");
+  for (const d of [older, newer, broken, future, current]) fs.mkdirSync(d, { recursive: true });
+  writeLedger(older, [foo]);
+  const fooEdited = { ...foo, files: { ...foo.files, [FOO_T]: sha256("class FooTest { edited }") }, dir: "/runs/b/batch-1-Foo" };
+  writeLedger(newer, [fooEdited, { ...bar, verdict: { scores: {}, blockers: "x" } } as unknown as PassedEntry]);
+  fs.writeFileSync(path.join(broken, LEDGER_FILE), "{ not json");
+  fs.writeFileSync(path.join(future, LEDGER_FILE), JSON.stringify({ version: 99, entries: [foo] }));
+  writeLedger(current, [foo]);
+  check("writeLedger：不留下 .tmp", !fs.existsSync(path.join(older, `${LEDGER_FILE}.tmp`)));
+  const ledger = readLedgers(runs, current);
+  check(
+    "readLedgers：新的執行在前；讀不了的、別的版本寫的、欄位不對的、這次自己的都略過",
+    JSON.stringify(ledger.map((e) => [path.basename(e.run), e.cls])) === JSON.stringify([[path.basename(newer), FOO], [path.basename(older), FOO]]),
+    JSON.stringify(ledger.map((e) => [path.basename(e.run), e.cls])),
+  );
+  check("readLedgers：runs 目錄不存在 → 沒有紀錄", readLedgers(path.join(root, "no-runs")).length === 0);
+  const found = findPass(FOO, ledger, hashOf, [FOO_T]);
+  check("findPass：最新的紀錄對不上、較舊的對得上 → 用較舊的（樹回到了它通過時的樣子）", found.entry?.dir === "/runs/a/batch-1-Foo", JSON.stringify(found));
+  put(FOO_T, "class FooTest { something else }");
+  const none = findPass(FOO.replace(/\//g, "\\"), ledger, hashOf, [FOO_T]);
+  check(
+    "findPass：都對不上 → 沒有 entry，理由取最新那筆的；類別路徑用反斜線也認得",
+    !none.entry && none.mismatch === `${FOO_T} 在上次通過之後改過`,
+    JSON.stringify(none),
+  );
+  check("findPass：從沒通過過的類別 → 什麼都沒有（不算要重做）", JSON.stringify(findPass(BAR, ledger, hashOf, [BAR_T])) === "{}");
+  check(
+    "ledgerEntry：只留自己的欄位（讀的時候加上的 run 不帶進新的紀錄）",
+    !("run" in ledgerEntry(ledger[0])) && ledgerEntry(ledger[0]).cls === FOO,
+  );
+
+  check("testClassOf：模組 src/test/java 底下的 .java → 類別名", testClassOf("m/src/test/java/com/x/FooTest.java", "m/src/test/java") === "com.x.FooTest");
+  check("testClassOf：反斜線路徑、根目錄結尾的斜線都行", testClassOf("m\\src\\test\\java\\com\\x\\FooTest.java", "m\\src\\test\\java\\") === "com.x.FooTest");
+  check(
+    "testClassOf：資源檔、別的模組、只是前綴相同的目錄 → 不是測試類別",
+    testClassOf(RES, "m/src/test/java") === undefined &&
+      testClassOf("n/src/test/java/com/x/FooTest.java", "m/src/test/java") === undefined &&
+      testClassOf("m/src/test/javax/FooTest.java", "m/src/test/java") === undefined,
+  );
+  check("testClassOf：模組就是 repo 根", testClassOf("src/test/java/FooTest.java", "src/test/java") === "FooTest");
+  fs.rmSync(root, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

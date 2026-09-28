@@ -13,7 +13,20 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, EXISTING_TEST, gitAvailable, jdkAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
+import {
+  ApiTurn,
+  buildFixture,
+  CALC_TEST as CALC_TEST_TEXT,
+  envKnobsInSource,
+  EXISTING_TEST,
+  gitAvailable,
+  jdkAvailable,
+  repoLockPath,
+  RUN_DIR,
+  Scenario,
+  targetDirOf,
+  TESTGEN_ROOT,
+} from "./itest-lib";
 import { FIXED_TEST as FIXED_TEST_TEXT, SCENARIOS } from "./itest-scenarios";
 import { planSpawn } from "../libs/shell";
 
@@ -80,6 +93,7 @@ const BASE_ENV: Record<string, string> = {
   UT_REVIEWER_MUST_READ: "1",
   UT_REVIEW_MAX_RETRIES: "2",
   UT_RUNNER: "opencode",
+  UT_RESUME: "1",
   UT_RUNS_DIR: "",
   UT_SCORE_THRESHOLDS: "",
   UT_SKILL_DIR: "",
@@ -279,6 +293,8 @@ interface Ctx {
   mvnCalls: number;
   /** Origins the fixture proxy was asked to reach; undefined when no proxy ran. */
   proxySeen?: string[];
+  /** With rerun: the first run, whose end the checks' run is the rerun of. */
+  first?: { result: Record<string, unknown>; runDir: string; code: number; stdout: string };
   read(rel: string): string;
   exists(rel: string): boolean;
   runRead(rel: string): string;
@@ -294,11 +310,8 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
   let result: Record<string, unknown> = {};
   let proxySeen: string[] | undefined;
 
+  let first: Ctx["first"];
   if (sc.entry === "loop") {
-    const api = await startFakeApi(sc.api ?? [], root);
-    const proxy = sc.proxy ? await startProxy() : undefined;
-    proxySeen = proxy?.seen;
-    const apiHost = new URL(api.url).host;
     const runsBase = path.join(root, sc.runsInRepo ? "testgen-runs" : path.join(".itest", "runs"));
     // Held by a live process — this one — exactly as a second testgen on the same repo would see.
     const lock = sc.lockHeld ? repoLockPath(root) : undefined;
@@ -311,30 +324,56 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
       fs.symlinkSync(process.execPath, path.join(bin, "node"));
       noJdkEnv = { JAVA_HOME: "", PATH: bin };
     }
-    out = await runTsx(
-      path.join(TESTGEN_ROOT, "loop.ts"),
-      [targetDirOf(sc)],
-      root,
-      childEnv({
-        ...sc.env,
-        UT_RUNNER: "api",
-        UT_API_BASE_URL: api.url,
-        UT_RUNS_DIR: runsBase,
-        ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
-        // Scenarios opt into the bypass by naming the endpoint's own host:port.
-        ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
-        ...noJdkEnv,
-      }),
-    );
-    await api.close();
-    await proxy?.close();
+    const runLoop = async (turns: ApiTurn[], env: Record<string, string> = {}) => {
+      const api = await startFakeApi(turns, root);
+      const proxy = sc.proxy ? await startProxy() : undefined;
+      proxySeen = proxy?.seen;
+      const apiHost = new URL(api.url).host;
+      const done = await runTsx(
+        path.join(TESTGEN_ROOT, "loop.ts"),
+        [targetDirOf(sc)],
+        root,
+        childEnv({
+          ...sc.env,
+          ...env,
+          UT_RUNNER: "api",
+          UT_API_BASE_URL: api.url,
+          UT_RUNS_DIR: runsBase,
+          ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
+          // Scenarios opt into the bypass by naming the endpoint's own host:port.
+          ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
+          ...noJdkEnv,
+        }),
+      );
+      await api.close();
+      await proxy?.close();
+      // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; the newest is the run that just ended.
+      const repoRuns = path.join(runsBase, path.basename(root));
+      const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
+      const dir = ids.length ? path.join(repoRuns, ids[ids.length - 1]) : path.join(root, RUN_DIR);
+      const summary = path.join(dir, "summary.json");
+      const res: Record<string, unknown> = fs.existsSync(summary) ? JSON.parse(fs.readFileSync(summary, "utf8")) : {};
+      return { out: done, runDir: dir, result: res };
+    };
+    let run = await runLoop(sc.api ?? []);
+    if (sc.rerun) {
+      first = { result: run.result, runDir: run.runDir, code: run.out.code, stdout: run.out.stdout };
+      // What the api log holds from here on is the second run's.
+      fs.rmSync(path.join(root, ".itest", "api-requests.jsonl"), { force: true });
+      for (const [rel, content] of Object.entries(sc.rerun.between ?? {})) {
+        const p = path.join(root, rel);
+        if (content === null) fs.rmSync(p, { force: true });
+        else {
+          fs.mkdirSync(path.dirname(p), { recursive: true });
+          fs.writeFileSync(p, content);
+        }
+      }
+      run = await runLoop(sc.rerun.api ?? [], sc.rerun.env);
+    }
     if (lock) fs.rmSync(lock, { force: true });
-    // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; exactly one run per scenario.
-    const repoRuns = path.join(runsBase, path.basename(root));
-    const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
-    if (ids.length) runDir = path.join(repoRuns, ids[ids.length - 1]);
-    const summary = path.join(runDir, "summary.json");
-    if (fs.existsSync(summary)) result = JSON.parse(fs.readFileSync(summary, "utf8"));
+    out = run.out;
+    runDir = run.runDir;
+    result = run.result;
   } else {
     out = await runTsx(
       path.join(TESTGEN_ROOT, "scripts", "itest-case.ts"),
@@ -372,6 +411,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     argv,
     mvnCalls: argv.length,
     proxySeen,
+    first,
     read: rd(root),
     exists: ex(root),
     runRead: rd(runDir),
@@ -1905,7 +1945,142 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("建置 3 次：預檢 + 修復驗證 + gate", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
     check("新測試確實產生", c.exists("src/test/java/com/x/CalcTest.java"));
   },
+
+  // ── Resuming an earlier run ────────────────────────────────────────────────
+  "loop-resume-all-passed": (c) => {
+    resumedCalc(c);
+    check("不再找 agent（重跑沒有任何 api 請求）", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+  },
+
+  "loop-resume-review-passed": (c) => {
+    resumedCalc(c);
+    check("不再找 writer 與 reviewer", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+    check("說明 review 分數以現在的門檻重新判定過", c.stdout.includes("review 分數以現在的門檻重新判定"), c.stdout.slice(-800));
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check("第一次的通過紀錄留下 reviewer 的分數", e?.verdict?.scores?.effectiveness === 8, JSON.stringify(e?.verdict));
+  },
+
+  "loop-resume-stale-report-strict": (c) => redone(c, "覆蓋率重新量測沒有通過：（"),
+  "loop-resume-stale-report-loose": (c) => {
+    resumedCalc(c);
+    check("沒有這次的報告就不說覆蓋率重新量過", c.stdout.includes("沒有這次建置的 JaCoCo 報告") && !c.stdout.includes("重新量過"), c.stdout.slice(-800));
+  },
+  "loop-resume-ran-unknown": (c) => redone(c, "這次的預檢建置認不出執行了哪些測試類別"),
+  "loop-resume-own-test-name": (c) => {
+    resumedCalc(c, "src/test/java/com/x/CalcBehaviourTest.java");
+    check("不再找 agent", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+  },
+  "loop-resume-test-edited": (c) => redone(c, "src/test/java/com/x/CalcTest.java 在上次通過之後改過"),
+  "loop-resume-source-edited": (c) => redone(c, "Calc.java 在上次通過之後改過"),
+  "loop-resume-new-test-file": (c) => redone(c, "多了上次通過時沒有的測試檔 src/test/java/com/x/CalcUnitTest.java"),
+  "loop-resume-helper-edited": (c) => {
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check(
+      "第一次的通過紀錄連同那批 writer 寫的 Support.java 一起記下",
+      !!e && "src/test/java/com/x/Support.java" in e.files && "src/test/java/com/x/CalcTest.java" in e.files,
+      JSON.stringify(e?.files),
+    );
+    redone(c, "src/test/java/com/x/Support.java 在上次通過之後改過");
+  },
+  "loop-resume-coverage-dropped": (c) => redone(c, "覆蓋率重新量測沒有通過：- Calc.java: line=40.0%"),
+  "loop-resume-tests-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-review-threshold-raised": (c) => redone(c, "上次的 review 判決以現在的門檻不通過（effectiveness（8 < 門檻 9））"),
+  "loop-resume-review-was-skipped": (c) => redone(c, "上次通過時 review gate 是關閉的"),
+  "loop-resume-rubric-changed": (c) => redone(c, "review 的 rubric 在上次通過之後改過"),
+  "loop-resume-dirty-baseline": (c) => redone(c, "但這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）"),
+  "loop-resume-skip-baseline": (c) => redone(c, "但這次沒有跑預檢建置（UT_SKIP_BASELINE=1）"),
+  "loop-resume-disabled": (c) => {
+    redone(c, "");
+    check("UT_RESUME=0 時不看先前的紀錄", !c.stdout.includes("[接續]"), c.stdout.slice(-800));
+    check("params.json 記錄 resume=false", JSON.parse(c.runRead("params.json") || "{}").resume === false);
+  },
+
+  "loop-resume-batches": (c) => {
+    check("第一次：Calc 通過、Greeter 沒過", c.first?.code === 2 && c.first?.result.stopReason === "some-batches-failed", `code=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑 exit 0", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+    check("重跑略過 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    check("重跑只剩一個類別，走單批的路", JSON.stringify(c.result.targetClasses) === '["src/main/java/com/x/Greeter.java"]', JSON.stringify(c.result.targetClasses));
+    const prompt = c.runRead("iter-1/prompt.md");
+    check("writer 的 prompt 只有 Greeter", prompt.includes("Greeter.java") && !prompt.includes("com/x/Calc.java"), prompt.slice(0, 600));
+    const ledger = ledgerOf(c.runDir);
+    const calc = ledger.find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check(
+      "這次的 passed.json 帶著 Calc 的通過紀錄（指向第一次那批）與 Greeter 這次的",
+      !!calc && calc.dir.startsWith(c.first?.runDir ?? "?") && ledger.some((e) => e.cls === "src/main/java/com/x/Greeter.java"),
+      JSON.stringify(ledger.map((e) => [e.cls, e.dir])),
+    );
+    check("建置 5 次：第一次 3 次、重跑 2 次（預檢 + Greeter）", c.mvnCalls === 5, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  "loop-resume-rerun-interrupted": (c) => {
+    if (process.platform === "win32") return; // the fake build signals the loop by its pid
+    check("重跑在 Greeter 被 Ctrl-C 中斷", c.result.stopReason === "interrupted:SIGINT", String(c.result.stopReason));
+    check("被中斷的 summary 照樣列出接續的 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    check("Calc 的通過紀錄已帶進這次的 passed.json", ledgerOf(c.runDir).some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+  },
+
+  "loop-resume-after-interrupt": (c) => {
+    if (process.platform === "win32") return; // the fake build signals the loop by its pid
+    check("第一次在第 2 批被 Ctrl-C 中斷", c.first?.result.stopReason === "interrupted:SIGINT", String(c.first?.result.stopReason));
+    check("第一次的 passed.json 已經有第 1 批的 Calc", ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+    check("重跑 exit 0", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+    check("重跑略過 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "重跑分兩批：Greeter、Zeta",
+      JSON.stringify(b.map((x) => (x.targetClasses as string[]).map((t) => t.replace(/\\/g, "/")))) ===
+        '[["src/main/java/com/x/Greeter.java"],["src/main/java/com/x/Zeta.java"]]',
+      JSON.stringify(b.map((x) => x.targetClasses)),
+    );
+    check("SUMMARY 列出接續的類別", c.stdout.includes("[接續] Calc（先前的執行已通過"), c.stdout.slice(-800));
+    check("三個測試檔都在", ["CalcTest", "GreeterTest", "ZetaTest"].every((t) => c.exists(`src/test/java/com/x/${t}.java`)));
+  },
 };
+
+// ─── Resume helpers ──────────────────────────────────────────────────────────
+
+type LedgerEntry = { cls: string; dir: string; files: Record<string, string | null>; verdict: { scores: Record<string, number> } | null };
+const ledgerOf = (runDir: string): LedgerEntry[] => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(runDir, "passed.json"), "utf8")).entries ?? [];
+  } catch {
+    return [];
+  }
+};
+const resumedOf = (c: Ctx) => ((c.result.resumed ?? []) as Array<{ cls: string }>).map((r) => r.cls.replace(/\\/g, "/"));
+const apiRequests = (c: Ctx) => c.read(".itest/api-requests.jsonl").split("\n").filter(Boolean);
+
+/** The rerun found Calc's pass still holding: nothing left to write. */
+function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java"): void {
+  check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+  check("第一次留下 passed.json，記著 Calc", ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+  check("重跑 exit 0，stopReason = already-passed", c.code === 0 && c.result.success === true && c.result.stopReason === "already-passed", `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+  check("summary 列出接續的 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+  check("重跑只建置一次：預檢", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  check("說明略過了什麼、依據是什麼", c.stdout.includes("[接續] 1 個類別在先前的執行已通過所有 gate"), c.stdout.slice(-800));
+  const carried = ledgerOf(c.runDir).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+  check(
+    "這次的 passed.json 帶著 Calc 的通過紀錄，指向第一次的 artifacts，只有紀錄自己的欄位",
+    !!carried && carried.dir === c.first?.runDir && !("run" in carried),
+    JSON.stringify(carried),
+  );
+  check(`${path.basename(testFile)} 還是第一次通過時的內容`, c.read(testFile) === CALC_TEST_TEXT.replace("class CalcTest", `class ${path.basename(testFile, ".java")}`));
+}
+
+/** The rerun found Calc's pass no longer holding, said why, and wrote Calc again. */
+function redone(c: Ctx, why: string): void {
+  check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+  check("重跑沒有略過 Calc", resumedOf(c).length === 0, JSON.stringify(c.result.resumed));
+  if (why) {
+    check(`說明為什麼要重新產生：${why}`, c.stdout.includes(why), c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-1200));
+  }
+  check(
+    "重跑照常產生並通過",
+    c.code === 0 && c.result.success === true && c.result.stopReason === "gates-passed",
+    `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`,
+  );
+  check("writer 被叫來重寫", apiRequests(c).length > 0);
+}
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -1920,8 +2095,11 @@ async function main() {
     `未釘住：${missing.join(", ")}`,
   );
 
+  // One scenario by name, or a group by a prefix ending in "*" (loop-resume-*).
   const only = process.argv[2];
-  const list = only ? SCENARIOS.filter((s) => s.name === only) : SCENARIOS;
+  const list = only
+    ? SCENARIOS.filter((s) => (only.endsWith("*") ? s.name.startsWith(only.slice(0, -1)) : s.name === only))
+    : SCENARIOS;
   if (!list.length) {
     console.error(`找不到情境：${only}`);
     process.exit(1);

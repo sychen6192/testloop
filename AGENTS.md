@@ -25,6 +25,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   只有常數的 enum、沒有本體的 record、Spring Boot 進入點——不當目標，`libs/utils.ts` 的 `codelessTypeReason`）、
   rubric 載入、runner 設定檢查（預檢建置之前，`runners/runner.ts` 的 `runnerConfigProblems`）、startup guard、
   版本戳記、既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
+  預檢之後略過先前的執行已通過、類別與測試檔（sha256）都沒變的目標類別——它們的測試要在這次的預檢中執行且通過、
+  覆蓋率從這次的報告重新量、review 分數以現在的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，
+  `UT_RESUME=0` 關閉）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
@@ -185,7 +188,7 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 
 ## 目錄結構
 ```
-loop.ts               entry point（參數驗證/目標分流/rubric 載入/runner 設定檢查/guard/預檢基準/runs 建立/版本戳記）
+loop.ts               entry point（參數驗證/目標分流/rubric 載入/runner 設定檢查/guard/預檢基準/接續/runs 建立/版本戳記）
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
@@ -207,6 +210,7 @@ libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter a
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手；持有者心跳；等不到就視為忙碌）
+libs/resume.ts        接續先前的執行：通過紀錄（passed.json，類別與測試檔的 sha256、判決）的寫入、讀取與比對
 libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
 libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）
@@ -228,7 +232,7 @@ runs/<repo>/<ts>/     artifacts（gitignore）
 ```bash
 npm install
 npm run check                          # tsc --noEmit + selftest + itest
-npm run itest                          # 只跑整合自測；加情境名可單跑一個
+npm run itest                          # 只跑整合自測；加情境名可單跑一個，`前綴*` 跑一組（'loop-resume-*'）
 npm run setup                          # agents+skill → ~/.config/opencode/
 # 在目標 Java repo 根執行：
 npx tsx <clone>/scripts/doctor.ts [目標路徑] [--smoke]
