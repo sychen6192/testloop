@@ -12,7 +12,7 @@ import * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   ApiTurn,
   buildFixture,
@@ -185,6 +185,7 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
           /* no run holds the lock: the checks will say so */
         }
       }
+      for (const rel of turn.sideDelete ?? []) fs.rmSync(path.join(root, rel), { force: true });
       for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
         fs.writeFileSync(path.join(root, rel), content);
@@ -380,6 +381,12 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
         age(root);
       }
       const firstRel = path.relative(root, run.runDir);
+      if (sc.rerun.pipeDirAt && process.platform !== "win32") {
+        const p = path.join(root, sc.rerun.pipeDirAt);
+        fs.rmSync(p, { recursive: true, force: true });
+        fs.mkdirSync(p, { recursive: true });
+        spawnSync("mkfifo", [path.join(p, "pipe")]);
+      }
       if (sc.rerun.rewrite) {
         const p = path.join(root, sc.rerun.rewrite.file.replace("{{firstRun}}", firstRel));
         try {
@@ -2008,6 +2015,36 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("不再找 agent", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
   },
   "loop-resume-test-edited": (c) => redone(c, "src/test/java/com/x/CalcTest.java 在上次通過之後改過"),
+  "loop-resume-touched-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-second-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-tests-all-skipped": (c) => redone(c, "com.x.CalcTest（全部被略過）"),
+  "loop-resume-own-test-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
+  "loop-resume-no-test-class": (c) => redone(c, "上次通過時的檔案裡找不到會被執行的測試類別"),
+  "loop-resume-repair-changed-resource": (c) => {
+    check("重跑的預檢紅燈、修復迴圈改了測試資源後轉綠", c.stdout.includes("修復") && c.exists("src/test/resources/legacy.properties"), c.stdout.slice(0, 1500));
+    redone(c, "修復迴圈改過測試資源（resources/legacy.properties），任何測試都可能讀到它");
+  },
+  "loop-resume-referenced-helper-edited": (c) => {
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check("通過紀錄記下 CalcTest 用到的既有 Support.java", !!e && "src/test/java/com/x/Support.java" in e.files, JSON.stringify(e?.files));
+    redone(c, "src/test/java/com/x/Support.java 在上次通過之後改過");
+  },
+  "loop-resume-last-class-set-aside": (c) => {
+    check("第一次：Calc 過、Greeter 沒過", c.first?.result.stopReason === "some-batches-failed", String(c.first?.result.stopReason));
+    check("重跑接續 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    const b = (c.result.batches ?? []) as Array<Record<string, any>>;
+    check(
+      "重跑時 Greeter 仍是資料夾的一批：沒過就撤回，嘗試的版本在 rejected/",
+      b.length === 1 && b[0].success === false && JSON.stringify(b[0].rolledBack?.created ?? []).includes("GreeterTest.java"),
+      JSON.stringify(b.map((x) => [x.stopReason, x.rolledBack?.created])),
+    );
+    check("src/test 不留下沒通過的 GreeterTest.java", !c.exists("src/test/java/com/x/GreeterTest.java"));
+  },
+  "loop-resume-gradle": (c) => {
+    resumedCalc(c);
+    check("不再找 agent", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+  },
+  "loop-resume-gradle-up-to-date": (c) => redone(c, "Gradle 的 test task 沒有實際執行"),
   "loop-resume-source-edited": (c) => redone(c, "Calc.java 在上次通過之後改過"),
   "loop-resume-new-test-file": (c) => redone(c, "多了上次通過時沒有的測試檔 src/test/java/com/x/CalcUnitTest.java"),
   "loop-resume-helper-edited": (c) => {
@@ -2036,8 +2073,13 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("第一次：Calc 通過、Greeter 沒過", c.first?.code === 2 && c.first?.result.stopReason === "some-batches-failed", `code=${c.first?.code} ${String(c.first?.result.stopReason)}`);
     check("重跑 exit 0", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
     check("重跑略過 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
-    check("重跑只剩一個類別，走單批的路", JSON.stringify(c.result.targetClasses) === '["src/main/java/com/x/Greeter.java"]', JSON.stringify(c.result.targetClasses));
-    const prompt = c.runRead("iter-1/prompt.md");
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "重跑只剩一個類別，仍是資料夾目標的分批（沒過會撤回、執行中有復原日誌），不是單一類別的 run",
+      JSON.stringify(c.result.targetClasses) === '["src/main/java/com/x/Greeter.java"]' && b.length === 1 && b[0].success === true,
+      JSON.stringify([c.result.targetClasses, b.map((x) => x.targetClasses)]),
+    );
+    const prompt = c.runRead("batch-1-Greeter/iter-1/prompt.md");
     check("writer 的 prompt 只有 Greeter", prompt.includes("Greeter.java") && !prompt.includes("com/x/Calc.java"), prompt.slice(0, 600));
     const ledger = ledgerOf(c.runDir);
     const calc = ledger.find((e) => e.cls === "src/main/java/com/x/Calc.java");
@@ -2098,8 +2140,78 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
   "loop-killed-orphan-other-checkout": (c) => orphanLeftAlone(c, { recordKept: true }),
   "loop-killed-orphan-other-host": (c) => orphanLeftAlone(c, { recordKept: true }),
   "loop-killed-orphan-rebooted": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-corrupt-record": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    check("損毀的子程序紀錄不讓重跑當掉：照常撤回那批、接續到通過", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stderr.slice(-600)}`);
+    orphanLeftAlone(c, { recordKept: false });
+  },
+  "loop-killed-orphan-other-container": (c) => {
+    if (process.platform !== "linux") return; // a pid namespace is Linux's
+    check("子程序紀錄帶著寫它的 pid namespace", /"pidns":"pid:\[1\]"/.test(firstRunRead(c, "children.json")), firstRunRead(c, "children.json") || "(紀錄不見了)");
+    orphanLeftAlone(c, { recordKept: true });
+  },
   // Its record is that run's own, still in use: not ours to remove either.
   "loop-killed-orphan-owner-alive": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-other-host": (c) => {
+    killedLeftAlone(c);
+    check("別台機器的日誌原樣留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("也不替它寫 summary", firstSummary(c) === undefined, JSON.stringify(firstSummary(c)));
+    check("log 說明有別台機器的日誌、不處理", c.stdout.includes("是別台機器的執行留下的"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-recloned": (c) => {
+    killedLeftAlone(c);
+    check("不屬於這個 checkout 的日誌丟掉，並說明", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")) && c.stdout.includes("重新 clone"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-corrupt-journal": (c) => {
+    killedLeftAlone(c);
+    check("損毀的日誌丟掉，並說明", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")) && c.stdout.includes("內容損毀"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-deleted-after-death": (c) => {
+    check("第一次執行被強制終止", !c.first?.result.stopReason);
+    check("死後才被刪掉的 ExistingTest.java 沒有被放回", !c.exists("src/test/java/com/x/ExistingTest.java"));
+    check(
+      "它原本的內容保留在那批的 deleted/",
+      firstRunRead(c, "batch-2-Greeter/deleted/src/test/java/com/x/ExistingTest.java") === EXISTING_TEST,
+      firstRunRead(c, "batch-2-Greeter/deleted/src/test/java/com/x/ExistingTest.java"),
+    );
+    check("log 說明無法判斷是誰刪的", c.stdout.includes("無法判斷是被終止的 writer") && c.stdout.includes("ExistingTest.java"), c.stdout.slice(0, 2500));
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check("writer 新增的 GreeterTest.java 照樣移出", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+    check("重跑照常完成", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-600)}`);
+  },
+  "loop-killed-restore-fails": (c) => {
+    if (process.platform === "win32") return; // mkfifo
+    check("撤回時有檔案放不回去 → 這次停下（不在寫到一半的測試上產生新的）", c.code !== 0 && c.result.stopReason === "killed-batch-not-restored", `code=${c.code} ${JSON.stringify(c.result)}`);
+    check("日誌留著，給下一次執行再試", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("說明原因與怎麼辦", c.stdout.includes("沒辦法完整撤回") || c.stderr.includes("沒辦法完整撤回"), (c.stdout + c.stderr).slice(-1500));
+    check("沒有開始產生測試（沒找 writer）", apiRequests(c).length === 0);
+  },
+  "loop-killed-writer-deleted": (c) => {
+    killedRecovered(c, { restored: false });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "被終止的 writer 刪掉的 ExistingTest.java 放回原本的內容",
+      (rb.undeleted ?? []).includes("java/com/x/ExistingTest.java") && c.read("src/test/java/com/x/ExistingTest.java") === EXISTING_TEST,
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-orphan-writes-on": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("留下的程序被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+      check(
+        "它在心跳停了之後才寫的 GreeterTest.java 仍算那批的：撤回、嘗試的版本留在 rejected/",
+        (rb.created ?? []).includes("java/com/x/GreeterTest.java") &&
+          firstRunRead(c, "batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java").includes("written by the orphan"),
+        JSON.stringify(rb),
+      );
+      check("最後的 GreeterTest.java 是這次的 writer 寫的", !c.read("src/test/java/com/x/GreeterTest.java").includes("written by the orphan"));
+    } finally {
+      stopPid(pid);
+    }
+  },
   "loop-killed-mid-build": (c) => {
     if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
     killedRecovered(c, { restored: true });
@@ -2185,7 +2297,7 @@ function orphanLeftAlone(c: Ctx, o: { recordKept: boolean }): void {
     check("那個程序沒有被結束：還活著", pid > 0 && pidAlive(pid), `pid ${pid}`);
     check("沒有說結束了什麼", !c.stdout.includes("還在跑的子程序"), c.stdout.slice(0, 2000));
     check(
-      o.recordKept ? "不是這次能處理的紀錄（別的 checkout、機器、開機，或主人還活著）：原樣留著" : "看過的紀錄移除（之後那些 pid 可能是任何人的）",
+      o.recordKept ? "不是這次能處理的紀錄（別的 checkout、機器、容器、開機，或主人還活著）：原樣留著" : "看過的紀錄移除（之後那些 pid 可能是任何人的）",
       fs.existsSync(firstRunFile(c, "children.json")) === o.recordKept,
     );
   } finally {

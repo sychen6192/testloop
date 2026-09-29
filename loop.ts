@@ -40,7 +40,16 @@ import { scanTestConventions } from "./libs/conventions";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
-import { detectBuildTool, detectEnvFailures, runBaseline, targetModuleSkipped, writableRel } from "./gates/build";
+import {
+  checkTestsRan,
+  detectBuildTool,
+  detectEnvFailures,
+  expectedTestOf,
+  gradleTestTaskRan,
+  runBaseline,
+  targetModuleSkipped,
+  writableRel,
+} from "./gates/build";
 import { checkCoverage, locateJacocoXml, reportIsStale } from "./gates/coverage";
 import { parseVerdict } from "./gates/review";
 import { configuredRunnerProblems, createRunner } from "./runners/runner";
@@ -51,6 +60,7 @@ import {
   captureTree,
   chunk,
   closeJournal,
+  dirIdentity,
   findJournals,
   journalCapture,
   JournalHandle,
@@ -61,6 +71,7 @@ import {
   removeBatchOutputs,
   rollbackTree,
   RollbackReport,
+  samePids,
   testOutputDirs,
   thisHost,
   traceJournal,
@@ -81,12 +92,14 @@ import {
 import {
   ChildrenJournal,
   groupAlive,
+  groupMembers,
   installShutdownHandlers,
   journalChildren,
   killAll,
   onShutdown,
   orphanAction,
   processStart,
+  startMsOf,
 } from "./libs/shell";
 import { acquireRepoLock, canonicalRoot, LOCK_HEARTBEAT_MS, LOCK_WAIT_MS } from "./libs/lock";
 import {
@@ -227,7 +240,7 @@ async function main() {
   crashRunDir = runDir;
   // What a run killed outright left running goes first: a build still writing target/, an agent
   // session still writing src/test, would race everything below (libs/shell.ts).
-  stopOrphans(runDir);
+  const orphansStoppedAt = stopOrphans(runDir);
   // A run killed while its test sources were in their ASCII view (libs/encoding.ts) left them so;
   // with the repo locked, nothing else can be using its journal.
   const recovered = recoverEncodingViews(path.join(mod.moduleRoot, "src", "test", "java"));
@@ -236,7 +249,7 @@ async function main() {
     recovered.forEach((f) => log(`  - ${path.relative(REPO_ROOT, f)}`));
   }
   // And a batch a killed run never got to set aside: its writer's half-written tests (libs/batch.ts).
-  recoverKilledBatches(runDir);
+  recoverKilledBatches(runDir, orphansStoppedAt);
   // From here on, this run's children are on disk too, for the next run should this one be killed.
   journalChildren(path.join(runDir, "children.json"), {
     repoRoot: canonicalRoot(REPO_ROOT),
@@ -339,6 +352,11 @@ async function main() {
   // undefined when there was none: the baseline skipped, or red and let through.
   let greenSince: number | undefined;
   let noGreenBaseline = "這次沒有跑預檢建置（UT_SKIP_BASELINE=1）";
+  // What failed before any writer — a class whose own tests are among it passed with tests that failed
+  // this time, green again only after a rebuild or a repair the reviewer never saw.
+  let baselineFailing: { classes: string[]; files: string[] } = { classes: [], files: [] };
+  // The green build's log, when it was the baseline's own: which classes it ran, where reports say nothing.
+  let greenLog = "";
   const measureStack = (buildLog = "", since?: number) => {
     testStack = mergeTestStack(testStack, measureTestStack(mod, REPO_ROOT, buildLog, since));
     sourceEncoding = refineSourceEncoding(sourceEncoding, measureSourceEncoding(mod, REPO_ROOT, buildLog));
@@ -473,8 +491,20 @@ async function main() {
       );
       die(`修復迴圈以 ${repair.stopReason} 結束，不論 UT_ALLOW_DIRTY_BASELINE 都不能繼續：\n${repair.report}\n詳見 ${runDir}`);
     }
-    if (clean) greenSince = baselineStartedAt;
-    else noGreenBaseline = "這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）";
+    if (clean) {
+      greenSince = baselineStartedAt;
+      greenLog = repair?.success ? "" : baseline.raw;
+    } else noGreenBaseline = "這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）";
+    baselineFailing = {
+      classes: baseline.failingTestClasses.map((c) => c.replace(/\$.*$/, "")),
+      files: baseline.compileErrorFiles.map((f) => path.relative(REPO_ROOT, path.resolve(REPO_ROOT, f)).replace(/\\/g, "/")),
+    };
+    // Gradle keeps its last execution's results: a test task that did not execute this time (up to
+    // date, skipped) leaves reports that are no evidence about this tree.
+    if (clean && buildTool === "gradle" && !repair?.success && gradleTestTaskRan(baseline.raw) !== true) {
+      greenSince = undefined;
+      noGreenBaseline = "這次預檢時 Gradle 的 test task 沒有實際執行（UP-TO-DATE、SKIPPED，或 log 看不出來），build/test-results 是之前留下的";
+    }
     if (!clean) {
       // What the writer is told to leave alone: still red after repair AND red before it. A class
       // the repair writer turned red was not pre-existing — telling the writer not to touch it
@@ -594,6 +624,7 @@ async function main() {
         repoRoot: REPO_ROOT,
         testsOf: (cls) => findExistingTests(cls, REPO_ROOT),
         written: [...written].map((w) => path.relative(REPO_ROOT, path.join(testTree, w))),
+        testTree: path.relative(REPO_ROOT, testTree),
         rubric: rubricHash,
         verdict: verdict ? { scores: verdict.scores, blockers: verdict.blockers } : null,
         dir,
@@ -603,7 +634,18 @@ async function main() {
     saveLedger();
   };
   const resume = RESUME
-    ? resumePassed({ targetClasses, mod, rubricHash, runDir, greenSince, noGreenBaseline, ranAtBaseline })
+    ? resumePassed({
+        targetClasses,
+        mod,
+        buildTool,
+        rubricHash,
+        runDir,
+        greenSince,
+        greenLog,
+        noGreenBaseline,
+        baselineFailing,
+        repairChanged: repair?.changedFiles ?? [],
+      })
     : { resumed: [], redo: [] };
   if (resume.resumed.length) {
     resumedClasses = resume.resumed.map(({ cls, entry }) => ({ cls, from: entry.dir, at: entry.at }));
@@ -626,9 +668,11 @@ async function main() {
     process.exit(0);
   }
 
-  // A folder target runs as batches, each its own maker-checker loop; one batch is today's run.
+  // A folder target runs as batches, each its own maker-checker loop; one batch is today's run. Decided
+  // by the target, not by what resuming left of it: the last class of a folder is still a batch — set
+  // aside when it fails, journaled while it runs — or a rerun would leave its failed attempt in src/test.
   const batches = chunk(pending, BATCH_SIZE);
-  if (batches.length > 1) {
+  if (chunk(targetClasses, BATCH_SIZE).length > 1) {
     const code = await runBatches({
       batches,
       buildTool,
@@ -732,11 +776,15 @@ const resumedField = () => (resumedClasses.length ? { resumed: resumedClasses } 
 function resumePassed(o: {
   targetClasses: string[];
   mod: ModuleInfo;
+  buildTool: BuildTool;
   rubricHash: string;
   runDir: string;
   greenSince?: number;
+  greenLog: string;
   noGreenBaseline: string;
-  ranAtBaseline?: string[];
+  baselineFailing: { classes: string[]; files: string[] };
+  /** What the repair changed, as the writer's changes are named (java/… relative to src/test/java, resources/…). */
+  repairChanged: string[];
 }): { resumed: Array<{ cls: string; entry: PassedEntry }>; redo: Array<{ cls: string; why: string }> } {
   const ledger = readLedgers(RUNS_DIR, o.runDir);
   const slash = (p: string) => p.replace(/\\/g, "/");
@@ -755,7 +803,11 @@ function resumePassed(o: {
     return hashes.get(rel) ?? null;
   };
   const testRootRel = path.relative(REPO_ROOT, path.join(o.mod.moduleRoot, "src", "test", "java"));
-  const ran = new Set(o.ranAtBaseline ?? []);
+  const failing = new Set(o.baselineFailing.classes);
+  const failingFiles = new Set(o.baselineFailing.files);
+  // A test resource a repair changed is reached through profiles, classpath scanning and string
+  // paths — any test may read it: no pass holds on the verdict of a reviewer who never saw it.
+  const repairedResources = o.repairChanged.filter((c) => !c.endsWith(".java"));
   const redo: Array<{ cls: string; why: string }> = [];
   const candidates: Array<{ cls: string; entry: PassedEntry }> = [];
   for (const cls of known) {
@@ -782,17 +834,43 @@ function resumePassed(o: {
         continue;
       }
     }
-    // Its tests ran in this run's green build — not just compiled, and not left out by a filter. Its
-    // tests are the files it passed with: a test the writer named its own way is one of them too.
-    const classes = Object.keys(entry.files)
-      .map((f) => testClassOf(f, testRootRel))
-      .filter((c): c is string => !!c);
-    if (!ran.size) {
+    // Its tests are the test classes among the files it passed with — a test the writer named its own
+    // way is one of them, and so is another test its batch's writer changed. Failed before any writer
+    // this time, it passed with tests that do not pass as they are: green again only after a rebuild
+    // or a repair. And every one of them ran in this run's green build, and not with every test skipped
+    // (the build gate's own check, checkTestsRan).
+    const testFiles = Object.keys(entry.files).filter((f) => testClassOf(f, testRootRel));
+    const failed = testFiles.filter((f) => failing.has(testClassOf(f, testRootRel)!) || failingFiles.has(f));
+    if (failed.length) {
+      redo.push({ cls, why: `它的測試（${failed.map((f) => path.posix.basename(f, ".java")).join("、")}）在這次的預檢建置中失敗過` });
+      continue;
+    }
+    if (repairedResources.length) {
+      redo.push({ cls, why: `修復迴圈改過測試資源（${repairedResources.join("、")}），任何測試都可能讀到它` });
+      continue;
+    }
+    const expected = testFiles
+      .map((f) => {
+        const abs = path.join(REPO_ROOT, f);
+        try {
+          return expectedTestOf(fs.readFileSync(abs, "latin1"), abs, "created");
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((t): t is NonNullable<typeof t> => !!t && !t.disabled);
+    if (!expected.length) {
+      redo.push({ cls, why: "上次通過時的檔案裡找不到會被執行的測試類別" });
+      continue;
+    }
+    const ranCheck = checkTestsRan(o.buildTool, o.mod, o.greenSince, o.greenLog, expected, [], true);
+    if (!ranCheck) {
       redo.push({ cls, why: "這次的預檢建置認不出執行了哪些測試類別（報告關了或寫到別處），無法確認它的測試有執行" });
       continue;
     }
-    if (!classes.some((c) => ran.has(c))) {
-      redo.push({ cls, why: `它的測試（${classes.join("、") || "無"}）沒有在這次的預檢建置中執行` });
+    const unrun = [...ranCheck.notRun.map((t) => t.fqcn), ...ranCheck.allSkipped.map((a) => `${a.test.fqcn}（全部被略過）`)];
+    if (unrun.length) {
+      redo.push({ cls, why: `它的測試（${unrun.join("、")}）沒有在這次的預檢建置中執行` });
       continue;
     }
     candidates.push({ cls, entry });
@@ -1162,7 +1240,20 @@ function openBatchJournal(
 ): JournalHandle | undefined {
   let journal: JournalHandle;
   try {
-    journal = openJournal({ ...j, repoRoot: canonicalRoot(REPO_ROOT), pid: process.pid, ...thisHost() }, start, outputs, LOCK_HEARTBEAT_MS);
+    journal = openJournal(
+      {
+        ...j,
+        repoRoot: canonicalRoot(REPO_ROOT),
+        rootId: dirIdentity(REPO_ROOT),
+        treeId: dirIdentity(j.testTree),
+        pid: process.pid,
+        start: processStart(process.pid) ?? "",
+        ...thisHost(),
+      },
+      start,
+      outputs,
+      LOCK_HEARTBEAT_MS,
+    );
   } catch (e) {
     log(`[WARN] 無法寫入這批的復原日誌（${String(e)}）——程序若被強制終止，下一次執行無法替這批撤回`);
     return undefined;
@@ -1195,23 +1286,36 @@ const pidExists = (pid: number) => {
   }
 };
 
+const mtimeOf = (p: string): number | undefined => {
+  try {
+    return fs.statSync(p).mtimeMs;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
- * The children an earlier run of this repo, killed outright, left running (libs/shell.ts): each one
- * still the same process — its start time the recorded one — is taken down with its process group.
- * Only on the host and since the boot they were recorded on; a pid that has since been given to
- * another process is left alone. Windows has no cheap way to tell, so there they are named, not
- * stopped. Each record is acted on once, then removed: later, its pids may be anyone's.
+ * The children an earlier run of this repo, killed outright, left running (libs/shell.ts). A child
+ * that is still the same process — its start time the recorded one — is taken down with its process
+ * group; of a group whose leader is gone, only the members that started while that run was alive
+ * (orphanAction). Only records written on this host, since this boot, for this repo; a pid given to
+ * another process since is left alone. On Windows, node's own children die with it (libuv's job
+ * object) and what outlives it — java.exe under the cmd.exe that ran mvn — was never recorded: the
+ * commands are named for a human to look for. Each record is acted on once, then removed: later, its
+ * pids may be anyone's. Returns, per run, when its children were stopped: they were alive until then.
  */
-function stopOrphans(runDir: string): void {
+function stopOrphans(runDir: string): Map<string, number> {
+  const stoppedAt = new Map<string, number>();
   const here = thisHost();
   const root = canonicalRoot(REPO_ROOT);
   let runs: string[] = [];
   try {
     runs = fs.readdirSync(RUNS_DIR);
   } catch {
-    return;
+    return stoppedAt;
   }
   const stopped: string[] = [];
+  const unsure: string[] = [];
   const named: string[] = [];
   for (const id of runs) {
     const dir = path.join(RUNS_DIR, id);
@@ -1223,21 +1327,48 @@ function stopOrphans(runDir: string): void {
     } catch {
       continue;
     }
-    // Another checkout's, another machine's, or from before a reboot: nothing of it runs here to stop.
-    if (doc.repoRoot !== root || doc.host !== here.host || Math.abs(doc.boot - here.boot) > 2) continue;
+    const children = Array.isArray(doc?.children)
+      ? doc.children.filter((c) => !!c && Number.isInteger(c.pid) && c.pid > 0 && typeof c.start === "string")
+      : [];
+    // Another checkout's, another machine's or container's, or from before a reboot: nothing of it
+    // runs here to stop — its pids name nobody here, or someone else.
+    if (!doc || doc.repoRoot !== root || !samePids(doc, here)) continue;
     // The run itself still going — only possible when the repo lock was bypassed: its children are its own.
     if (doc.pid !== process.pid && doc.start && processStart(doc.pid) === doc.start) continue;
-    for (const c of doc.children ?? []) {
+    const lastAlive = mtimeOf(file) ?? 0;
+    for (const c of children) {
+      const what = `pid ${c.pid}（${String(c.cmd ?? "").slice(0, 200)}）`;
       if (process.platform === "win32") {
-        if (pidExists(c.pid)) named.push(`pid ${c.pid}（${c.cmd}）`);
+        named.push(String(c.cmd ?? "").slice(0, 200));
         continue;
       }
-      if (orphanAction(c, { start: processStart(c.pid), groupAlive: groupAlive(c.pid) }) !== "stop") continue;
-      try {
-        process.kill(-c.pid, "SIGKILL");
-        stopped.push(`pid ${c.pid}（${c.cmd}）`);
-      } catch {
-        /* gone meanwhile */
+      const start = processStart(c.pid);
+      const a = orphanAction(
+        c,
+        { start, groupAlive: start === undefined && groupAlive(c.pid), members: start === undefined ? groupMembers(c.pid) : undefined },
+        { from: c.start && process.platform === "linux" ? startMsOf(c.start) : undefined, to: lastAlive + LOCK_HEARTBEAT_MS },
+      );
+      if (a.kind === "stop-group") {
+        try {
+          process.kill(-c.pid, "SIGKILL");
+          stopped.push(what);
+          stoppedAt.set(path.resolve(dir), Date.now());
+        } catch {
+          /* gone meanwhile */
+        }
+      } else if (a.kind === "stop-members") {
+        for (const pid of a.pids) {
+          try {
+            process.kill(pid, "SIGKILL");
+            stopped.push(`pid ${pid}（${what} 的程序群組裡）`);
+            stoppedAt.set(path.resolve(dir), Date.now());
+          } catch {
+            /* gone meanwhile */
+          }
+        }
+        for (const pid of a.left) unsure.push(`pid ${pid}（程序群組 ${c.pid}，在那次執行結束之後才啟動，可能是別人的）`);
+      } else if (a.kind === "report") {
+        unsure.push(`程序群組 ${c.pid}（${what} 已經不在，群組裡還有程序；這個平台看不出它們是不是它的）`);
       }
     }
     try {
@@ -1247,33 +1378,50 @@ function stopOrphans(runDir: string): void {
     }
   }
   if (stopped.length) {
-    log(`[WARN] 上一次執行被強制終止時留下 ${stopped.length} 個還在跑的子程序（建置或 agent session），已結束它們（連同各自的程序群組）：`);
+    log(`[WARN] 上一次執行被強制終止時留下 ${stopped.length} 個還在跑的子程序（建置或 agent session），已結束它們：`);
     stopped.forEach((p) => log(`  - ${p}`));
+  }
+  if (unsure.length) {
+    log("[WARN] 以下程序可能是上一次被強制終止的執行留下的，但無法確定，沒有結束——請確認後自行處理：");
+    unsure.forEach((p) => log(`  - ${p}`));
   }
   if (named.length) {
     log(
-      `[WARN] 上一次執行被強制終止時啟動的子程序，有 ${named.length} 個 pid 現在還有程序在用——可能是它留下還在跑的建置或 agent，` +
-        "也可能是 pid 被重用（Windows 上無法分辨，所以沒有結束它們）。請在工作管理員確認，是的話結束它們：",
+      `[WARN] 上一次執行被強制終止時有 ${named.length} 個子程序在跑。Windows 上 node 結束時只會帶走它直接啟動的程序，` +
+        "它們再啟動的（例如 mvn 底下的 java.exe、opencode）可能還在跑、還在寫 target/ 或 src/test——請在工作管理員確認後結束：",
     );
     named.forEach((p) => log(`  - ${p}`));
   }
+  return stoppedAt;
 }
 
 function recordedBatches(runDir: string): Array<{ batch: number; success: boolean }> {
   try {
     const b = JSON.parse(fs.readFileSync(path.join(runDir, "batches.json"), "utf8"));
-    return Array.isArray(b) ? b : [];
+    return Array.isArray(b) ? b.filter((r) => !!r && typeof r === "object") : [];
   } catch {
     return [];
   }
 }
 
-function recoverKilledBatches(runDir: string): void {
-  const { dead, stale, running } = findJournals(RUNS_DIR, canonicalRoot(REPO_ROOT), pidExists);
-  for (const j of stale) closeBatchJournal(j);
-  if (running) {
-    log(`[WARN] 有 ${running} 個復原日誌屬於可能還在執行的 testgen（另一台機器共用這個 runs 目錄，且幾分鐘內還有心跳），這次先不處理`);
+/**
+ * Sets aside the batch each killed run of this repo was in the middle of (libs/batch.ts journals),
+ * as that run would have. `stoppedAt`: runs whose children were only just stopped (stopOrphans) —
+ * alive, and possibly writing, until then. A batch that cannot be put back stops this run: the test
+ * tree still holds what a killed writer left, and every batch would be built on it.
+ */
+function recoverKilledBatches(runDir: string, stoppedAt: Map<string, number>): void {
+  const { dead, stale, running, elsewhere } = findJournals(
+    RUNS_DIR,
+    { repoRoot: canonicalRoot(REPO_ROOT), rootId: dirIdentity(REPO_ROOT) },
+    { alive: pidExists, start: (pid) => processStart(pid) },
+  );
+  for (const j of stale) {
+    if (j.why !== "那次執行有收尾") log(`[WARN] 丟掉一份用不到的復原日誌（${j.why}）：${j.dir}`);
+    closeBatchJournal(j.dir);
   }
+  if (running) log(`[WARN] 有 ${running} 份復原日誌屬於可能還在執行的 testgen，這次先不處理`);
+  if (elsewhere) log(`（有 ${elsewhere} 份復原日誌是別台機器的執行留下的——共用這個 runs 目錄，但它的測試目錄是那台的，不處理）`);
   for (const d of dead) {
     const j = d.journal;
     const records = recordedBatches(j.runDir);
@@ -1282,30 +1430,31 @@ function recoverKilledBatches(runDir: string): void {
     const recorded = records.some((b) => b.batch === j.batch);
     if (!recorded) {
       const names = j.targetClasses.map((c) => path.basename(c, ".java")).join("、");
+      const lastSeen = Math.max(d.lastSeen, stoppedAt.get(path.resolve(j.runDir)) ?? 0);
       log(
         `[WARN] 上一次執行（${j.runDir}）在第 ${j.batch} 批（${names}）被強制終止，沒來得及撤回這批沒通過 gate 的變更` +
-          `（${new Date(d.lastSeen).toISOString()} 之後就沒有心跳）——這次替它撤回：`,
+          `（${new Date(lastSeen).toISOString()} 之後就沒有動靜）——這次替它撤回：`,
       );
-      // What the killed writer changed, less what changed after the run died: that was someone else.
-      const only = killedWriterChanges(
-        d,
-        snapshotTree(j.testTree),
-        (rel) => {
-          try {
-            return fs.statSync(path.join(j.testTree, rel)).mtimeMs;
-          } catch {
-            return undefined;
-          }
-        },
-        2 * LOCK_HEARTBEAT_MS,
-      );
+      let undecided: string[] = [];
       try {
-        rolledBack = setAside(j.dir, journalCapture(d), journalOutputs(d), j.treeRel, only, true);
+        // What the killed writer changed, less what changed after the run died: that was someone else.
+        const changes = killedWriterChanges(
+          { ...d, lastSeen },
+          snapshotTree(j.testTree),
+          (rel) => mtimeOf(path.join(j.testTree, rel)),
+          2 * LOCK_HEARTBEAT_MS,
+        );
+        undecided = changes.undecided;
+        const capture = journalCapture(d);
+        rolledBack = setAside(j.dir, capture, journalOutputs(d), j.treeRel, changes.only, true);
+        keepDeletedOriginals(j.dir, j.treeRel, capture, undecided);
       } catch (e) {
-        log(`[WARN] 撤回沒有完成（${String(e)}）——復原日誌留著，下一次執行再試：${d.path}`);
-        continue;
+        stopUnrestored(runDir, d.path, `撤回沒有完成：${String(e)}`);
       }
-      if (!rolledBack) log("  （這批沒有留下要撤回的變更）");
+      if (rolledBack?.failed.length) {
+        stopUnrestored(runDir, d.path, `有檔案放不回去：${rolledBack.failed.join("、")}`);
+      }
+      if (!rolledBack && !undecided.length) log("  （這批沒有留下要撤回的變更）");
     }
     // Its run left no summary: without one, its artifacts look like a run still going.
     try {
@@ -1328,6 +1477,51 @@ function recoverKilledBatches(runDir: string): void {
     }
     closeBatchJournal(d.path);
   }
+}
+
+/**
+ * Files a killed batch started with that are gone now, where nothing tells whether the batch's writer
+ * deleted them or someone did after the run died: not put back, but their original content is kept
+ * in the batch's artifacts, and said so.
+ */
+function keepDeletedOriginals(dir: string, treeRel: string, capture: TreeCapture, undecided: string[]): void {
+  const kept: string[] = [];
+  for (const rel of undecided) {
+    const original = capture.files.get(rel);
+    if (!original) continue;
+    try {
+      const dest = path.join(dir, "deleted", treeRel, rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, original);
+      kept.push(rel);
+    } catch {
+      /* the artifacts cannot hold it: it is still named below */
+    }
+  }
+  if (!undecided.length) return;
+  log(
+    `[WARN] 以下檔案在那批開始時存在、現在不見了；它所在的目錄在那次執行結束之後又被改過，無法判斷是被終止的 writer ` +
+      `還是之後的人刪的，所以沒有放回${kept.length ? `（原本的內容保留在 ${path.join(dir, "deleted")}）` : ""}：`,
+  );
+  undecided.forEach((rel) => log(`  - ${treeRel}/${rel}`));
+}
+
+/** A killed batch that cannot be put back: this run stops, and the journal stays for the next one to try again. */
+function stopUnrestored(runDir: string, journal: string, why: string): never {
+  try {
+    fs.writeFileSync(
+      path.join(runDir, "summary.json"),
+      JSON.stringify({ success: false, stopReason: "killed-batch-not-restored", error: why, journal }, null, 2),
+    );
+  } catch {
+    /* the message below is what matters */
+  }
+  die(
+    `上一次被強制終止的那批沒辦法完整撤回（${why}）。src/test 裡可能還留著那批 writer 寫到一半、沒通過任何 gate 的測試，` +
+      `在它上面產生新的測試會把它們當成既有測試保護起來，所以這次先停下。\n` +
+      `常見原因是檔案被 IDE 或防毒軟體鎖住：關掉它們後重跑即可，復原日誌還在（${journal}）。\n` +
+      `確定要保留現況的話，刪掉那個目錄再重跑。`,
+  );
 }
 
 // The interrupt and crash paths: the batch that was cut short is set aside like a failed one — its

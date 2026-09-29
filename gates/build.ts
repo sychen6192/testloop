@@ -1459,6 +1459,18 @@ export function gradleRedDespiteExit0(out: string, reported = false): string | u
 }
 
 /**
+ * Pure: whether a Gradle build log shows its test task executed this time — not UP-TO-DATE, SKIPPED,
+ * NO-SOURCE or FROM-CACHE. Gradle keeps the last execution's results in build/test-results, so a
+ * task that did not execute leaves results that say nothing about this build: evidence only when it
+ * ran. undefined when the log names no test task (quiet logging).
+ */
+export function gradleTestTaskRan(out: string): boolean | undefined {
+  const tasks = [...out.matchAll(/^> Task (?::[\w.-]+)*:test(?:[ \t]+([A-Z-]+))?[ \t]*$/gm)];
+  if (!tasks.length) return undefined;
+  return tasks.some((m) => !m[1]);
+}
+
+/**
  * Pure: were the target module's tests skipped — did every surefire execution Maven ran for it say
  * "Tests are skipped."? skipTests or maven.test.skip, from the pom, settings.xml or
  * .mvn/maven.config: the build is green, nothing ran, and nothing the writer writes ever will.

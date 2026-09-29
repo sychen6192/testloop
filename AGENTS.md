@@ -25,14 +25,15 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   只有常數的 enum、沒有本體的 record、Spring Boot 進入點——不當目標，`libs/utils.ts` 的 `codelessTypeReason`）、
   rubric 載入、runner 設定檢查（預檢建置之前，`runners/runner.ts` 的 `runnerConfigProblems`）、startup guard、
   版本戳記、既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
-  預檢之後略過先前的執行已通過、類別與測試檔（sha256）都沒變的目標類別——它們的測試要在這次的預檢中執行且通過、
-  覆蓋率從這次的報告重新量、review 分數以現在的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，
-  `UT_RESUME=0` 關閉）。
+  預檢之後略過先前的執行已通過、類別與測試檔（連同測試引用到的 helper 與資源，sha256）都沒變的目標類別——它們的
+  每一個測試類別都要在這次的預檢中執行（不是全部略過）而且沒有失敗過、覆蓋率從這次的報告重新量、review 分數以現在
+  的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，`UT_RESUME=0` 關閉）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
-  斷電）而沒機會撤回的那批，由下一次執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、`recoverKilledBatches`；
-  DESIGN.md「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與 agent 也在那之前結束（`stopOrphans`）。
+  斷電）而沒機會撤回的那批，由下一次在同一台機器上的執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、
+  `recoverKilledBatches`；撤回不完整就停下；DESIGN.md「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與
+  agent 也在那之前結束（`stopOrphans`，只結束確定是同一個程序的）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）

@@ -347,7 +347,8 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
 // and the tree as the open session found it. The next run on the repo finishes the job
 // (loop.ts recoverKilledBatches); a batch that ends in any other way removes its journal.
 
-const JOURNAL_VERSION = 1;
+// 2: the tree it started from packed into start.bin, and who wrote it with its start time and checkout.
+const JOURNAL_VERSION = 2;
 /** Under the batch's artifacts directory. */
 export const JOURNAL_DIR = "inflight";
 
@@ -356,17 +357,67 @@ export interface JournalHost {
   host: string;
   /** Boot time, in minutes since the epoch. */
   boot: number;
+  /**
+   * Linux: the pid namespace (/proc/self/ns/pid). Containers on one machine can share its host name
+   * and boot (host networking) and still number their processes apart: a pid written in another one
+   * names nobody here. Absent where there is none to read.
+   */
+  pidns?: string;
 }
+
+let pidNamespace: string | null | undefined;
 
 export function thisHost(): JournalHost {
-  return { host: os.hostname(), boot: Math.round((Date.now() / 1000 - os.uptime()) / 60) };
+  if (pidNamespace === undefined) {
+    try {
+      pidNamespace = process.platform === "linux" ? fs.readlinkSync("/proc/self/ns/pid") : null;
+    } catch {
+      pidNamespace = null;
+    }
+  }
+  const here: JournalHost = { host: os.hostname(), boot: Math.round((Date.now() / 1000 - os.uptime()) / 60) };
+  if (pidNamespace) here.pidns = pidNamespace;
+  return here;
 }
 
-export interface BatchJournal extends JournalHost {
-  version: number;
-  /** Canonical (libs/lock.ts canonicalRoot): another checkout sharing the runs directory is not ours to undo. */
+/** Pure: whether a pid recorded `there` still means a process here — the same host, boot and pid namespace. */
+export function samePids(there: { host?: unknown; boot?: unknown; pidns?: unknown }, here: JournalHost): boolean {
+  return (
+    there.host === here.host &&
+    typeof there.boot === "number" &&
+    Math.abs(there.boot - here.boot) <= 2 &&
+    (there.pidns ?? "") === (here.pidns ?? "")
+  );
+}
+
+/**
+ * Which directory this is, beyond its path: device and inode. A checkout deleted and cloned again at
+ * the same path, a test tree removed and recreated, is another directory — a killed batch's leftovers
+ * cannot be in it. "" when the file system has no inode numbers to tell by.
+ */
+export function dirIdentity(dir: string): string {
+  try {
+    const st = fs.statSync(dir, { bigint: true });
+    return st.ino ? `${st.dev}:${st.ino}` : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Who wrote a journal: the run, where, and for which checkout. Written first (owner.json). */
+export interface JournalOwner extends JournalHost {
+  /** Canonical (libs/lock.ts canonicalRoot). */
   repoRoot: string;
+  /** dirIdentity of the repo root and of the test tree when the batch started. */
+  rootId: string;
+  treeId: string;
   pid: number;
+  /** processStart (libs/shell.ts) of the run: "" where there is no way to read it (Windows). */
+  start: string;
+}
+
+export interface BatchJournal extends JournalOwner {
+  version: number;
   runDir: string;
   batch: number;
   /** The batch's artifacts. */
@@ -375,7 +426,8 @@ export interface BatchJournal extends JournalHost {
   /** The test tree, absolute, and as the run shows it (repo-relative). */
   testTree: string;
   treeRel: string;
-  capture: { kept: string[]; tooLarge: Record<string, string>; dirs: string[] };
+  /** The files kept as [relative path, offset, length] in start.bin; those too large, by fingerprint. */
+  capture: { kept: Array<[string, number, number]>; tooLarge: Record<string, string>; dirs: string[] };
   outputs: Array<{ dir: string; files: string[] }>;
 }
 
@@ -399,7 +451,9 @@ export interface JournalHandle {
 /**
  * Writes a batch's journal as the batch starts, and starts its heartbeat. Whose it is goes first and
  * journal.json last: a journal without journal.json was cut short while being written, and the
- * owner file says whether it is this repo's to throw away. `beatMs`: for the selftest.
+ * owner file says whether it is this repo's to throw away. The tree the batch starts from goes into
+ * one file: thousands of small copies, per batch, were what an antivirus scanning every write made
+ * slow. A journal that cannot be written completely is not left half-written. `beatMs`: for the selftest.
  */
 export function openJournal(
   j: Omit<BatchJournal, "version" | "capture" | "outputs">,
@@ -409,27 +463,47 @@ export function openJournal(
 ): JournalHandle {
   const dir = path.join(j.dir, JOURNAL_DIR);
   fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ repoRoot: j.repoRoot, pid: j.pid, host: j.host, boot: j.boot }));
-  const kept: string[] = [];
-  const tooLarge: Record<string, string> = {};
-  for (const [rel, buf] of capture.files) {
-    if (!buf) {
-      tooLarge[rel] = capture.fingerprints.get(rel) ?? "";
-      continue;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const owner: JournalOwner = {
+      repoRoot: j.repoRoot,
+      rootId: j.rootId,
+      treeId: j.treeId,
+      pid: j.pid,
+      start: j.start,
+      host: j.host,
+      boot: j.boot,
+      ...(j.pidns ? { pidns: j.pidns } : {}),
+    };
+    fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify(owner));
+    const kept: Array<[string, number, number]> = [];
+    const tooLarge: Record<string, string> = {};
+    const fd = fs.openSync(path.join(dir, "start.bin"), "w");
+    try {
+      let at = 0;
+      for (const [rel, buf] of capture.files) {
+        if (!buf) {
+          tooLarge[rel] = capture.fingerprints.get(rel) ?? "";
+          continue;
+        }
+        for (let off = 0; off < buf.length; ) off += fs.writeSync(fd, buf, off, buf.length - off);
+        kept.push([rel, at, buf.length]);
+        at += buf.length;
+      }
+    } finally {
+      fs.closeSync(fd);
     }
-    const dest = path.join(dir, "start", rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, buf);
-    kept.push(rel);
+    const journal: BatchJournal = {
+      version: JOURNAL_VERSION,
+      ...j,
+      capture: { kept, tooLarge, dirs: [...capture.dirs] },
+      outputs: outputs.dirs.map((d) => ({ dir: d.dir, files: [...d.files] })),
+    };
+    writeAtomic(path.join(dir, "journal.json"), JSON.stringify(journal));
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw e;
   }
-  const journal: BatchJournal = {
-    version: JOURNAL_VERSION,
-    ...j,
-    capture: { kept, tooLarge, dirs: [...capture.dirs] },
-    outputs: outputs.dirs.map((d) => ({ dir: d.dir, files: [...d.files] })),
-  };
-  writeAtomic(path.join(dir, "journal.json"), JSON.stringify(journal));
   // The run is alive: what the next run compares a change's time against, once this one is killed.
   const beat = setInterval(() => {
     const now = new Date();
@@ -471,44 +545,103 @@ const mtimeOrZero = (p: string) => {
   }
 };
 
-/**
- * Pure: whether the run that wrote a journal may still be running. The caller holds the repo lock,
- * so a run of this repo on this machine cannot be — but a pid is only worth asking about on the host
- * and since the boot it was written on (a machine that rebooted has no run from before), and a run on
- * another host sharing the runs directory (a volume mounted into two containers) is dead only once it
- * has stopped beating. `alive(pid)`: whether a process with that pid exists here.
- */
-export function mayBeRunning(
-  owner: Partial<JournalHost> & { pid?: number },
-  lastSeen: number,
-  here: JournalHost,
-  alive: (pid: number) => boolean,
-  now: number,
-  staleAfterMs: number,
-): boolean {
-  const fresh = now - lastSeen < staleAfterMs;
-  if (owner.host !== here.host) return fresh;
-  if (owner.boot === undefined || Math.abs(owner.boot - here.boot) > 2) return false;
-  return owner.pid !== process.pid && alive(owner.pid ?? -1) && fresh;
+/** How the caller finds out about processes on this machine (libs/shell.ts, injected for the selftest). */
+export interface ProcessProbe {
+  alive(pid: number): boolean;
+  /** processStart: undefined when there is no such process, or no way to tell. */
+  start(pid: number): string | undefined;
 }
 
 /**
- * The journals this repo's earlier runs left under `runsDir`: batches whose run ended without
- * setting them aside (see mayBeRunning). Journals whose run did end (it has a summary.json) and
- * journals cut short are this repo's to throw away: `stale` lists them. Another checkout's journals
- * are left alone, and so are those of a run that may still be going: `running` counts them.
+ * Pure: whether the run that wrote a journal on this host may still be running. The caller holds the
+ * repo lock, so it cannot be — but a pid only means something since the boot it was written in (a
+ * machine that rebooted has no run from before), and is only that run while it is the same process:
+ * its start time says so, where the OS reports one. Without it (Windows), a live pid that is still
+ * beating counts as the run. Written in another pid namespace (a container sharing this machine's
+ * name), its pid names nobody here: only its heartbeat can tell.
+ */
+export function mayBeRunning(
+  owner: { pid?: number; start?: string; boot?: number; pidns?: string },
+  lastSeen: number,
+  here: JournalHost,
+  probe: ProcessProbe,
+  now: number,
+  staleAfterMs: number,
+): boolean {
+  if (owner.boot === undefined || Math.abs(owner.boot - here.boot) > 2) return false;
+  if ((owner.pidns ?? "") !== (here.pidns ?? "")) return now - lastSeen < staleAfterMs;
+  const pid = owner.pid ?? -1;
+  if (pid === process.pid) return false;
+  const start = owner.start ? probe.start(pid) : undefined;
+  if (start !== undefined) return start === owner.start;
+  return probe.alive(pid) && now - lastSeen < staleAfterMs;
+}
+
+const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
+/** Pure: whether a parsed journal.json is one this version wrote, in every field recovery reads. */
+export function isJournal(j: unknown): j is BatchJournal {
+  const x = j as BatchJournal;
+  return (
+    !!x &&
+    typeof x === "object" &&
+    x.version === JOURNAL_VERSION &&
+    typeof x.repoRoot === "string" &&
+    typeof x.runDir === "string" &&
+    typeof x.dir === "string" &&
+    typeof x.testTree === "string" &&
+    typeof x.treeRel === "string" &&
+    Number.isInteger(x.batch) &&
+    Number.isInteger(x.pid) &&
+    isStrings(x.targetClasses) &&
+    !!x.capture &&
+    Array.isArray(x.capture.kept) &&
+    x.capture.kept.every((k) => Array.isArray(k) && typeof k[0] === "string" && Number.isInteger(k[1]) && Number.isInteger(k[2])) &&
+    !!x.capture.tooLarge &&
+    typeof x.capture.tooLarge === "object" &&
+    isStrings(x.capture.dirs) &&
+    Array.isArray(x.outputs) &&
+    x.outputs.every((o) => !!o && typeof o.dir === "string" && isStrings(o.files))
+  );
+}
+
+function readTrace(dir: string): JournalTrace | undefined {
+  let t: JournalTrace;
+  try {
+    t = JSON.parse(fs.readFileSync(path.join(dir, "trace.json"), "utf8"));
+  } catch (e) {
+    // No writer session had begun: nothing recorded yet.
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? { written: [] } : undefined;
+  }
+  const ok =
+    !!t &&
+    isStrings(t.written) &&
+    (t.session === undefined || (!!t.session && typeof t.session === "object" && Object.values(t.session).every((v) => typeof v === "string")));
+  return ok ? t : undefined;
+}
+
+/**
+ * The journals this repo's earlier runs on this machine left under `runsDir`: batches whose run ended
+ * without setting them aside (see mayBeRunning). A journal is only ever this run's to act on when it
+ * was written here, for this checkout: another host sharing the runs directory — the same path, its
+ * own checkout — has its own tree; its journals are left for it (`elsewhere`), and so are those of
+ * another container on this machine whose checkout is not this one. Ours to throw away (`stale`):
+ * one whose run did end (it has a summary.json), one cut short while being written, one that will
+ * not parse, and one whose checkout or test tree is not there any more (the same path now holds
+ * another). A run that may still be going keeps its journals (`running`).
  */
 export function findJournals(
   runsDir: string,
-  repoRoot: string,
-  alive: (pid: number) => boolean,
+  checkout: { repoRoot: string; rootId: string },
+  probe: ProcessProbe,
   here: JournalHost = thisHost(),
   now = Date.now(),
   staleAfterMs = 5 * 60_000,
-): { dead: DeadBatch[]; stale: string[]; running: number } {
+): { dead: DeadBatch[]; stale: Array<{ dir: string; why: string }>; running: number; elsewhere: number } {
   const dead: DeadBatch[] = [];
-  const stale: string[] = [];
+  const stale: Array<{ dir: string; why: string }> = [];
   let running = 0;
+  let elsewhere = 0;
   const list = (d: string) => {
     try {
       return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
@@ -519,58 +652,85 @@ export function findJournals(
   for (const run of list(runsDir)) {
     for (const batch of list(path.join(runsDir, run)).filter((b) => b.startsWith("batch-"))) {
       const dir = path.join(runsDir, run, batch, JOURNAL_DIR);
-      let owner: Partial<JournalHost> & { repoRoot?: string; pid?: number };
+      let owner: Partial<JournalOwner>;
       try {
         owner = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf8"));
       } catch {
         continue; // none, or not this tool's: not ours to judge
       }
-      if (owner.repoRoot !== repoRoot) continue;
-      let journal: BatchJournal;
-      try {
-        journal = JSON.parse(fs.readFileSync(path.join(dir, "journal.json"), "utf8"));
-      } catch {
-        // Cut short while being written — or still being written, by a run that is alive.
-        if (mayBeRunning(owner, mtimeOrZero(path.join(dir, "owner.json")), here, alive, now, staleAfterMs)) running++;
-        else stale.push(dir);
+      if (!owner || typeof owner !== "object" || owner.repoRoot !== checkout.repoRoot) continue;
+      if (owner.host !== here.host) {
+        elsewhere++;
         continue;
       }
-      if (journal.version !== JOURNAL_VERSION) continue;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(fs.readFileSync(path.join(dir, "journal.json"), "utf8"));
+      } catch (e) {
+        // Cut short while being written — or still being written, by a run that is alive.
+        const missing = (e as NodeJS.ErrnoException).code === "ENOENT";
+        if (missing && mayBeRunning(owner, mtimeOrZero(path.join(dir, "owner.json")), here, probe, now, staleAfterMs)) running++;
+        else stale.push({ dir, why: missing ? "寫到一半就被終止" : "內容損毀" });
+        continue;
+      }
+      if (!isJournal(raw)) {
+        const v = (raw as { version?: unknown })?.version;
+        if (typeof v === "number" && v !== JOURNAL_VERSION) continue; // another version's: not ours to read
+        stale.push({ dir, why: "內容損毀" });
+        continue;
+      }
+      const journal = raw;
       const lastSeen = Math.max(mtimeOrZero(path.join(dir, "journal.json")), mtimeOrZero(path.join(dir, "trace.json")));
-      if (mayBeRunning(journal, lastSeen, here, alive, now, staleAfterMs)) {
+      if (mayBeRunning(journal, lastSeen, here, probe, now, staleAfterMs)) {
         running++;
         continue;
       }
       if (fs.existsSync(path.join(journal.runDir, "summary.json"))) {
-        stale.push(dir);
+        stale.push({ dir, why: "那次執行有收尾" });
         continue;
       }
-      let trace: JournalTrace = { written: [] };
-      try {
-        trace = JSON.parse(fs.readFileSync(path.join(dir, "trace.json"), "utf8"));
-      } catch {
-        /* no writer session had ended or begun */
+      // Its checkout, and its test tree, must be the ones on disk now. Written in another pid namespace
+      // — a container sharing this machine's name — a different one is that container's own checkout
+      // at the same path, not this one cloned again: its journal is left for it.
+      const theirs = (journal.pidns ?? "") !== (here.pidns ?? "");
+      if (journal.rootId && checkout.rootId && journal.rootId !== checkout.rootId) {
+        if (theirs) elsewhere++;
+        else stale.push({ dir, why: "這個路徑現在是另一個 checkout（重新 clone 過）" });
+        continue;
+      }
+      const treeNow = dirIdentity(journal.testTree);
+      if (!fs.existsSync(journal.testTree) || (journal.treeId && treeNow && treeNow !== journal.treeId)) {
+        if (theirs) elsewhere++;
+        else stale.push({ dir, why: `它的測試目錄 ${journal.treeRel} 已經不是那時的那一個（被刪除或重建過）` });
+        continue;
+      }
+      const trace = readTrace(dir);
+      if (!trace) {
+        stale.push({ dir, why: "內容損毀" });
+        continue;
       }
       dead.push({ path: dir, journal, trace, lastSeen });
     }
   }
-  return { dead, stale, running };
+  return { dead, stale, running, elsewhere };
 }
 
 /** The tree a dead batch started from, as setAside takes it. */
 export function journalCapture(d: DeadBatch): TreeCapture {
   const files = new Map<string, Buffer | null>();
   const fingerprints = new Map<string, string>();
-  for (const rel of d.journal.capture.kept) {
-    try {
-      files.set(rel, fs.readFileSync(path.join(d.path, "start", rel)));
-    } catch {
-      files.set(rel, null); // lost from the journal: a change to it can only be reported
-    }
+  let blob: Buffer | undefined;
+  try {
+    blob = fs.readFileSync(path.join(d.path, "start.bin"));
+  } catch {
+    /* lost from the journal: a change to any of them can only be reported */
+  }
+  for (const [rel, at, len] of d.journal.capture.kept) {
+    files.set(rel, blob && at + len <= blob.length ? blob.subarray(at, at + len) : null);
   }
   for (const [rel, fp] of Object.entries(d.journal.capture.tooLarge)) {
     files.set(rel, null);
-    fingerprints.set(rel, fp);
+    fingerprints.set(rel, String(fp));
   }
   return { root: d.journal.testTree, files, fingerprints, dirs: new Set(d.journal.capture.dirs) };
 }
@@ -580,24 +740,38 @@ export function journalOutputs(d: DeadBatch): OutputCapture {
 }
 
 /**
- * Pure: what a killed batch's writer changed — what its journal recorded, and what differs from
- * the tree its open session started with — less what changed after the run was last seen alive
- * (with `slackMs` for the heartbeat's interval): that was someone else, after it died, and stays.
- * `mtimeOf` gives a file's modification time now; undefined when it is gone.
+ * Pure: what a killed batch's writer changed — what its journal recorded, and what differs from the
+ * tree its open session started with — less what changed after the run was last seen alive (with
+ * `slackMs` for the heartbeat's interval): that was someone else, after it died, and stays.
+ * A file that is gone has no time to tell by; its directory does. One whose directory changed after
+ * the death, or is gone, may have been deleted by anyone — a branch switch, a teammate's rename
+ * pulled in — and is not put back: `undecided` lists those. `mtimeOf` gives a file's (or directory's)
+ * modification time now; undefined when it is gone.
  */
 export function killedWriterChanges(
   d: Pick<DeadBatch, "trace" | "lastSeen">,
   now: TreeSnapshot,
   mtimeOf: (rel: string) => number | undefined,
   slackMs: number,
-): Set<string> {
-  const changed = new Set(d.trace.written);
-  if (d.trace.session) for (const rel of diffSnapshots(d.trace.session, now)) changed.add(rel);
-  for (const rel of [...changed]) {
+): { only: Set<string>; undecided: string[] } {
+  const only = new Set(d.trace.written);
+  if (d.trace.session) for (const rel of diffSnapshots(d.trace.session, now)) only.add(rel);
+  const undecided: string[] = [];
+  const after = (m: number | undefined) => m !== undefined && m > d.lastSeen + slackMs;
+  for (const rel of [...only]) {
     const m = mtimeOf(rel);
-    if (m !== undefined && m > d.lastSeen + slackMs) changed.delete(rel);
+    if (m !== undefined) {
+      if (after(m)) only.delete(rel);
+      continue;
+    }
+    const parent = path.posix.dirname(rel);
+    const dm = mtimeOf(parent === "." ? "" : parent);
+    if (dm === undefined || after(dm)) {
+      only.delete(rel);
+      undecided.push(rel);
+    }
   }
-  return changed;
+  return { only, undecided: undecided.sort() };
 }
 
 // ─── Across batches ──────────────────────────────────────────────────────────

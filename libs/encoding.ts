@@ -655,8 +655,10 @@ export function sourceViews(enc: SourceEncoding | undefined, files: string[]): A
 interface Viewed {
   original: Buffer;
   view: Buffer;
-  atime: Date;
-  mtime: Date;
+  /** Its times before the view, in ms with the fraction: put back through a Date they lost it, and the
+   *  whole-millisecond snapshots read about half of the files the agent never touched as changed. */
+  atimeMs: number;
+  mtimeMs: number;
   /**
    * The agent's own UTF-8 text from earlier in the run, before the encoding was known or while it
    * could not be converted: written in the module's encoding at close even if left alone.
@@ -726,11 +728,16 @@ export function restoreOpenViews(): void {
   openViews.clear();
 }
 
+/** Puts a file's times back, in seconds with the fraction (see Viewed). */
+function putTimes(file: string, t: { atimeMs: number; mtimeMs: number }): void {
+  fs.utimesSync(file, t.atimeMs / 1000, t.mtimeMs / 1000);
+}
+
 function restoreView(v: EncodingView): void {
   for (const [file, f] of v.viewed) {
     try {
       fs.writeFileSync(file, f.original);
-      fs.utimesSync(file, f.atime, f.mtime);
+      putTimes(file, f);
     } catch {
       /* best effort on the way out */
     }
@@ -784,13 +791,18 @@ function journalDir(root: string, create: boolean): string | undefined {
   return cacheDir(["views", createHash("sha1").update(real).digest("hex").slice(0, 16)], create);
 }
 
-function writeJournal(root: string, entries: Array<{ file: string; original: Buffer; view: Buffer }>): string | undefined {
+function writeJournal(
+  root: string,
+  entries: Array<{ file: string; original: Buffer; view: Buffer; st: fs.Stats }>,
+): string | undefined {
   const dir = journalDir(root, true);
   if (!dir) return undefined;
   try {
+    // Its times too: a file put back with the time of its recovery reads as changed after the run
+    // that was killed — someone else's — and the next run left that run's batch output in place.
     const manifest = entries.map((e, i) => {
       fs.writeFileSync(path.join(dir, `${i}.bin`), e.original);
-      return { file: e.file, view: sha1(e.view), original: `${i}.bin` };
+      return { file: e.file, view: sha1(e.view), original: `${i}.bin`, atimeMs: e.st.atimeMs, mtimeMs: e.st.mtimeMs };
     });
     fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest));
     return dir;
@@ -813,11 +825,24 @@ export function recoverEncodingViews(root: string): string[] {
   }
   const restored: string[] = [];
   try {
-    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8")) as Array<{ file: string; view: string; original: string }>;
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8")) as Array<{
+      file: string;
+      view: string;
+      original: string;
+      atimeMs?: number;
+      mtimeMs?: number;
+    }>;
     for (const e of manifest) {
       try {
         if (sha1(fs.readFileSync(e.file)) !== e.view) continue;
         fs.writeFileSync(e.file, fs.readFileSync(path.join(dir, e.original)));
+        if (typeof e.atimeMs === "number" && typeof e.mtimeMs === "number") {
+          try {
+            putTimes(e.file, { atimeMs: e.atimeMs, mtimeMs: e.mtimeMs });
+          } catch {
+            /* its content is back; only its time is not */
+          }
+        }
         restored.push(e.file);
       } catch {
         /* gone or changed since: leave it */
@@ -922,7 +947,7 @@ export function openEncodingView(
   for (const s of shown) {
     try {
       fs.writeFileSync(s.file, s.view);
-      view.viewed.set(s.file, { original: s.original, view: s.view, atime: s.st.atime, mtime: s.st.mtime, agentText: s.agentText });
+      view.viewed.set(s.file, { original: s.original, view: s.view, atimeMs: s.st.atimeMs, mtimeMs: s.st.mtimeMs, agentText: s.agentText });
     } catch {
       view.protectedFiles.set(s.file, s.original);
     }
@@ -943,11 +968,11 @@ export function closeEncodingView(view: EncodingView, opts: { timeoutMs?: number
   const now = new Set(javaFiles(view.root));
   // Texts to encode, and how to put each file together from them.
   const jobs: Array<{ file: string; parts: Array<Buffer | string>; restore?: Buffer }> = [];
-  const put = (file: string, bytes: Buffer, times?: { atime: Date; mtime: Date }) => {
+  const put = (file: string, bytes: Buffer, times?: { atimeMs: number; mtimeMs: number }) => {
     fs.writeFileSync(file, bytes);
     if (times) {
       try {
-        fs.utimesSync(file, times.atime, times.mtime);
+        putTimes(file, times);
       } catch {
         /* another user's file: its content is back, only its time is not */
       }

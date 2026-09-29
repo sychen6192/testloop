@@ -22,6 +22,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { codeOnly } from "./javasrc";
 
 export const LEDGER_FILE = "passed.json";
 const LEDGER_VERSION = 1;
@@ -67,11 +68,73 @@ export function hashFile(abs: string): string | null {
   }
 }
 
+// A transitive walk that could reach the whole test tree is bounded: past this many files the pass
+// records what it found, and a change beyond them is one the rerun does not see — the checks it does
+// run again (build, coverage) still apply.
+const MAX_REFERENCED = 400;
+
+/**
+ * The files of the test tree `roots` reach: the classes of the tree they name, and the ones those
+ * name, and the resources their string literals name (by file name). What a reviewer reading a test
+ * also reads — the base class it extends, the fixture builder and assertion helper it calls, the JSON
+ * it loads — and what the test's behaviour hangs on: a hollowed-out helper leaves the build green and
+ * the coverage where it was. Repo-relative, "/" separators; `testTree` is the module's src/test.
+ */
+export function referencedTestFiles(roots: string[], repoRoot: string, testTree: string): string[] {
+  const byClass = new Map<string, string[]>();
+  const resources: Array<{ name: string; rel: string }> = [];
+  const walk = (dir: string, onFile: (rel: string, name: string) => void) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(repoRoot, dir), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const rel = `${dir}/${e.name}`;
+      if (e.isDirectory()) walk(rel, onFile);
+      else if (e.isFile()) onFile(rel, e.name);
+    }
+  };
+  const tree = toSlash(testTree).replace(/\/$/, "");
+  walk(`${tree}/java`, (rel, name) => {
+    if (!name.endsWith(".java")) return;
+    const cls = name.slice(0, -".java".length);
+    byClass.set(cls, [...(byClass.get(cls) ?? []), rel]);
+  });
+  walk(`${tree}/resources`, (rel, name) => resources.push({ name, rel }));
+  const found = new Set<string>();
+  const queue = roots.map(toSlash).filter((r) => r.endsWith(".java"));
+  const seen = new Set(queue);
+  while (queue.length && found.size < MAX_REFERENCED) {
+    const rel = queue.shift()!;
+    let src: string;
+    try {
+      src = fs.readFileSync(path.join(repoRoot, rel), "latin1");
+    } catch {
+      continue;
+    }
+    for (const id of new Set(codeOnly(src).match(/[A-Za-z_$][\w$]*/g) ?? [])) {
+      for (const f of byClass.get(id) ?? []) {
+        if (seen.has(f)) continue;
+        seen.add(f);
+        found.add(f);
+        queue.push(f);
+      }
+    }
+    for (const r of resources) {
+      if (!found.has(r.rel) && new RegExp(`["/\\\\]${r.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`).test(src)) found.add(r.rel);
+    }
+  }
+  return [...found].sort();
+}
+
 /**
  * The records a passed batch leaves: one per class. A class's files are its own test files (by the
- * naming convention the loop uses everywhere, findExistingTests) and whatever else the batch's writer
- * wrote that is not another class's test — a helper, a fixture under resources/. A change to any of
- * them after the pass is a change the reviewer never saw.
+ * naming convention the loop uses everywhere, findExistingTests), whatever else the batch's writer
+ * wrote that is not another class's test — a helper, a fixture under resources/ — and what all of
+ * those reach in the test tree (referencedTestFiles). A change to any of them after the pass is a
+ * change the reviewer never saw.
  */
 export function passedEntries(o: {
   classes: string[];
@@ -79,6 +142,8 @@ export function passedEntries(o: {
   testsOf: (cls: string) => string[];
   /** Repo-relative paths the batch's writer changed, deleted ones included. */
   written: string[];
+  /** The module's src/test, repo-relative: where the tests' helpers and resources are looked for. */
+  testTree: string;
   rubric: string;
   verdict: PassedEntry["verdict"];
   dir: string;
@@ -89,7 +154,8 @@ export function passedEntries(o: {
   return o.classes.map((cls) => {
     const others = new Set(o.classes.filter((c) => c !== cls).flatMap((c) => own.get(c) ?? []));
     const mine = own.get(cls) ?? [];
-    const rels = [...new Set([...mine, ...written.filter((w) => !others.has(w) || mine.includes(w))])].sort();
+    const direct = [...new Set([...mine, ...written.filter((w) => !others.has(w) || mine.includes(w))])];
+    const rels = [...new Set([...direct, ...referencedTestFiles(direct, o.repoRoot, o.testTree)])].sort();
     return {
       cls: toSlash(cls),
       source: hashFile(path.join(o.repoRoot, cls)) ?? "",
@@ -190,9 +256,10 @@ export function entryMismatch(
 }
 
 /**
- * Pure: the newest pass of `cls` that still describes the tree — an older one does as well as a newer
- * one when the tree is back to what it passed with. Without one, why the newest pass no longer holds;
- * neither when no run ever passed the class.
+ * Pure: the newest pass of `cls`, when it still describes the tree; else why not; neither when no run
+ * ever passed the class. Only the newest: an older record matching again says the files it lists are
+ * back as they were, not the ones a newer record added — a helper the newer pass relied on, changed
+ * since, and absent from the older record.
  */
 export function findPass(
   cls: string,
@@ -200,14 +267,10 @@ export function findPass(
   hashOf: (rel: string) => string | null,
   tests: string[],
 ): { entry?: PassedEntry; mismatch?: string } {
-  const mine = entries.filter((e) => e.cls === toSlash(cls));
-  let first: string | undefined;
-  for (const e of mine) {
-    const why = entryMismatch(e, hashOf, tests);
-    if (!why) return { entry: e };
-    first ??= why;
-  }
-  return first ? { mismatch: first } : {};
+  const newest = entries.find((e) => e.cls === toSlash(cls));
+  if (!newest) return {};
+  const why = entryMismatch(newest, hashOf, tests);
+  return why ? { mismatch: why } : { entry: newest };
 }
 
 /** Pure: a test source's class name, from its path under the module's src/test/java; undefined outside it. */

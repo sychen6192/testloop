@@ -58,6 +58,7 @@ import {
   passedEntries,
   PassedEntry,
   readLedgers,
+  referencedTestFiles,
   sha256,
   testClassOf,
   writeLedger,
@@ -102,7 +103,10 @@ import {
   captureTree,
   chunk,
   closeJournal,
+  dirIdentity,
   findJournals,
+  isJournal,
+  JOURNAL_DIR,
   journalCapture,
   journalOutputs,
   killedWriterChanges,
@@ -110,6 +114,7 @@ import {
   openJournal,
   removeBatchOutputs,
   rollbackTree,
+  samePids,
   testOutputDirs,
   thisHost,
   traceJournal,
@@ -163,10 +168,12 @@ import {
   assembleCapture,
   DETACH_CHILDREN,
   groupAlive,
+  groupMembers,
   journalChildren,
   orphanAction,
   parseStat,
   processStart,
+  startMsOf,
   trackForShutdown,
 } from "../libs/shell";
 import { runnerConfigProblems } from "../runners/runner";
@@ -178,6 +185,7 @@ import {
   targetModuleSkipped,
   mavenRedDespiteExit0,
   gradleRedDespiteExit0,
+  gradleTestTaskRan,
   testsSkippedInLog,
   classesRunInLog,
   classifyEnvFailures,
@@ -4445,8 +4453,11 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     fs.writeFileSync(f("com/x/AsciiTest.java"), "class AsciiTest {}\n");
     // All ASCII, with an escape its author wrote on purpose.
     fs.writeFileSync(f("com/x/PlainTest.java"), 'class PlainTest {\n  String e = "\\u4e2d";\n}\n');
-    const old = new Date(Date.now() - 3_600_000);
-    fs.utimesSync(f("com/x/UntouchedTest.java"), old, old);
+    // A time a fraction of a millisecond past the half: put back through a Date, it rounds up, and the
+    // file the writer never touched reads as changed to every snapshot after.
+    const oldS = Math.floor(Date.now() / 1000) - 3600 + 0.5847;
+    fs.utimesSync(f("com/x/UntouchedTest.java"), oldS, oldS);
+    const oldMs = fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs;
     const ms950 = { name: "MS950", source: "pom" as const };
     const view = openEncodingView(ms950, tree)!;
     const shown = fs.readFileSync(f("com/x/EditedTest.java"), "latin1");
@@ -4468,7 +4479,8 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     const big5 = new TextDecoder("big5");
     check(
       "closeEncodingView：沒改的檔拿回原本的 bytes 與修改時間（建置看不到變化）",
-      fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && Math.abs(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs - old.getTime()) < 2000,
+      fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && Math.floor(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs) === Math.floor(oldMs),
+      `${oldMs} → ${fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs}`,
     );
     const edited = fs.readFileSync(f("com/x/EditedTest.java"));
     check(
@@ -4559,6 +4571,7 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     fs.rmSync(lostFile);
 
     // A run killed with the view open: the next run puts the originals back from the journal.
+    fs.utimesSync(f("com/x/UntouchedTest.java"), oldS, oldS);
     const kv = openEncodingView(ms950, tree)!;
     check("被砍掉之前：檔案是 ASCII 形式", !fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && kv.viewed.size > 0);
     const recoveredFiles = recoverEncodingViews(tree);
@@ -4566,6 +4579,13 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
       "recoverEncodingViews：下一次執行從復原日誌把原本的 bytes 放回",
       fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && recoveredFiles.map((p) => path.basename(p)).includes("UntouchedTest.java"),
       JSON.stringify(recoveredFiles.map((p) => path.basename(p))),
+    );
+    // And its time: put back with the time of the recovery, it read as changed after the killed run died
+    // — someone else's — and that run's batch was left in place (libs/batch.ts killedWriterChanges).
+    check(
+      "recoverEncodingViews：修改時間也放回原本的（到毫秒以下）",
+      Math.floor(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs) === Math.floor(oldMs),
+      `${oldMs} → ${fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs}`,
     );
     check("recoverEncodingViews：日誌用過就刪（再跑一次什麼都不做）", recoverEncodingViews(tree).length === 0);
     restoreOpenViews();
@@ -5163,6 +5183,7 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
     repoRoot: root,
     testsOf,
     written: [FOO_T, BAR_T, HELPER.replace(/\//g, "\\"), RES, GONE],
+    testTree: "m/src/test",
     rubric: "r1",
     verdict: { scores: { effectiveness: 8 }, blockers: [] },
     dir: "/runs/a/batch-1-Foo",
@@ -5237,7 +5258,12 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
   );
   check("readLedgers：runs 目錄不存在 → 沒有紀錄", readLedgers(path.join(root, "no-runs")).length === 0);
   const found = findPass(FOO, ledger, hashOf, [FOO_T]);
-  check("findPass：最新的紀錄對不上、較舊的對得上 → 用較舊的（樹回到了它通過時的樣子）", found.entry?.dir === "/runs/a/batch-1-Foo", JSON.stringify(found));
+  check(
+    "findPass：只看最新的紀錄——它對不上就重做，不退回較舊、記得比較少檔案的那筆",
+    !found.entry && found.mismatch === `${FOO_T} 在上次通過之後改過`,
+    JSON.stringify(found),
+  );
+  check("findPass：最新的紀錄對得上 → 用它", findPass(FOO, readLedgers(runs, newer), hashOf, [FOO_T]).entry?.dir === "/runs/a/batch-1-Foo");
   put(FOO_T, "class FooTest { something else }");
   const none = findPass(FOO.replace(/\//g, "\\"), ledger, hashOf, [FOO_T]);
   check(
@@ -5260,68 +5286,197 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
       testClassOf("m/src/test/javax/FooTest.java", "m/src/test/java") === undefined,
   );
   check("testClassOf：模組就是 repo 根", testClassOf("src/test/java/FooTest.java", "src/test/java") === "FooTest");
+
+  // What a test reaches in its tree is part of what it passed with.
+  const T = "m/src/test";
+  put(`${T}/java/com/x/QuxTest.java`, 'package com.x;\nclass QuxTest extends BaseTest { void t() { Fixtures.build(); load("/data/qux.json"); } }\n');
+  put(`${T}/java/com/x/BaseTest.java`, "package com.x;\nabstract class BaseTest { Asserts a; }\n");
+  put(`${T}/java/com/x/Asserts.java`, "package com.x;\nclass Asserts {}\n");
+  put(`${T}/java/com/x/Fixtures.java`, "package com.x;\nclass Fixtures { static void build() {} }\n");
+  put(`${T}/java/com/x/Unrelated.java`, "package com.x;\nclass Unrelated {}\n");
+  put(`${T}/java/com/x/Mentioned.java`, "package com.x;\nclass Mentioned {}\n");
+  put(`${T}/resources/data/qux.json`, "{}");
+  put(`${T}/resources/data/other.json`, "{}");
+  put(`${T}/java/com/x/CommentOnly.java`, "package com.x;\n// see Mentioned\nclass CommentOnly {}\n");
+  const reached = referencedTestFiles([`${T}/java/com/x/QuxTest.java`], root, T);
+  check(
+    "referencedTestFiles：它繼承的、呼叫的（連同那些再引用的）與字串裡點名的資源；沒用到的不算",
+    JSON.stringify(reached) ===
+      JSON.stringify([`${T}/java/com/x/Asserts.java`, `${T}/java/com/x/BaseTest.java`, `${T}/java/com/x/Fixtures.java`, `${T}/resources/data/qux.json`].sort()),
+    JSON.stringify(reached),
+  );
+  check(
+    "referencedTestFiles：只在註解裡提到的名字不算",
+    !referencedTestFiles([`${T}/java/com/x/CommentOnly.java`], root, T).includes(`${T}/java/com/x/Mentioned.java`),
+  );
+  const qux = passedEntries({
+    classes: ["m/src/main/java/com/x/Qux.java"],
+    repoRoot: root,
+    testsOf: () => [`${T}/java/com/x/QuxTest.java`],
+    written: [],
+    testTree: T,
+    rubric: "r",
+    verdict: null,
+    dir: "/d",
+    at: "t",
+  })[0];
+  check(
+    "passedEntries：通過紀錄也記下測試引用到的 helper 與資源——事後有人把 helper 掏空，重跑會看到",
+    `${T}/java/com/x/Asserts.java` in qux.files && `${T}/resources/data/qux.json` in qux.files && !(`${T}/java/com/x/Unrelated.java` in qux.files),
+    JSON.stringify(Object.keys(qux.files)),
+  );
+
+  // TimeUnitTest.java is TimeUnit's test when there is a TimeUnit, not Time's.
+  put("m/src/main/java/com/x/Time.java", "class Time {}");
+  put("m/src/test/java/com/x/TimeTest.java", "class TimeTest {}");
+  put("m/src/test/java/com/x/TimeUnitTest.java", "class TimeUnitTest {}");
+  check(
+    "findExistingTests：沒有 TimeUnit 這個類別時，TimeUnitTest.java 照舊算 Time 的",
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)) ===
+      JSON.stringify(["m/src/test/java/com/x/TimeTest.java", "m/src/test/java/com/x/TimeUnitTest.java"]),
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)),
+  );
+  put("m/src/main/java/com/x/TimeUnit.java", "class TimeUnit {}");
+  check(
+    "findExistingTests：同一個套件有 TimeUnit 時，TimeUnitTest.java 是它的、不是 Time 的",
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)) === '["m/src/test/java/com/x/TimeTest.java"]' &&
+      JSON.stringify(findExistingTests("m/src/main/java/com/x/TimeUnit.java", root)) === '["m/src/test/java/com/x/TimeUnitTest.java"]',
+    JSON.stringify([findExistingTests("m/src/main/java/com/x/Time.java", root), findExistingTests("m/src/main/java/com/x/TimeUnit.java", root)]),
+  );
   fs.rmSync(root, { recursive: true, force: true });
+
+  check("gradleTestTaskRan：> Task :test（沒有結果標記）→ 這次有執行", gradleTestTaskRan("> Task :compileTestJava\n> Task :test\n> Task :jacocoTestReport\n") === true);
+  check("gradleTestTaskRan：多模組的 :core:test 也認得", gradleTestTaskRan("> Task :core:test\n") === true);
+  check(
+    "gradleTestTaskRan：UP-TO-DATE／SKIPPED／NO-SOURCE／FROM-CACHE → 這次沒有執行（結果是之前的）",
+    ["UP-TO-DATE", "SKIPPED", "NO-SOURCE", "FROM-CACHE"].every((o) => gradleTestTaskRan(`> Task :test ${o}\n`) === false),
+  );
+  check("gradleTestTaskRan：log 沒有列出 test task（quiet）→ 看不出來（undefined）", gradleTestTaskRan("BUILD SUCCESSFUL in 3s\n") === undefined);
+  check("gradleTestTaskRan：:testClasses、:integrationTest 不是 :test", gradleTestTaskRan("> Task :testClasses\n> Task :integrationTest\n") === undefined);
 }
 
 console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日誌）");
 {
   const here = { host: "box", boot: 29_000_000 };
-  const alive = (pid: number) => pid === 4242;
+  const probeOf = (running: Record<number, string | undefined>, alive: number[] = []) => ({
+    alive: (pid: number) => pid in running || alive.includes(pid),
+    start: (pid: number) => running[pid],
+  });
   const now = 1_000_000_000_000;
   const fresh = now - 60_000;
   const old = now - 10 * 60_000;
   const stale = 5 * 60_000;
-  check("mayBeRunning：同一台、同一次開機、pid 還在、心跳新鮮 → 可能還在跑", mayBeRunning({ host: "box", boot: 29_000_000, pid: 4242 }, fresh, here, alive, now, stale));
-  check("mayBeRunning：pid 已經不在 → 已經死了", !mayBeRunning({ host: "box", boot: 29_000_000, pid: 4243 }, fresh, here, alive, now, stale));
-  check("mayBeRunning：pid 在但心跳停了很久（pid 被別的程序重用）→ 已經死了", !mayBeRunning({ host: "box", boot: 29_000_000, pid: 4242 }, old, here, alive, now, stale));
+  const owner = { boot: 29_000_000, pid: 4242, start: "563817" };
+  check("mayBeRunning：同一次開機、那個 pid 還是同一個程序（啟動時間相同）→ 還在跑", mayBeRunning(owner, old, here, probeOf({ 4242: "563817" }), now, stale));
+  check(
+    "mayBeRunning：pid 還在、心跳也新鮮，但啟動時間不同（pid 被重用）→ 已經死了",
+    !mayBeRunning(owner, fresh, here, probeOf({ 4242: "999" }), now, stale),
+  );
+  check("mayBeRunning：pid 已經不在 → 已經死了", !mayBeRunning(owner, fresh, here, probeOf({}), now, stale));
   check(
     "mayBeRunning：pid 就是自己的（容器裡 pid 從頭編號）→ 那次執行不可能是自己，已經死了",
-    !mayBeRunning({ host: "box", boot: 29_000_000, pid: process.pid }, fresh, here, () => true, now, stale),
+    !mayBeRunning({ ...owner, pid: process.pid }, fresh, here, probeOf({ [process.pid]: "563817" }), now, stale),
   );
-  check("mayBeRunning：重開機過（開機時間差兩分鐘以上）→ 已經死了", !mayBeRunning({ host: "box", boot: 28_000_000, pid: 4242 }, fresh, here, alive, now, stale));
-  check("mayBeRunning：開機時間的誤差在兩分鐘內 → 同一次開機", mayBeRunning({ host: "box", boot: 29_000_001, pid: 4242 }, fresh, here, alive, now, stale));
-  check("mayBeRunning：沒記開機時間 → 不能拿 pid 判斷，當作已經死了", !mayBeRunning({ host: "box", pid: 4242 }, fresh, here, alive, now, stale));
+  check("mayBeRunning：重開機過（開機時間差兩分鐘以上）→ 已經死了", !mayBeRunning({ ...owner, boot: 28_000_000 }, fresh, here, probeOf({ 4242: "563817" }), now, stale));
+  check("mayBeRunning：沒記開機時間 → 已經死了", !mayBeRunning({ pid: 4242, start: "563817" }, fresh, here, probeOf({ 4242: "563817" }), now, stale));
   check(
-    "mayBeRunning：別台機器（共用的 runs 目錄）→ 只看心跳：新鮮就可能還在跑，停了就死了",
-    mayBeRunning({ host: "other", boot: 29_000_000, pid: 1 }, fresh, here, alive, now, stale) &&
-      !mayBeRunning({ host: "other", boot: 29_000_000, pid: 1 }, old, here, alive, now, stale),
+    "mayBeRunning：讀不到啟動時間（Windows）→ pid 還在而且心跳新鮮才算還在跑",
+    mayBeRunning({ ...owner, start: "" }, fresh, here, probeOf({}, [4242]), now, stale) &&
+      !mayBeRunning({ ...owner, start: "" }, old, here, probeOf({}, [4242]), now, stale) &&
+      !mayBeRunning({ ...owner, start: "" }, fresh, here, probeOf({}), now, stale),
+  );
+  // A container sharing the machine's name and boot (host networking) numbers its processes apart.
+  const inBox = { ...here, pidns: "pid:[4026531836]" };
+  check(
+    "mayBeRunning：別的 pid namespace 寫的（共用主機名稱的另一個容器）→ 不問 pid，只看心跳",
+    mayBeRunning({ ...owner, pidns: "pid:[4026532999]" }, fresh, inBox, probeOf({}), now, stale) &&
+      !mayBeRunning({ ...owner, pidns: "pid:[4026532999]" }, old, inBox, probeOf({ 4242: "563817" }), now, stale) &&
+      !mayBeRunning(owner, old, inBox, probeOf({ 4242: "563817" }), now, stale),
+  );
+  check("mayBeRunning：同一個 pid namespace → 照樣問 pid", mayBeRunning({ ...owner, pidns: inBox.pidns }, old, inBox, probeOf({ 4242: "563817" }), now, stale));
+  check(
+    "samePids：同一台、同一次開機、同一個 pid namespace 才算；都沒有 namespace（Windows、macOS）也算同一個",
+    samePids({ host: "box", boot: 29_000_001 }, here) &&
+      samePids({ host: "box", boot: 29_000_000, pidns: inBox.pidns }, inBox) &&
+      !samePids({ host: "box", boot: 29_000_000, pidns: "pid:[4026532999]" }, inBox) &&
+      !samePids({ host: "box", boot: 29_000_000 }, inBox) &&
+      !samePids({ host: "other", boot: 29_000_000 }, here) &&
+      !samePids({ host: "box", boot: 28_000_000 }, here) &&
+      !samePids({ host: "box", boot: "29000000" }, here),
+  );
+  check(
+    "thisHost：Linux 上帶著自己的 pid namespace",
+    process.platform !== "linux" || /^pid:\[\d+\]$/.test(thisHost().pidns ?? ""),
+    JSON.stringify(thisHost()),
   );
 
-  const dead = { trace: { written: ["java/com/x/A.java", "java/com/x/B.java"], session: { "java/com/x/C.java": "1:1", "java/com/x/D.java": "1:1" } }, lastSeen: 5_000 };
+  const dead = { trace: { written: ["java/com/x/A.java", "java/com/x/B.java"], session: { "java/com/x/C.java": "1:1", "java/com/x/D.java": "1:1", "java/com/y/G.java": "1:1" } }, lastSeen: 5_000 };
   const nowTree = { "java/com/x/A.java": "2:2", "java/com/x/B.java": "2:2", "java/com/x/C.java": "1:1", "java/com/x/E.java": "3:3" };
-  const mtimes: Record<string, number> = { "java/com/x/A.java": 4_000, "java/com/x/B.java": 5_000 + 60_000 + 1, "java/com/x/E.java": 5_500 };
+  const mtimes: Record<string, number> = { "java/com/x/A.java": 4_000, "java/com/x/B.java": 5_000 + 60_000 + 1, "java/com/x/E.java": 5_500, "java/com/x": 4_500 };
   const changed = killedWriterChanges(dead, nowTree, (rel) => mtimes[rel], 60_000);
   check(
-    "killedWriterChanges：日誌記下的，加上開著的 session 之後的差異（新增的、刪掉的）；死後才改的（超過心跳加寬限）不算",
-    JSON.stringify([...changed].sort()) === JSON.stringify(["java/com/x/A.java", "java/com/x/D.java", "java/com/x/E.java"]),
-    JSON.stringify([...changed].sort()),
+    "killedWriterChanges：日誌記下的，加上開著的 session 之後的差異；死後才改的（超過心跳加寬限）不算",
+    JSON.stringify([...changed.only].sort()) === JSON.stringify(["java/com/x/A.java", "java/com/x/D.java", "java/com/x/E.java"]),
+    JSON.stringify([...changed.only].sort()),
+  );
+  check(
+    "killedWriterChanges：不見了的檔，所在目錄在那之後沒動過 → 算 writer 刪的、放回；目錄也不見了 → 無法判斷，不放回",
+    changed.only.has("java/com/x/D.java") && JSON.stringify(changed.undecided) === '["java/com/y/G.java"]',
+    JSON.stringify(changed),
+  );
+  const later = killedWriterChanges(dead, nowTree, (rel) => ({ ...mtimes, "java/com/x": 5_000 + 60_000 + 1 })[rel], 60_000);
+  check(
+    "killedWriterChanges：不見了的檔，所在目錄在那次執行死後又被改過（分支切換、別人刪的）→ 無法判斷，不放回",
+    !later.only.has("java/com/x/D.java") && later.undecided.includes("java/com/x/D.java"),
+    JSON.stringify(later),
   );
   check(
     "killedWriterChanges：沒有開著的 session → 只有日誌記下的",
-    JSON.stringify([...killedWriterChanges({ trace: { written: ["java/X.java"] }, lastSeen: 0 }, nowTree, () => undefined, 0)]) === '["java/X.java"]',
+    JSON.stringify([...killedWriterChanges({ trace: { written: ["java/X.java"] }, lastSeen: 0 }, nowTree, () => 0, 0).only]) === '["java/X.java"]',
   );
 
   // A journal written and read back: what setAside needs, from disk.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-journal-"));
-  const tree = path.join(root, "repo", "src", "test");
+  const repoRoot = path.join(root, "repo");
+  const tree = path.join(repoRoot, "src", "test");
   fs.mkdirSync(path.join(tree, "java", "com", "x"), { recursive: true });
   fs.writeFileSync(path.join(tree, "java", "com", "x", "ATest.java"), "class ATest {}");
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "BTest.java"), "class BTest { int b; }");
   fs.writeFileSync(path.join(tree, "java", "com", "x", "Big.json"), "x".repeat(64));
-  const out = path.join(root, "repo", "target", "test-classes");
+  const out = path.join(repoRoot, "target", "test-classes");
   fs.mkdirSync(path.join(out, "com", "x"), { recursive: true });
   fs.writeFileSync(path.join(out, "com", "x", "ATest.class"), "cafebabe");
+  check("dirIdentity：目錄的 dev:ino；不存在的 → \"\"", /^\d+:\d+$/.test(dirIdentity(repoRoot)) && dirIdentity(path.join(root, "nope")) === "", dirIdentity(repoRoot));
   const cap = captureTree(tree, { file: 32, total: 1024 });
   const runs = path.join(root, "runs");
   const runDir = path.join(runs, "2026-01-01T00-00-00-000Z");
   const batchDir = path.join(runDir, "batch-2-A");
-  const repoRoot = path.join(root, "repo");
+  const checkout = { repoRoot, rootId: dirIdentity(repoRoot) };
   const handle = openJournal(
-    { repoRoot, pid: 4243, ...thisHost(), runDir, batch: 2, dir: batchDir, targetClasses: ["src/main/java/com/x/A.java"], testTree: tree, treeRel: "src/test" },
+    {
+      repoRoot,
+      rootId: checkout.rootId,
+      treeId: dirIdentity(tree),
+      pid: 4243,
+      start: "777",
+      ...thisHost(),
+      runDir,
+      batch: 2,
+      dir: batchDir,
+      targetClasses: ["src/main/java/com/x/A.java"],
+      testTree: tree,
+      treeRel: "src/test",
+    },
     cap,
     captureOutputs([out]),
     50,
   );
   const jdir = handle.dir;
+  check(
+    "openJournal：批次開始時的內容寫成單一檔案（不是一個檔一份）",
+    fs.existsSync(path.join(jdir, "start.bin")) && !fs.existsSync(path.join(jdir, "start")),
+    fs.readdirSync(jdir).join(","),
+  );
   traceJournal(handle, { written: ["java/com/x/ATest.java"] });
   // The heartbeat: the journal's time moves while its run lives, and stops once it is closed.
   const t0 = new Date(Date.now() - 3_600_000);
@@ -5331,32 +5486,83 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
     await new Promise((r) => setTimeout(r, 20));
   }
   check("openJournal：心跳在執行期間更新日誌的時間", fs.statSync(path.join(jdir, "journal.json")).mtimeMs > t0.getTime() + 1_000);
-  const found = findJournals(runs, repoRoot, () => false);
+  const nobody = { alive: () => false, start: () => undefined };
+  const found = findJournals(runs, checkout, nobody);
   const d = found.dead[0];
-  check("findJournals：死掉的 run 留下的日誌找得到，連同 writer 的變更", found.dead.length === 1 && d.trace.written[0] === "java/com/x/ATest.java", JSON.stringify(found));
+  check("findJournals：死掉的 run 留下的日誌找得到，連同 writer 的變更", found.dead.length === 1 && d.trace.written[0] === "java/com/x/ATest.java", JSON.stringify(found).slice(0, 300));
   const back = d ? journalCapture(d) : undefined;
   check(
-    "journalCapture：批次開始時的樹原樣讀回（內容、太大沒留的指紋、目錄）",
+    "journalCapture：批次開始時的樹原樣讀回（每個檔的內容、太大沒留的指紋、目錄）",
     !!back &&
       back.files.get("java/com/x/ATest.java")?.toString() === "class ATest {}" &&
+      back.files.get("java/com/x/BTest.java")?.toString() === "class BTest { int b; }" &&
       back.files.get("java/com/x/Big.json") === null &&
       back.fingerprints.get("java/com/x/Big.json") === cap.fingerprints.get("java/com/x/Big.json") &&
       back.dirs.has("java/com/x") &&
       back.root === tree,
   );
   check("journalOutputs：建置輸出的清單讀回", !!d && [...journalOutputs(d).dirs[0].files].includes("com/x/ATest.class"));
-  check("findJournals：別的 repo 路徑的日誌不理（不算死的、也不丟）", JSON.stringify(findJournals(runs, "/elsewhere", () => false)) === '{"dead":[],"stale":[],"running":0}');
-  check("findJournals：那次執行還活著（pid 在、心跳新鮮）→ 只計數，不動", findJournals(runs, repoRoot, (pid) => pid === 4243).running === 1);
+  const none = (r: ReturnType<typeof findJournals>) => r.dead.length === 0 && r.stale.length === 0 && r.running === 0;
+  check("findJournals：別的 repo 路徑的日誌不理（不算死的、也不丟）", none(findJournals(runs, { ...checkout, repoRoot: "/elsewhere" }, nobody)));
+  const other = findJournals(runs, checkout, nobody, { host: "another-machine", boot: thisHost().boot });
+  check(
+    "findJournals：別台機器寫的日誌（共用 runs 目錄、同一個路徑、它自己的 checkout）→ 不碰，只計數",
+    none(other) && other.elsewhere === 1,
+    JSON.stringify(other),
+  );
+  check("findJournals：那次執行還是同一個程序（啟動時間相同）→ 只計數，不動", findJournals(runs, checkout, { alive: () => true, start: (pid) => (pid === 4243 ? "777" : undefined) }).running === 1);
+  const recloned = findJournals(runs, { ...checkout, rootId: "1:1" }, nobody);
+  check("findJournals：這個路徑現在是另一個 checkout（重新 clone 過）→ 丟掉，不撤回", recloned.dead.length === 0 && /重新 clone/.test(recloned.stale[0]?.why ?? ""), JSON.stringify(recloned));
+  // Read from another container on this machine: same name and boot, its own pid namespace.
+  const container = { ...thisHost(), pidns: "pid:[1]" };
+  const theirCheckout = findJournals(runs, { ...checkout, rootId: "1:1" }, nobody, container, Date.now() + 10 * 60_000);
+  check(
+    "findJournals：另一個容器寫的、checkout 不是這一個（它自己同路徑的 checkout）→ 不丟，只計數",
+    none(theirCheckout) && theirCheckout.elsewhere === 1,
+    JSON.stringify(theirCheckout),
+  );
+  const fromContainer = findJournals(runs, checkout, { alive: () => true, start: () => "777" }, container);
+  check(
+    "findJournals：另一個容器寫的、同一個 checkout（共用的 volume）→ pid 不算數，心跳還新鮮就是還在跑",
+    fromContainer.running === 1 && fromContainer.dead.length === 0,
+    JSON.stringify(fromContainer),
+  );
+  const containerDied = findJournals(runs, checkout, { alive: () => true, start: () => "777" }, container, Date.now() + 10 * 60_000);
+  check(
+    "findJournals：另一個容器寫的、同一個 checkout、心跳停了 → 死了，撤回",
+    containerDied.dead.length === 1,
+    JSON.stringify(containerDied).slice(0, 300),
+  );
   fs.writeFileSync(path.join(runDir, "summary.json"), "{}");
-  const ended = findJournals(runs, repoRoot, () => false);
-  check("findJournals：那次執行有 summary.json（有收尾）→ 日誌是剩下的，列為可丟", ended.dead.length === 0 && ended.stale[0] === jdir, JSON.stringify(ended));
+  const ended = findJournals(runs, checkout, nobody);
+  check("findJournals：那次執行有 summary.json（有收尾）→ 日誌是剩下的，列為可丟", ended.dead.length === 0 && ended.stale[0]?.dir === jdir, JSON.stringify(ended));
   fs.rmSync(path.join(runDir, "summary.json"));
+  fs.writeFileSync(path.join(jdir, "trace.json"), '{"written":null}');
+  check("findJournals：trace.json 損毀 → 丟掉，不拿它撤回", /損毀/.test(findJournals(runs, checkout, nobody).stale[0]?.why ?? ""));
+  fs.rmSync(path.join(jdir, "trace.json"));
+  const journalText = fs.readFileSync(path.join(jdir, "journal.json"), "utf8");
+  fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ ...JSON.parse(journalText), capture: null }));
+  check("findJournals：journal.json 解析得了、但欄位不對 → 丟掉（每次啟動都當掉不是選項）", /損毀/.test(findJournals(runs, checkout, nobody).stale[0]?.why ?? ""));
+  check("isJournal：欄位齊全才算", isJournal(JSON.parse(journalText)) && !isJournal({ ...JSON.parse(journalText), outputs: [null] }) && !isJournal(null));
+  fs.writeFileSync(path.join(jdir, "journal.json"), journalText);
+  fs.renameSync(tree, `${tree}-moved`);
+  const gone = findJournals(runs, checkout, nobody);
+  check("findJournals：它的測試目錄不見了 → 丟掉，不重建", gone.dead.length === 0 && /測試目錄/.test(gone.stale[0]?.why ?? ""), JSON.stringify(gone));
+  fs.mkdirSync(tree, { recursive: true });
+  const rebuilt = findJournals(runs, checkout, nobody);
+  check(
+    "findJournals：它的測試目錄被刪掉又建了一個（不是同一個目錄）→ 丟掉",
+    dirIdentity(tree) === "" || (rebuilt.dead.length === 0 && /測試目錄/.test(rebuilt.stale[0]?.why ?? "")),
+    JSON.stringify(rebuilt),
+  );
+  fs.rmSync(tree, { recursive: true, force: true });
+  fs.renameSync(`${tree}-moved`, tree);
   fs.rmSync(path.join(jdir, "journal.json"));
-  const cut = findJournals(runs, repoRoot, () => false);
-  check("findJournals：寫到一半就被終止的日誌（沒有 journal.json）→ 可丟", cut.dead.length === 0 && cut.stale[0] === jdir, JSON.stringify(cut));
-  check("findJournals：寫到一半、但寫它的執行還活著 → 不丟", findJournals(runs, repoRoot, (pid) => pid === 4243).running === 1);
+  const cut = findJournals(runs, checkout, nobody);
+  check("findJournals：寫到一半就被終止的日誌（沒有 journal.json）→ 可丟", cut.dead.length === 0 && cut.stale[0]?.dir === jdir, JSON.stringify(cut));
+  check("findJournals：寫到一半、但寫它的執行還活著 → 不丟", findJournals(runs, checkout, { alive: () => true, start: (pid) => (pid === 4243 ? "777" : undefined) }).running === 1);
   fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ version: 99, repoRoot, pid: 4243, runDir }));
-  check("findJournals：別的版本寫的日誌 → 不理", JSON.stringify(findJournals(runs, repoRoot, () => false)) === '{"dead":[],"stale":[],"running":0}');
+  check("findJournals：別的版本寫的日誌 → 不理", none(findJournals(runs, checkout, nobody)));
   closeJournal(handle);
   check("closeJournal：日誌目錄刪掉", !fs.existsSync(jdir));
   fs.mkdirSync(jdir, { recursive: true });
@@ -5364,6 +5570,44 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
   fs.utimesSync(path.join(jdir, "journal.json"), t0, t0);
   await new Promise((r) => setTimeout(r, 200));
   check("closeJournal：心跳跟著停（不再碰同一個路徑）", fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000);
+  // A journal that cannot be written is not left behind half-written: its batch dir is a file here.
+  fs.writeFileSync(path.join(root, "not-a-dir"), "");
+  let threw = false;
+  try {
+    openJournal(
+      { repoRoot, rootId: "", treeId: "", pid: 1, start: "", ...thisHost(), runDir, batch: 3, dir: path.join(root, "not-a-dir"), targetClasses: [], testTree: tree, treeRel: "src/test" },
+      cap,
+      captureOutputs([]),
+      50,
+    );
+  } catch {
+    threw = true;
+  }
+  check("openJournal：寫不進去就丟出（呼叫端警告、照常往下），不留下半份日誌", threw && fs.statSync(path.join(root, "not-a-dir")).isFile());
+  // Cut short partway — the disk full while the tree is copied in: nothing of it is left behind.
+  const exploding = {
+    *[Symbol.iterator]() {
+      yield ["java/com/x/ATest.java", Buffer.from("class ATest {}")] as [string, Buffer];
+      throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+    },
+  } as unknown as Map<string, Buffer | null>;
+  const halfDir = path.join(runDir, "batch-4-H");
+  let halfThrew = false;
+  try {
+    openJournal(
+      { repoRoot, rootId: "", treeId: "", pid: 1, start: "", ...thisHost(), runDir, batch: 4, dir: halfDir, targetClasses: [], testTree: tree, treeRel: "src/test" },
+      { ...cap, files: exploding },
+      captureOutputs([]),
+      50,
+    );
+  } catch {
+    halfThrew = true;
+  }
+  check(
+    "openJournal：寫到一半失敗（磁碟滿）→ 丟出，已經寫了的那一半刪掉",
+    halfThrew && fs.existsSync(halfDir) && !fs.existsSync(path.join(halfDir, JOURNAL_DIR)),
+    fs.existsSync(halfDir) ? fs.readdirSync(halfDir, { recursive: true }).join(",") : "(no batch dir)",
+  );
   fs.rmSync(root, { recursive: true, force: true });
 }
 
@@ -5385,20 +5629,51 @@ console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）
   if (process.platform !== "win32") {
     const viaPs = processStart(process.pid, "darwin");
     check("processStart（其他 POSIX，ps -o lstart=）：讀得到、兩次一樣", !!viaPs && viaPs === processStart(process.pid, "darwin"), String(viaPs));
+    // ps prints the start in the local zone: two runs under different TZ would never match each other's.
+    const savedTz = process.env.TZ;
+    process.env.TZ = "TST-8"; // a POSIX zone, eight hours east: no tz database needed
+    const underTaipei = processStart(process.pid, "darwin");
+    const local = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" }).stdout.trim();
+    if (savedTz === undefined) delete process.env.TZ;
+    else process.env.TZ = savedTz;
+    check(
+      "processStart（ps）：不論使用者的時區與語系，都用同一種格式與 UTC（兩次執行在不同 TZ 下也認得彼此的子程序）",
+      !!viaPs && underTaipei === viaPs && (local === "" || local !== viaPs),
+      `${underTaipei} / ${viaPs} / local ${local}`,
+    );
   }
   check("processStart：Windows 沒有便宜的辦法 → undefined（只點名、不結束）", processStart(process.pid, "win32") === undefined);
   const done = spawnSync(process.execPath, ["-e", "0"]);
   check("processStart：已經結束的程序 → undefined", processStart(done.pid ?? 0) === undefined && processStart(0x3ffffffe) === undefined);
 
   const rec = { pid: 4242, start: "563817", cmd: "mvn test" };
-  check("orphanAction：同一個程序（啟動時間相同）→ 結束它的程序群組", orphanAction(rec, { start: "563817", groupAlive: true }) === "stop");
-  check("orphanAction：pid 被別的程序重用（啟動時間不同）→ 不是它的", orphanAction(rec, { start: "999", groupAlive: true }) === "not-ours");
+  const win = { from: 1_000_000, to: 2_000_000 };
+  const act = (o: Parameters<typeof orphanAction>[1]) => JSON.stringify(orphanAction(rec, o, win));
+  check("orphanAction：同一個程序（啟動時間相同）→ 結束它的程序群組", act({ start: "563817", groupAlive: true }) === '{"kind":"stop-group"}');
+  check("orphanAction：pid 被別的程序重用（啟動時間不同）→ 不是它的", act({ start: "999", groupAlive: true }) === '{"kind":"not-ours"}');
   check(
     "orphanAction：沒記到啟動時間 → 無從確認，不碰還在的程序",
-    orphanAction({ ...rec, start: "" }, { start: "563817", groupAlive: true }) === "not-ours",
+    JSON.stringify(orphanAction({ ...rec, start: "" }, { start: "563817", groupAlive: true }, win)) === '{"kind":"not-ours"}',
   );
-  check("orphanAction：launcher 已經結束、群組還有成員（fork 出來的 JVM）→ 結束群組", orphanAction(rec, { groupAlive: true }) === "stop");
-  check("orphanAction：都不在了 → gone", orphanAction(rec, { groupAlive: false }) === "gone");
+  check("orphanAction：都不在了 → gone", act({ groupAlive: false }) === '{"kind":"gone"}');
+  check(
+    "orphanAction：launcher 已經不在、群組還有程序 → 只結束那次執行還活著時啟動的（fork 出去的 JVM）；之後才啟動的可能是別人重用了這個群組 id，只列出",
+    act({ groupAlive: true, members: [{ pid: 11, startMs: 1_500_000 }, { pid: 12, startMs: 2_500_000 }, { pid: 13 }] }) ===
+      '{"kind":"stop-members","pids":[11],"left":[12,13]}',
+    act({ groupAlive: true, members: [{ pid: 11, startMs: 1_500_000 }, { pid: 12, startMs: 2_500_000 }, { pid: 13 }] }),
+  );
+  check(
+    "orphanAction：比那個子程序還早啟動的成員不是它 fork 的",
+    act({ groupAlive: true, members: [{ pid: 14, startMs: 900_000 }] }) === '{"kind":"stop-members","pids":[],"left":[14]}',
+  );
+  check("orphanAction：launcher 不在、又看不到成員何時啟動（沒有 /proc）→ 只回報，不結束", act({ groupAlive: true }) === '{"kind":"report"}');
+  if (process.platform === "linux") {
+    const mine = processStart(process.pid);
+    const started = mine ? startMsOf(mine) : undefined;
+    const expected = Date.now() - process.uptime() * 1000;
+    check("startMsOf：/proc 的啟動時間換算成時刻（誤差在幾秒內）", started !== undefined && Math.abs(started - expected) < 3_000, `${started} vs ${expected}`);
+  }
+  check("groupMembers：不是 Linux → 看不到（undefined）", groupMembers(process.pid, "darwin") === undefined);
 
   if (process.platform !== "win32") {
     // A real process group, and a zombie in it: `sleep 0.1` ends while its parent (which exec'd into
@@ -5407,6 +5682,15 @@ console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）
     const zombie = Number(await new Promise<string>((r) => leader.stdout!.once("data", (d) => r(String(d)))));
     await new Promise((r) => setTimeout(r, 400));
     check("groupAlive：群組裡還有在跑的程序 → true", groupAlive(leader.pid!), String(leader.pid));
+    if (process.platform === "linux") {
+      const members = groupMembers(leader.pid!) ?? [];
+      check(
+        "groupMembers：列出群組裡還在跑的程序與啟動時間，已經結束的（zombie）不列",
+        members.some((m) => m.pid === leader.pid && m.startMs !== undefined && Math.abs(m.startMs - Date.now()) < 10_000) &&
+          !members.some((m) => m.pid === zombie),
+        JSON.stringify(members),
+      );
+    }
     if (process.platform === "linux") {
       let isZombie = false;
       try {
@@ -5425,7 +5709,12 @@ console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）
   // The children journal: a tracked child is on disk while it runs, and off it once it has ended.
   const jdir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-children-"));
   const file = path.join(jdir, "children.json");
-  journalChildren(file, { repoRoot: "/repo", host: "box", boot: 1, pid: process.pid, start: me ?? "" });
+  journalChildren(file, { repoRoot: "/repo", host: "box", boot: 1, pid: process.pid, start: me ?? "" }, 50);
+  const t0 = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(file, t0, t0);
+  const beatWait = Date.now() + 2_000;
+  while (fs.statSync(file).mtimeMs < t0.getTime() + 1_000 && Date.now() < beatWait) await new Promise((r) => setTimeout(r, 20));
+  check("journalChildren：心跳在執行期間更新紀錄的時間（下一次執行拿它當最後還活著的時刻）", fs.statSync(file).mtimeMs > t0.getTime() + 1_000);
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { detached: DETACH_CHILDREN, stdio: "ignore" });
   trackForShutdown(child);
   const listed = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -5438,6 +5727,9 @@ console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）
   await new Promise((r) => child.once("exit", r));
   check("journalChildren：子程序結束就從紀錄移除", JSON.parse(fs.readFileSync(file, "utf8")).children.length === 0);
   journalChildren(undefined);
+  fs.utimesSync(file, t0, t0);
+  await new Promise((r) => setTimeout(r, 200));
+  check("journalChildren(undefined)：不再記錄，心跳也停", fs.statSync(file).mtimeMs < t0.getTime() + 1_000);
   fs.rmSync(jdir, { recursive: true, force: true });
 }
 

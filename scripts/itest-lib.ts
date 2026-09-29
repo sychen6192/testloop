@@ -90,6 +90,9 @@ export interface MvnStep {
   /** With linger: what lingers is a process the build started in its own process group (surefire's
    *  forked JVM); the build itself ends at once. */
   lingerFork?: boolean;
+  /** With linger: while it lingers, the orphan keeps writing this file (repo-relative) — an agent
+   *  session still writing src/test after its run was killed. */
+  lingerWrite?: { file: string; content: string };
   /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
    *  a rollback cannot put a file back at, whatever its privileges. */
   pipeDirAt?: string;
@@ -179,6 +182,9 @@ export interface Scenario {
     backdateMs?: number;
     /** One replacement in a file between the runs (`{{firstRun}}` as in `between`). */
     rewrite?: { file: string; from: RegExp; to: string };
+    /** Between the runs, this file (repo-relative) becomes a directory holding a named pipe (POSIX): a
+     *  path nothing can put a file back at. */
+    pipeDirAt?: string;
   };
   mvn: MvnStep[];
 }
@@ -201,6 +207,9 @@ export interface ApiTurn {
   interrupt?: boolean;
   /** The run holding the repo's lock is SIGKILLed while this turn is served: no handler runs, nothing is undone. */
   kill?: boolean;
+  /** Files the endpoint deletes (relative to the fixture root) while serving this turn — a writer runtime
+   *  that can delete (opencode's), which the api runner's own tools cannot. */
+  sideDelete?: string[];
   /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file while
    *  this turn is served: whatever the run writes there next fails — a crash mid-round. */
   breakRunDir?: boolean;
@@ -394,6 +403,12 @@ if (step.killLoop && process.platform !== "win32") {
   process.kill(process.ppid, "SIGKILL");
   // Nothing is written to stdout from here: the pipe's reader is gone.
   if (step.linger && !step.lingerFork) {
+    if (step.lingerWrite) {
+      const target = path.join(root, step.lingerWrite.file);
+      setInterval(() => {
+        try { fs.writeFileSync(target, step.lingerWrite.content); } catch (e) { /* its directory may be gone */ }
+      }, 50);
+    }
     setTimeout(() => process.exit(0), step.linger);
     return;
   }

@@ -230,16 +230,20 @@ export function matchesTestNaming(className: string, fileName: string): boolean 
 
 // Existing test files for a target class, repo-relative, canonical <ClassName>Test.java first.
 // The writer is told about these explicitly: left to infer it, it writes a second file
-// (FooUnitTest.java) beside the one that already exists.
+// (FooUnitTest.java) beside the one that already exists. A name two classes of the package could
+// claim goes to the one it names whole: TimeUnitTest.java is TimeUnit's test, not Time's, when there
+// is a TimeUnit — handing it to Time's writer had the two classes edit each other's tests.
 export function findExistingTests(clsRelPath: string, repoRoot: string): string[] {
   const expected = expectedTestPath(clsRelPath);
   const dir = path.dirname(expected).replace(/\\/g, "/");
   const className = path.basename(clsRelPath).replace(/\.java$/, "");
   const absDir = path.join(repoRoot, dir);
   if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) return [];
+  const sibling = (name: string) => fs.existsSync(path.join(repoRoot, path.dirname(clsRelPath), `${name}.java`));
   return fs
     .readdirSync(absDir)
     .filter((f) => matchesTestNaming(className, f))
+    .filter((f) => !(new RegExp(`^${className.replace(/[$]/g, "\\$")}UnitTests?\\.java$`).test(f) && sibling(`${className}Unit`)))
     .map((f) => `${dir}/${f}`)
     .sort((a, b) => (a === expected ? -1 : b === expected ? 1 : a.localeCompare(b)));
 }

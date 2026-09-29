@@ -499,10 +499,11 @@ export interface ChildRecord {
 }
 
 export interface ChildrenJournal {
-  /** Canonical repo root, host and boot (libs/lock.ts, libs/batch.ts thisHost): whose, and where they run. */
+  /** Canonical repo root, host, boot and pid namespace (libs/lock.ts, libs/batch.ts thisHost): whose, and where they run. */
   repoRoot: string;
   host: string;
   boot: number;
+  pidns?: string;
   /** The run itself: its pid and processStart(). */
   pid: number;
   start: string;
@@ -510,11 +511,28 @@ export interface ChildrenJournal {
 }
 
 const childRecords = new Map<ChildProcess, ChildRecord>();
-let childrenJournal: { file: string; owner: Omit<ChildrenJournal, "children"> } | undefined;
+let childrenJournal: { file: string; owner: Omit<ChildrenJournal, "children">; beat: ReturnType<typeof setInterval> } | undefined;
 
-/** From here on, the children being tracked are kept in `file` as well (undefined: no longer). */
-export function journalChildren(file: string | undefined, owner?: Omit<ChildrenJournal, "children">): void {
-  childrenJournal = file && owner ? { file, owner } : undefined;
+/**
+ * From here on, the children being tracked are kept in `file` as well (undefined: no longer). Its
+ * time is kept current while the run lives: what the next run takes as the moment it was last alive,
+ * once this one is killed. `beatMs`: for the selftest.
+ */
+export function journalChildren(file: string | undefined, owner?: Omit<ChildrenJournal, "children">, beatMs = 30_000): void {
+  if (childrenJournal) clearInterval(childrenJournal.beat);
+  childrenJournal = undefined;
+  if (file && owner) {
+    const beat = setInterval(() => {
+      const now = new Date();
+      try {
+        fs.utimesSync(file, now, now);
+      } catch {
+        /* not written yet, or gone */
+      }
+    }, beatMs);
+    beat.unref();
+    childrenJournal = { file, owner, beat };
+  }
   persistChildren();
 }
 
@@ -568,7 +586,13 @@ export function processStart(pid: number, platform: string = process.platform): 
     }
   }
   try {
-    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 });
+    // One format and one zone whatever the user's are: two runs started under different LC_TIME or TZ
+    // would otherwise never recognise each other's children.
+    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+    });
     const out = r.status === 0 ? r.stdout.trim() : "";
     return out || undefined;
   } catch {
@@ -576,16 +600,77 @@ export function processStart(pid: number, platform: string = process.platform): 
   }
 }
 
+let clockTicks: number | undefined;
+/** Linux: when a process started, in ms since the epoch, from its /proc start time (clock ticks since boot). */
+export function startMsOf(ticks: string): number | undefined {
+  let btime: number | undefined;
+  try {
+    btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]);
+  } catch {
+    return undefined;
+  }
+  if (!btime) return undefined;
+  if (clockTicks === undefined) {
+    const r = spawnSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 5_000 });
+    clockTicks = Number(r.stdout?.trim()) || 100;
+  }
+  return btime * 1000 + (Number(ticks) * 1000) / clockTicks;
+}
+
+/** Linux: the processes of group `pgid` still running, with when each started. undefined elsewhere. */
+export function groupMembers(pgid: number, platform: string = process.platform): Array<{ pid: number; startMs?: number }> | undefined {
+  if (platform !== "linux") return undefined;
+  let pids: string[];
+  try {
+    pids = fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+  } catch {
+    return undefined;
+  }
+  const out: Array<{ pid: number; startMs?: number }> = [];
+  for (const p of pids) {
+    try {
+      const st = parseStat(fs.readFileSync(`/proc/${p}/stat`, "utf8"));
+      if (st && st.pgrp === pgid && !ended(st.state)) out.push({ pid: Number(p), startMs: startMsOf(st.start) });
+    } catch {
+      /* gone meanwhile */
+    }
+  }
+  return out;
+}
+
+export type OrphanAction =
+  | { kind: "stop-group" }
+  | { kind: "stop-members"; pids: number[]; left: number[] }
+  | { kind: "report" }
+  | { kind: "gone" }
+  | { kind: "not-ours" };
+
 /**
  * Pure: what to do with a child a killed run left recorded. Its leader still running as the same
- * process (same start time): take its group down. No process with that pid, but its group still
- * has members (a build's forked JVM outliving the launcher): theirs too — a group id is not handed
- * out again while any member lives. A process with that pid that started at another time is
- * someone else's: the pid was reused. And a record without a start time cannot be told from one.
+ * process (same start time): take its group down. A process with that pid that started at another
+ * time is someone else's (the pid was reused), and a record without a start time cannot be told from
+ * one. No process with that pid, but a group with that id still running (a build's forked JVM
+ * outliving the launcher): its id may have been handed out again — the pid reused by a process that
+ * led a group of its own and left it behind, as a script that backgrounds a server does — so only the
+ * members that started while the killed run was alive (`window`, from its child's start to the run's
+ * last sign of life) are taken down; the rest are named (`left`). Without start times to tell by
+ * (no /proc: `members` undefined), nothing of such a group is taken down: it is reported.
  */
-export function orphanAction(rec: ChildRecord, now: { start?: string; groupAlive: boolean }): "stop" | "gone" | "not-ours" {
-  if (now.start !== undefined) return rec.start && now.start === rec.start ? "stop" : "not-ours";
-  return now.groupAlive ? "stop" : "gone";
+export function orphanAction(
+  rec: ChildRecord,
+  now: { start?: string; groupAlive: boolean; members?: Array<{ pid: number; startMs?: number }> },
+  window: { from?: number; to: number },
+): OrphanAction {
+  if (now.start !== undefined) return rec.start && now.start === rec.start ? { kind: "stop-group" } : { kind: "not-ours" };
+  if (!now.groupAlive) return { kind: "gone" };
+  if (!now.members) return { kind: "report" };
+  const within = (m: { startMs?: number }) =>
+    m.startMs !== undefined && (window.from === undefined || m.startMs >= window.from - 2_000) && m.startMs <= window.to;
+  return {
+    kind: "stop-members",
+    pids: now.members.filter(within).map((m) => m.pid),
+    left: now.members.filter((m) => !within(m)).map((m) => m.pid),
+  };
 }
 
 /**

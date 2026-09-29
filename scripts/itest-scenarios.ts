@@ -559,6 +559,8 @@ const ORPHAN_REWRITES: Record<string, Partial<NonNullable<Scenario["rerun"]>>> =
   "loop-killed-orphan-other-checkout": { rewrite: { file: "{{firstRun}}/children.json", from: /"repoRoot":"[^"]*"/, to: '"repoRoot":"/elsewhere"' } },
   "loop-killed-orphan-other-host": { rewrite: { file: "{{firstRun}}/children.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
   "loop-killed-orphan-rebooted": { rewrite: { file: "{{firstRun}}/children.json", from: /"boot":\d+/, to: '"boot":1' } },
+  "loop-killed-orphan-other-container": { rewrite: { file: "{{firstRun}}/children.json", from: /"pidns":"[^"]*"/, to: '"pidns":"pid:[1]"' } },
+  "loop-killed-orphan-corrupt-record": { rewrite: { file: "{{firstRun}}/children.json", from: /"children":\[[^\]]*\]/, to: '"children":{"not":"a list"}' } },
   // This very process — alive, and the same process its start time says — stands in for the run.
   "loop-killed-orphan-owner-alive": {
     rewrite: {
@@ -581,6 +583,28 @@ const killedMidWriter = (o: { name: string; desc: string; rerun?: Omit<NonNullab
   },
   mvn: [BASE_EXISTING, CALC_BUILD, CALC_BUILD, GREETER_ROUND],
 });
+
+
+// For the resume review's cases: a test that passed but did not run this time, a test that failed at
+// the baseline, a helper the test reaches, and Gradle's up-to-date test task.
+const SUREFIRE_ALL_SKIPPED = (cls: string) =>
+  [`Test set: ${cls}`, "-------------------------------------------------------------------------------", "Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: {{elapsed}} s"].join("\n");
+const CALC_TEST_WITH_SUPPORT = CALC_TEST.replace(
+  "assertEquals(3, new Calc().add(1, 2));",
+  "assertEquals(3, new Calc().add(Support.one(), 2));",
+);
+const SUPPORT_JAVA = "package com.x;\n\nclass Support {\n    static int one() { return 1; }\n}\n";
+const CALC_FIXTURE_PATH = `${TEST_DIR}/CalcFixture.java`;
+const CALC_FIXTURE = "package com.x;\n\nclass CalcFixture {\n    static Calc calc() { return new Calc(); }\n}\n";
+const GRADLE_TEST_RAN = "> Task :compileTestJava\n> Task :test\n\nBUILD SUCCESSFUL in 1s\n";
+const GRADLE_TEST_UP_TO_DATE = "> Task :compileTestJava UP-TO-DATE\n> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 1s\n";
+const gradleResults = (...classes: string[]) =>
+  Object.fromEntries(
+    classes.map((cls) => [
+      `build/test-results/test/TEST-${cls}.xml`,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="${cls}" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.05">\n  <testcase name="t()" classname="${cls}" time="0.01"/>\n</testsuite>\n`,
+    ]),
+  );
 
 export const SCENARIOS: Scenario[] = [
   // ── The writer's scope ─────────────────────────────────────────────────────
@@ -3539,6 +3563,141 @@ export const SCENARIOS: Scenario[] = [
     rerunMvn: [{ ...CALC_BUILD, surefire: ran("com.x.CalcBehaviourTest", "com.x.ExistingTest") }],
   }),
   resumeCalc({
+    name: "loop-resume-touched-test-not-run",
+    desc: "Calc 那批的 writer 也改了 ExistingTest；這次預檢只跑了 ExistingTest、CalcTest 沒跑 → 不能拿 ExistingTest 有跑當證據，重新產生",
+    firstApi: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: EXISTING_PATH, content: `${EXISTING_TEST}// the writer touched it\n` } },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+    ],
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [{ ...BASE_EXISTING, jacoco: JACOCO_GREEN }, CALC_BUILD],
+  }),
+  resumeCalc({
+    name: "loop-resume-second-test-not-run",
+    desc: "Calc 以 CalcTest 與 CalcUnitTest 通過；這次預檢只跑了 CalcUnitTest → 每一個都要跑過才算，重新產生",
+    firstApi: [
+      {
+        toolCalls: [
+          { name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } },
+          { name: "write_file", args: { path: `${TEST_DIR}/CalcUnitTest.java`, content: CALC_TEST.replace("class CalcTest", "class CalcUnitTest") } },
+        ],
+      },
+      { content: "已建立 CalcTest.java 與 CalcUnitTest.java" },
+    ],
+    mvnFirst: [BASE_EXISTING, { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.CalcUnitTest", "com.x.ExistingTest") }],
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      { ...CALC_BUILD, surefire: ran("com.x.CalcUnitTest", "com.x.ExistingTest") },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.CalcUnitTest", "com.x.ExistingTest") },
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-tests-all-skipped",
+    desc: "這次預檢裡 CalcTest 的測試全部被略過 → 被略過不算跑過，重新產生",
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      { ...CALC_BUILD, surefire: [{ cls: "com.x.CalcTest", body: SUREFIRE_ALL_SKIPPED("com.x.CalcTest") }, ...ran("com.x.ExistingTest")] },
+      CALC_BUILD,
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-own-test-failed",
+    desc: "這次預檢時 CalcTest 失敗、重跑才過（不穩定）→ 它通過時的測試現在不是每次都過，review 的可靠度分數不再成立，重新產生",
+    rerun: {
+      api: [{ content: "看了一下，CalcTest 沒有要改的" }, ...RESUME_REWRITE_CALC],
+    },
+    rerunMvn: [
+      { exit: 1, out: TEST_FAILURE("com.x.CalcTest"), cleanSurefire: true, surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add_twoPositives_returnsSum", message: "flaky", line: 10 }]) }] },
+      CALC_BUILD, // the repair's rebuild: green, nothing changed
+      CALC_BUILD,
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-referenced-helper-edited",
+    desc: "CalcTest 用到既有的 Support.java（不是那批寫的）；通過後有人把 Support 改了 → 它是測試的一部分，重新產生",
+    extraFiles: { [SUPPORT_PATH]: SUPPORT_JAVA },
+    firstApi: [{ toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_WITH_SUPPORT } }] }, { content: "已建立 CalcTest.java" }],
+    rerun: { between: { [SUPPORT_PATH]: SUPPORT_JAVA.replace("return 1;", "return 1 + 0;") }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-no-test-class",
+    desc: "Calc 那批的 writer 只寫了 CalcFixture（不是測試類別），覆蓋率靠既有的測試 → 通過紀錄裡沒有會被執行的測試類別，無從確認它的測試有跑，重新產生",
+    firstApi: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_FIXTURE_PATH, content: CALC_FIXTURE } }] },
+      { content: "已建立 CalcFixture.java" },
+    ],
+    rerun: { api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-repair-changed-resource",
+    desc: "重跑的預檢在 LegacyTest 紅燈，修復迴圈改了一個測試資源才轉綠 → 任何測試都可能讀到它，Calc 的 review 分數不再成立，重新產生",
+    rerun: {
+      between: { [LEGACY_PATH]: LEGACY_FIXED },
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: "src/test/resources/legacy.properties", content: "mode=new\n" } }] },
+        { content: "已補上 legacy.properties" },
+        ...RESUME_REWRITE_CALC,
+      ],
+    },
+    rerunMvn: [
+      LEGACY_RED(),
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+    ],
+  }),
+  {
+    name: "loop-resume-last-class-set-aside",
+    desc: "資料夾兩個類別：第一次 Calc 過、Greeter 沒過；重跑接續 Calc、Greeter 又沒過 → 它仍是資料夾的一批，失敗的嘗試照樣移出 src/test",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: {
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+        { content: "已建立 GreeterTest.java" },
+      ],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER_RED] },
+      CALC_BUILD, // the rerun's baseline
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER_RED] },
+    ],
+  },
+  ...(["loop-resume-gradle", "loop-resume-gradle-up-to-date"] as const).map(
+    (name): Scenario => ({
+      name,
+      desc:
+        name === "loop-resume-gradle"
+          ? "Gradle：這次預檢的 test task 真的執行了、Calc 的測試在結果裡 → 照樣接續"
+          : "Gradle：這次預檢的 test task 是 UP-TO-DATE（build/test-results 是上一次留下的）→ 沒有這次的證據，重新產生",
+      entry: "loop",
+      buildTool: "gradle",
+      env: { UT_SKIP_REVIEW: "1" },
+      api: RESUME_WRITE_CALC,
+      rerun: { api: name === "loop-resume-gradle" ? [{ content: "不應該有任何 agent 請求" }] : RESUME_REWRITE_CALC },
+      mvn: [
+        { exit: 0, out: GRADLE_TEST_RAN, writeFiles: gradleResults("com.x.ExistingTest") },
+        { exit: 0, out: GRADLE_TEST_RAN, writeFiles: gradleResults("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN },
+        name === "loop-resume-gradle"
+          ? { exit: 0, out: GRADLE_TEST_RAN, writeFiles: gradleResults("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN }
+          : { exit: 0, out: GRADLE_TEST_UP_TO_DATE },
+        { exit: 0, out: GRADLE_TEST_RAN, writeFiles: gradleResults("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN },
+      ],
+    }),
+  ),
+  resumeCalc({
     name: "loop-resume-disabled",
     desc: "UT_RESUME=0 → 上次通過的也重新產生",
     rerun: { env: { UT_RESUME: "0" }, api: RESUME_REWRITE_CALC },
@@ -3673,6 +3832,8 @@ export const SCENARIOS: Scenario[] = [
       "loop-killed-orphan-other-checkout",
       "loop-killed-orphan-other-host",
       "loop-killed-orphan-rebooted",
+      "loop-killed-orphan-other-container",
+      "loop-killed-orphan-corrupt-record",
       "loop-killed-orphan-owner-alive",
     ] as const
   ).map(
@@ -3685,6 +3846,9 @@ export const SCENARIOS: Scenario[] = [
         "loop-killed-orphan-other-checkout": "同上，但那份子程序紀錄屬於共用 runs 目錄的另一個 checkout → 不碰",
         "loop-killed-orphan-other-host": "同上，但紀錄是另一台機器寫的（共用的 runs 目錄）→ 那些 pid 在這台沒有意義，不碰",
         "loop-killed-orphan-rebooted": "同上，但紀錄是重開機前寫的 → 那些程序不可能還在，現在用那些 pid 的都不是，不碰",
+        "loop-killed-orphan-corrupt-record": "同上，但子程序紀錄解析得了、children 卻不是清單（損毀）→ 認不出任何子程序，不碰、不當掉，照常收尾",
+        "loop-killed-orphan-other-container":
+          "同上，但紀錄是同一台機器上另一個容器寫的（共用主機名稱與開機時間，pid namespace 不同）→ 那些 pid 在這裡是別的程序，不碰",
         "loop-killed-orphan-owner-alive": "同上，但寫紀錄的那次執行其實還活著（繞過了 repo 鎖）→ 它的子程序是它自己的，不碰",
       }[name],
       entry: "loop",
@@ -3704,6 +3868,71 @@ export const SCENARIOS: Scenario[] = [
       ],
     }),
   ),
+  killedMidWriter({
+    name: "loop-killed-other-host",
+    desc: "復原日誌是另一台機器寫的（共用 runs 目錄、同一個 repo 路徑、它自己的 checkout）→ 它的樹不是這台的，完全不碰",
+    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/owner.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-recloned",
+    desc: "同一個路徑現在是另一個 checkout（repo 刪掉重新 clone 過）→ 那批留下的東西不可能在這裡，丟掉日誌、不撤回",
+    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"rootId":"[^"]*"/, to: '"rootId":"1:1"' } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-corrupt-journal",
+    desc: "復原日誌解析得了、但欄位壞了 → 丟掉它、照常執行，不是每次啟動都當掉",
+    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"capture":\{/, to: '"capture":null,"was":{' } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-deleted-after-death",
+    desc: "run 死掉之後有人刪了 ExistingTest.java（分支切換、別人的刪除拉進來）→ 不知道是誰刪的，不放回，原本的內容留在那批的 deleted/",
+    rerun: { backdateMs: 600_000, between: { [EXISTING_PATH]: null } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-restore-fails",
+    desc: "撤回時有檔案放不回去（位置被一個放了 named pipe 的目錄佔住）→ 這次先停下、日誌留著給下一次，不在寫到一半的測試上產生新的",
+    rerun: { pipeDirAt: EXISTING_PATH },
+  }),
+  {
+    name: "loop-killed-writer-deleted",
+    desc: "被終止的 writer 刪掉了既有的 ExistingTest.java（它的目錄在那之後沒被動過）→ 撤回時放回去",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }], sideDelete: [EXISTING_PATH] },
+      { kill: true },
+    ],
+    rerun: {
+      api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+    },
+    mvn: [BASE_EXISTING, CALC_BUILD, CALC_BUILD, GREETER_ROUND],
+  },
+  {
+    name: "loop-killed-orphan-writes-on",
+    desc: "run 在建置途中被 SIGKILL，留下的程序還一直寫 GreeterTest.java；重跑時那次執行的心跳早已停了 → 寫到被結束為止的都算那批的，照樣撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [...RESUME_WRITE_CALC, KILLED_WRITES, { content: "已建立 GreeterTest.java" }],
+    rerun: {
+      backdateMs: 600_000,
+      api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      {
+        exit: 0,
+        killLoop: true,
+        linger: 60_000,
+        lingerWrite: { file: GREETER_TEST_PATH, content: `// written by the orphan after its run died\n${GREETER_TEST}` },
+      },
+      CALC_BUILD,
+      GREETER_ROUND,
+    ],
+  },
   {
     name: "loop-killed-mid-build",
     desc: "第 2 批的 writer 已經寫完、run 在建置途中被 SIGKILL → 重跑依日誌記下的 writer 變更撤回",
