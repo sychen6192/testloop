@@ -82,7 +82,7 @@ const MAX_REFERENCED = 400;
  */
 export function referencedTestFiles(roots: string[], repoRoot: string, testTree: string): string[] {
   const byClass = new Map<string, string[]>();
-  const resources: Array<{ name: string; rel: string }> = [];
+  const resources = new Map<string, string[]>();
   const walk = (dir: string, onFile: (rel: string, name: string) => void) => {
     let entries: fs.Dirent[];
     try {
@@ -102,7 +102,7 @@ export function referencedTestFiles(roots: string[], repoRoot: string, testTree:
     const cls = name.slice(0, -".java".length);
     byClass.set(cls, [...(byClass.get(cls) ?? []), rel]);
   });
-  walk(`${tree}/resources`, (rel, name) => resources.push({ name, rel }));
+  walk(`${tree}/resources`, (rel, name) => resources.set(name, [...(resources.get(name) ?? []), rel]));
   const found = new Set<string>();
   const queue = roots.map(toSlash).filter((r) => r.endsWith(".java"));
   const seen = new Set(queue);
@@ -122,9 +122,10 @@ export function referencedTestFiles(roots: string[], repoRoot: string, testTree:
         queue.push(f);
       }
     }
-    for (const r of resources) {
-      if (!found.has(r.rel) && new RegExp(`["/\\\\]${r.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`).test(src)) found.add(r.rel);
-    }
+    // Resources, by the file name a string ends with — "fixtures/order.json", "/order.json",
+    // "classpath:order.json", "order.json": one pass over the text, looked up by name. A pattern per
+    // resource per file took a minute a class on a test tree with thousands of fixtures.
+    for (const m of src.matchAll(/["/\\:]([^"/\\:\r\n]+)"/g)) for (const r of resources.get(m[1]) ?? []) found.add(r);
   }
   return [...found].sort();
 }

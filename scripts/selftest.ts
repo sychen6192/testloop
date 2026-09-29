@@ -5309,6 +5309,18 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
     "referencedTestFiles：只在註解裡提到的名字不算",
     !referencedTestFiles([`${T}/java/com/x/CommentOnly.java`], root, T).includes(`${T}/java/com/x/Mentioned.java`),
   );
+  put(
+    `${T}/java/com/x/SqlTest.java`,
+    'package com.x;\n@Sql("classpath:seed.sql")\nclass SqlTest { void t() { load("data\\\\win.json"); load("myqux.json"); } }\n',
+  );
+  put(`${T}/resources/seed.sql`, "");
+  put(`${T}/resources/data/win.json`, "{}");
+  const sql = referencedTestFiles([`${T}/java/com/x/SqlTest.java`], root, T);
+  check(
+    "referencedTestFiles：classpath: 開頭、Windows 反斜線路徑裡點名的資源也算；只是名字結尾相同（myqux.json）的不算",
+    JSON.stringify(sql) === JSON.stringify([`${T}/resources/data/win.json`, `${T}/resources/seed.sql`]),
+    JSON.stringify(sql),
+  );
   const qux = passedEntries({
     classes: ["m/src/main/java/com/x/Qux.java"],
     repoRoot: root,
