@@ -38,6 +38,7 @@ import { execSync } from "node:child_process";
 import { banner, log, die } from "./libs/log";
 import { listJavaClasses, findModuleInfo, findExistingTests, stripRaw, codelessTypeReason, snapshotTree } from "./libs/utils";
 import { scanTestConventions } from "./libs/conventions";
+import { codeOnly, decodeJavaSource } from "./libs/javasrc";
 import { loadRubric } from "./libs/rubric";
 import { assertAgents } from "./libs/guard";
 import { getToolVersion } from "./libs/version";
@@ -47,6 +48,7 @@ import {
   detectEnvFailures,
   ExpectedTest,
   expectedTestOf,
+  flakyTestClasses,
   gradleTestTaskRan,
   runBaseline,
   targetModuleSkipped,
@@ -116,6 +118,7 @@ import {
   PassedEntry,
   readLedgers,
   sha256,
+  springLoaded,
   testClassOf,
   writeLedger,
 } from "./libs/resume";
@@ -499,7 +502,7 @@ async function main() {
     }
     if (clean) {
       greenSince = baselineStartedAt;
-      greenLog = repair?.success ? "" : baseline.raw;
+      greenLog = repair?.success ? (repair.raw ?? "") : baseline.raw;
     } else noGreenBaseline = "這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）";
     baselineFailing = {
       // The suites that failed, and the classes of the failing cases: a TestNG or JUnit 4 Suite
@@ -633,6 +636,7 @@ async function main() {
         testsOf: (cls) => findExistingTests(cls, REPO_ROOT),
         written: [...written].map((w) => path.relative(REPO_ROOT, path.join(testTree, w))),
         testTree: path.relative(REPO_ROOT, testTree),
+        charset: sourceEncoding?.name,
         rubric: rubricHash,
         verdict: verdict ? { scores: verdict.scores, blockers: verdict.blockers } : null,
         dir,
@@ -640,6 +644,47 @@ async function main() {
       }),
     );
     saveLedger();
+  };
+  // Tests that failed a build and passed its rebuild (the orchestrator's flakyTests) and that a pass
+  // in this run's ledger — this run's own, or one carried over — passed with: a pass holds only as
+  // long as its tests do, and the next run writes the class again. Marked, not removed: see invalid.
+  const forgetFlaky = (flaky: string[] | undefined) => {
+    if (!flaky?.length) return;
+    const unstable = new Set(flaky.map((c) => c.replace(/\$.*$/, "")));
+    const testRootRel = path.relative(REPO_ROOT, path.join(mod.moduleRoot, "src", "test", "java"));
+    let changed = false;
+    passes.forEach((e, i) => {
+      if (e.invalid) return;
+      const refs = new Set(e.refs ?? []);
+      const hit = Object.keys(e.files)
+        .filter((f) => !refs.has(f))
+        .map((f) => testClassOf(f, testRootRel))
+        .find((c) => !!c && unstable.has(c));
+      if (!hit) return;
+      log(`[接續] ${path.basename(e.cls, ".java")} 的通過紀錄作廢：它的測試 ${hit} 在這次執行中不穩定（建置失敗、重跑才通過），下次執行會重新產生`);
+      passes[i] = { ...e, invalid: `它的測試 ${hit} 在 ${path.basename(runDir)} 的執行中不穩定（建置失敗、重跑才通過）` };
+      changed = true;
+    });
+    if (changed) saveLedger();
+  };
+  // A later batch whose writer changed a file an earlier pass was recorded with — a shared helper it
+  // extended, a suite it added its test to: the pass holds for what its reviewer read, and the next run
+  // writes that class again. Said when it happens rather than left for the next run to find. Only the
+  // files the batch wrote are looked at.
+  const staleNoted = new Set<string>();
+  const noteStale = (batch: number, written: Iterable<string>) => {
+    const testTree = path.join(mod.moduleRoot, "src", "test");
+    const changed = new Set([...written].map((w) => path.relative(REPO_ROOT, path.join(testTree, w)).replace(/\\/g, "/")));
+    for (const e of passes) {
+      if (e.invalid || staleNoted.has(e.cls)) continue;
+      const hit = Object.keys(e.files).find((f) => changed.has(f) && hashFile(path.join(REPO_ROOT, f)) !== e.files[f]);
+      if (!hit) continue;
+      staleNoted.add(e.cls);
+      log(
+        `[接續] 第 ${batch} 批改了 ${hit}：${path.basename(e.cls, ".java")} 的通過紀錄不再相符（它的審查沒有看過這個版本），` +
+          "下次執行會重新產生它",
+      );
+    }
   };
   const resume = RESUME
     ? resumePassed({
@@ -653,6 +698,7 @@ async function main() {
         noGreenBaseline,
         baselineFailing,
         repairChanged: repair?.changedFiles ?? [],
+        charset: sourceEncoding?.name,
       })
     : { resumed: [], redo: [] };
   if (resume.resumed.length) {
@@ -696,6 +742,8 @@ async function main() {
       sourceEncoding,
       ranAtBaseline,
       recordPass,
+      forgetFlaky,
+      noteStale,
     });
     log(`artifacts 已寫入：${runDir}`);
     process.exit(code);
@@ -756,6 +804,7 @@ async function main() {
     log(`[WARN] 需要人工處理：這些測試不穩定（建置失敗、重跑通過）：${result.flakyTests.join("、")}`);
   }
   if (result.success) recordPass(pending, trace.written, result.finalVerdict, runDir);
+  forgetFlaky(result.flakyTests);
   fs.writeFileSync(
     path.join(runDir, "summary.json"),
     JSON.stringify({ ...result, repair, toleratedFailures: tolerate ?? [], ...resumedField() }, stripRaw, 2),
@@ -793,9 +842,11 @@ function resumePassed(o: {
   baselineFailing: { classes: string[]; files: string[] };
   /** What the repair changed, as the writer's changes are named (java/… relative to src/test/java, resources/…). */
   repairChanged: string[];
+  /** The module's source encoding (Java's name): its tests read as javac reads them. */
+  charset?: string;
 }): { resumed: Array<{ cls: string; entry: PassedEntry }>; redo: Array<{ cls: string; why: string }> } {
-  const ledger = readLedgers(RUNS_DIR, o.runDir);
   const slash = (p: string) => p.replace(/\\/g, "/");
+  const ledger = readLedgers(RUNS_DIR, o.runDir, o.targetClasses.map(slash));
   const known = o.targetClasses.filter((cls) => ledger.some((e) => e.cls === slash(cls)));
   if (!known.length) return { resumed: [], redo: [] };
   if (o.greenSince === undefined) {
@@ -813,9 +864,22 @@ function resumePassed(o: {
   const testRootRel = path.relative(REPO_ROOT, path.join(o.mod.moduleRoot, "src", "test", "java"));
   const failing = new Set(o.baselineFailing.classes);
   const failingFiles = new Set(o.baselineFailing.files);
+  // Failed and then passed when surefire ran them again (rerunFailingTestsCount, Gradle's test-retry):
+  // green, and no evidence that they pass.
+  const flaky = new Set(flakyTestClasses(o.buildTool, o.mod, o.greenSince, o.greenLog));
   // A test resource a repair changed is reached through profiles, classpath scanning and string
-  // paths — any test may read it: no pass holds on the verdict of a reviewer who never saw it.
-  const repairedResources = o.repairChanged.filter((c) => !c.endsWith(".java"));
+  // paths — any test may read it: no pass holds on the verdict of a reviewer who never saw it. So is a
+  // class Spring picks up without a test naming it: a @Component or @Configuration that component
+  // scanning finds, a @TestConfiguration a @SpringBootTest's search for configuration does.
+  const javaRoot = path.join(o.mod.moduleRoot, "src", "test", "java");
+  const repairedResources = o.repairChanged.filter((c) => {
+    if (!c.endsWith(".java")) return true;
+    try {
+      return springLoaded(codeOnly(decodeJavaSource(fs.readFileSync(path.join(javaRoot, c)), o.charset)));
+    } catch {
+      return false; // deleted: nothing left to load
+    }
+  });
   const redo: Array<{ cls: string; why: string }> = [];
   const candidates: Array<{ cls: string; entry: PassedEntry }> = [];
   for (const cls of known) {
@@ -854,20 +918,31 @@ function resumePassed(o: {
         const abs = path.join(REPO_ROOT, f);
         let declared: ExpectedTest | undefined;
         try {
-          declared = expectedTestOf(fs.readFileSync(abs, "latin1"), abs, "created");
+          declared = expectedTestOf(decodeJavaSource(fs.readFileSync(abs), o.charset), abs, "created");
         } catch {
           declared = undefined;
         }
         return { file: f, byPath: testClassOf(f, testRootRel)!, declared };
       });
-    // By its path and by the package it declares: they differ when a test sits in another folder.
-    const failed = tests.filter((t) => failing.has(t.byPath) || (t.declared && failing.has(t.declared.fqcn)) || failingFiles.has(t.file));
+    // By its path, by the package it declares — they differ when a test sits in another folder — and by
+    // its @DisplayName, which is what surefire's phrased reporters name a suite by.
+    const among = (set: Set<string>, t: (typeof tests)[number]) =>
+      set.has(t.byPath) || (!!t.declared && (set.has(t.declared.fqcn) || (!!t.declared.displayName && set.has(t.declared.displayName))));
+    const failed = tests.filter((t) => among(failing, t) || failingFiles.has(t.file));
     if (failed.length) {
       redo.push({ cls, why: `它的測試（${failed.map((t) => path.posix.basename(t.file, ".java")).join("、")}）在這次的預檢建置中失敗過` });
       continue;
     }
+    const unstable = tests.filter((t) => among(flaky, t));
+    if (unstable.length) {
+      redo.push({
+        cls,
+        why: `它的測試（${unstable.map((t) => path.posix.basename(t.file, ".java")).join("、")}）在這次的預檢建置中不穩定：失敗之後重跑才通過`,
+      });
+      continue;
+    }
     if (repairedResources.length) {
-      redo.push({ cls, why: `修復迴圈改過測試資源（${repairedResources.join("、")}），任何測試都可能讀到它` });
+      redo.push({ cls, why: `修復迴圈改過測試資源或 Spring 會自己載入的類別（${repairedResources.join("、")}），任何測試都可能讀到它` });
       continue;
     }
     const expected = tests.map((t) => t.declared).filter((t): t is ExpectedTest => !!t && !t.disabled);
@@ -875,7 +950,7 @@ function resumePassed(o: {
       redo.push({ cls, why: "上次通過時的檔案裡找不到會被執行的測試類別" });
       continue;
     }
-    const ranCheck = checkTestsRan(o.buildTool, o.mod, o.greenSince, o.greenLog, expected, [], true);
+    const ranCheck = checkTestsRan(o.buildTool, o.mod, o.greenSince, o.greenLog, expected, [], true, o.charset);
     if (!ranCheck) {
       redo.push({ cls, why: "這次的預檢建置認不出執行了哪些測試類別（報告關了或寫到別處），無法確認它的測試有執行" });
       continue;
@@ -987,6 +1062,10 @@ interface BatchRunInput {
   ranAtBaseline?: string[];
   /** A batch passed: what it passed with goes into this run's ledger (libs/resume.ts). */
   recordPass: (classes: string[], written: Iterable<string>, verdict: ReviewVerdict | undefined, dir: string) => void;
+  /** A batch's builds found these tests flaky: the passes in the ledger that hang on them are marked invalid. */
+  forgetFlaky: (flaky: string[] | undefined) => void;
+  /** A batch passed having written these (relative to src/test): earlier passes they no longer match. */
+  noteStale: (batch: number, written: Iterable<string>) => void;
 }
 
 const lastGate = (funnel: IterationRecord[]) => funnel[funnel.length - 1]?.gate;
@@ -1050,7 +1129,11 @@ async function runBatches(o: BatchRunInput): Promise<number> {
       run.inFlight = undefined;
     }
     if (r.success && r.ranTests) ranBefore = [...new Set([...(ranBefore ?? []), ...r.ranTests])].sort();
-    if (r.success) o.recordPass(batch, trace.written, r.finalVerdict, dir);
+    if (r.success) {
+      o.noteStale(i + 1, trace.written);
+      o.recordPass(batch, trace.written, r.finalVerdict, dir);
+    }
+    o.forgetFlaky(r.flakyTests);
     const rec: BatchRecord = {
       batch: i + 1,
       targetClasses: batch,

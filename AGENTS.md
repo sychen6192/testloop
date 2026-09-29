@@ -26,8 +26,9 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   rubric 載入、runner 設定檢查（預檢建置之前，`runners/runner.ts` 的 `runnerConfigProblems`）、startup guard、
   版本戳記、既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
   預檢之後略過先前的執行已通過、類別與測試檔（連同測試引用到的 helper 與資源，sha256）都沒變的目標類別——它們的
-  每一個測試類別都要在這次的預檢中執行（不是全部略過）而且沒有失敗過、覆蓋率從這次的報告重新量、review 分數以現在
-  的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，`UT_RESUME=0` 關閉）。
+  每一個測試類別都要在這次的預檢中執行（不是全部略過）而且沒有失敗過（重跑才過也算）、覆蓋率從這次的報告重新量、
+  review 分數以現在的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，`UT_RESUME=0` 關閉；
+  引用照 javac 的方式解析、原始碼以模組的編碼讀；同一次執行裡後面的批次改了前面紀錄裡的檔，那筆下次重做）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
@@ -43,7 +44,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
      並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`
      （只算編譯與測試的 goal）、Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`：surefire 在測試
      跑完後自己印的判定，不含測試自己的輸出；報告以 `<failure>`/`<error>` 元素判定、CDATA 是文字，重跑後通過的
-     flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）
+     flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）。
+     Gradle 一律 `cleanTest test -Dorg.gradle.caching=false`：`UP-TO-DATE`／`FROM-CACHE` 的 test task 沒有執行，結果不是這次的
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
      欄位宣告、型別宣告與它們上方只有註解的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
@@ -75,9 +77,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    新寫的測試類別、改過且 writer 介入前有執行的類別、加了測試的既有類別（介入前就沒執行也算——加在
    不會被執行的類別裡的測試等於沒寫）、以及跑完整模組時**每一個** writer 介入前有執行的類別
    （`ranAtBaseline`，分批時加上前面批次通過後執行的；測試資源裡的 discovery filter 也擋得到），都要在
-   這次建置的 surefire 報告或 log 的 `Running` 行裡出現；只要求來源仍是可執行的測試類別（沒有測試方法的
-   類別改成 abstract 是對的修法）。writer 新寫而測試全部 skipped 的也不算。類別層級 `@DisplayName` 命名的
-   報告會對回類別；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯會讓每一輪都 FAIL。
+   這次建置的 surefire 報告或 log 的 `Running` 行（只算目標模組的 surefire 區段）裡出現；只要求來源仍是可執行的
+   測試類別（沒有測試方法的類別改成 abstract 是對的修法）。writer 新寫而測試全部 skipped 的也不算（suite 報告裡它的
+   每個 case 都 skipped 也是）。類別層級 `@DisplayName` 命名的報告會對回類別（XML 裡的名字完全相同；檔名的 `?`
+   一個字對一個、模組裡沒有別的類別也對得上才算）；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯會讓每一輪都 FAIL。
    修復迴圈同樣套用，flaky 確認重跑也是。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
@@ -196,7 +199,7 @@ loop.ts               entry point（參數驗證/目標分流/rubric 載入/runn
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋綠燈看報告不看 exit code（testFailureIgnore／-fn／ignoreFailures）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p cleanTest test、關 build cache；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋綠燈看報告不看 exit code（testFailureIgnore／-fn／ignoreFailures）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先；逐行資料齊全時不計只有宣告的行、列出未覆蓋的行與分支）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory（含啟動前的 runner 設定檢查）＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
@@ -209,7 +212,7 @@ libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不�
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / codelessTypeReason / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
-libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）＋註解參數清除與只有宣告的行
+libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）＋註解參數清除與只有宣告的行＋以模組的編碼解碼原始碼
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記

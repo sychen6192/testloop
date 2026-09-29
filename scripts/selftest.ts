@@ -62,6 +62,8 @@ import {
   MAX_REFERENCED_RESOURCES,
   referencedTestFiles,
   resourcesNamed,
+  safeLedgerPath,
+  springLoaded,
   stringLiterals,
   sha256,
   testClassOf,
@@ -170,7 +172,7 @@ import {
   surefireVersionFromLog,
   surefireProviderFromLog,
 } from "../libs/teststack";
-import { codeOnly, declarationOnlyLines, decodeUnicodeEscapes } from "../libs/javasrc";
+import { codeOnly, declarationOnlyLines, decodeJavaSource, decodeUnicodeEscapes, javaStringValue } from "../libs/javasrc";
 import {
   planSpawn,
   resolveWindowsCommand,
@@ -202,6 +204,13 @@ import {
   gradleTestTaskRan,
   testsSkippedInLog,
   classesRunInLog,
+  classesRunInModuleLog,
+  flakyClassesInLog,
+  flakyClassesInReport,
+  flakyTestClasses,
+  lossyFileNameOf,
+  reportContents,
+  surefireSections,
   classifyEnvFailures,
   crashedTestClasses,
   expectedTestOf,
@@ -5130,6 +5139,212 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     phrased.join("、"),
   );
   for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+
+  // Two Chinese display names under a POSIX locale: both files are all "?"s, and the XML holds each
+  // name whole. One of them not run is not the other's report.
+  const calcShown = src("CalcShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass CalcShownTest { @Test void a() {} }\n');
+  const orderShown = src("OrderShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("訂單測試")\nclass OrderShownTest { @Test void a() {} }\n');
+  const calcT = expectedTestOf(fs.readFileSync(calcShown, "utf8"), calcShown, "created")!;
+  const orderT = expectedTestOf(fs.readFileSync(orderShown, "utf8"), orderShown, "created")!;
+  report("TEST-com.x.OldTest.xml");
+  report("TEST-????.xml", '<testsuite name="訂單測試" tests="1"><testcase name="a" classname="訂單測試"/></testsuite>');
+  const cjk = checkTestsRan("maven", mi, since, "", [calcT, orderT]);
+  check(
+    "checkTestsRan：只有「訂單測試」有報告（檔名在 POSIX locale 下是 ????）→「計算機測試」沒執行，別的類別的 display name 不算它的",
+    cjk?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+    JSON.stringify(cjk?.notRun.map((t) => t.fqcn)),
+  );
+  // No XML (disableXmlReport): the file name is all there is, one "?" for each character it lost.
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  report("com.x.OldTest.txt", "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0");
+  report("????.txt", "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0");
+  const byFile = checkTestsRan("maven", mi, since, "", [calcT, orderT]);
+  check(
+    "checkTestsRan：只有 .txt、檔名 ????——四個字的「訂單測試」算有執行，五個字的「計算機測試」不算",
+    byFile?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+    JSON.stringify(byFile?.notRun.map((t) => t.fqcn)),
+  );
+  const sameShape = src("PayShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("付款測試")\nclass PayShownTest { @Test void a() {} }\n');
+  const ambiguous = checkTestsRan("maven", mi, since, "", [orderT]);
+  check(
+    "checkTestsRan：模組裡另一個類別的 display name（「付款測試」）也寫得成 ???? → 這個檔名認不出是誰的，不算",
+    ambiguous?.notRun.map((t) => t.fqcn).join() === "com.x.OrderShownTest",
+    JSON.stringify(ambiguous?.notRun.map((t) => t.fqcn)),
+  );
+  fs.rmSync(sameShape);
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  report("TEST-com.x.OldTest.xml");
+  report("計算機測試.txt", "Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.01 s");
+  const shownSkipped = checkTestsRan("maven", mi, since, "", [calcT]);
+  check(
+    "checkTestsRan：以 @DisplayName 命名的它自己的報告（.txt 摘要）說全部被略過 → 全部被略過",
+    shownSkipped?.notRun.length === 0 && shownSkipped.allSkipped.length === 1 && shownSkipped.allSkipped[0].tests === 2,
+    JSON.stringify(shownSkipped),
+  );
+  // An MS950 module: the display name is what javac reads, not what the bytes read as UTF-8 or latin1 are.
+  const big5Name = Buffer.from([0xad, 0x70, 0xba, 0xe2, 0xbe, 0xf7, 0xb4, 0xfa, 0xb8, 0xd5]); // 計算機測試
+  const ms950 = path.join(m, "src", "test", "java", "com", "x", "CalcShownTest.java");
+  fs.writeFileSync(
+    ms950,
+    Buffer.concat([Buffer.from('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("'), big5Name, Buffer.from('")\nclass CalcShownTest { @Test void a() {} }\n')]),
+  );
+  check(
+    "decodeJavaSource + expectedTestOf：MS950 原始碼的 @DisplayName 以 MS950 讀出（計算機測試）",
+    expectedTestOf(decodeJavaSource(fs.readFileSync(ms950), "MS950"), ms950, "created")?.displayName === "計算機測試",
+  );
+  fs.writeFileSync(calcShown, 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass CalcShownTest { @Test void a() {} }\n');
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  check(
+    "expectedTestOf：@DisplayName 照 JUnit 的讀法——\\u 跳脫、value =、前後空白去掉；空白的不算名字",
+    et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("\\u8a08\\u7b97 ")\nclass FooTest { @Test void a() {} }')?.displayName === "計算" &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName(value = "Calc \\"x\\"")\nclass FooTest { @Test void a() {} }')?.displayName === 'Calc "x"' &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("  ")\nclass FooTest { @Test void a() {} }')?.displayName === undefined,
+  );
+  check(
+    "lossyFileNameOf：一個字一個 ?；ASCII 要一樣；沒有 ? 的檔名不用這條",
+    lossyFileNameOf("?????", "計算機測試") &&
+      !lossyFileNameOf("????", "計算機測試") &&
+      lossyFileNameOf("Calc ??", "Calc 加法") &&
+      !lossyFileNameOf("Calx ??", "Calc 加法") &&
+      !lossyFileNameOf("計算", "計算") &&
+      !lossyFileNameOf("a?", "ab"),
+  );
+  check(
+    "javaStringValue / decodeJavaSource：跳脫照 javac；MS950 的「處理成功」（第二個 byte 是 \\）不會把引號吃掉；不認得的編碼且不是 UTF-8 → 逐 byte",
+    javaStringValue("\\u8a08 \\\\u0041 \\\\\\u0041 \\t\\101") === "計 \\u0041 \\A \tA" &&
+      decodeJavaSource(Buffer.from([0x22, 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, 0x22]), "x-windows-950") === '"處理成功"' &&
+      decodeJavaSource(Buffer.from([0xa5, 0x5c]), "no-such-charset") === "\u00a5\\" &&
+      decodeJavaSource(Buffer.from("\ufeff計", "utf8")) === "計",
+  );
+
+  // A TestNG class skipped whole (a SkipException in its @BeforeClass): only TEST-TestSuite.xml, every case of it skipped.
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3" skipped="2"><testcase name="a" classname="com.x.NewTest"><skipped/></testcase><testcase name="b" classname="com.x.NewTest"><skipped message="no db"/></testcase><testcase name="c" classname="com.x.OldTest"/></testsuite>');
+  const ngSkipped = checkTestsRan("maven", mi, since, "", [newTest]);
+  check(
+    "checkTestsRan：只在 TestNG 的 TEST-TestSuite.xml 裡、它的每個 case 都 skipped → 全部被略過（suite 的總數不算）",
+    ngSkipped?.notRun.length === 0 && ngSkipped.allSkipped.length === 1 && ngSkipped.allSkipped[0].tests === 2,
+    JSON.stringify(ngSkipped?.allSkipped),
+  );
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3" skipped="1"><testcase name="a" classname="com.x.NewTest"><skipped/></testcase><testcase name="b" classname="com.x.NewTest"><system-out><![CDATA[<skipped/>]]></system-out></testcase><testcase name="c" classname="com.x.OldTest"/></testsuite>');
+  check(
+    "checkTestsRan：suite 裡它有一個 case 真的跑了（輸出裡的 <skipped/> 是文字）→ 不算全部被略過",
+    checkTestsRan("maven", mi, since, "", [newTest])?.allSkipped.length === 0,
+  );
+  fs.rmSync(path.join(reports, "TEST-TestSuite.xml"));
+  // A JUnit 4 Suite member skipped by an assumption in its @BeforeClass: one case, no name, skipped.
+  report("TEST-com.x.AllTests.xml", '<testsuite name="com.x.AllTests" tests="2" skipped="1"><testcase name="" classname="com.x.NewTest"><skipped/></testcase><testcase name="a" classname="com.x.OldTest"/></testsuite>');
+  const suiteSkipped = checkTestsRan("maven", mi, since, "", [newTest]);
+  check(
+    "checkTestsRan：JUnit 4 Suite 的成員，報告裡只有一個沒有名字、skipped 的 case → 全部被略過",
+    suiteSkipped?.notRun.length === 0 && suiteSkipped.allSkipped.length === 1,
+    JSON.stringify(suiteSkipped),
+  );
+  fs.rmSync(path.join(reports, "TEST-com.x.AllTests.xml"));
+  check(
+    "reportContents：testsuite 的名字、每個 classname 的 case 數與 skipped 數；CDATA 裡的標記是文字",
+    (() => {
+      const r = reportContents('<testsuite name="S"><testcase name="a" classname="p.A"/><testcase name="b" classname="p.A"><skipped/></testcase><testcase name="c" classname="p.B"><system-out><![CDATA[<testcase classname="p.C"/>]]></system-out></testcase></testsuite>');
+      return JSON.stringify(r.names.sort()) === JSON.stringify(["S", "p.A", "p.B"]) && r.cases.get("p.A")?.tests === 2 && r.cases.get("p.A")?.skipped === 1 && r.cases.get("p.B")?.skipped === 0 && !r.cases.has("p.C");
+    })(),
+  );
+
+  // Tests that failed and then passed when run again: green, and no evidence that they pass.
+  check(
+    "flakyClassesInReport：surefire 的 <flakyFailure>/<flakyError>、Gradle test-retry 同名一敗一過；真的失敗、略過、輸出裡的文字都不算",
+    JSON.stringify(
+      flakyClassesInReport(
+        '<testsuite name="com.x.CalcTest"><testcase name="a" classname="com.x.CalcTest"><flakyFailure message="x"/></testcase>' +
+          '<testcase name="b" classname="com.x.CalcTest$Inner"><flakyError/></testcase></testsuite>',
+      ),
+    ) === JSON.stringify(["com.x.CalcTest"]) &&
+      JSON.stringify(
+        flakyClassesInReport(
+          '<testsuite name="com.x.RetryTest"><testcase name="a" classname="com.x.RetryTest"><failure message="1"/></testcase><testcase name="a" classname="com.x.RetryTest"/>' +
+            '<testcase name="b" classname="com.x.StillTest"><failure/></testcase><testcase name="c" classname="com.x.SkipTest"><skipped/></testcase><testcase name="c" classname="com.x.SkipTest"><failure/></testcase>' +
+            '<testcase name="d" classname="com.x.TextTest"><system-out><![CDATA[<flakyFailure/>]]></system-out></testcase></testsuite>',
+        ),
+      ) === JSON.stringify(["com.x.RetryTest"]),
+  );
+  check(
+    "flakyClassesInLog：3.x 的「Flakes:」（類別.方法）、2.22 的（類別.方法(類別)）與 2.20 以前的「Flaked tests:」；讀到 Tests run 就停",
+    JSON.stringify(
+      flakyClassesInLog(
+        [
+          "[INFO] Results:",
+          "[INFO] ",
+          "[WARNING] Flakes: ",
+          "[WARNING] com.x.CalcTest.add",
+          "[ERROR]   Run 1: CalcTest.add:11 expected: <3> but was: <4>",
+          "[INFO]   Run 2: PASS",
+          "[INFO] ",
+          "[WARNING] com.x.OrderTest.total(com.x.OrderTest)",
+          "[ERROR]   Run 1: OrderTest.total:9 expected:<3> but was:<4>",
+          "[INFO]   Run 2: PASS",
+          "[INFO] ",
+          "[INFO] ",
+          "[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 2",
+          "[INFO] Running com.x.LaterTest.after",
+        ].join("\n"),
+      ),
+    ) === JSON.stringify(["com.x.CalcTest", "com.x.OrderTest"]) &&
+      JSON.stringify(
+        flakyClassesInLog(
+          ["[INFO] Flaked tests: ", "[INFO] com.x.CalcTest.add(com.x.CalcTest)", "[INFO]   Run 1: CalcTest.add:11 expected:<3> but was:<4>", "[INFO]   Run 2: PASS", "[INFO] ", "[WARNING] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1"].join("\n"),
+        ),
+      ) === JSON.stringify(["com.x.CalcTest"]),
+  );
+  report("TEST-com.x.NewTest.xml", '<testsuite name="com.x.NewTest" tests="1"><testcase name="a" classname="com.x.NewTest"><flakyFailure message="x"/></testcase></testsuite>');
+  report("TEST-com.x.OldTest.xml", '<testsuite name="com.x.OldTest" tests="1"><testcase name="a" classname="com.x.OldTest"><flakyFailure message="x"/></testcase></testsuite>', 60_000);
+  check(
+    "flakyTestClasses：這次建置的報告裡重跑才過的類別（之前的建置留下的不算）；沒有 XML 時看 log 的 Flakes 段",
+    JSON.stringify(flakyTestClasses("maven", mi, since, "")) === JSON.stringify(["com.x.NewTest"]) &&
+      JSON.stringify(flakyTestClasses("maven", mi, Date.now() + 60_000, "[WARNING] Flakes: \n[WARNING] com.x.OldTest.a\n[INFO]   Run 2: PASS\n")) === JSON.stringify(["com.x.OldTest"]),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+
+  // A reactor: an upstream module has a class of the same name, and only its ran.
+  const reactorLog = [
+    "[INFO] -------------------------< com.x:common >--------------------------",
+    "[INFO] Building common 1.0                                           [1/2]",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ common ---",
+    "[INFO] Running com.x.NewTest",
+    "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.NewTest",
+    "[INFO] --- jar:3.3.0:jar (default-jar) @ common ---",
+    "[INFO] -------------------------< com.x:web >--------------------------",
+    "[INFO] Building web 1.0                                           [2/2]",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ web ---",
+    "[INFO] Running com.x.OldTest",
+    "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.OldTest",
+  ].join("\n");
+  check(
+    "classesRunInModuleLog：只看目標模組的 surefire 區段；不知道 artifactId 就看最後建置的模組；沒有區段標頭就看整份",
+    classesRunInModuleLog(reactorLog, "web").join() === "com.x.OldTest" &&
+      classesRunInModuleLog(reactorLog, "common").join() === "com.x.NewTest" &&
+      classesRunInModuleLog(reactorLog).join() === "com.x.OldTest" &&
+      classesRunInModuleLog("[INFO] Running com.x.NewTest\n").join() === "com.x.NewTest" &&
+      surefireSections(reactorLog).map((x) => `${x.artifact}:${x.lines.length}`).join() === "common:2,web:2",
+    JSON.stringify(surefireSections(reactorLog)),
+  );
+  check(
+    "surefireSections：下一個模組的標頭就結束上一個模組的 surefire 區段（中間沒有別的 plugin 也一樣）",
+    classesRunInModuleLog(
+      [
+        "[INFO] --- surefire:3.2.5:test (default-test) @ common ---",
+        "[INFO] Running com.x.NewTest",
+        "[INFO] -------------------------< com.x:web >--------------------------",
+        "[INFO] Running com.x.Stray",
+        "[INFO] --- surefire:3.2.5:test (default-test) @ web ---",
+        "[INFO] Running com.x.OldTest",
+      ].join("\n"),
+      "common",
+    ).join() === "com.x.NewTest",
+  );
+  const upstreamOnly = checkTestsRan("maven", mi, since, reactorLog, [newTest]);
+  check(
+    "checkTestsRan：上游模組跑了同名的 com.x.NewTest，目標模組沒有 → 不算目標模組的執行過",
+    upstreamOnly?.notRun.map((t) => t.fqcn).join() === "com.x.NewTest",
+    JSON.stringify(upstreamOnly),
+  );
   // TestNG: one TEST-TestSuite.xml for everything — its classes are what ran, and what to protect.
   src("NgTest", "package com.x;\nimport org.testng.annotations.Test;\npublic class NgTest { @Test public void a() {} }\n");
   report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="1"><testcase name="a" classname="com.x.NgTest" time="0"/></testsuite>');
@@ -5435,6 +5650,169 @@ console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比�
       ledgerEntry(goldenEntry).partial === true &&
       /超過記錄的上限/.test(entryMismatch(goldenEntry, (rel) => hashFile(path.join(root, rel)), []) ?? ""),
     entryMismatch(goldenEntry, (rel) => hashFile(path.join(root, rel)), []) ?? "(matched)",
+  );
+
+  // Names resolved as javac resolves them: a helper every package has is the one of the test's own
+  // package, or the one it imports — not every one of that name.
+  const P = "p/src/test";
+  for (const pkg of ["com/x", "com/y", "com/z"]) {
+    const name = pkg.replace(/\//g, ".");
+    put(`${P}/java/${pkg}/Support.java`, `package ${name};\nclass Support { static int one() { return 1; } }\n`);
+  }
+  put(`${P}/java/com/x/SameTest.java`, "package com.x;\nclass SameTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/x/ImportTest.java`, "package com.x;\nimport com.y.Support;\nclass ImportTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/w/DemandTest.java`, "package com.w;\nimport com.z.*;\nclass DemandTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/w/QualifiedTest.java`, "package com.w;\nclass QualifiedTest { void t() { com.y.Support.one(); } }\n");
+  put(`${P}/java/com/w/StaticTest.java`, "package com.w;\nimport static com.z.Support.one;\nclass StaticTest { void t() { one(); } }\n");
+  put(`${P}/java/com/v/NowhereTest.java`, "package com.v;\nclass NowhereTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/y/Outer.java`, "package com.y;\nclass Outer { static class Inner {} }\n");
+  put(`${P}/java/com/w/NestedTest.java`, "package com.w;\nimport com.y.Outer.Inner;\nclass NestedTest { Inner i; }\n");
+  put(`${P}/java/com/x/ForeignStaticTest.java`, "package com.x;\nimport static org.acme.Support.one;\nclass ForeignStaticTest { void t() { one(); } }\n");
+  const refsOf = (cls: string) => referencedTestFiles([`${P}/java/${cls}.java`], root, P).files.map((f) => f.slice(`${P}/java/`.length));
+  check(
+    "referencedTestFiles：同名的 helper 以 javac 的解析取——同 package、import、on-demand import、完整類名、static import、巢狀類別的 import；import 的是樹外的同名類別就不是樹裡的；都對不到才算每一個同名的",
+    JSON.stringify(refsOf("com/x/SameTest")) === '["com/x/Support.java"]' &&
+      JSON.stringify(refsOf("com/x/ImportTest")) === '["com/y/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/DemandTest")) === '["com/z/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/QualifiedTest")) === '["com/y/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/StaticTest")) === '["com/z/Support.java"]' &&
+      JSON.stringify(refsOf("com/v/NowhereTest")) === '["com/x/Support.java","com/y/Support.java","com/z/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/NestedTest")) === '["com/y/Outer.java"]' &&
+      JSON.stringify(refsOf("com/x/ForeignStaticTest")) === "[]",
+    JSON.stringify(
+      ["com/x/SameTest", "com/x/ImportTest", "com/w/DemandTest", "com/w/QualifiedTest", "com/w/StaticTest", "com/v/NowhereTest", "com/w/NestedTest", "com/x/ForeignStaticTest"].map((c) => [c, refsOf(c)]),
+    ),
+  );
+  // Decoded before it is lexed: an MS950 "\" second byte does not end a literal early, and names
+  // outside ASCII are the names on disk.
+  const E = "e/src/test";
+  const big5 = (text: string) =>
+    Buffer.concat(
+      text.split(/(處理成功)/).map((part) => (part === "處理成功" ? Buffer.from([0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c]) : Buffer.from(part))),
+    );
+  fs.mkdirSync(path.join(root, `${E}/java/com/x`), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, `${E}/java/com/x/Ms950Test.java`),
+    big5('package com.x;\nclass Ms950Test { void t() { assertEquals("處理成功", Fixtures.load("expected.json")); } }\n'),
+  );
+  put(`${E}/java/com/x/Fixtures.java`, "package com.x;\nclass Fixtures { static String load(String n) { return n; } }\n");
+  put(`${E}/resources/expected.json`, "{}");
+  put(`${E}/java/com/x/CjkTest.java`, 'package com.x;\nclass CjkTest { String a = "fixtures/訂單.json"; String b = "caf\u00e9.json"; }\n');
+  put(`${E}/resources/fixtures/訂單.json`, "{}");
+  put(`${E}/resources/cafe\u0301.json`, "{}");
+  const ms950Refs = referencedTestFiles([`${E}/java/com/x/Ms950Test.java`], root, E, "MS950").files;
+  check(
+    "referencedTestFiles：以模組的編碼（MS950）解碼後才 lex——「處理成功」第二個 byte 是 \\，同一行後面的 helper 與資源照樣記下",
+    JSON.stringify(ms950Refs) === JSON.stringify([`${E}/java/com/x/Fixtures.java`, `${E}/resources/expected.json`]),
+    JSON.stringify(ms950Refs),
+  );
+  put(`${E}/java/com/x/EscapedTest.java`, 'package com.x;\nclass EscapedTest { String a = "golden\\u002Fescaped.json"; String b = """\n    golden/block.json\n    golden/second.json\n    """; }\n');
+  put(`${E}/resources/golden/escaped.json`, "{}");
+  put(`${E}/resources/golden/block.json`, "{}");
+  put(`${E}/resources/golden/second.json`, "{}");
+  const escapedRefs = referencedTestFiles([`${E}/java/com/x/EscapedTest.java`], root, E).files;
+  check(
+    "referencedTestFiles：字串照 javac 的讀法（\\u002F 是 /）、text block 一行一行看",
+    JSON.stringify(escapedRefs) === JSON.stringify([`${E}/resources/golden/block.json`, `${E}/resources/golden/escaped.json`, `${E}/resources/golden/second.json`]),
+    JSON.stringify(escapedRefs),
+  );
+  const cjkRefs = referencedTestFiles([`${E}/java/com/x/CjkTest.java`], root, E).files;
+  check(
+    "referencedTestFiles：非 ASCII 的資源名（fixtures/訂單.json；檔名是分解形式的 café.json）照樣對得上",
+    JSON.stringify(cjkRefs) === JSON.stringify([`${E}/resources/cafe\u0301.json`, `${E}/resources/fixtures/訂單.json`]),
+    JSON.stringify(cjkRefs),
+  );
+  // Named after the test, never in a string: Spring's CalcTest.sql and CalcTest-context.xml, an
+  // approval file beside the test.
+  const N = "n/src/test";
+  put(`${N}/java/com/x/CalcTest.java`, "package com.x;\nclass CalcTest { void t() {} }\n");
+  put(`${N}/java/com/x/CalcTest.add.approved.txt`, "3");
+  put(`${N}/java/com/x/snapshot.json`, "{}");
+  put(`${N}/java/com/x/UsesSnapshotTest.java`, 'package com.x;\nclass UsesSnapshotTest { String s = "com/x/snapshot.json"; }\n');
+  put(`${N}/resources/com/x/CalcTest.sql`, "");
+  put(`${N}/resources/com/x/CalcTest-context.xml`, "");
+  put(`${N}/resources/CalcTest_expected.json`, "{}");
+  put(`${N}/resources/CalcTestHelper.json`, "{}");
+  put(`${N}/resources/Other.sql`, "");
+  const named = referencedTestFiles([`${N}/java/com/x/CalcTest.java`], root, N).files;
+  check(
+    "referencedTestFiles：以測試命名的檔（CalcTest.sql、CalcTest-context.xml、CalcTest_expected.json、src/test/java 裡的 CalcTest.add.approved.txt）也算；只是開頭相同的名字不算",
+    JSON.stringify(named) ===
+      JSON.stringify(
+        [`${N}/java/com/x/CalcTest.add.approved.txt`, `${N}/resources/CalcTest_expected.json`, `${N}/resources/com/x/CalcTest-context.xml`, `${N}/resources/com/x/CalcTest.sql`].sort(),
+      ),
+    JSON.stringify(named),
+  );
+  check(
+    "referencedTestFiles：src/test/java 裡的非 .java 檔以字串點名也算",
+    JSON.stringify(referencedTestFiles([`${N}/java/com/x/UsesSnapshotTest.java`], root, N).files) === JSON.stringify([`${N}/java/com/x/snapshot.json`]),
+  );
+
+  // What a ledger names is read from inside the repo only; and what is not a regular file is never opened.
+  check(
+    "safeLedgerPath：相對、在 repo 裡；.. 、絕對路徑、磁碟代號都不行",
+    safeLedgerPath("m/src/test/java/A.java") &&
+      !safeLedgerPath("../outside.java") &&
+      !safeLedgerPath("m/../../outside.java") &&
+      !safeLedgerPath("m\\..\\..\\x") &&
+      !safeLedgerPath("/etc/passwd") &&
+      !safeLedgerPath("C:/x") &&
+      !safeLedgerPath(""),
+  );
+  check(
+    "entryMismatch：紀錄裡的路徑跑出 repo → 不讀它、不接續",
+    /不在 repo 裡/.test(entryMismatch({ ...foo, files: { "../../etc/hosts": "x" } }, () => "x", []) ?? ""),
+  );
+  check(
+    "entryMismatch：作廢的紀錄（後來發現它的測試不穩定）→ 說出原因，不接續",
+    entryMismatch({ ...foo, invalid: "它的測試 com.x.FooTest 不穩定" }, hashOf, [FOO_T]) === "它的測試 com.x.FooTest 不穩定" &&
+      ledgerEntry({ ...foo, invalid: "x" }).invalid === "x",
+  );
+  const fifo = path.join(root, "pipe.json");
+  const mk = spawnSync("mkfifo", [fifo]);
+  if (mk.status === 0) {
+    const t0 = Date.now();
+    const h = hashFile(fifo);
+    check("hashFile：FIFO 不打開（會一直等寫入端）→ 讀不了", h === "unreadable:not-a-file" && Date.now() - t0 < 2000, String(h));
+    fs.rmSync(fifo);
+  }
+  const big = Buffer.alloc(3 * 1024 * 1024 + 17, 7);
+  fs.writeFileSync(path.join(root, "big.bin"), big);
+  check("hashFile：分段讀（大檔一樣）", hashFile(path.join(root, "big.bin")) === sha256(big));
+  check(
+    "springLoaded：Spring 會自己載入的（@Component、@TestConfiguration、@Configuration、完整類名的註解）；@ConfigurationProperties 與一般類別不算",
+    springLoaded("@Component class A {}") &&
+      springLoaded("@TestConfiguration\nclass Cfg {}") &&
+      springLoaded("@org.springframework.context.annotation.Configuration class C {}") &&
+      !springLoaded("@ConfigurationProperties class P {}") &&
+      !springLoaded("class Plain { @Test void t() {} }"),
+  );
+  // Only the newest record of a class counts: once each wanted class has one, older ledgers are not read.
+  const L = path.join(root, "ledgers");
+  const [l1, l2, l3] = ["2026-01-01T00-00-00-000Z", "2026-02-01T00-00-00-000Z", "2026-03-01T00-00-00-000Z"].map((d) => path.join(L, d));
+  for (const d of [l1, l2, l3]) fs.mkdirSync(d, { recursive: true });
+  writeLedger(l1, [{ ...foo, dir: "l1" }, { ...bar, dir: "l1" }]);
+  writeLedger(l2, [{ ...bar, dir: "l2" }]);
+  writeLedger(l3, [{ ...foo, dir: "l3" }]);
+  // The oldest one cannot be read at all — opening a FIFO waits for a writer: it must not be opened.
+  const l0 = path.join(L, "2025-12-01T00-00-00-000Z");
+  fs.mkdirSync(l0, { recursive: true });
+  const blocking = spawnSync("mkfifo", [path.join(l0, LEDGER_FILE)]).status === 0;
+  const wantFoo = readLedgers(L, undefined, [FOO]);
+  const wantBoth = readLedgers(L, undefined, [FOO, BAR]);
+  check(
+    `readLedgers(wanted)：只留要的類別、每個只到它最新的那筆為止；都找到了就不再讀更舊的${blocking ? "（更舊的一份打開就會卡住，沒有被打開）" : ""}`,
+    JSON.stringify(wantFoo.map((e) => [e.cls, e.dir])) === JSON.stringify([[FOO, "l3"]]) &&
+      JSON.stringify(wantBoth.map((e) => [e.cls, e.dir])) === JSON.stringify([[FOO, "l3"], [BAR, "l2"]]),
+    JSON.stringify([wantFoo.map((e) => [e.cls, e.dir]), wantBoth.map((e) => [e.cls, e.dir])]),
+  );
+  check(
+    "findPass：最新的紀錄作廢了 → 不退回較舊、仍然相符的那筆",
+    (() => {
+      writeLedger(l3, [{ ...foo, dir: "l3", invalid: "它的測試不穩定" }]);
+      const r = findPass(FOO, readLedgers(L, undefined, [FOO]), hashOf, [FOO_T]);
+      return !r.entry && r.mismatch === "它的測試不穩定";
+    })(),
   );
 
   // TimeUnitTest.java is TimeUnit's test when there is a TimeUnit, not Time's.

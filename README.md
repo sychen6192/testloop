@@ -297,15 +297,20 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 同一個目標再跑一次（被中斷、有幾批沒過、或只是想補完），先前已通過所有 gate 的類別**不會再產生一次**。
 每一批（或單一類別的 run）通過時，loop 把它通過時的樣子記在該次 artifacts 的 `passed.json`：類別原始碼、
 它的測試檔、那批 writer 寫的其他檔（共用的 helper、`src/test/resources` 裡的檔），以及這些測試引用到的
-測試目錄裡的檔（繼承的基底類別、呼叫的 helper、字串裡點名的資源；類別與資源各記最近的 400 個，超過的紀錄不接續）
-的 sha256，reviewer 的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別（看它最新的一筆紀錄）：
+測試目錄裡的檔（繼承的基底類別、呼叫的 helper——名字照 javac 的方式解析：同 package 的、import 的、寫了完整類名的，
+都對不到才算每一個同名的——、字串裡點名的資源（`src/test/java` 裡的非 .java 檔也算）、以測試命名的檔
+（`CalcTest.sql`、`CalcTest-context.xml`、approval／snapshot 檔）；原始碼以模組的編碼讀；類別與資源各記最近的
+400 個，超過的紀錄不接續）的 sha256，reviewer 的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別（看它最新的一筆紀錄）：
 
 - **紀錄仍描述現在的樹**：類別與上面那些檔一個 byte 都沒變、沒有多出當時沒有的測試檔（reviewer 沒看過它）。
   有人把測試用的 helper 掏空，建置照樣綠、覆蓋率照樣在，只有這一項看得到。
 - **建置**：這次的預檢建置是綠的（或修復後轉綠），而且它的**每一個**測試類別（它自己的測試檔與那批 writer 寫的；
-  只是被引用的基底類別與 helper 只比對內容）都確實執行了、不是全部被略過。它的測試在這次預檢時失敗過（不穩定、
-  重跑才過，或是修復迴圈修好的；TestNG 與 JUnit 4 `Suite` 的報告看失敗案例自己的類別）、修復迴圈改過測試資源、
-  或 Gradle 目標專案的 test task 這次沒有實際執行（`UP-TO-DATE`——`build/test-results` 是上一次留下的）時重新產生。
+  只是被引用的基底類別與 helper 只比對內容）都確實執行了、不是全部被略過（TestNG 與 JUnit 4 `Suite` 的報告裡它的
+  每個 case 都 skipped 也算；中文 `@DisplayName` 命名的報告要名字完全相同才算它的）。它的測試在這次預檢時失敗過
+  （不穩定、重跑才過，或是修復迴圈修好的；TestNG 與 JUnit 4 `Suite` 的報告看失敗案例自己的類別）、失敗之後
+  surefire 自己重跑才過（`rerunFailingTestsCount` 的 `Flakes`；Gradle 的 test-retry）、修復迴圈改過測試資源或
+  Spring 會自己載入的類別（`@Component`、`@Configuration`、`@TestConfiguration`……），或 Gradle 目標專案的 test task
+  這次沒有實際執行時重新產生（Gradle 的建置一律先 `cleanTest`、關掉 build cache，test task 每次都真的執行）。
   預檢紅燈而以
   `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1` 時，沒有東西可以證明它們現在仍然通過，全部重新產生。
 - **覆蓋率**：從這次預檢建置的 JaCoCo 報告以現在的門檻重新量——別的測試或它呼叫的類別改了，覆蓋率會變，
@@ -318,6 +323,12 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 剩下要做的即使只有一個類別，資料夾目標也照樣分批（沒過就撤回）。目標類別全都略過時只跑預檢，以
 `stopReason: "already-passed"` exit 0。reviewer 的模型與工具版本不在比對之內：換了模型、或升級工具後想重新審，
 設 `UT_RESUME=0` 全部重新產生；刪掉 `runs/<repo>/` 也一樣（紀錄就在裡面）。
+
+同一次執行裡，後面的批次改了前面通過紀錄裡的檔（擴充共用的 helper、把測試加進 suite），前面那筆就不再相符——
+它的審查沒看過新的版本：log 在那一批通過時就說，下一次重跑重新產生那個類別。後面的建置發現前面通過的類別的
+測試不穩定（失敗、重跑才過），那筆紀錄標記作廢。比對的是內容：git 的 autocrlf 改了換行也算改過；
+`runs/<repo 名>` 以 repo 目錄名區分，同名的另一個 checkout 共用紀錄（只會少接續，不會誤接續）；路徑大小寫
+不敏感的檔案系統上，目標要用和上次同樣的大小寫。
 
 ## Troubleshooting
 

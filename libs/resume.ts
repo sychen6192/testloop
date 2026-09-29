@@ -22,7 +22,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { codeOnly } from "./javasrc";
+import { codeOnly, decodeJavaSource, javaStringValue } from "./javasrc";
 
 export const LEDGER_FILE = "passed.json";
 const LEDGER_VERSION = 1;
@@ -43,6 +43,12 @@ export interface PassedEntry {
   refs?: string[];
   /** What its tests reach was more than the walk records: a change beyond it would go unseen. */
   partial?: boolean;
+  /**
+   * Why the pass no longer holds, found after it was recorded: its tests failed a later build of the
+   * same run and passed its rebuild. Kept rather than dropped — the newest record is the one that
+   * counts (findPass), and without it an older record of the class would count again.
+   */
+  invalid?: string;
   /** sha256 of the rubric the reviewer judged by. */
   rubric: string;
   /** The passing verdict; null when the review gate was switched off (UT_SKIP_REVIEW=1). */
@@ -65,15 +71,30 @@ const unreadable = (h: string | null) => !!h && h.startsWith(UNREADABLE);
 /**
  * sha256 of a file's bytes; null when there is no file there. A file that cannot be read gets
  * `unreadable:<code>`, which entryMismatch never takes as a match — not even for itself: two reads
- * that both failed say nothing about whether the content is the same.
+ * that both failed say nothing about whether the content is the same. Only a regular file is read —
+ * opening a FIFO waits for a writer that never comes — and it is read in pieces, so its size is no
+ * limit (a whole read fails past 2 GB).
  */
 export function hashFile(abs: string): string | null {
+  let fd: number | undefined;
   try {
-    return sha256(fs.readFileSync(abs));
+    if (!fs.statSync(abs).isFile()) return `${UNREADABLE}not-a-file`;
+    fd = fs.openSync(abs, "r");
+    const hash = createHash("sha256");
+    const buf = Buffer.alloc(1024 * 1024);
+    for (let n; (n = fs.readSync(fd, buf, 0, buf.length, null)) > 0; ) hash.update(buf.subarray(0, n));
+    return hash.digest("hex");
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     return code === "ENOENT" || code === "ENOTDIR" ? null : `${UNREADABLE}${code ?? "?"}`;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
+}
+
+/** Pure: a path a ledger may name — relative, inside the repo, not `..` anywhere in it. */
+export function safeLedgerPath(rel: string): boolean {
+  return !!rel && !path.isAbsolute(rel) && !/^[A-Za-z]:/.test(rel) && !rel.split(/[\\/]/).includes("..");
 }
 
 // The walk is bounded, classes and resources each on their own budget — a helper that names a
@@ -101,10 +122,11 @@ export function stringLiterals(src: string, code = codeOnly(src)): string[] {
  * Pure: the resources a string literal names, from those of the test tree by file name. A path names
  * the ones at that path ("golden/case1/expected.json" — not every expected.json); when none is, or
  * the literal is a bare name, every one of that name. A scheme ("classpath:"), backslashes and a
- * leading slash do not count.
+ * leading slash do not count. Names compare in NFC: a file system may hand them back decomposed.
  */
 export function resourcesNamed(literal: string, byName: Map<string, string[]>): string[] {
   const p = literal
+    .normalize("NFC")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^[A-Za-z][\w+.*-]*:/, "")
@@ -118,15 +140,32 @@ export function resourcesNamed(literal: string, byName: Map<string, string[]>): 
 
 /**
  * The files of the test tree `roots` reach: the classes of the tree they name, and the ones those
- * name, and the resources their string literals name. What a reviewer reading a test also reads —
- * the base class it extends, the fixture builder and assertion helper it calls, the JSON it loads —
- * and what the test's behaviour hangs on: a hollowed-out helper leaves the build green and the
- * coverage where it was. Breadth first: the nearest helpers are the ones kept when a budget runs out
- * (`partial`). Repo-relative, "/" separators; `testTree` is the module's src/test.
+ * name, and the resources their string literals name or that are named after them. What a reviewer
+ * reading a test also reads — the base class it extends, the fixture builder and assertion helper it
+ * calls, the JSON it loads — and what the test's behaviour hangs on: a hollowed-out helper leaves the
+ * build green and the coverage where it was. Breadth first: the nearest helpers are the ones kept
+ * when a budget runs out (`partial`). Repo-relative, "/" separators; `testTree` is the module's
+ * src/test, `charset` its sources' encoding (Java's name).
+ *
+ * A name is resolved as javac resolves it, as far as the files tell: an import names its class, and a
+ * simple name is the one of the file's own package or of a package it imports on demand; only a name
+ * none of those has — another class's nested one, one in a folder its package does not match — is
+ * every class of that name. Every class of a name was a helper each package of a large tree has
+ * (Fixtures, Builders), and the walk ran out of budget on classes no test used.
  */
-export function referencedTestFiles(roots: string[], repoRoot: string, testTree: string): { files: string[]; partial: boolean } {
+export function referencedTestFiles(
+  roots: string[],
+  repoRoot: string,
+  testTree: string,
+  charset?: string,
+): { files: string[]; partial: boolean } {
   const byClass = new Map<string, string[]>();
+  const javaFiles = new Set<string>();
   const resources = new Map<string, string[]>();
+  // A resource by every prefix of its name that ends at a separator: "CalcTest.add.approved.txt"
+  // under CalcTest and CalcTest.add — Spring's CalcTest.sql and CalcTest-context.xml, an approval
+  // or snapshot file: named after the test, never in a string.
+  const byPrefix = new Map<string, string[]>();
   const walk = (dir: string, onFile: (rel: string, name: string) => void) => {
     let entries: fs.Dirent[];
     try {
@@ -140,49 +179,110 @@ export function referencedTestFiles(roots: string[], repoRoot: string, testTree:
       else if (e.isFile()) onFile(rel, e.name);
     }
   };
+  const add = (map: Map<string, string[]>, key: string, rel: string) => {
+    const list = map.get(key);
+    if (list) list.push(rel);
+    else map.set(key, [rel]);
+  };
+  const addResource = (rel: string, raw: string) => {
+    const name = raw.normalize("NFC");
+    add(resources, name, rel);
+    for (let i = 1; i < name.length; i++) if (".-_".includes(name[i])) add(byPrefix, name.slice(0, i), rel);
+  };
   const tree = toSlash(testTree).replace(/\/$/, "");
-  walk(`${tree}/java`, (rel, name) => {
-    if (!name.endsWith(".java")) return;
-    const cls = name.slice(0, -".java".length);
-    byClass.set(cls, [...(byClass.get(cls) ?? []), rel]);
+  const javaRoot = `${tree}/java`;
+  walk(javaRoot, (rel, name) => {
+    // Beside the tests, not only under resources/: approval and snapshot files are read by path.
+    if (!name.endsWith(".java")) return addResource(rel, name);
+    add(byClass, name.slice(0, -".java".length), rel);
+    javaFiles.add(rel);
   });
-  walk(`${tree}/resources`, (rel, name) => resources.set(name, [...(resources.get(name) ?? []), rel]));
+  walk(`${tree}/resources`, addResource);
+  const fileOf = (fqcn: string) => {
+    const rel = `${javaRoot}/${fqcn.replace(/\./g, "/")}.java`;
+    return javaFiles.has(rel) ? rel : undefined;
+  };
+  // A qualified name's file: the longest prefix of it that is a class of the tree (a.b.Outer.Inner.x).
+  const typeFile = (dotted: string, least: number) => {
+    const segs = dotted.split(".");
+    for (let n = segs.length; n >= least; n--) {
+      const f = fileOf(segs.slice(0, n).join("."));
+      if (f) return f;
+    }
+    return undefined;
+  };
   const classes = new Set<string>();
   const named = new Set<string>();
   let partial = false;
   const queue = roots.map(toSlash).filter((r) => r.endsWith(".java"));
   const seen = new Set(queue);
+  const reach = (f: string) => {
+    if (seen.has(f)) return;
+    seen.add(f);
+    if (classes.size >= MAX_REFERENCED_CLASSES) {
+      partial = true;
+      return;
+    }
+    classes.add(f);
+    queue.push(f);
+  };
+  const name = (r: string) => {
+    if (named.has(r)) return;
+    if (named.size >= MAX_REFERENCED_RESOURCES) {
+      partial = true;
+      return;
+    }
+    named.add(r);
+  };
   while (queue.length) {
     const rel = queue.shift()!;
     let src: string;
     try {
-      src = fs.readFileSync(path.join(repoRoot, rel), "latin1");
+      src = decodeJavaSource(fs.readFileSync(path.join(repoRoot, rel)), charset);
     } catch {
       continue;
     }
     const code = codeOnly(src);
-    for (const id of new Set(code.match(/[A-Za-z_$][\w$]*/g) ?? [])) {
-      for (const f of byClass.get(id) ?? []) {
-        if (seen.has(f)) continue;
-        seen.add(f);
-        if (classes.size >= MAX_REFERENCED_CLASSES) {
-          partial = true;
-          continue;
-        }
-        classes.add(f);
-        queue.push(f);
-      }
+    // What is left to read for simple names once the package, the imports and the qualified names
+    // that name a class of the tree are read: the "Support" of com.y.Support is that one, no other.
+    const rest = code.split("");
+    const done = (m: RegExpMatchArray) => {
+      for (let k = m.index!; k < m.index! + m[0].length; k++) if (rest[k] !== "\n" && rest[k] !== "\r") rest[k] = " ";
+    };
+    const pkgDecl = /^\s*package\s+([\w$]+(?:\s*\.\s*[\w$]+)*)\s*;/m.exec(code);
+    const pkg = pkgDecl?.[1].replace(/\s+/g, "") ?? "";
+    if (pkgDecl) done(pkgDecl);
+    const single = new Set<string>();
+    const onDemand: string[] = [];
+    for (const m of code.matchAll(/\bimport\s+(static\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)(\s*\.\s*\*)?\s*;/g)) {
+      done(m);
+      const imported = m[2].replace(/\s+/g, "");
+      const f = typeFile(imported, 1);
+      if (f) reach(f);
+      if (m[3]) onDemand.push(imported);
+      else single.add(imported.split(".").pop()!);
+    }
+    // Qualified names in the code: com.x.support.Fixtures.load().
+    const unqualified = rest.join("");
+    for (const m of unqualified.matchAll(/[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+/g)) {
+      const f = typeFile(m[0].replace(/\s+/g, ""), 2);
+      if (!f) continue;
+      reach(f);
+      done(m);
+    }
+    for (const id of new Set(rest.join("").match(/[A-Za-z_$][\w$]*/g) ?? [])) {
+      const all = byClass.get(id);
+      if (!all || single.has(id)) continue;
+      const scoped = [pkg, ...onDemand].map((p) => fileOf(p ? `${p}.${id}` : id)).filter((f): f is string => !!f);
+      (scoped.length ? scoped : all).forEach(reach);
     }
     for (const literal of stringLiterals(src, code)) {
-      for (const r of resourcesNamed(literal, resources)) {
-        if (named.has(r)) continue;
-        if (named.size >= MAX_REFERENCED_RESOURCES) {
-          partial = true;
-          break;
-        }
-        named.add(r);
+      const value = javaStringValue(literal);
+      for (const piece of new Set([value, ...value.split(/\r?\n/)].map((p) => p.trim()).filter(Boolean))) {
+        resourcesNamed(piece, resources).forEach(name);
       }
     }
+    for (const r of byPrefix.get(path.posix.basename(rel, ".java").normalize("NFC")) ?? []) name(r);
   }
   return { files: [...classes, ...named].sort(), partial };
 }
@@ -202,6 +302,8 @@ export function passedEntries(o: {
   written: string[];
   /** The module's src/test, repo-relative: where the tests' helpers and resources are looked for. */
   testTree: string;
+  /** The module's source encoding (Java's name): the tests are read as javac reads them. */
+  charset?: string;
   rubric: string;
   verdict: PassedEntry["verdict"];
   dir: string;
@@ -213,7 +315,7 @@ export function passedEntries(o: {
     const others = new Set(o.classes.filter((c) => c !== cls).flatMap((c) => own.get(c) ?? []));
     const mine = own.get(cls) ?? [];
     const direct = [...new Set([...mine, ...written.filter((w) => !others.has(w) || mine.includes(w))])];
-    const reach = referencedTestFiles(direct, o.repoRoot, o.testTree);
+    const reach = referencedTestFiles(direct, o.repoRoot, o.testTree, o.charset);
     const refs = reach.files.filter((f) => !direct.includes(f));
     const rels = [...new Set([...direct, ...refs])].sort();
     return {
@@ -238,6 +340,7 @@ export function ledgerEntry(e: PassedEntry): PassedEntry {
     files: e.files,
     ...(e.refs ? { refs: e.refs } : {}),
     ...(e.partial ? { partial: true } : {}),
+    ...(e.invalid ? { invalid: e.invalid } : {}),
     rubric: e.rubric,
     verdict: e.verdict,
     dir: e.dir,
@@ -245,12 +348,32 @@ export function ledgerEntry(e: PassedEntry): PassedEntry {
   };
 }
 
-/** This run's ledger, rewritten whole each time — a reader never sees half a file (rename is atomic). */
+/**
+ * This run's ledger, rewritten whole each time — a reader never sees half a file (rename is atomic),
+ * and the file is on disk before it replaces the last one: a power cut after a rename of unsynced
+ * data can leave an empty file, and every pass it held with it.
+ */
 export function writeLedger(runDir: string, entries: PassedEntry[]): void {
   const file = path.join(runDir, LEDGER_FILE);
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: LEDGER_VERSION, entries }, null, 2));
+  const fd = fs.openSync(tmp, "w");
+  try {
+    fs.writeSync(fd, JSON.stringify({ version: LEDGER_VERSION, entries }, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
+  try {
+    const dir = fs.openSync(runDir, "r");
+    try {
+      fs.fsyncSync(dir);
+    } finally {
+      fs.closeSync(dir);
+    }
+  } catch {
+    /* a directory cannot be synced everywhere (Windows): the rename is as durable as it gets */
+  }
 }
 
 const isEntry = (e: unknown): e is PassedEntry => {
@@ -264,6 +387,7 @@ const isEntry = (e: unknown): e is PassedEntry => {
     Object.values(x.files).every((h) => h === null || typeof h === "string") &&
     (x.refs === undefined || (Array.isArray(x.refs) && x.refs.every((r) => typeof r === "string"))) &&
     (x.partial === undefined || typeof x.partial === "boolean") &&
+    (x.invalid === undefined || typeof x.invalid === "string") &&
     typeof x.rubric === "string" &&
     (x.verdict === null ||
       (!!x.verdict &&
@@ -280,26 +404,63 @@ const isEntry = (e: unknown): e is PassedEntry => {
  * Every pass the earlier runs of this repo recorded, newest run first: run ids are ISO timestamps,
  * so their order is the order they ran in. A ledger that will not parse, or that a later version of
  * the tool wrote, is left out — it can only cost a class its skip.
+ *
+ * `wanted`: only these classes (repo-relative, "/"), and no older ledger once each has its newest
+ * entry — only the newest counts (findPass), and every run's ledger carries the passes it resumed, so
+ * the newest ledger or two is usually all there is to read, however many runs the directory holds.
  */
-export function readLedgers(runsDir: string, exceptDir?: string): Array<PassedEntry & { run: string }> {
+export function readLedgers(runsDir: string, exceptDir?: string, wanted?: Iterable<string>): Array<PassedEntry & { run: string }> {
   let runs: string[] = [];
   try {
     runs = fs.readdirSync(runsDir).sort().reverse();
   } catch {
     return [];
   }
+  const want = wanted ? new Set([...wanted].map(toSlash)) : undefined;
+  const found = new Set<string>();
   const out: Array<PassedEntry & { run: string }> = [];
   for (const run of runs) {
+    if (want && found.size >= want.size) break;
     const dir = path.join(runsDir, run);
     if (exceptDir && path.resolve(dir) === path.resolve(exceptDir)) continue;
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(dir, LEDGER_FILE), "utf8");
+    } catch {
+      continue;
+    }
+    // A class that never passed is looked for in every ledger there is: one that names none of those
+    // still looked for is not parsed — the "cls" values are all that is read of it.
+    if (want) {
+      let names = false;
+      for (const m of text.matchAll(/"cls"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+        let cls: unknown;
+        try {
+          cls = JSON.parse(`"${m[1]}"`);
+        } catch {
+          continue;
+        }
+        if (typeof cls === "string" && want.has(cls) && !found.has(cls)) {
+          names = true;
+          break;
+        }
+      }
+      if (!names) continue;
+    }
     let doc: { version?: unknown; entries?: unknown };
     try {
-      doc = JSON.parse(fs.readFileSync(path.join(dir, LEDGER_FILE), "utf8"));
+      doc = JSON.parse(text);
     } catch {
       continue;
     }
     if (doc?.version !== LEDGER_VERSION || !Array.isArray(doc.entries)) continue;
-    for (const e of doc.entries) if (isEntry(e)) out.push({ ...e, run: dir });
+    const newlyFound: string[] = [];
+    for (const e of doc.entries) {
+      if (!isEntry(e) || (want && (!want.has(e.cls) || found.has(e.cls)))) continue;
+      out.push({ ...e, run: dir });
+      newlyFound.push(e.cls);
+    }
+    newlyFound.forEach((c) => found.add(c));
   }
   return out;
 }
@@ -313,9 +474,12 @@ export function entryMismatch(
   hashOf: (rel: string) => string | null,
   tests: string[],
 ): string | undefined {
+  if (e.invalid) return e.invalid;
   if (e.partial) {
     return `上次通過時它的測試引用到的檔超過記錄的上限（類別 ${MAX_REFERENCED_CLASSES}、資源 ${MAX_REFERENCED_RESOURCES} 個），沒有全部記下，無法確認都沒變`;
   }
+  const outside = Object.keys(e.files).find((rel) => !safeLedgerPath(rel));
+  if (outside !== undefined) return `紀錄裡的檔案路徑 ${outside} 不在 repo 裡，這筆紀錄不能用`;
   const source = hashOf(e.cls);
   if (unreadable(source) || unreadable(e.source)) return `${path.posix.basename(e.cls)} 讀不了，無法確認它沒變`;
   if (source !== e.source) return `${path.posix.basename(e.cls)} 在上次通過之後改過`;
@@ -348,6 +512,18 @@ export function findPass(
   if (!newest) return {};
   const why = entryMismatch(newest, hashOf, tests);
   return why ? { mismatch: why } : { entry: newest };
+}
+
+/**
+ * Pure: does this test source (code only: see codeOnly) declare a class Spring loads without any test
+ * naming it — a stereotype that component scanning finds, a configuration class, a @TestConfiguration
+ * a @SpringBootTest's search for configuration finds? Changed, it changes what every test that starts
+ * a context runs with, and no reference from a test leads to it.
+ */
+export function springLoaded(code: string): boolean {
+  return /@(?:[\w$]+\s*\.\s*)*(?:Component|ComponentScan|Service|Repository|Controller|RestController|ControllerAdvice|RestControllerAdvice|Configuration|TestConfiguration|SpringBootConfiguration|SpringBootApplication|AutoConfiguration|TestComponent|JsonComponent)\b/.test(
+    code,
+  );
 }
 
 /** Pure: a test source's class name, from its path under the module's src/test/java; undefined outside it. */

@@ -28,13 +28,18 @@
   或別的容器、重開機前的紀錄不碰。Windows 上只列出那次執行當時在跑的指令，請人確認。
 - **重跑同一個目標時，接續先前的執行（`UT_RESUME`，預設開啟）。** 資料夾目標一批一個類別、一批幾分鐘到
   半小時；跑到一半被打斷，或有幾批沒過，再跑一次就從第一個類別重來，已通過的幾個小時重做一遍。現在每一批
-  通過時把類別原始碼、它的測試檔、那批 writer 寫的其他檔與這些測試引用到的 helper 與資源（字串常值裡點名的，
-  帶路徑就只算那個路徑；類別與資源各最多 400 個，超過的紀錄不接續）的 sha256、reviewer 的分數與 rubric 記進該次
+  通過時把類別原始碼、它的測試檔、那批 writer 寫的其他檔與這些測試引用到的 helper 與資源（名字照 javac 的方式
+  解析——同 package、import 的、完整類名，對不到才算每一個同名的；字串常值裡點名的，帶路徑就只算那個路徑；以測試
+  命名的 `CalcTest.sql`、`CalcTest-context.xml`、approval 檔；原始碼以模組的編碼讀，MS950 的中文字串不會吃掉同一行
+  後面的東西；類別與資源各最多 400 個，超過的紀錄不接續）的 sha256、reviewer 的分數與 rubric 記進該次
   artifacts 的 `passed.json`；重跑時略過最新一筆紀錄仍符合的類別——但只在這次的預檢建置是綠的而且它的每一個測試
-  類別都執行了（不是全部略過；只是被引用的基底類別不要求）、沒有一個在這次預檢時失敗過（TestNG、JUnit 4 Suite
-  的報告看失敗案例自己的類別）、覆蓋率從這次的 JaCoCo 報告以現在的門檻重新量過也達標、review 分數以現在的門檻
-  重新判定也通過時。類別或任何一個相關的檔改過、多了當時沒有的測試檔、rubric 換了、當時沒開 review、修復迴圈改過
-  測試資源、Gradle 目標專案的 test task 這次沒有實際執行、預檢紅燈被放行或跳過預檢，都照常重新產生，log 以
+  類別都執行了（不是全部略過，TestNG、JUnit 4 Suite 報告裡的 case 也算；只是被引用的基底類別不要求）、沒有一個在
+  這次預檢時失敗過（TestNG、JUnit 4 Suite 的報告看失敗案例自己的類別；surefire 自己重跑才過的 `Flakes` 也算失敗過）、
+  覆蓋率從這次的 JaCoCo 報告以現在的門檻重新量過也達標、review 分數以現在的門檻重新判定也通過時。類別或任何一個
+  相關的檔改過、多了當時沒有的測試檔、rubric 換了、當時沒開 review、修復迴圈改過測試資源或 Spring 會自己載入的
+  類別、Gradle 目標專案的 test task 這次沒有實際執行、預檢紅燈被放行或跳過預檢，都照常重新產生；同一次執行裡後面的
+  批次改了前面紀錄裡的檔（擴充共用 helper），log 當下就說那個類別下次會重做，後面的建置發現它的測試不穩定則標記
+  作廢。紀錄由新到舊讀、每個類別找到最新一筆就停（先前每次啟動讀遍所有執行的紀錄），log 以
   `[接續]` 開頭說明略過了哪些、哪些要重做與原因；剩下一個類別也照樣分批（沒過就撤回）；全部略過時只跑預檢，
   `stopReason: "already-passed"`、exit 0。`UT_RESUME=0` 全部重新產生。既有測試偵測也不再把 `TimeUnitTest.java`
   當成 `Time` 的測試（同一個 package 裡有 `TimeUnit` 時）。
@@ -170,6 +175,10 @@
   `UT_MAX_FAILURE_BLOCKS`（預設 5）限制，超出的類別數會據實標明而非靜默丟棄。
 
 ### Fixed
+- **Gradle 的建置一律真的執行測試。** 預檢與 gate 跑 `gradle test`：什麼都沒改時 test task 是 `UP-TO-DATE`，
+  開了 build cache（`org.gradle.caching=true`）時每次撤回回到的那棵樹都是 `FROM-CACHE`，留下的測試結果不是這次
+  執行的——一個只有真的跑才會失敗的測試照樣過，接續也幾乎永遠沒有證據可用。現在是 `cleanTest test
+  -Dorg.gradle.caching=false`（Gradle 8.14.3 實測：光 `cleanTest` 照樣 `FROM-CACHE`）。
 - **pom 設了 `testFailureIgnore` 時，writer 的失敗測試會以 `gates-passed` 交差。** build gate 以 Maven 的 exit
   code 判綠燈，而 surefire 的 `testFailureIgnore`（屬性 `maven.test.failure.ignore`，公司 parent pom 或
   `.mvn/maven.config` 常設，好讓 CI 在測試失敗時照樣收報告）下測試失敗照樣 exit 0、BUILD SUCCESS。以真的專案
@@ -273,8 +282,9 @@
   （介入前就沒執行也算——加進一個不會被執行的類別的測試等於沒寫），以及跑完整模組時 writer 介入前有執行的
   每一個類別（讓其他測試不被探索到的測試資源也擋得到；分批時包括前面批次寫好的測試）——以這次建置的 surefire
   報告（TestNG 的單一 `TEST-TestSuite.xml`、JUnit 4 suite 裡的成員、`@Nested` 的 `$內部類別` 報告、
-  reportNameSuffix、類別層級 `@DisplayName` 命名的報告都認得）或 log 的 `Running` 行（只算本模組的類別）為準；
-  writer 新寫的類別測試全部 skipped 也不算，沒有測試方法的類別改成 abstract 則不要求。沒執行時該輪 FAIL，
+  reportNameSuffix、類別層級 `@DisplayName` 命名的報告都認得——名字要完全相同，POSIX locale 下變成 `?` 的檔名一個字
+  對一個、模組裡沒有別的類別對得上才算）或 log 的 `Running` 行（只算目標模組的 surefire 區段）為準；
+  writer 新寫的類別測試全部 skipped 也不算（只出現在 suite 報告裡的，看它自己的 case），沒有測試方法的類別改成 abstract 則不要求。沒執行時該輪 FAIL，
   回饋點名類別與它的寫法、這次實際執行了哪些類別各是什麼框架、類名是否符合 surefire 的 includes（`*Tests` 要
   2.20 以後）、是否類別層級停用。完全看不出來時（報告關了、寫到別處、對不到任何類別）只印 WARN、不判。修復
   迴圈同樣套用，writer 沒改檔案時的 flaky 確認重跑也是——紅燈的建置不檢查誰沒跑，一輪裡把失敗的測試改成

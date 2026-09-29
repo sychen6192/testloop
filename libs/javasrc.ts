@@ -129,6 +129,73 @@ export function decodeUnicodeEscapes(src: string): string {
   );
 }
 
+/**
+ * Pure: the value of a string literal as written between its quotes: its Unicode escapes, then its
+ * escape sequences (\n, \", \\, octal), translated as javac translates them.
+ */
+export function javaStringValue(body: string): string {
+  const simple: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", s: " ", '"': '"', "'": "'", "\\": "\\" };
+  return decodeUnicodeEscapes(body).replace(/\\(?:([btnfrs"'\\])|([0-3][0-7]{0,2}|[4-7][0-7]?))/g, (_m, c: string, oct: string) =>
+    c ? simple[c] : String.fromCharCode(parseInt(oct, 8)),
+  );
+}
+
+// Java's names for the double-byte charsets of older repos, as the WHATWG labels Node's TextDecoder
+// knows them by. Other names it takes as they are: GBK, GB18030, Shift_JIS, EUC-KR, windows-1252.
+const DECODER_LABELS: Record<string, string> = {
+  ms950: "big5",
+  cp950: "big5",
+  "windows-950": "big5",
+  "x-windows-950": "big5",
+  "ms950-hkscs": "big5",
+  "x-ms950-hkscs": "big5",
+  "big5-hkscs": "big5",
+  ms936: "gbk",
+  cp936: "gbk",
+  "windows-936": "gbk",
+  "x-mswin-936": "gbk",
+  "euc-cn": "gbk",
+  ms932: "shift_jis",
+  cp932: "shift_jis",
+  "windows-932": "shift_jis",
+  ms949: "euc-kr",
+  cp949: "euc-kr",
+  "windows-949": "euc-kr",
+  "x-windows-949": "euc-kr",
+};
+
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * Pure: a Java source's text, decoded as javac decodes it — in `charset` (Java's name for the module's
+ * source encoding) when that is known and Node has a decoder for it; else as UTF-8, when the bytes are
+ * that. Otherwise byte for byte (latin1): every ASCII character where it is. That is not enough for
+ * the lexer: MS950 has "\" (0x5C) as the second byte of 功, 許 and 蓋, so the quote after "處理成功"
+ * reads as escaped and the string runs to the end of the line, the code after it with it; and a
+ * string literal or a @DisplayName read so is not the one javac compiles.
+ */
+export function decodeJavaSource(buf: Buffer, charset?: string): string {
+  const name = charset?.trim().toLowerCase().replace(/_/g, "-");
+  let decoder: TextDecoder | undefined;
+  if (name && !/^utf-?8$/.test(name)) {
+    for (const label of [DECODER_LABELS[name], name, charset!.trim()]) {
+      if (!label) continue;
+      try {
+        decoder = new TextDecoder(label);
+        break;
+      } catch {
+        /* not a label Node knows */
+      }
+    }
+  }
+  if (decoder) return decoder.decode(buf);
+  try {
+    return strictUtf8.decode(buf);
+  } catch {
+    return buf.toString("latin1");
+  }
+}
+
 // javac's line terminators: CR LF, a lone LF, and a lone CR.
 const LINE_BREAK = /\r\n|\r|\n/;
 

@@ -57,6 +57,7 @@ import {
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
 import { collectTestMetrics, findShrunk, MetricsSnapshot, testMetrics } from "./libs/testmetrics";
+import { decodeJavaSource } from "./libs/javasrc";
 import {
   runBuild,
   runBaseline,
@@ -156,13 +157,15 @@ function testsThatMustRun(
   preexisting: MetricsSnapshot,
   ranBefore: string[] | undefined,
   wholeModule: boolean,
+  // The module's source encoding: a @DisplayName is compared with what surefire reports, as javac read it.
+  charset: string | undefined,
 ): ExpectedTest[] {
   const before = new Set(ranBefore ?? []);
   const out = new Map<string, ExpectedTest>();
   const writtenFiles = new Set<string>();
   const read = (file: string) => {
     try {
-      return fs.readFileSync(file, "latin1");
+      return decodeJavaSource(fs.readFileSync(file), charset);
     } catch {
       return undefined; // deleted
     }
@@ -693,8 +696,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const buildOpts: BuildOptions = {
       onlyTests,
       tolerate: cfg.tolerate,
-      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped),
+      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped, sourceEncoding?.name),
       ranBefore: cfg.ranAtBaseline,
+      charset: sourceEncoding?.name,
     };
     lastCollateral = undefined;
     const firstBuild = await runBuild(cfg.buildTool, cfg.mod, buildOpts);
@@ -830,8 +834,9 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
         const verifyOpts: BuildOptions = {
           tolerate: cfg.tolerate,
-          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
+          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true, sourceEncoding?.name),
           ranBefore: cfg.ranAtBaseline,
+          charset: sourceEncoding?.name,
         };
         const firstVerify = await runBuild(cfg.buildTool, cfg.mod, verifyOpts);
         save("final-verify.log", firstVerify.gate.raw ?? firstVerify.gate.report);
@@ -944,6 +949,9 @@ export interface RepairResult {
   changedFiles: string[];
   // On success: the test classes the green build ran — what every later round must keep running.
   ranTests?: string[];
+  // On success: the green build's log — which classes it ran and which passed only on a rerun, where
+  // its reports do not say. "raw" as a build's log is everywhere: summaries leave it out (stripRaw).
+  raw?: string;
 }
 
 // A writer-changed path (relative to src/test/java, or resources/…) as a repo-relative path.
@@ -1133,8 +1141,9 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
           cfg.buildTool,
           cfg.mod,
           "repair",
-          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name),
           ranBefore,
+          sourceEncoding?.name,
         );
         save("recheck-build.log", recheck.raw);
         if (recheck.clean) {
@@ -1147,6 +1156,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
             report: `預檢時失敗、重跑後通過的測試（flaky）：${current.failingTestClasses.join("、")}`,
             changedFiles: [...touched].sort(),
             ranTests: recheck.ranTests,
+            raw: recheck.raw,
           };
         }
         // The rebuild is the module as it now stands, and may say something the writer never saw.
@@ -1183,8 +1193,9 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       cfg.buildTool,
       cfg.mod,
       "repair",
-      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name),
       ranBefore,
+      sourceEncoding?.name,
     );
     save("build.log", current.raw);
     testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
@@ -1202,6 +1213,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         report: current.summary,
         changedFiles: [...touched].sort(),
         ranTests: current.ranTests,
+        raw: current.raw,
       };
     }
     report = describe(current);

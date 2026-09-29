@@ -77,8 +77,12 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    類別改成 abstract 由上面的數量量尺擋下。writer 新寫的類別測試全部 skipped 也不算。修復迴圈裡 writer 沒改
    任何檔案時的 flaky 確認重跑同樣要檢查：紅燈的建置不檢查誰沒跑，一輪裡把失敗的測試改成不執行、同時另一個
    測試 flaky 紅燈，重跑轉綠就會被當成 flaky 放行。
-   判不出來時不判：類別層級 `@DisplayName` 命名的報告（檔名裡的非 ASCII 變成 `?`）會對回類別，但報告關了、
-   寫到別處、或完全對不到任何測試類別時只印 WARN——這道檢查判錯的代價是每一輪都 FAIL、run 永遠不會成功，
+   判不出來時不判：類別層級 `@DisplayName` 命名的報告會對回類別——XML 裡的名字要完全相同（原始碼以模組的編碼
+   讀，跳脫照 javac）；檔名在 POSIX locale 下每個寫不出來的字變成一個 `?`，所以只在字數一樣、而且模組裡沒有別的
+   類別的名字也對得上時才算（先前任一段非 ASCII 都當成一個 `?`，「計算機測試」與「訂單測試」互相替對方作證）。
+   suite 報告（TestNG 的 `TEST-TestSuite.xml`、JUnit 4 的 `Suite`）是它的成員唯一的報告：它在裡面的每個 case 都
+   skipped 也算全部被略過。log 的 `Running` 行只算目標模組的 surefire 區段——`-am` 帶進來的上游模組裡同名的類別
+   不是它。報告關了、寫到別處、或完全對不到任何測試類別時只印 WARN——這道檢查判錯的代價是每一輪都 FAIL、run 永遠不會成功，
    比放過一個沒執行的測試更糟。回饋說出這次執行了哪些類別、各是什麼框架（限縮執行時退回 writer 介入前執行的
    那些）、類名是否符合 surefire 的 includes（`*Tests` 要 2.20 以後——Maven 3.8 沒指定版本時用的 2.12.4 不跑），
    writer 才知道該改寫成什麼。限縮執行時 `-Dtest` 帶的是 `Name,Name$*`：surefire 3.0.0-M5 以前的 `-Dtest=Name`
@@ -100,8 +104,11 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
      .txt 摘要同樣寫 `Failures: 1`，分不出來，所以不採用。找元素之前先把 CDATA 等長換成空白：測試輸出與堆疊都在
      CDATA 裡，一個 flaky 第一次失敗留下的訊息裡的 `<error code="503">`、測試印出的 `</testcase>` 都是文字。綠建置
      只讀每份報告開頭的計數，計數不是 0 才完整解析。
-   Gradle 同理，另外還要看測試結果本身：test 任務 up-to-date 時什麼都不印（開發者先跑過一次 `gradle test`，或這輪的
-   修改沒有改到 bytecode），而測試結果目錄只存著最後一次執行的結果。Gradle 以 exit 0 帶過的失敗也從這裡點名，
+   Gradle 同理，另外還要看測試結果本身：log 可能什麼都不說（quiet），而測試結果目錄只存著最後一次執行的結果。
+   Gradle 的建置一律是 `cleanTest test -Dorg.gradle.caching=false`：test 任務沒有實際執行（`UP-TO-DATE`——什麼都沒改；
+   `FROM-CACHE`——build cache 有這組輸入的輸出，每次撤回回到的正是上一批建置過的那棵樹）時留下的結果不是這次執行
+   的，一個只有真的跑才會失敗的測試就這樣過了。`cleanTest` 解決前者、解決不了後者（Gradle 8.14.3 實測），關掉 cache
+   用屬性而不用 `--no-build-cache`：Gradle 4 以前不認得那個選項、整個建置失敗；`--rerun` 要 7.6。Gradle 以 exit 0 帶過的失敗也從這裡點名，
    所以預檢照樣修得了、`UT_ALLOW_DIRTY_BASELINE` 照樣容忍得了。test-retry plugin（預設不合併重試）把每次重試寫成
    獨立的 test case：同名的測試有一次通過就不算失敗，否則重試後通過的綠建置會被判紅。
    不強制加 `-Dmaven.test.failure.ignore=false`：那會讓 reactor 停在失敗的上游模組，`UT_ALLOW_DIRTY_BASELINE`
@@ -382,8 +389,15 @@ production code 上）、連續兩批以同一個 `writer-no-op` 或 `reviewer-u
 **作法。** 每一批（或單一類別的 run）通過時，把它通過時的樣子記在該次 artifacts 的 `passed.json`
 （`libs/resume.ts`）：類別原始碼、它的測試檔（`findExistingTests` 的命名慣例）、那批 writer 寫的其他檔
 （不是別的類別的測試——共用 helper、`src/test/resources`），以及這些檔在測試目錄裡引用到的檔——它繼承的
-基底類別、呼叫的 fixture builder 與斷言 helper（連同它們再引用的），字串常值裡點名的資源（`referencedTestFiles`）
-——各自的 sha256；只因為被引用才記下的另列在 `refs`。reviewer 的分數與 blockers、它依據的 rubric 的 sha256。
+基底類別、呼叫的 fixture builder 與斷言 helper（連同它們再引用的），字串常值裡點名的資源，以測試命名的資源
+（`CalcTest.sql`——`@Sql` 沒寫路徑時 Spring 載入的、`CalcTest-context.xml`、approval／snapshot 檔；
+`src/test/java` 裡的非 .java 檔也算資源）（`referencedTestFiles`）——各自的 sha256；只因為被引用才記下的另列在
+`refs`。名字照 javac 的方式解析：import 的類別、同 package 與 on-demand import 的 package 裡的、寫了完整類名的；
+都對不到（別的類別的巢狀類別、放在和 package 不符的目錄）才算每一個同名的。先前每一個同名的都算：每個 package
+都有一個 `Fixtures` 的樹裡，一個測試記下所有 package 的 `Fixtures` 與它們的 builder，60 個 package 就碰到上限、
+永遠不接續。原始碼先以模組的編碼解碼再 lex（`decodeJavaSource`）：以 byte 讀 MS950，「功、許、蓋」的第二個 byte
+是 `\`，`"處理成功"` 的結尾引號被當成跳脫，同一行後面的 helper 與資源全部消失；非 ASCII 的資源名也要是真的字
+才對得上（兩邊都正規化成 NFC）。reviewer 的分數與 blockers、它依據的 rubric 的 sha256。
 reviewer 讀測試時也讀這些，而測試的行為就掛在它們上面：一個被掏空的斷言 helper 讓建置照樣綠、覆蓋率照樣在
 （覆蓋率量的是執行，不是斷言）。引用的走訪由近而遠，類別與資源各有上限（各 400 個）：資源各算各的，一個點名
 上千個 golden file 的 helper 才不會用掉它呼叫的 helper 需要的額度。字串常值從 lexer 處理過的原始碼取（
@@ -403,13 +417,18 @@ reviewer 讀測試時也讀這些，而測試的行為就掛在它們上面：�
   只要其中一個有跑就算的話，那批順手改過的既有測試有跑，就替一個沒被執行的新測試作了證；反過來，一個被引用、
   自己也有 `@Test` 卻不在 surefire includes 裡的基底類別，要求它單獨執行就永遠接續不了。它的測試在這次預檢時
   失敗過（不穩定、重跑才過，或是修復迴圈修好的）就重新產生：通過時的 review 對一個剛失敗過的測試已不成立。
+  surefire 自己重跑才過的（`rerunFailingTestsCount`：建置是綠的，報告裡是 `<flakyFailure>` / `<flakyError>`，沒有
+  XML 時看 log 的 `Flakes:`；Gradle 的 test-retry 是同名的一敗一過）也一樣——綠燈藏住了失敗。
   失敗的類別取自 suite 名與失敗案例自己的 `classname`——TestNG 只寫一個 `TEST-TestSuite.xml`、JUnit 4 的
   `Suite` 以 suite 類別命名，只看 suite 名永遠對不上；比對的一邊用測試檔的路徑、也用它宣告的 package。
   修復迴圈改過測試資源時全部重新產生——profile、classpath 掃描、字串路徑，任何測試都可能讀到它，而 reviewer
-  沒看過。紀錄裡找不到會被執行的測試類別時無從證明，重新產生。Gradle 的 test task 這次沒有實際執行
-  （`UP-TO-DATE`、`SKIPPED`、`FROM-CACHE`，或 log 看不出來）時，`build/test-results` 是之前那次留下的，不是這棵樹
-  的證據，什麼都不略過；看的是目標專案自己的 test task（buildSrc 以外最淺的那個）——`gradle test` 在子專案裡也
-  會執行，子專案的有跑不代表目標的有跑。預檢紅燈而被 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1`
+  沒看過；改過 Spring 會自己載入的類別（component scan 找得到的 `@Component`、`@Configuration`，`@SpringBootTest`
+  找得到的 `@TestConfiguration`，`springLoaded`）也一樣：沒有測試點名它，context 照樣載入它。修復改的是普通的
+  helper 時不必——用到它的測試在紀錄的 `refs` 裡，照常比對。紀錄裡找不到會被執行的測試類別時無從證明，重新產生。
+  Gradle 的 test task 這次沒有實際執行（`SKIPPED`，或 log 看不出來；建置本身已經排除了 `UP-TO-DATE` 與
+  `FROM-CACHE`，見 build gate）時，`build/test-results` 不是這棵樹的證據，什麼都不略過；看的是目標專案自己的
+  test task（buildSrc 以外最淺的那個）——`gradle test` 在子專案裡也會執行，子專案的有跑不代表目標的有跑。
+  修復讓預檢轉綠時，`Running` 行與 `Flakes:` 看的是修復那次綠燈建置的 log。預檢紅燈而被 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1`
   時，沒有東西證明它們現在仍然通過，什麼都不略過；報告對不到任何類別時也一樣。
 - **覆蓋率**：用 coverage gate 自己的 `checkCoverage` 對這次預檢的 JaCoCo 報告重新量，門檻是現在的。
   別的測試被刪、它呼叫的類別改了，覆蓋率會變，即使紀錄裡的檔都沒動——所以不能沿用當時的數字。沒有這次建置
@@ -424,12 +443,28 @@ reviewer 讀測試時也讀這些，而測試的行為就掛在它們上面：�
 即使只剩一個類別，也照樣以批次執行（沒過就撤回、執行中有復原日誌）：是不是分批由目標決定，不是由剩下幾個
 決定——否則最常見的重跑（有幾批沒過，再跑一次）會把最後那一批沒過的測試留在 `src/test`。
 
+**同一次執行裡的變化。** 後面的批次改了前面通過紀錄裡的檔——擴充共用的 helper、把自己的測試加進 JUnit 4
+suite——前面那筆就不再相符，下一次重跑重新產生那個類別。這是刻意的：更新前面那筆的雜湊等於讓它的判決涵蓋一個
+它的 reviewer 沒讀過的 helper 版本，而後面那批的 reviewer 審的是自己的測試，不保證讀了那份 diff。代價是共用
+helper 每一批都改的模組，重跑要重做前面的類別；重做時測試已經在、helper 也有了需要的方法，writer 多半不再動它，
+所以通常一兩次就收斂。log 在那一批通過時就說哪一筆不再相符、為什麼（`noteStale`，只看那批寫過的檔）。後面的建置
+發現前面通過的類別的測試不穩定（建置失敗、重跑才過：orchestrator 的 `flakyTests`），那筆紀錄標記作廢（`invalid`）
+而不是刪掉：只看最新一筆的規則下，刪掉會讓更舊的一筆重新算數。
+
+讀紀錄由新到舊，每個目標類別取到最新的一筆就不再往舊的找（`readLedgers` 的 `wanted`）：每次執行的 `passed.json`
+都帶著它接續的紀錄，所以通常讀一兩份就夠——先前每次啟動讀遍所有執行的紀錄，300 個類別、100 次執行是 240 MB、
+1.3 秒。紀錄裡的路徑必須在 repo 裡（共用的 runs 目錄裡一份被改過的紀錄可以指向任何地方）；雜湊只讀一般檔案
+（打開 FIFO 會一直等寫入端），分段讀、大小不限；`passed.json` 寫完 fsync 才換上。
+
 **為什麼預設開啟。** 重跑多半就是為了補完被打斷的那次；略過的每一個類別都經過這次的建置與覆蓋率重新驗證，
 沿用的只有 reviewer 的判決，而它的輸入逐 byte 比對過。最壞的情況是該略過的沒略過——那就是以前的行為。
 要全部重新產生設 `UT_RESUME=0`。
 
 **沒有做的。** reviewer 的模型、prompt 範本與工具版本不在比對之內——沿用的判決只比對 reviewer 讀的東西與
-rubric。換了模型、或升級工具後想重新審一遍，設 `UT_RESUME=0`。被 SIGKILL 的 run 留下的半成品在接續之前就由
+rubric。換了模型、或升級工具後想重新審一遍，設 `UT_RESUME=0`。引用的走訪只看測試目錄：目錄、glob、
+`String.format` 組出來的路徑，`src/main` 裡的常數，`src/test/resources` 以外的資料目錄，上游模組的 test-jar 與
+Gradle 的 `src/testFixtures` 都看不到。比對的是內容：git 的 autocrlf 改了換行也算改過；`runs/<repo 名>` 以目錄名
+區分，同名的另一個 checkout 共用紀錄（只會少接續）；路徑大小寫不敏感的檔案系統上，目標要用和上次同樣的大小寫。被 SIGKILL 的 run 留下的半成品在接續之前就由
 它的復原日誌撤回（下一節），不在任何通過紀錄裡。
 
 ## 已採納：替被強制終止的 run 收尾（2026-09-28）
