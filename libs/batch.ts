@@ -5,6 +5,7 @@
 // more than a few classes that session outgrew the model's context or the agent timeout, and one
 // class that could not be made green ended the run for all of them. loop.ts now runs the
 // maker-checker loop per batch; these helpers are the parts of that which are not control flow.
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -157,9 +158,16 @@ function removeEmptyTree(dir: string): void {
  *
  * `only`, when given, is what the batch's writer changed (relative paths): anything else that
  * changed meanwhile — an edit in the developer's IDE, a file a test wrote — is not the batch's to
- * undo, and is listed as foreign instead.
+ * undo, and is listed as foreign instead. `leave`: paths the caller has already accounted for
+ * (reported its own way): neither undone nor listed.
  */
-export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejectedPrefix = "", only?: Set<string>): RollbackReport {
+export function rollbackTree(
+  capture: TreeCapture,
+  rejectedDir: string,
+  rejectedPrefix = "",
+  only?: Set<string>,
+  leave?: Set<string>,
+): RollbackReport {
   const report: RollbackReport = { created: [], restored: [], undeleted: [], unrestorable: [], failed: [], notKept: [], foreign: [] };
   const ours = (rel: string) => !only || only.has(rel);
   const keep = (rel: string, abs: string) => {
@@ -185,6 +193,7 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
     capture.root,
     (rel, abs) => {
       seen.add(rel);
+      if (leave?.has(rel)) return;
       if (!capture.files.has(rel)) {
         if (!ours(rel)) {
           report.foreign.push(rel);
@@ -234,7 +243,7 @@ export function rollbackTree(capture: TreeCapture, rejectedDir: string, rejected
     },
   );
   for (const [rel, original] of capture.files) {
-    if (seen.has(rel)) continue;
+    if (seen.has(rel) || leave?.has(rel)) continue;
     if (!ours(rel)) {
       report.foreign.push(rel);
       continue;
@@ -348,7 +357,8 @@ export function removeBatchOutputs(capture: OutputCapture, touched: string[]): s
 // (loop.ts recoverKilledBatches); a batch that ends in any other way removes its journal.
 
 // 2: the tree it started from packed into start.bin, and who wrote it with its start time and checkout.
-const JOURNAL_VERSION = 2;
+// 3: the checkout identified by inode and birth time (no device number).
+const JOURNAL_VERSION = 3;
 /** Under the batch's artifacts directory. */
 export const JOURNAL_DIR = "inflight";
 
@@ -391,17 +401,40 @@ export function samePids(there: { host?: unknown; boot?: unknown; pidns?: unknow
 }
 
 /**
- * Which directory this is, beyond its path: device and inode. A checkout deleted and cloned again at
- * the same path, a test tree removed and recreated, is another directory — a killed batch's leftovers
- * cannot be in it. "" when the file system has no inode numbers to tell by.
+ * Which directory this is, beyond its path: its inode and its birth time ("<ino>@<ns>", the birth
+ * time 0 where the file system keeps none). A checkout deleted and cloned again at the same path, a
+ * test tree removed and recreated, is another directory — a killed batch's leftovers cannot be in
+ * it. Not the device number: many file systems hand one out at mount time (overlayfs, btrfs
+ * subvolumes, NFS), so after a reboot — the power cut a journal exists for — the same directory had
+ * another. "" when the file system has no inode numbers to tell by.
  */
 export function dirIdentity(dir: string): string {
   try {
     const st = fs.statSync(dir, { bigint: true });
-    return st.ino ? `${st.dev}:${st.ino}` : "";
+    return st.ino ? `${st.ino}@${st.birthtimeNs}` : "";
   } catch {
     return "";
   }
+}
+
+/**
+ * Pure: whether two dirIdentity values name the same directory — true, false, or undefined when
+ * there is no telling (either has no inode number, or is in a form an earlier version wrote). The
+ * same inode without a birth time on both sides is taken as the same: a re-created directory can
+ * reuse the number, but then everything in it is newer than the killed run anyway.
+ */
+export function sameDirectory(recorded: string, now: string): boolean | undefined {
+  const a = /^(\d+)@(\d+)$/.exec(recorded);
+  const b = /^(\d+)@(\d+)$/.exec(now);
+  if (!a || !b) return undefined;
+  if (a[1] !== b[1]) return false;
+  return a[2] === "0" || b[2] === "0" || a[2] === b[2];
+}
+
+/** Pure: whether two dirIdentity values prove the same directory — inode and a birth time both match. */
+export function provenSameDirectory(recorded: string, now: string): boolean {
+  const a = /^(\d+)@(\d+)$/.exec(recorded);
+  return !!a && a[2] !== "0" && recorded === now;
 }
 
 /** Who wrote a journal: the run, where, and for which checkout. Written first (owner.json). */
@@ -437,9 +470,40 @@ export interface JournalTrace {
   session?: TreeSnapshot;
 }
 
+/** Its data on the disk before anything names it: a power cut is what a journal is for. */
+function writeDurable(file: string, data: string | Buffer): void {
+  const fd = fs.openSync(file, "w");
+  try {
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// The rename too: until the directory is on disk, the new name may not be. Windows cannot open a
+// directory to sync it (NTFS journals the rename itself).
+function syncDir(dir: string): void {
+  if (process.platform === "win32") return;
+  try {
+    const fd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    /* a file system that cannot: the data itself is synced */
+  }
+}
+
+// Written whole or not at all, and on the disk: after a power cut ext4 and XFS can leave a file that
+// was renamed into place empty when its data was never synced — a journal read as damaged, and
+// thrown away without its rollback.
 function writeAtomic(file: string, text: string): void {
-  fs.writeFileSync(`${file}.tmp`, text);
+  writeDurable(`${file}.tmp`, text);
   fs.renameSync(`${file}.tmp`, file);
+  syncDir(path.dirname(file));
 }
 
 /** An open journal: its directory, and the heartbeat that keeps its time current while the run lives. */
@@ -475,7 +539,7 @@ export function openJournal(
       boot: j.boot,
       ...(j.pidns ? { pidns: j.pidns } : {}),
     };
-    fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify(owner));
+    writeAtomic(path.join(dir, "owner.json"), JSON.stringify(owner));
     const kept: Array<[string, number, number]> = [];
     const tooLarge: Record<string, string> = {};
     const fd = fs.openSync(path.join(dir, "start.bin"), "w");
@@ -490,6 +554,8 @@ export function openJournal(
         kept.push([rel, at, buf.length]);
         at += buf.length;
       }
+      // On the disk before journal.json says where in it each file is.
+      fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
@@ -533,6 +599,12 @@ export interface DeadBatch {
   path: string;
   journal: BatchJournal;
   trace: JournalTrace;
+  /**
+   * Its trace could not be read (damaged — by hand, or a disk that lost it): what the writer changed
+   * is not known, and everything that changed since the batch started, before the run died, is taken
+   * as the batch's.
+   */
+  traceLost?: boolean;
   /** When the run was last known alive: the journal's heartbeat, or its last trace. */
   lastSeen: number;
 }
@@ -545,6 +617,30 @@ const mtimeOrZero = (p: string) => {
   }
 };
 
+/** How long a journal's heartbeat may be silent before its run is taken for dead. */
+export const JOURNAL_STALE_MS = 5 * 60_000;
+
+/**
+ * Waits while `busy()` names journals of this checkout whose run may still be going — until none
+ * does, or `maxMs` has passed — and returns what is still busy then. `sleep` and `clock`: for the
+ * selftest.
+ */
+export async function waitWhileBusy(
+  busy: () => string[],
+  maxMs: number,
+  pollMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  clock: () => number = Date.now,
+): Promise<string[]> {
+  const until = clock() + maxMs;
+  let left = busy();
+  while (left.length && clock() < until) {
+    await sleep(pollMs);
+    left = busy();
+  }
+  return left;
+}
+
 /** How the caller finds out about processes on this machine (libs/shell.ts, injected for the selftest). */
 export interface ProcessProbe {
   alive(pid: number): boolean;
@@ -556,9 +652,10 @@ export interface ProcessProbe {
  * Pure: whether the run that wrote a journal on this host may still be running. The caller holds the
  * repo lock, so it cannot be — but a pid only means something since the boot it was written in (a
  * machine that rebooted has no run from before), and is only that run while it is the same process:
- * its start time says so, where the OS reports one. Without it (Windows), a live pid that is still
- * beating counts as the run. Written in another pid namespace (a container sharing this machine's
- * name), its pid names nobody here: only its heartbeat can tell.
+ * its start time says so, where the OS reports one — a start time recorded but not readable now is
+ * a process that has ended (a zombie still answers a signal). Without one recorded (Windows), a live
+ * pid that is still beating counts as the run. Written in another pid namespace (a container sharing
+ * this machine's name), its pid names nobody here: only its heartbeat can tell.
  */
 export function mayBeRunning(
   owner: { pid?: number; start?: string; boot?: number; pidns?: string },
@@ -572,8 +669,7 @@ export function mayBeRunning(
   if ((owner.pidns ?? "") !== (here.pidns ?? "")) return now - lastSeen < staleAfterMs;
   const pid = owner.pid ?? -1;
   if (pid === process.pid) return false;
-  const start = owner.start ? probe.start(pid) : undefined;
-  if (start !== undefined) return start === owner.start;
+  if (owner.start) return probe.start(pid) === owner.start;
   return probe.alive(pid) && now - lastSeen < staleAfterMs;
 }
 
@@ -605,6 +701,41 @@ export function isJournal(j: unknown): j is BatchJournal {
   );
 }
 
+/** Pure: a relative path that stays inside the directory it is relative to. */
+export const safeRel = (rel: string): boolean =>
+  rel !== "" && !path.isAbsolute(rel) && !/^[A-Za-z]:/.test(rel) && !rel.split(/[\\/]/).includes("..");
+
+const realOr = (p: string) => {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+};
+
+/** Whether `p` is `parent` or under it, both taken as they are on disk (symlinks resolved). */
+export function isInside(parent: string, p: string): boolean {
+  const r = path.relative(realOr(parent), realOr(p));
+  return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
+}
+
+/**
+ * Whether what a journal of this checkout points at is where one can point: its test tree inside the
+ * checkout (not the checkout itself), and every file it names inside the tree. A runs directory can
+ * be shared; what someone else wrote there must not make a rollback write outside src/test. (Its
+ * artifacts are taken from where it was found, and build outputs outside the checkout are dropped.)
+ */
+export function journalContained(j: BatchJournal, repoRoot: string): boolean {
+  return (
+    isInside(repoRoot, j.testTree) &&
+    realOr(j.testTree) !== realOr(repoRoot) &&
+    j.outputs.every((o) => o.files.every(safeRel)) &&
+    j.capture.kept.every((k) => safeRel(k[0])) &&
+    Object.keys(j.capture.tooLarge).every(safeRel) &&
+    j.capture.dirs.every(safeRel)
+  );
+}
+
 function readTrace(dir: string): JournalTrace | undefined {
   let t: JournalTrace;
   try {
@@ -616,19 +747,30 @@ function readTrace(dir: string): JournalTrace | undefined {
   const ok =
     !!t &&
     isStrings(t.written) &&
-    (t.session === undefined || (!!t.session && typeof t.session === "object" && Object.values(t.session).every((v) => typeof v === "string")));
+    t.written.every(safeRel) &&
+    (t.session === undefined ||
+      (!!t.session &&
+        typeof t.session === "object" &&
+        Object.entries(t.session).every(([rel, v]) => safeRel(rel) && typeof v === "string")));
   return ok ? t : undefined;
 }
 
 /**
- * The journals this repo's earlier runs on this machine left under `runsDir`: batches whose run ended
- * without setting them aside (see mayBeRunning). A journal is only ever this run's to act on when it
- * was written here, for this checkout: another host sharing the runs directory — the same path, its
- * own checkout — has its own tree; its journals are left for it (`elsewhere`), and so are those of
- * another container on this machine whose checkout is not this one. Ours to throw away (`stale`):
- * one whose run did end (it has a summary.json), one cut short while being written, one that will
- * not parse, and one whose checkout or test tree is not there any more (the same path now holds
- * another). A run that may still be going keeps its journals (`running`).
+ * The journals this repo's earlier runs left under `runsDir`, sorted by what this run may do with
+ * each. Only a journal of this checkout is ever acted on — the same directories (dirIdentity), not
+ * just the same path: another machine sharing the runs directory has its own checkout at that path,
+ * and applying its journal here would swap this checkout's files for that one's. Another machine's
+ * is taken as this one's only when the directories are proven the same (inode and birth time: a
+ * volume shared into containers that each get a new host name); with no pid of it meaning anything
+ * here, only its heartbeat tells whether it is alive.
+ *
+ * - `dead`: a batch whose run died without setting it aside — the caller finishes it.
+ * - `busy`: a batch of this checkout whose run may still be going (a container restarted within the
+ *   heartbeat's window, a run that bypassed the repo lock): nothing on this checkout may start.
+ * - `stale`: ours to throw away — its run ended (it has a summary.json), it was cut short while
+ *   being written, it will not parse or points outside the checkout, or its checkout or test tree
+ *   is not there any more (the same path now holds another).
+ * - `elsewhere`: another checkout's, left alone.
  */
 export function findJournals(
   runsDir: string,
@@ -636,11 +778,11 @@ export function findJournals(
   probe: ProcessProbe,
   here: JournalHost = thisHost(),
   now = Date.now(),
-  staleAfterMs = 5 * 60_000,
-): { dead: DeadBatch[]; stale: Array<{ dir: string; why: string }>; running: number; elsewhere: number } {
+  staleAfterMs = JOURNAL_STALE_MS,
+): { dead: DeadBatch[]; stale: Array<{ dir: string; why: string }>; busy: string[]; elsewhere: number } {
   const dead: DeadBatch[] = [];
   const stale: Array<{ dir: string; why: string }> = [];
-  let running = 0;
+  const busy: string[] = [];
   let elsewhere = 0;
   const list = (d: string) => {
     try {
@@ -659,60 +801,73 @@ export function findJournals(
         continue; // none, or not this tool's: not ours to judge
       }
       if (!owner || typeof owner !== "object" || owner.repoRoot !== checkout.repoRoot) continue;
-      if (owner.host !== here.host) {
-        elsewhere++;
-        continue;
-      }
+      const sameHost = owner.host === here.host;
+      // Nothing of another machine's is ours to throw away: at most it is proven to be this checkout.
+      const dropOrLeave = (why: string) => (sameHost ? stale.push({ dir, why }) : elsewhere++);
+      const alive = (o: Partial<JournalOwner>, lastSeen: number) =>
+        sameHost ? mayBeRunning(o, lastSeen, here, probe, now, staleAfterMs) : now - lastSeen < staleAfterMs;
       let raw: unknown;
       try {
         raw = JSON.parse(fs.readFileSync(path.join(dir, "journal.json"), "utf8"));
       } catch (e) {
         // Cut short while being written — or still being written, by a run that is alive.
         const missing = (e as NodeJS.ErrnoException).code === "ENOENT";
-        if (missing && mayBeRunning(owner, mtimeOrZero(path.join(dir, "owner.json")), here, probe, now, staleAfterMs)) running++;
+        const itsCheckout = sameDirectory(typeof owner.rootId === "string" ? owner.rootId : "", checkout.rootId) !== false;
+        if (!sameHost) elsewhere++;
+        else if (missing && alive(owner, mtimeOrZero(path.join(dir, "owner.json")))) itsCheckout ? busy.push(dir) : elsewhere++;
         else stale.push({ dir, why: missing ? "寫到一半就被終止" : "內容損毀" });
         continue;
       }
       if (!isJournal(raw)) {
         const v = (raw as { version?: unknown })?.version;
         if (typeof v === "number" && v !== JOURNAL_VERSION) continue; // another version's: not ours to read
-        stale.push({ dir, why: "內容損毀" });
+        dropOrLeave("內容損毀");
         continue;
       }
-      const journal = raw;
+      // Its artifacts are where it was found, whatever it says; its build outputs only in the checkout.
+      const journal: BatchJournal = {
+        ...raw,
+        runDir: path.join(runsDir, run),
+        dir: path.join(runsDir, run, batch),
+        outputs: raw.outputs.filter((o) => isInside(checkout.repoRoot, o.dir)),
+      };
+      if (!journalContained(journal, checkout.repoRoot)) {
+        dropOrLeave("內容不合法（指向這個 checkout 的測試目錄之外）");
+        continue;
+      }
+      // Whether it describes this checkout: the directories it was written for, and the ones here now.
+      const treeNow = fs.existsSync(journal.testTree) ? dirIdentity(journal.testTree) : undefined;
+      const root = sameDirectory(journal.rootId, checkout.rootId);
+      const tree = treeNow === undefined ? false : sameDirectory(journal.treeId, treeNow);
+      const ours = root !== false && tree !== false;
+      const proven = provenSameDirectory(journal.rootId, checkout.rootId) && !!treeNow && provenSameDirectory(journal.treeId, treeNow);
+      if (!sameHost && !proven) {
+        elsewhere++; // another machine's own checkout at the same path
+        continue;
+      }
       const lastSeen = Math.max(mtimeOrZero(path.join(dir, "journal.json")), mtimeOrZero(path.join(dir, "trace.json")));
-      if (mayBeRunning(journal, lastSeen, here, probe, now, staleAfterMs)) {
-        running++;
+      if (alive(journal, lastSeen)) {
+        if (ours) busy.push(dir);
+        else elsewhere++;
         continue;
       }
       if (fs.existsSync(path.join(journal.runDir, "summary.json"))) {
         stale.push({ dir, why: "那次執行有收尾" });
         continue;
       }
-      // Its checkout, and its test tree, must be the ones on disk now. Written in another pid namespace
-      // — a container sharing this machine's name — a different one is that container's own checkout
-      // at the same path, not this one cloned again: its journal is left for it.
-      const theirs = (journal.pidns ?? "") !== (here.pidns ?? "");
-      if (journal.rootId && checkout.rootId && journal.rootId !== checkout.rootId) {
-        if (theirs) elsewhere++;
-        else stale.push({ dir, why: "這個路徑現在是另一個 checkout（重新 clone 過）" });
-        continue;
-      }
-      const treeNow = dirIdentity(journal.testTree);
-      if (!fs.existsSync(journal.testTree) || (journal.treeId && treeNow && treeNow !== journal.treeId)) {
-        if (theirs) elsewhere++;
+      if (!ours) {
+        // Written in another pid namespace — a container sharing this machine's name — a different
+        // checkout is that container's own at the same path, not this one cloned again: left for it.
+        if (!samePids(journal, here)) elsewhere++;
+        else if (root === false) stale.push({ dir, why: "這個路徑現在是另一個 checkout（重新 clone 過）" });
         else stale.push({ dir, why: `它的測試目錄 ${journal.treeRel} 已經不是那時的那一個（被刪除或重建過）` });
         continue;
       }
       const trace = readTrace(dir);
-      if (!trace) {
-        stale.push({ dir, why: "內容損毀" });
-        continue;
-      }
-      dead.push({ path: dir, journal, trace, lastSeen });
+      dead.push({ path: dir, journal, trace: trace ?? { written: [] }, ...(trace ? {} : { traceLost: true }), lastSeen });
     }
   }
-  return { dead, stale, running, elsewhere };
+  return { dead, stale, busy, elsewhere };
 }
 
 /** The tree a dead batch started from, as setAside takes it. */
@@ -745,14 +900,16 @@ export function journalOutputs(d: DeadBatch): OutputCapture {
  * `slackMs` for the heartbeat's interval): that was someone else, after it died, and stays.
  * A file that is gone has no time to tell by; its directory does. One whose directory changed after
  * the death, or is gone, may have been deleted by anyone — a branch switch, a teammate's rename
- * pulled in — and is not put back: `undecided` lists those. `mtimeOf` gives a file's (or directory's)
- * modification time now; undefined when it is gone.
+ * pulled in — and is not put back: `undecided` lists those. A file gone that the batch did not start
+ * with (`startedWith`) has nothing to put back and is dropped. `mtimeOf` gives a file's (or
+ * directory's) modification time now; undefined when it is gone.
  */
 export function killedWriterChanges(
   d: Pick<DeadBatch, "trace" | "lastSeen">,
   now: TreeSnapshot,
   mtimeOf: (rel: string) => number | undefined,
   slackMs: number,
+  startedWith: (rel: string) => boolean,
 ): { only: Set<string>; undecided: string[] } {
   const only = new Set(d.trace.written);
   if (d.trace.session) for (const rel of diffSnapshots(d.trace.session, now)) only.add(rel);
@@ -764,6 +921,10 @@ export function killedWriterChanges(
       if (after(m)) only.delete(rel);
       continue;
     }
+    if (!startedWith(rel)) {
+      only.delete(rel);
+      continue;
+    }
     const parent = path.posix.dirname(rel);
     const dm = mtimeOf(parent === "." ? "" : parent);
     if (dm === undefined || after(dm)) {
@@ -772,6 +933,123 @@ export function killedWriterChanges(
     }
   }
   return { only, undecided: undecided.sort() };
+}
+
+/**
+ * Pure: files moved after the run died — `mv`, `git mv`, an IDE's move: a file the writer did not
+ * start with, holding byte for byte the content of one the batch started with that is gone now, and
+ * gone undecided (its directory changed after the death). A move keeps the file's time, so the new
+ * one looks as old as the writer's own files; rolling it back and not putting the old one back
+ * would leave neither in the tree. Neither is the batch's: both are left as they are. `read` gives
+ * a file's content now; undefined when it cannot be read.
+ */
+export function movesAfterDeath(
+  only: Set<string>,
+  undecided: string[],
+  start: TreeCapture,
+  read: (rel: string) => Buffer | undefined,
+): Array<{ from: string; to: string }> {
+  const gone = new Map<string, string[]>();
+  const digest = (b: Buffer) => createHash("sha1").update(b).digest("hex");
+  for (const rel of undecided) {
+    const original = start.files.get(rel);
+    if (!original) continue;
+    const k = digest(original);
+    gone.set(k, [...(gone.get(k) ?? []), rel]);
+  }
+  const moves: Array<{ from: string; to: string }> = [];
+  if (!gone.size) return moves;
+  for (const rel of [...only].sort()) {
+    if (start.files.has(rel)) continue;
+    const content = read(rel);
+    if (!content) continue;
+    const from = gone.get(digest(content))?.find((g) => start.files.get(g)!.equals(content));
+    if (!from) continue;
+    gone.set(digest(content), gone.get(digest(content))!.filter((g) => g !== from));
+    moves.push({ from, to: rel });
+  }
+  return moves;
+}
+
+/**
+ * What a recovery decided, kept in the journal before it acts: a retry after it stopped halfway (a
+ * file locked, the recovering run itself killed) decides the same — its own first attempt changed the
+ * tree's times, and would read as changes made after the death.
+ */
+export interface RecoveryDecision {
+  /** When it was decided: a file changed after it, and not put back by it, was changed by someone since. */
+  at: number;
+  only: string[];
+  undecided: string[];
+  moves: Array<{ from: string; to: string }>;
+}
+
+export function readDecision(journalDir: string): RecoveryDecision | undefined {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(journalDir, "decision.json"), "utf8")) as RecoveryDecision;
+    const ok =
+      !!d &&
+      Number.isFinite(d.at) &&
+      isStrings(d.only) &&
+      d.only.every(safeRel) &&
+      isStrings(d.undecided) &&
+      d.undecided.every(safeRel) &&
+      Array.isArray(d.moves) &&
+      d.moves.every((m) => !!m && typeof m.from === "string" && typeof m.to === "string" && safeRel(m.from) && safeRel(m.to));
+    return ok ? d : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeDecision(journalDir: string, d: RecoveryDecision): void {
+  writeAtomic(path.join(journalDir, "decision.json"), JSON.stringify(d));
+}
+
+/**
+ * What of a killed batch is its writer's to undo (killedWriterChanges, movesAfterDeath), decided once
+ * and kept in its journal before anything is changed: a retry after the recovery stopped halfway — a
+ * file locked, the recovering run itself killed — decides the same (`reused`). Its own first attempt
+ * moved files out and put others back, after the death, and would read as someone else's changes:
+ * a file it could not put back would sit in a directory "changed after the death", and not be put
+ * back at all. What someone changed after that first decision stays theirs. With its trace lost,
+ * what the writer changed is unknown: everything that changed since the batch started, before the
+ * run died, is the batch's (kept in rejected/ like the rest). `view` reads the test tree now.
+ */
+export function decideRecovery(
+  d: DeadBatch,
+  capture: TreeCapture,
+  lastSeen: number,
+  slackMs: number,
+  view: { snapshot: () => TreeSnapshot; mtimeOf: (rel: string) => number | undefined; read: (rel: string) => Buffer | undefined },
+  now = Date.now(),
+): { decision: RecoveryDecision; reused: boolean } {
+  const earlier = readDecision(d.path);
+  if (earlier) {
+    const only = earlier.only.filter((rel) => {
+      const m = view.mtimeOf(rel);
+      return m === undefined || m <= earlier.at + slackMs;
+    });
+    return { decision: { ...earlier, only }, reused: true };
+  }
+  const tree = view.snapshot();
+  const trace = d.traceLost ? { written: [...new Set([...capture.files.keys(), ...Object.keys(tree)])] } : d.trace;
+  const changes = killedWriterChanges({ trace, lastSeen }, tree, view.mtimeOf, slackMs, (rel) => capture.files.has(rel));
+  const moves = movesAfterDeath(changes.only, changes.undecided, capture, view.read);
+  for (const m of moves) changes.only.delete(m.to);
+  const moved = new Set(moves.map((m) => m.from));
+  const decision: RecoveryDecision = {
+    at: now,
+    only: [...changes.only].sort(),
+    undecided: changes.undecided.filter((u) => !moved.has(u)),
+    moves,
+  };
+  try {
+    writeDecision(d.path, decision);
+  } catch {
+    /* read-only artifacts: a retry decides again */
+  }
+  return { decision, reused: false };
 }
 
 // ─── Across batches ──────────────────────────────────────────────────────────

@@ -31,9 +31,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
-  斷電）而沒機會撤回的那批，由下一次在同一台機器上的執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、
-  `recoverKilledBatches`；撤回不完整就停下；DESIGN.md「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與
-  agent 也在那之前結束（`stopOrphans`，只結束確定是同一個程序的）。
+  斷電）而沒機會撤回的那批，由下一次對同一個 checkout 的執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、
+  `recoverKilledBatches`；撤回不完整就停下，這個 checkout 還有 testgen 在跑就先等、等不到就停下；DESIGN.md
+  「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與 agent 也在那之前結束（`stopOrphans`，只結束確定是
+  同一個程序的）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）

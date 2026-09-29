@@ -190,6 +190,12 @@ export const REVIEWER_TEMPERATURE = 0;
 // Build/test gate wall-clock timeout. A hung mvn (unreachable repo, a test with a real
 // socket) was the one unbounded wait left in the pipeline.
 export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000, MAX_TIMER_MS);
+// How long a run waits, before it starts, for a batch of this checkout that another testgen may still
+// be running — its journal still beating: a container restarted within the heartbeat's window, a run
+// that bypassed the repo lock (loop.ts recoverKilledBatches). The default outlasts the five minutes a
+// heartbeat is trusted for, so a killed run's journal goes quiet and its batch is set aside; still
+// busy after it, the run stops (checkout-busy). 0: stop at once.
+export const OTHER_RUN_WAIT_MS = numEnv("UT_OTHER_RUN_WAIT_MS", 6 * 60 * 1000, 0, MAX_TIMER_MS);
 // How much build output is kept in memory for the gates (characters). Beyond it the head is
 // dropped and only its [ERROR] / "Tests run:" lines survive. An unbounded capture crashed the
 // whole tool at V8's ~512M-character string limit when a test logged heavily.

@@ -51,7 +51,7 @@ export function shLive(
       shell: process.platform === "win32",
       detached: DETACH_CHILDREN,
     });
-    trackForShutdown(child);
+    trackForShutdown(child, "build");
 
     let timedOut = false;
     const timer = timeoutMs
@@ -469,10 +469,14 @@ export function installShutdownHandlers(): void {
   });
 }
 
-/** Registers `child` so an interrupted run still takes its process tree down with it. */
-export function trackForShutdown(child: ChildProcess): void {
+/**
+ * Registers `child` so an interrupted run still takes its process tree down with it. `kind`: "build"
+ * for a build (it writes target/, not src/test); anything else — an agent session — may write the
+ * test tree.
+ */
+export function trackForShutdown(child: ChildProcess, kind: ChildRecord["kind"] = "other"): void {
   liveChildren.add(child);
-  recordChild(child);
+  recordChild(child, kind);
   child.once("exit", () => {
     liveChildren.delete(child);
     if (childRecords.delete(child)) persistChildren();
@@ -496,6 +500,11 @@ export interface ChildRecord {
   start: string;
   /** What it was, for the log. */
   cmd: string;
+  /**
+   * "build": writes the build's outputs, not the test tree — stopping one left running says nothing
+   * about when src/test was last written. Absent in records of earlier versions: taken as "other".
+   */
+  kind?: "build" | "other";
 }
 
 export interface ChildrenJournal {
@@ -547,9 +556,9 @@ function persistChildren(): void {
   }
 }
 
-function recordChild(child: ChildProcess): void {
+function recordChild(child: ChildProcess, kind: ChildRecord["kind"]): void {
   if (child.pid === undefined) return;
-  childRecords.set(child, { pid: child.pid, start: processStart(child.pid) ?? "", cmd: child.spawnargs.join(" ").slice(0, 300) });
+  childRecords.set(child, { pid: child.pid, start: processStart(child.pid) ?? "", cmd: child.spawnargs.join(" ").slice(0, 300), kind });
   persistChildren();
 }
 

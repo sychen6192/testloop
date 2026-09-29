@@ -560,6 +560,12 @@ const ORPHAN_REWRITES: Record<string, Partial<NonNullable<Scenario["rerun"]>>> =
   "loop-killed-orphan-other-host": { rewrite: { file: "{{firstRun}}/children.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
   "loop-killed-orphan-rebooted": { rewrite: { file: "{{firstRun}}/children.json", from: /"boot":\d+/, to: '"boot":1' } },
   "loop-killed-orphan-other-container": { rewrite: { file: "{{firstRun}}/children.json", from: /"pidns":"[^"]*"/, to: '"pidns":"pid:[1]"' } },
+  // Stopping a build left running says nothing about src/test: the developer's fix made after the
+  // crash to a file the killed writer had touched stays theirs.
+  "loop-killed-orphan-build-keeps-fix": {
+    backdateMs: 600_000,
+    between: { [EXISTING_PATH]: `${EXISTING_TEST}// fixed by the developer after the crash\n` },
+  },
   "loop-killed-orphan-corrupt-record": { rewrite: { file: "{{firstRun}}/children.json", from: /"children":\[[^\]]*\]/, to: '"children":{"not":"a list"}' } },
   // This very process — alive, and the same process its start time says — stands in for the run.
   "loop-killed-orphan-owner-alive": {
@@ -594,6 +600,27 @@ const CALC_TEST_WITH_SUPPORT = CALC_TEST.replace(
   "assertEquals(3, new Calc().add(Support.one(), 2));",
 );
 const SUPPORT_JAVA = "package com.x;\n\nclass Support {\n    static int one() { return 1; }\n}\n";
+// A TestNG run reports one suite, TEST-TestSuite.xml: the failing case's own class is in @classname.
+const TESTNG_SUITE_FAIL = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="TestSuite" time="0.5" tests="3" errors="0" skipped="0" failures="1">
+  <testcase name="add_twoPositives_returnsSum" classname="com.x.CalcTest" time="0.03">
+    <failure message="flaky" type="java.lang.AssertionError"><![CDATA[java.lang.AssertionError: flaky
+\tat com.x.CalcTest.add_twoPositives_returnsSum(CalcTest.java:10)
+]]></failure>
+  </testcase>
+  <testcase name="passes_0" classname="com.x.CalcTest" time="0.01"/>
+  <testcase name="passes_1" classname="com.x.ExistingTest" time="0.01"/>
+</testsuite>
+`;
+const ORDER_FIXTURE = "src/test/resources/fixtures/order.json";
+const CALC_TEST_CONCAT = CALC_TEST.replace(
+  "assertEquals(3, new Calc().add(1, 2));",
+  'assertEquals(3, new Calc().add(1, 2));\n        String fixture = "fixtures/" + "order.json";',
+);
+// A concrete class with tests of its own that surefire's includes never run by itself: CalcTest's base.
+const CALC_CASES_PATH = `${TEST_DIR}/CalcCases.java`;
+const CALC_CASES =
+  "package com.x;\n\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\nclass CalcCases {\n    @Test\n    void add_zero_isIdentity() {\n        assertEquals(2, new Calc().add(2, 0));\n    }\n}\n";
 const CALC_FIXTURE_PATH = `${TEST_DIR}/CalcFixture.java`;
 const CALC_FIXTURE = "package com.x;\n\nclass CalcFixture {\n    static Calc calc() { return new Calc(); }\n}\n";
 const GRADLE_TEST_RAN = "> Task :compileTestJava\n> Task :test\n\nBUILD SUCCESSFUL in 1s\n";
@@ -3650,6 +3677,54 @@ export const SCENARIOS: Scenario[] = [
       { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
     ],
   }),
+  resumeCalc({
+    name: "loop-resume-testng-suite-failed",
+    desc: "TestNG 的報告只有一個 TEST-TestSuite.xml：這次預檢時 CalcTest 在裡面失敗、重跑才過 → 看的是失敗案例自己的類別，不是 suite 名：重新產生",
+    rerun: { api: [{ content: "看了一下，CalcTest 沒有要改的" }, ...RESUME_REWRITE_CALC] },
+    rerunMvn: [
+      { exit: 1, out: TEST_FAILURE("com.x.CalcTest"), cleanSurefire: true, surefireXml: [{ suite: "TestSuite", body: TESTNG_SUITE_FAIL }] },
+      CALC_BUILD,
+      CALC_BUILD,
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-package-differs-failed",
+    desc: "CalcTest.java 放在 com/x 底下、宣告的卻是 package com.y；這次預檢時 com.y.CalcTest 失敗、重跑才過 → 以它宣告的類別比對，重新產生",
+    firstApi: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST.replace("package com.x;", "package com.y;\n\nimport com.x.Calc;") } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    mvnFirst: [BASE_EXISTING, { ...CALC_BUILD, surefire: ran("com.y.CalcTest", "com.x.ExistingTest") }],
+    rerun: { api: [{ content: "看了一下，CalcTest 沒有要改的" }, ...RESUME_REWRITE_CALC] },
+    rerunMvn: [
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.y.CalcTest"),
+        cleanSurefire: true,
+        surefireXml: [{ suite: "com.y.CalcTest", body: SUREFIRE_XML("com.y.CalcTest", 3, [{ nested: "", method: "add_twoPositives_returnsSum", message: "flaky", line: 10 }]) }],
+      },
+      { ...CALC_BUILD, surefire: ran("com.y.CalcTest", "com.x.ExistingTest") },
+      CALC_BUILD,
+    ],
+  }),
+  resumeCalc({
+    name: "loop-resume-concat-resource",
+    desc: "CalcTest 以 \"fixtures/\" + \"order.json\" 點名它的 fixture；通過後有人改了那個 fixture → 它是測試的一部分，重新產生",
+    extraFiles: { [ORDER_FIXTURE]: '{"total":3}\n' },
+    firstApi: [{ toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_CONCAT } }] }, { content: "已建立 CalcTest.java" }],
+    rerun: { between: { [ORDER_FIXTURE]: "{}\n" }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-concrete-base",
+    desc: "CalcTest 繼承一個自己也有 @Test、但 surefire 不會單獨執行的 CalcCases；什麼都沒變的重跑 → 照樣接續（被引用的只比對內容，不要求它自己被執行）",
+    extraFiles: { [CALC_CASES_PATH]: CALC_CASES },
+    firstApi: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST.replace("class CalcTest {", "class CalcTest extends CalcCases {") } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    rerun: { api: [{ content: "不應該有任何 agent 請求" }] },
+    rerunMvn: [CALC_BUILD],
+  }),
   {
     name: "loop-resume-last-class-set-aside",
     desc: "資料夾兩個類別：第一次 Calc 過、Greeter 沒過；重跑接續 Calc、Greeter 又沒過 → 它仍是資料夾的一批，失敗的嘗試照樣移出 src/test",
@@ -3833,6 +3908,7 @@ export const SCENARIOS: Scenario[] = [
       "loop-killed-orphan-other-host",
       "loop-killed-orphan-rebooted",
       "loop-killed-orphan-other-container",
+      "loop-killed-orphan-build-keeps-fix",
       "loop-killed-orphan-corrupt-record",
       "loop-killed-orphan-owner-alive",
     ] as const
@@ -3847,6 +3923,8 @@ export const SCENARIOS: Scenario[] = [
         "loop-killed-orphan-other-host": "同上，但紀錄是另一台機器寫的（共用的 runs 目錄）→ 那些 pid 在這台沒有意義，不碰",
         "loop-killed-orphan-rebooted": "同上，但紀錄是重開機前寫的 → 那些程序不可能還在，現在用那些 pid 的都不是，不碰",
         "loop-killed-orphan-corrupt-record": "同上，但子程序紀錄解析得了、children 卻不是清單（損毀）→ 認不出任何子程序，不碰、不當掉，照常收尾",
+        "loop-killed-orphan-build-keeps-fix":
+          "同上，重跑在 10 分鐘後；那之間開發者修了被終止的 writer 改過的 ExistingTest.java → 結束留下的建置不代表 writer 活到那時：開發者的修正留著",
         "loop-killed-orphan-other-container":
           "同上，但紀錄是同一台機器上另一個容器寫的（共用主機名稱與開機時間，pid namespace 不同）→ 那些 pid 在這裡是別的程序，不碰",
         "loop-killed-orphan-owner-alive": "同上，但寫紀錄的那次執行其實還活著（繞過了 repo 鎖）→ 它的子程序是它自己的，不碰",
@@ -3871,12 +3949,57 @@ export const SCENARIOS: Scenario[] = [
   killedMidWriter({
     name: "loop-killed-other-host",
     desc: "復原日誌是另一台機器寫的（共用 runs 目錄、同一個 repo 路徑、它自己的 checkout）→ 它的樹不是這台的，完全不碰",
-    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/owner.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
+    rerun: {
+      rewrite: [
+        { file: "{{firstRun}}/batch-2-Greeter/inflight/owner.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' },
+        { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' },
+        { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"rootId":"[^"]*"/, to: '"rootId":"1@1"' },
+      ],
+    },
   }),
+  killedMidWriter({
+    name: "loop-killed-other-host-same-checkout",
+    desc: "復原日誌的主機名稱不同，但目錄證明是同一個（inode 與建立時間都相同：每次換名字的容器掛同一個 volume），心跳早已停了 → 照樣撤回",
+    rerun: {
+      backdateMs: 600_000,
+      rewrite: [
+        { file: "{{firstRun}}/batch-2-Greeter/inflight/owner.json", from: /"host":"[^"]*"/, to: '"host":"container-1234"' },
+        { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"host":"[^"]*"/, to: '"host":"container-1234"' },
+      ],
+    },
+  }),
+  killedMidWriter({
+    name: "loop-killed-busy-owner-exits",
+    desc: "復原日誌屬於這個 checkout 上還在跑的 testgen（它的程序還在）→ 先等它，它幾秒後結束了，再照常替它撤回、接續",
+    rerun: { liveOwner: { journal: "{{firstRun}}/batch-2-Greeter/inflight", ms: 5_000 } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-busy-gives-up",
+    desc: "復原日誌屬於這個 checkout 上還在跑的 testgen，等了 UT_OTHER_RUN_WAIT_MS 還在 → 不在它上面開始，以 checkout-busy 停下，日誌留著",
+    rerun: { liveOwner: { journal: "{{firstRun}}/batch-2-Greeter/inflight", ms: 60_000 }, env: { UT_OTHER_RUN_WAIT_MS: "4000" } },
+  }),
+  killedMidWriter({
+    name: "loop-killed-trace-lost",
+    desc: "復原日誌的 trace.json 在斷電後是空的（讀不了）→ 不丟日誌：那批開始之後、死前的變更全部撤回",
+    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/trace.json", from: /^[\s\S]*$/, to: "" } },
+  }),
+  {
+    name: "loop-killed-moved-after-death",
+    desc: "run 在 writer session 途中被終止；之後開發者把 src/test/resources/fixtures 改名成 data（mv 保留時間）→ 移動不是那批的：兩邊都不動，writer 的 GreeterTest 照樣撤回",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, "src/test/resources/fixtures/order.json": '{"id":1}\n' },
+    api: [...RESUME_WRITE_CALC, KILLED_WRITES, { kill: true }],
+    rerun: {
+      renames: [["src/test/resources/fixtures", "src/test/resources/data"]],
+      api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
+    },
+    mvn: [BASE_EXISTING, CALC_BUILD, CALC_BUILD, GREETER_ROUND],
+  },
   killedMidWriter({
     name: "loop-killed-recloned",
     desc: "同一個路徑現在是另一個 checkout（repo 刪掉重新 clone 過）→ 那批留下的東西不可能在這裡，丟掉日誌、不撤回",
-    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"rootId":"[^"]*"/, to: '"rootId":"1:1"' } },
+    rerun: { rewrite: { file: "{{firstRun}}/batch-2-Greeter/inflight/journal.json", from: /"rootId":"[^"]*"/, to: '"rootId":"1@1"' } },
   }),
   killedMidWriter({
     name: "loop-killed-corrupt-journal",
@@ -3918,6 +4041,8 @@ export const SCENARIOS: Scenario[] = [
     api: [...RESUME_WRITE_CALC, KILLED_WRITES, { content: "已建立 GreeterTest.java" }],
     rerun: {
       backdateMs: 600_000,
+      // The process left writing is an agent session's (the fake build stands in for it): its record says so.
+      rewrite: { file: "{{firstRun}}/children.json", from: /"kind":"build"/g, to: '"kind":"other"' },
       api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }],
     },
     mvn: [

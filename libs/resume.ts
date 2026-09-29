@@ -35,6 +35,14 @@ export interface PassedEntry {
   source: string;
   /** Its test files and whatever else its batch wrote in src/test, repo-relative → sha256; null: absent. */
   files: Record<string, string | null>;
+  /**
+   * Of `files`, those there only because its tests reach them (referencedTestFiles): fingerprinted,
+   * but not tests it passed by — a base class surefire never runs on its own is one. Absent in
+   * records of earlier versions: every test class in `files` is then taken as its.
+   */
+  refs?: string[];
+  /** What its tests reach was more than the walk records: a change beyond it would go unseen. */
+  partial?: boolean;
   /** sha256 of the rubric the reviewer judged by. */
   rubric: string;
   /** The passing verdict; null when the review gate was switched off (UT_SKIP_REVIEW=1). */
@@ -68,19 +76,55 @@ export function hashFile(abs: string): string | null {
   }
 }
 
-// A transitive walk that could reach the whole test tree is bounded: past this many files the pass
-// records what it found, and a change beyond them is one the rerun does not see — the checks it does
-// run again (build, coverage) still apply.
-const MAX_REFERENCED = 400;
+// The walk is bounded, classes and resources each on their own budget — a helper that names a
+// thousand fixtures must not use up what the helpers it calls need. Past either, the record is
+// marked partial, and a partial record is never resumed: a change beyond it would not be seen, and
+// a hollowed-out helper passes the build and the coverage both.
+export const MAX_REFERENCED_CLASSES = 400;
+export const MAX_REFERENCED_RESOURCES = 400;
+
+/**
+ * Pure: the string literals of a Java source, as written between their quotes (text blocks too),
+ * from its lexed form (codeOnly keeps the delimiters where it blanks the content, char for char):
+ * a quote in a char literal or a comment does not start one, and two literals on a line stay two.
+ */
+export function stringLiterals(src: string, code = codeOnly(src)): string[] {
+  const out: string[] = [];
+  for (const m of code.matchAll(/"""[\s\S]*?"""|"[^"\r\n]*"/g)) {
+    const q = m[0].startsWith('"""') ? 3 : 1;
+    out.push(src.slice(m.index! + q, m.index! + m[0].length - q));
+  }
+  return out;
+}
+
+/**
+ * Pure: the resources a string literal names, from those of the test tree by file name. A path names
+ * the ones at that path ("golden/case1/expected.json" — not every expected.json); when none is, or
+ * the literal is a bare name, every one of that name. A scheme ("classpath:"), backslashes and a
+ * leading slash do not count.
+ */
+export function resourcesNamed(literal: string, byName: Map<string, string[]>): string[] {
+  const p = literal
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^[A-Za-z][\w+.*-]*:/, "")
+    .replace(/^\.?\//, "");
+  const name = p.split("/").pop();
+  const all = (name && byName.get(name)) || [];
+  if (!p.includes("/")) return all;
+  const at = all.filter((r) => `/${r}`.endsWith(`/${p}`));
+  return at.length ? at : all;
+}
 
 /**
  * The files of the test tree `roots` reach: the classes of the tree they name, and the ones those
- * name, and the resources their string literals name (by file name). What a reviewer reading a test
- * also reads — the base class it extends, the fixture builder and assertion helper it calls, the JSON
- * it loads — and what the test's behaviour hangs on: a hollowed-out helper leaves the build green and
- * the coverage where it was. Repo-relative, "/" separators; `testTree` is the module's src/test.
+ * name, and the resources their string literals name. What a reviewer reading a test also reads —
+ * the base class it extends, the fixture builder and assertion helper it calls, the JSON it loads —
+ * and what the test's behaviour hangs on: a hollowed-out helper leaves the build green and the
+ * coverage where it was. Breadth first: the nearest helpers are the ones kept when a budget runs out
+ * (`partial`). Repo-relative, "/" separators; `testTree` is the module's src/test.
  */
-export function referencedTestFiles(roots: string[], repoRoot: string, testTree: string): string[] {
+export function referencedTestFiles(roots: string[], repoRoot: string, testTree: string): { files: string[]; partial: boolean } {
   const byClass = new Map<string, string[]>();
   const resources = new Map<string, string[]>();
   const walk = (dir: string, onFile: (rel: string, name: string) => void) => {
@@ -103,10 +147,12 @@ export function referencedTestFiles(roots: string[], repoRoot: string, testTree:
     byClass.set(cls, [...(byClass.get(cls) ?? []), rel]);
   });
   walk(`${tree}/resources`, (rel, name) => resources.set(name, [...(resources.get(name) ?? []), rel]));
-  const found = new Set<string>();
+  const classes = new Set<string>();
+  const named = new Set<string>();
+  let partial = false;
   const queue = roots.map(toSlash).filter((r) => r.endsWith(".java"));
   const seen = new Set(queue);
-  while (queue.length && found.size < MAX_REFERENCED) {
+  while (queue.length) {
     const rel = queue.shift()!;
     let src: string;
     try {
@@ -114,20 +160,31 @@ export function referencedTestFiles(roots: string[], repoRoot: string, testTree:
     } catch {
       continue;
     }
-    for (const id of new Set(codeOnly(src).match(/[A-Za-z_$][\w$]*/g) ?? [])) {
+    const code = codeOnly(src);
+    for (const id of new Set(code.match(/[A-Za-z_$][\w$]*/g) ?? [])) {
       for (const f of byClass.get(id) ?? []) {
         if (seen.has(f)) continue;
         seen.add(f);
-        found.add(f);
+        if (classes.size >= MAX_REFERENCED_CLASSES) {
+          partial = true;
+          continue;
+        }
+        classes.add(f);
         queue.push(f);
       }
     }
-    // Resources, by the file name a string ends with — "fixtures/order.json", "/order.json",
-    // "classpath:order.json", "order.json": one pass over the text, looked up by name. A pattern per
-    // resource per file took a minute a class on a test tree with thousands of fixtures.
-    for (const m of src.matchAll(/["/\\:]([^"/\\:\r\n]+)"/g)) for (const r of resources.get(m[1]) ?? []) found.add(r);
+    for (const literal of stringLiterals(src, code)) {
+      for (const r of resourcesNamed(literal, resources)) {
+        if (named.has(r)) continue;
+        if (named.size >= MAX_REFERENCED_RESOURCES) {
+          partial = true;
+          break;
+        }
+        named.add(r);
+      }
+    }
   }
-  return [...found].sort();
+  return { files: [...classes, ...named].sort(), partial };
 }
 
 /**
@@ -156,11 +213,15 @@ export function passedEntries(o: {
     const others = new Set(o.classes.filter((c) => c !== cls).flatMap((c) => own.get(c) ?? []));
     const mine = own.get(cls) ?? [];
     const direct = [...new Set([...mine, ...written.filter((w) => !others.has(w) || mine.includes(w))])];
-    const rels = [...new Set([...direct, ...referencedTestFiles(direct, o.repoRoot, o.testTree)])].sort();
+    const reach = referencedTestFiles(direct, o.repoRoot, o.testTree);
+    const refs = reach.files.filter((f) => !direct.includes(f));
+    const rels = [...new Set([...direct, ...refs])].sort();
     return {
       cls: toSlash(cls),
       source: hashFile(path.join(o.repoRoot, cls)) ?? "",
       files: Object.fromEntries(rels.map((r) => [r, hashFile(path.join(o.repoRoot, r))])),
+      ...(refs.length ? { refs } : {}),
+      ...(reach.partial ? { partial: true } : {}),
       rubric: o.rubric,
       verdict: o.verdict,
       dir: o.dir,
@@ -171,7 +232,17 @@ export function passedEntries(o: {
 
 /** An entry as a ledger holds it: its own fields and nothing a reader added (the run it was read from). */
 export function ledgerEntry(e: PassedEntry): PassedEntry {
-  return { cls: e.cls, source: e.source, files: e.files, rubric: e.rubric, verdict: e.verdict, dir: e.dir, at: e.at };
+  return {
+    cls: e.cls,
+    source: e.source,
+    files: e.files,
+    ...(e.refs ? { refs: e.refs } : {}),
+    ...(e.partial ? { partial: true } : {}),
+    rubric: e.rubric,
+    verdict: e.verdict,
+    dir: e.dir,
+    at: e.at,
+  };
 }
 
 /** This run's ledger, rewritten whole each time — a reader never sees half a file (rename is atomic). */
@@ -191,6 +262,8 @@ const isEntry = (e: unknown): e is PassedEntry => {
     !!x.files &&
     typeof x.files === "object" &&
     Object.values(x.files).every((h) => h === null || typeof h === "string") &&
+    (x.refs === undefined || (Array.isArray(x.refs) && x.refs.every((r) => typeof r === "string"))) &&
+    (x.partial === undefined || typeof x.partial === "boolean") &&
     typeof x.rubric === "string" &&
     (x.verdict === null ||
       (!!x.verdict &&
@@ -240,6 +313,9 @@ export function entryMismatch(
   hashOf: (rel: string) => string | null,
   tests: string[],
 ): string | undefined {
+  if (e.partial) {
+    return `上次通過時它的測試引用到的檔超過記錄的上限（類別 ${MAX_REFERENCED_CLASSES}、資源 ${MAX_REFERENCED_RESOURCES} 個），沒有全部記下，無法確認都沒變`;
+  }
   const source = hashOf(e.cls);
   if (unreadable(source) || unreadable(e.source)) return `${path.posix.basename(e.cls)} 讀不了，無法確認它沒變`;
   if (source !== e.source) return `${path.posix.basename(e.cls)} 在上次通過之後改過`;

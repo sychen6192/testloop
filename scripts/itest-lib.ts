@@ -180,8 +180,16 @@ export interface Scenario {
     /** Every file of the fixture — the first run's artifacts included — made this much older first: the
      *  first run ended that long ago, and whatever `between` writes happened after it. */
     backdateMs?: number;
-    /** One replacement in a file between the runs (`{{firstRun}}` as in `between`). */
-    rewrite?: { file: string; from: RegExp; to: string };
+    /** Replacements in files between the runs (`{{firstRun}}` as in `between`), in order. */
+    rewrite?: { file: string; from: RegExp; to: string } | Array<{ file: string; from: RegExp; to: string }>;
+    /**
+     * Between the runs, a process that lives this long is started and made the owner of this journal
+     * (`{{firstRun}}/batch-N-X/inflight`): its pid and start time in owner.json and journal.json — a
+     * run on this checkout that is still going, then stops.
+     */
+    liveOwner?: { journal: string; ms: number };
+    /** Moved between the runs, repo-relative (a file or a directory), keeping their times: `mv`, `git mv`. */
+    renames?: Array<[string, string]>;
     /** Between the runs, this file (repo-relative) becomes a directory holding a named pipe (POSIX): a
      *  path nothing can put a file back at. */
     pipeDirAt?: string;

@@ -56,6 +56,9 @@ export interface BaselineResult {
   notRun?: boolean;
   // The test classes this build ran in the module — before a writer, the ones it has to keep running.
   ranTests?: string[];
+  // The classes of the failing test cases (their @classname, outer class): where a report is per
+  // suite — TestNG's TestSuite, a JUnit 4 Suite — failingTestClasses names the suite, not the class.
+  failingCaseClasses?: string[];
   // Green only because the target module's tests never ran: surefire said "Tests are skipped."
   // (skipTests or maven.test.skip, from a pom, settings.xml or .mvn/maven.config). Every round's
   // build would say the same, and no test the writer writes would ever run. Why, and what to set.
@@ -212,6 +215,9 @@ export interface SurefireCase {
   kind: "failure" | "error";
   // "Inner.deliberately_fails" — the nested container is kept; it locates the code.
   name: string;
+  // Its @classname as written: the test class itself where the suite is not the class — TestNG's
+  // TEST-TestSuite.xml, a JUnit 4 @RunWith(Suite) — though a @DisplayName where JUnit 5 names it.
+  className?: string;
   message: string;
   // First stack frame in the project's own code. Framework frames locate nothing.
   frame: string;
@@ -311,6 +317,7 @@ export function parseSurefireXml(xml: string): SurefireSuite | null {
     cases.push({
       kind: fail[1] as "failure" | "error",
       name,
+      ...(className ? { className } : {}),
       message: message.replace(/\s+/g, " ").trim(),
       frame: firstProjectFrame(stack),
       trace: stack.length > 20_000 ? stack.slice(0, 20_000) : stack,
@@ -967,6 +974,7 @@ export async function runBaseline(
     envFailures,
     failureDetail,
     failingTests,
+    failingCaseClasses: [...new Set(suites.flatMap((s) => s.cases.map((c) => (c.className ?? "").replace(/\$.*$/, "")).filter(Boolean)))].sort(),
     summary: lines.join("\n"),
     raw,
     ranTests,
@@ -1459,15 +1467,21 @@ export function gradleRedDespiteExit0(out: string, reported = false): string | u
 }
 
 /**
- * Pure: whether a Gradle build log shows its test task executed this time — not UP-TO-DATE, SKIPPED,
- * NO-SOURCE or FROM-CACHE. Gradle keeps the last execution's results in build/test-results, so a
- * task that did not execute leaves results that say nothing about this build: evidence only when it
- * ran. undefined when the log names no test task (quiet logging).
+ * Pure: whether a Gradle build log shows the target project's test task executed this time — not
+ * UP-TO-DATE, SKIPPED, NO-SOURCE or FROM-CACHE. Gradle keeps the last execution's results in
+ * build/test-results, so a task that did not execute leaves results that say nothing about this
+ * build: evidence only when it ran. `gradle test` in a project runs the task in its subprojects
+ * too, and buildSrc's tests run before any build: the target's own task is the shallowest one
+ * outside buildSrc. undefined when the log names no test task (quiet logging).
  */
 export function gradleTestTaskRan(out: string): boolean | undefined {
-  const tasks = [...out.matchAll(/^> Task (?::[\w.-]+)*:test(?:[ \t]+([A-Z-]+))?[ \t]*$/gm)];
+  const tasks = [...out.matchAll(/^> Task ((?::[\w.-]+)*):test(?:[ \t]+([A-Z-]+))?[ \t]*$/gm)]
+    .map((m) => ({ project: m[1], outcome: m[2] }))
+    .filter((t) => !/^:buildSrc(?::|$)/.test(t.project));
   if (!tasks.length) return undefined;
-  return tasks.some((m) => !m[1]);
+  const depth = (project: string) => project.split(":").length;
+  const top = Math.min(...tasks.map((t) => depth(t.project)));
+  return tasks.filter((t) => depth(t.project) === top).every((t) => !t.outcome);
 }
 
 /**

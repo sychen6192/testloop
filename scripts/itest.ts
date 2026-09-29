@@ -28,7 +28,7 @@ import {
   TESTGEN_ROOT,
 } from "./itest-lib";
 import { FIXED_TEST as FIXED_TEST_TEXT, SCENARIOS } from "./itest-scenarios";
-import { planSpawn } from "../libs/shell";
+import { planSpawn, processStart } from "../libs/shell";
 
 let passCount = 0;
 let failCount = 0;
@@ -54,6 +54,9 @@ function check(name: string, cond: boolean, detail = "") {
 // tool auto-loads its own .env: an operator's UT_STRICT_COV=1 must not decide whether a
 // coverage assertion here passes. The completeness check below keeps this list honest.
 
+// Journal owners a scenario started (rerun.liveOwner): none outlives its scenario.
+const liveOwners: number[] = [];
+
 const BASE_ENV: Record<string, string> = {
   UT_AGENT_TIMEOUT_MS: "60000",
   UT_ALLOW_DIRTY_BASELINE: "0",
@@ -66,6 +69,8 @@ const BASE_ENV: Record<string, string> = {
   UT_API_MAX_TURNS: "8",
   UT_AGENT_RETRY_WINDOW_MS: "180000",
   UT_BUILD_TIMEOUT_MS: "60000",
+  // A journal unexpectedly still beating fails fast here, not after six minutes.
+  UT_OTHER_RUN_WAIT_MS: "20000",
   UT_MAX_BUILD_OUTPUT_CHARS: "67108864",
   UT_CA_CERTS: "",
   UT_HTTPS_PROXY: "",
@@ -387,12 +392,34 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
         fs.mkdirSync(p, { recursive: true });
         spawnSync("mkfifo", [path.join(p, "pipe")]);
       }
-      if (sc.rerun.rewrite) {
-        const p = path.join(root, sc.rerun.rewrite.file.replace("{{firstRun}}", firstRel));
+      // A rewrite is what the file held all along: its time stays (a journal's time is its heartbeat).
+      for (const rw of [sc.rerun.rewrite ?? []].flat()) {
+        const p = path.join(root, rw.file.replace("{{firstRun}}", firstRel));
         try {
-          fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(sc.rerun.rewrite.from, sc.rerun.rewrite.to));
+          const st = fs.statSync(p);
+          fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(rw.from, rw.to));
+          fs.utimesSync(p, st.atimeMs / 1000, st.mtimeMs / 1000);
         } catch {
           /* not there: the checks say what is missing */
+        }
+      }
+      for (const [from, to] of sc.rerun.renames ?? []) {
+        fs.mkdirSync(path.dirname(path.join(root, to)), { recursive: true });
+        fs.renameSync(path.join(root, from), path.join(root, to));
+      }
+      if (sc.rerun.liveOwner) {
+        const owner = spawn(process.execPath, ["-e", `setTimeout(() => {}, ${sc.rerun.liveOwner.ms})`], { stdio: "ignore", detached: true });
+        owner.unref();
+        liveOwners.push(owner.pid!);
+        const start = processStart(owner.pid!) ?? "";
+        const jdir = path.join(root, sc.rerun.liveOwner.journal.replace("{{firstRun}}", firstRel));
+        for (const f of ["owner.json", "journal.json"]) {
+          const p = path.join(jdir, f);
+          try {
+            fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(/"pid":\d+,"start":"[^"]*"/, `"pid":${owner.pid},"start":"${start}"`));
+          } catch {
+            /* not there: the checks say what is missing */
+          }
         }
       }
       for (const [key, content] of Object.entries(sc.rerun.between ?? {})) {
@@ -2019,6 +2046,20 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
   "loop-resume-second-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
   "loop-resume-tests-all-skipped": (c) => redone(c, "com.x.CalcTest（全部被略過）"),
   "loop-resume-own-test-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
+  "loop-resume-testng-suite-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
+  "loop-resume-package-differs-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
+  "loop-resume-concat-resource": (c) => {
+    check(
+      "第一次的通過紀錄記下 CalcTest 以字串相加點名的 fixture",
+      Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/resources/fixtures/order.json"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    redone(c, "src/test/resources/fixtures/order.json 在上次通過之後改過");
+  },
+  "loop-resume-concrete-base": (c) => {
+    resumedCalc(c, undefined, CALC_TEST_TEXT.replace("class CalcTest {", "class CalcTest extends CalcCases {"));
+    check("沒有找 agent", apiRequests(c).length === 0, `${apiRequests(c).length} 個請求`);
+  },
   "loop-resume-no-test-class": (c) => redone(c, "上次通過時的檔案裡找不到會被執行的測試類別"),
   "loop-resume-repair-changed-resource": (c) => {
     check("重跑的預檢紅燈、修復迴圈改了測試資源後轉綠", c.stdout.includes("修復") && c.exists("src/test/resources/legacy.properties"), c.stdout.slice(0, 1500));
@@ -2145,6 +2186,22 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("損毀的子程序紀錄不讓重跑當掉：照常撤回那批、接續到通過", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stderr.slice(-600)}`);
     orphanLeftAlone(c, { recordKept: false });
   },
+  "loop-killed-orphan-build-keeps-fix": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("留下的建置被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+      check(
+        "開發者在那之後修的 ExistingTest.java 留著，列為別人的變更",
+        c.read("src/test/java/com/x/ExistingTest.java").includes("fixed by the developer") && (rb.foreign ?? []).includes("java/com/x/ExistingTest.java"),
+        JSON.stringify(rb),
+      );
+      check("writer 新增的 GreeterTest.java 照樣撤回", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+    } finally {
+      stopPid(pid);
+    }
+  },
   "loop-killed-orphan-other-container": (c) => {
     if (process.platform !== "linux") return; // a pid namespace is Linux's
     check("子程序紀錄帶著寫它的 pid namespace", /"pidns":"pid:\[1\]"/.test(firstRunRead(c, "children.json")), firstRunRead(c, "children.json") || "(紀錄不見了)");
@@ -2156,7 +2213,41 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     killedLeftAlone(c);
     check("別台機器的日誌原樣留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
     check("也不替它寫 summary", firstSummary(c) === undefined, JSON.stringify(firstSummary(c)));
-    check("log 說明有別台機器的日誌、不處理", c.stdout.includes("是別台機器的執行留下的"), c.stdout.slice(0, 2000));
+    check("log 說明有別台機器的日誌、不處理", c.stdout.includes("是別台機器或別的容器留下的"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-other-host-same-checkout": (c) => killedRecovered(c, { restored: true }),
+  "loop-killed-busy-owner-exits": (c) => {
+    if (process.platform === "win32") return; // no start times to tell the owner by
+    check("先說明這個 checkout 上可能還有 testgen 在跑、等它", c.stdout.includes("可能還在執行的 testgen") && c.stdout.includes("它已經停止"), c.stdout.slice(0, 2000));
+    killedRecovered(c, { restored: true });
+  },
+  "loop-killed-busy-gives-up": (c) => {
+    if (process.platform === "win32") return; // no start times to tell the owner by
+    check("等不到它停止 → 以 checkout-busy 停下", c.code !== 0 && c.result.stopReason === "checkout-busy", `code=${c.code} ${JSON.stringify(c.result)}`);
+    check("說明原因與怎麼辦", (c.stdout + c.stderr).includes("可能還有另一個 testgen 在執行"), (c.stdout + c.stderr).slice(-1500));
+    check("它的日誌留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("沒有撤回、也沒有替它寫 summary（它可能還在跑）", firstSummary(c) === undefined && c.read("src/test/java/com/x/ExistingTest.java").includes(KILLED_LINE));
+    check("沒有開始產生測試（沒找 writer）", apiRequests(c).length === 0);
+  },
+  "loop-killed-trace-lost": (c) => {
+    check("說明 trace 讀不了、改用那批開始之後的所有變更", c.stdout.includes("trace.json 讀不了"), c.stdout.slice(0, 2500));
+    killedRecovered(c, { restored: true });
+  },
+  "loop-killed-moved-after-death": (c) => {
+    killedRecovered(c, { restored: true });
+    check("開發者的移動留著：data/order.json 在、fixtures/order.json 沒被放回", c.exists("src/test/resources/data/order.json") && !c.exists("src/test/resources/fixtures/order.json"));
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "移動的兩邊都不算那批的，也不列成別人的變更",
+      ![...(rb.created ?? []), ...(rb.undeleted ?? []), ...(rb.foreign ?? [])].some((f: string) => /order\.json$/.test(f)),
+      JSON.stringify(rb),
+    );
+    check("log 說明是之後的移動", c.stdout.includes("被移動過") && c.stdout.includes("data/order.json"), c.stdout.slice(0, 2500));
+    check(
+      "移走的原檔不當成「無法判斷誰刪的」（不點名、不存進 deleted/）",
+      !c.stdout.includes("無法判斷是被終止的 writer") && !fs.existsSync(firstRunFile(c, "batch-2-Greeter/deleted")),
+      c.stdout.slice(0, 2500),
+    );
   },
   "loop-killed-recloned": (c) => {
     killedLeftAlone(c);
@@ -2380,7 +2471,7 @@ const resumedOf = (c: Ctx) => ((c.result.resumed ?? []) as Array<{ cls: string }
 const apiRequests = (c: Ctx) => c.read(".itest/api-requests.jsonl").split("\n").filter(Boolean);
 
 /** The rerun found Calc's pass still holding: nothing left to write. */
-function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java"): void {
+function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java", content?: string): void {
   check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
   check("第一次留下 passed.json，記著 Calc", ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === "src/main/java/com/x/Calc.java"));
   check("重跑 exit 0，stopReason = already-passed", c.code === 0 && c.result.success === true && c.result.stopReason === "already-passed", `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
@@ -2393,7 +2484,10 @@ function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java"): vo
     !!carried && carried.dir === c.first?.runDir && !("run" in carried),
     JSON.stringify(carried),
   );
-  check(`${path.basename(testFile)} 還是第一次通過時的內容`, c.read(testFile) === CALC_TEST_TEXT.replace("class CalcTest", `class ${path.basename(testFile, ".java")}`));
+  check(
+    `${path.basename(testFile)} 還是第一次通過時的內容`,
+    c.read(testFile) === (content ?? CALC_TEST_TEXT.replace("class CalcTest", `class ${path.basename(testFile, ".java")}`)),
+  );
 }
 
 /** The rerun found Calc's pass no longer holding, said why, and wrote Calc again. */
@@ -2467,6 +2561,7 @@ async function main() {
     } catch (e) {
       check(`${sc.name} 斷言未拋錯`, false, `${String(e)}\nstderr: ${ctx.stderr.slice(-500)}`);
     }
+    for (const pid of liveOwners.splice(0)) stopPid(pid);
     // A failed scenario keeps its fixture: the artifacts, the build log and the argv log are
     // the whole diagnosis, and they are gone by the time anyone reads the output otherwise.
     if (failCount > before) console.log(`  → 保留 fixture 供診斷：${ctx.root}`);
