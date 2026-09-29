@@ -523,7 +523,8 @@ runs 目錄被複製、搬走也不變（檔案時間會變）。
 要全部重新產生設 `UT_RESUME=0`。
 
 **沒有做的。** reviewer 的模型、prompt 範本與工具版本不在比對之內——沿用的判決只比對 reviewer 讀的東西與
-rubric。換了模型、或升級工具後想重新審一遍，設 `UT_RESUME=0`。引用的走訪只看測試目錄：目錄、glob、
+rubric。換了模型、或升級工具後想重新審一遍，設 `UT_RESUME=0`。Spring 會自己找到的類別只認得寫在它身上的
+註解：自訂的 stereotype（`@UseCase` 上面掛著 `@Component`，多半宣告在 main）只看這個檔判斷不了。引用的走訪只看測試目錄：目錄、glob、
 `String.format` 組出來的路徑，`src/main` 裡的常數，`src/test/resources` 以外的資料目錄，上游模組的 test-jar 與
 Gradle 的 `src/testFixtures` 都看不到。比對的是內容：git 的 autocrlf 改了換行也算改過；`runs/<repo 名>` 以目錄名
 區分，同名的另一個 checkout 共用紀錄（只會少接續）；路徑大小寫不敏感的檔案系統上，目標要用和上次同樣的大小寫。被 SIGKILL 的 run 留下的半成品在接續之前就由

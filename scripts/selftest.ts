@@ -5361,6 +5361,22 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
   }
   if (fs.existsSync(svcFile)) fs.rmSync(svcFile);
+  // A name read inside a report is whole: "計算機??" is a class that goes by that, every test of it skipped —
+  // not a file name that lost the characters of 計算機測試, which ran (the log says so) with none skipped.
+  report("TEST-other.xml", '<testsuite name="計算機??" tests="2" skipped="2"><testcase name="a" classname="計算機??"><skipped/></testcase><testcase name="b" classname="計算機??"><skipped/></testcase></testsuite>');
+  const namedInside = checkTestsRan(
+    "maven",
+    mi,
+    since,
+    "[INFO] Running com.x.CalcShownTest\n[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.CalcShownTest",
+    [calcT],
+  );
+  check(
+    "checkTestsRan：報告裡寫的名字「計算機??」是完整的名字，不是遺失了字的檔名 → 它全部略過不算「計算機測試」的",
+    namedInside?.notRun.length === 0 && namedInside.allSkipped.length === 0,
+    JSON.stringify(namedInside),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
 
   // A TestNG class skipped whole (a SkipException in its @BeforeClass): only TEST-TestSuite.xml, every case of it skipped.
   report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3" skipped="2"><testcase name="a" classname="com.x.NewTest"><skipped/></testcase><testcase name="b" classname="com.x.NewTest"><skipped message="no db"/></testcase><testcase name="c" classname="com.x.OldTest"/></testsuite>');
@@ -5517,13 +5533,16 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     JSON.stringify(surefireSections(reactorLog)),
   );
   check(
-    "surefireSections：測試自己印的「[INFO] Building …」、句中的「--- x @ y ---」都不會切斷區段；時間戳記開頭的標頭照樣認得",
+    "surefireSections：測試自己印的「[INFO] Building …」、句中的「--- x @ y ---」、logger 前綴之後或後面還有字的 Maven 標頭都不會切斷區段；時間戳記開頭的標頭照樣認得",
     classesRunInModuleLog(
       [
         "[INFO] --- surefire:3.2.5:test (default-test) @ web ---",
         "[INFO] Running com.x.AaaReportTest",
         "[INFO] Building monthly report for 2026-09",
         "report --- totals @ page ---",
+        // A test that runs an embedded build logs Maven's own lines — after its logger's prefix, or with more after them.
+        "10:00:01.123 [main] INFO  com.x.EmbeddedMaven - [INFO] --- maven-jar-plugin:3.3.0:jar (default-jar) @ inner ---",
+        "[INFO] --- surefire:3.2.5:test (default-test) @ inner --- (quoted by a test)",
         "[INFO] Running com.x.NewTest",
         "10:00:01,234 [INFO] --- jacoco:0.8.12:report (report) @ web ---",
         "[INFO] Running com.x.NotSurefire",
