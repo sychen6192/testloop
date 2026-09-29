@@ -8,7 +8,7 @@
 // method without the count going down.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { codeOnly } from "./javasrc";
+import { codeOnly, decodeJavaSource } from "./javasrc";
 
 // readFileSync on a FIFO or a device blocks the whole process; only regular files are sources.
 function isRegularFile(p: string): boolean {
@@ -134,7 +134,12 @@ export function testMetrics(src: string): TestMetrics {
   };
 }
 
-export function collectTestMetrics(testRoot: string): MetricsSnapshot {
+/**
+ * Every test file's counts, read in `charset` (the module's source encoding) as javac reads them: read as
+ * UTF-8, an MS950 file whose 功 ends in the byte of "\" has a string that swallows the code after it, and
+ * its tests count as none — nothing to protect, and a class that "grew" when read right.
+ */
+export function collectTestMetrics(testRoot: string, charset?: string): MetricsSnapshot {
   const snap: MetricsSnapshot = {};
   if (!fs.existsSync(testRoot)) return snap;
   const walk = (d: string) => {
@@ -149,9 +154,7 @@ export function collectTestMetrics(testRoot: string): MetricsSnapshot {
       if (e.isDirectory()) walk(p);
       else if (e.name.endsWith(".java") && isRegularFile(p)) {
         try {
-          snap[path.relative(testRoot, p).replace(/\\/g, "/")] = testMetrics(
-            fs.readFileSync(p, "utf8"),
-          );
+          snap[path.relative(testRoot, p).replace(/\\/g, "/")] = testMetrics(decodeJavaSource(fs.readFileSync(p), charset));
         } catch {
           /* unreadable — nothing to protect */
         }

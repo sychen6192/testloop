@@ -194,6 +194,17 @@ export interface Scenario {
      *  path nothing can put a file back at. */
     pipeDirAt?: string;
   };
+  /**
+   * entry=loop, with rerun: a third run once the rerun has ended. The mvn plan carries on; the checks
+   * see the third run, the first as `first` and the rerun as `second`.
+   */
+  rerun2?: {
+    api?: ApiTurn[];
+    /** On top of the scenario's env. */
+    env?: Record<string, string>;
+    /** Files written (a string) or deleted (null) between the second run and the third, repo-relative. */
+    between?: Record<string, string | null>;
+  };
   mvn: MvnStep[];
 }
 

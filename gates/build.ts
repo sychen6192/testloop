@@ -616,8 +616,8 @@ function collectSurefireFailures(moduleRoot: string, since: number): string {
 }
 
 // Gradle's test results that record a failing test. Not filtered by time: the build deletes them
-// before the test task runs (cleanTest, runBuild), so the directory holds this build's execution
-// only. Read only where the build exited 0 — one that failed before its test task ran has none.
+// before the test task runs (runBuild), so the directory holds this build's execution only. Read
+// only where the build exited 0 — one that failed before its test task ran has none.
 function gradleFailingSuites(mod: ModuleInfo): SurefireSuite[] {
   const dir = path.join(mod.moduleRoot, "build", "test-results", "test");
   if (!fs.existsSync(dir)) return [];
@@ -792,8 +792,19 @@ export function testOnlyFailures(
 ): Array<{ cls: string; module: string }> | undefined {
   if (tool !== "maven" || extractCompileErrorFiles(raw, tool).length) return undefined;
   const suites = failingSuites(mod.moduleRoot, since);
+  // A suite report — TestNG's one TEST-TestSuite.xml, a JUnit 4 Suite's — names the suite, which has no
+  // source to tell touched from untouched, or is not the class that failed: the failing cases' own
+  // classes are, where their module has their source.
+  const sourceIn = (module: string, cls: string) =>
+    fs.existsSync(path.join(module, "src", "test", "java", ...cls.split(".")) + ".java");
   const failing = suites.length
-    ? suites.map((s) => ({ cls: s.suite, module: s.dir ? moduleOfSurefireDir(s.dir) : mod.moduleRoot }))
+    ? suites.flatMap((s) => {
+        const module = s.dir ? moduleOfSurefireDir(s.dir) : mod.moduleRoot;
+        const own = [...new Set(s.cases.map((c) => outerClassName(c.className ?? "")))].filter(
+          (c) => c && c !== outerClassName(s.suite) && sourceIn(module, c),
+        );
+        return own.length ? own.map((cls) => ({ cls, module })) : [{ cls: s.suite, module }];
+      })
     : surefireDirs(mod.moduleRoot).flatMap((dir) =>
         failingReports(dir, since).map((f) => ({ cls: f.replace(/\.txt$/, ""), module: moduleOfSurefireDir(dir) })),
       );
@@ -975,7 +986,7 @@ export async function runBaseline(
     envFailures,
     failureDetail,
     failingTests,
-    failingCaseClasses: [...new Set(suites.flatMap((s) => s.cases.map((c) => (c.className ?? "").replace(/\$.*$/, "")).filter(Boolean)))].sort(),
+    failingCaseClasses: [...new Set(suites.flatMap((s) => s.cases.map((c) => outerClassName(c.className ?? "")).filter(Boolean)))].sort(),
     summary: lines.join("\n"),
     raw,
     ranTests,
@@ -1010,6 +1021,14 @@ export interface ExpectedTest {
   disabled: boolean;
   /** The class's own @DisplayName: what surefire's phrased reporters name it by instead of its FQCN. */
   displayName?: string;
+  /** It has a class-level @DisplayName whose text is no string literal here (a constant): a name it goes by, unknown. */
+  displayNameUnread?: boolean;
+  /**
+   * Set by checkTestsRan on a class it did not see run: the other classes of the module whose
+   * @DisplayName is the same as its own, while a report goes by that name — surefire writes one report
+   * for a name, and which class's it is, nothing tells.
+   */
+  sharedName?: string[];
   /**
    * "created": the writer's new class — one whose every test was skipped is not run either.
    * "changed": a class the writer edited that ran before it did. "grown": one it added tests to
@@ -1044,21 +1063,33 @@ export function expectedTestOf(src: string, file: string, origin: ExpectedTest["
   ).exec(code);
   if (!decl || decl[2] !== "class" || /\babstract\b/.test(decl[1])) return undefined;
   const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(code)?.[1];
-  // The class's own annotations: after the statement before it (the last import) and before it.
+  // The class's own annotations: after the statement before it (the last import, a type before it)
+  // and before it. A ";" or "}" inside an annotation's arguments — @ExtendWith({A.class, B.class}) —
+  // is not where they start: only one outside every parenthesis.
   const head = code.slice(0, decl.index + 1);
-  const ownStart = Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1;
+  let ownStart = 0;
+  for (let i = 0, depth = 0; i < head.length; i++) {
+    const c = head[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth = Math.max(0, depth - 1);
+    else if (!depth && (c === ";" || c === "}")) ownStart = i + 1;
+  }
   const own = head.slice(ownStart);
   const disabled = /@(?:[\w.]+\.)?(?:Disabled|Ignore)\b|@(?:[\w.]+\.)?Test\s*\([^)]*\benabled\s*=\s*false/.test(own);
   // Its text is a string literal, which codeOnly blanked: read at the same place in the source, and
-  // taken as JUnit takes it — escapes translated, trimmed; a blank one is no name.
+  // taken as JUnit takes it — escapes translated, trimmed as Java trims (what is at most U+0020; an
+  // ideographic space stays); a blank one is no name. Anything but one literal (a constant, a
+  // concatenation) is a name this cannot read.
   const literal = /@(?:[\w.]+\.)?DisplayName\s*\(\s*(?:value\s*=\s*)?"((?:[^"\\\n]|\\.)*)"\s*\)/.exec(src.slice(ownStart, decl.index + 1))?.[1];
-  const shown = literal === undefined ? "" : javaStringValue(literal).trim();
+  const shown = literal === undefined ? "" : javaStringValue(literal).replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+  const unread = literal === undefined && /@(?:[\w.]+\.)?DisplayName\s*\(/.test(own);
   return {
     file,
     fqcn: pkg ? `${pkg}.${name}` : name,
     framework: testFrameworkOf(code),
     disabled,
     ...(shown ? { displayName: shown } : {}),
+    ...(unread ? { displayNameUnread: true } : {}),
     origin,
   };
 }
@@ -1091,13 +1122,37 @@ export interface RanCheck {
   surefireVersion?: string;
 }
 
+/**
+ * Pure: the class a reported name belongs to — `com.x.CalcTest$Inner` is com.x.CalcTest's — and a name
+ * that is no Java class name, a @DisplayName under surefire's phrased reporters ("滿 NT$1000 折 NT$100"),
+ * as it is: cut at its "$", it is nobody's.
+ */
+export function outerClassName(name: string): string {
+  return /^[\p{L}_$][\p{L}\p{N}_$]*(?:\.[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(name) ? name.replace(/\$.*$/, "") : name;
+}
+
 // A class ran when something names it: its own report (TEST-<fqcn>.xml, <fqcn>.txt, with a
 // reportNameSuffix or for a @Nested class after it), a suite report's test cases (TestNG writes one
 // TEST-TestSuite.xml for everything), or surefire's "Running <fqcn>" line.
 const names = (fqcn: string, name: string) => name === fqcn || name.startsWith(`${fqcn}$`) || name.startsWith(`${fqcn}-`);
-// Or its @DisplayName, where surefire's phrased reporters name it by that: exactly — the XML holds it
-// as JUnit read it from the source, and a file name holds it as it is when the platform could write it.
-const shownAs = (t: ExpectedTest, name: string) => !!t.displayName && name.normalize("NFC") === t.displayName.normalize("NFC");
+// Or its @DisplayName, where surefire's phrased reporters name it by that: exactly as JUnit read it
+// from the source, which is how the report holds it inside.
+const sameShown = (a: string, b: string) => a.normalize("NFC") === b.normalize("NFC");
+
+/**
+ * The name a report goes by inside it — its testsuite's (XML), its "Test set:" (a .txt summary) — for a
+ * report whose file name is no class's: a phrased one, a suite's. What is inside is UTF-8 and whole,
+ * where the file name is the JVM's file-name encoding's (a POSIX locale writes "計算機測試" as "?????")
+ * and one per name (two classes of the same @DisplayName write one file, the last one's). undefined when
+ * it cannot be read.
+ */
+function reportNameInside(file: string): string | undefined {
+  const text = readHead(file);
+  if (text === undefined) return undefined;
+  const tag = /<testsuite\b[^>]*>/.exec(text)?.[0];
+  const name = tag ? unescapeXml(attr(tag, "name")) : /^Test set:[ \t]*(.*?)[ \t]*\r?$/m.exec(text)?.[1];
+  return name && !name.includes("\uFFFD") ? name : undefined;
+}
 
 /**
  * Pure: can `fileName`, a report's name, be `shown` written by a JVM whose file-name encoding could not
@@ -1112,6 +1167,20 @@ export function lossyFileNameOf(fileName: string, shown: string): boolean {
   return a.length === b.length && a.includes("?") && a.every((c, i) => c === b[i] || (c === "?" && b[i].codePointAt(0)! > 0x7f));
 }
 
+/**
+ * Pure: how many tests surefire's console says each class ran, and how many of them it skipped — its
+ * "Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.01 s -- in com.x.CalcTest" lines
+ * ("- in" before 3.0). What says a class's tests were all skipped when its reports are written elsewhere.
+ */
+export function testCountsInLog(out: string): Map<string, { tests: number; skipped: number }> {
+  const counts = new Map<string, { tests: number; skipped: number }>();
+  for (const m of out.matchAll(/Tests run:\s*(\d+),.*?Skipped:\s*(\d+)\b.*?\s--?\sin\s+([\w.$]+)\s*$/gm)) {
+    const c = counts.get(m[3]) ?? { tests: 0, skipped: 0 };
+    counts.set(m[3], { tests: c.tests + Number(m[1]), skipped: c.skipped + Number(m[2]) });
+  }
+  return counts;
+}
+
 /** Pure: the classes a surefire console log says it ran. */
 export function classesRunInLog(out: string): string[] {
   const found = new Set<string>();
@@ -1119,22 +1188,28 @@ export function classesRunInLog(out: string): string[] {
   return [...found];
 }
 
+// A Maven plugin execution's header, "[INFO] --- surefire:3.2.5:test (default-test) @ web ---": a whole
+// line of Maven's own (a timestamp before the level allowed), never a test's output that says the same
+// in the middle of a line. Its goal, and the module it ran for.
+const PLUGIN_HEADER = /^(?:[\d:.,T-]+\s+)?\[INFO\] --- (\S.*?) @ (\S+) ---\s*$/;
+const isSurefireTest = (goal: string) => /^(?:maven-)?surefire(?:-plugin)?:[^:\s]+:test\b/.test(goal);
+
 /**
  * Pure: the lines of each surefire execution in a Maven log, by the module it ran for — from its
- * header ("--- surefire:3.2.5:test (default-test) @ web ---") to the next plugin's, or to the next
- * module's banner.
+ * header ("--- surefire:3.2.5:test (default-test) @ web ---") to the next plugin's. Surefire is the
+ * last goal of `test` a module runs, and the next module starts with a header of its own: nothing in
+ * between ends a section — a test that prints "[INFO] Building the report" is still inside it.
  */
 export function surefireSections(out: string): Array<{ artifact: string; lines: string[] }> {
   const sections: Array<{ artifact: string; lines: string[] }> = [];
   let current: { artifact: string; lines: string[] } | undefined;
   for (const line of out.split(/\r?\n/)) {
-    const header = /--- \S.*? @ (\S+) ---/.exec(line);
+    const header = PLUGIN_HEADER.exec(line);
     if (header) {
-      current = /--- (?:maven-)?surefire(?:-plugin)?:[^:\s]+:test\b/.test(line) ? { artifact: header[1], lines: [] } : undefined;
+      current = isSurefireTest(header[1]) ? { artifact: header[2], lines: [] } : undefined;
       if (current) sections.push(current);
       continue;
     }
-    if (/^\[INFO\] -+< \S+ >-+\s*$|^\[INFO\] Building \S/.test(line)) current = undefined;
     current?.lines.push(line);
   }
   return sections;
@@ -1163,13 +1238,17 @@ export function moduleSurefireLog(out: string, artifactId?: string): string {
  * Pure: the classes (outer) of the test cases a report says passed only when run again. Surefire's
  * rerunFailingTestsCount keeps the failed attempts in <flakyFailure> / <flakyError> under a case that
  * counts as passed, on a green build; Gradle's test-retry plugin writes each attempt as a case of its
- * own, one failed and one of the same name passed (mergeReruns folds them as surefire does).
+ * own, one failed and one of the same name passed (mergeReruns folds them as surefire does); TestNG's
+ * retry analyzer reports the failed attempt as skipped, then the one that passed (measured: TestNG 7.5,
+ * surefire 3.2.5, a green build that says Skipped: 0). A data provider that skips one row and passes
+ * another under the same name reads as flaky too: its class is redone, never resumed wrongly.
  */
 export function flakyClassesInReport(xml: string): string[] {
   const markup = xml.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, (t) => t.replace(/[^\n]/g, " "));
   const suite = unescapeXml(attr(/<testsuite\b[^>]*>/.exec(markup)?.[0] ?? "", "name"));
   const flaky = new Set<string>();
   const failed = new Set<string>();
+  const skipped = new Set<string>();
   const passed = new Set<string>();
   for (const m of markup.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)) {
     const cls = unescapeXml(attr(m[1], "classname")) || suite;
@@ -1177,10 +1256,14 @@ export function flakyClassesInReport(xml: string): string[] {
     if (/<flaky(?:Failure|Error)\b/.test(body)) flaky.add(cls);
     const id = JSON.stringify([cls, attr(m[1], "name")]);
     if (/<(?:failure|error)\b/.test(body)) failed.add(id);
-    else if (!/<skipped\b/.test(body)) passed.add(id);
+    else if (/<skipped\b/.test(body)) skipped.add(id);
+    else passed.add(id);
   }
   for (const id of failed) if (passed.has(id)) flaky.add(JSON.parse(id)[0]);
-  return [...new Set([...flaky].filter(Boolean).map((c) => c.replace(/\$.*$/, "")))].sort();
+  // TestNG's retry analyzer: the failed attempt is reported as skipped (its message the failure's),
+  // then the same test again, passed.
+  for (const id of skipped) if (passed.has(id)) flaky.add(JSON.parse(id)[0]);
+  return [...new Set([...flaky].filter(Boolean).map(outerClassName))].sort();
 }
 
 /**
@@ -1197,7 +1280,7 @@ export function flakyClassesInLog(out: string): string[] {
       if (/^(?:\[\w+\])?\s*$/.test(l) || /^(?:\[\w+\])?\s+Run \d+:/.test(l)) continue;
       const test = /^(?:\[\w+\]\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)(?:[(\[].*)?\s*$/.exec(l);
       if (!test) break;
-      const cls = test[1].split(".").slice(0, -1).join(".").replace(/\$.*$/, "");
+      const cls = outerClassName(test[1].split(".").slice(0, -1).join("."));
       if (cls.includes(".") || /^[A-Z]/.test(cls)) found.add(cls);
     }
   }
@@ -1323,8 +1406,8 @@ export function checkTestsRan(
   } catch {
     /* no reports at all */
   }
-  // Maven leaves earlier builds' reports in place; the Gradle build deletes them first (cleanTest,
-  // runBuild), so the ones there are this build's.
+  // Maven leaves earlier builds' reports in place; the Gradle build deletes them first (runBuild), so
+  // the ones there are this build's.
   const reports = entries.filter((f) => {
     if (!/^TEST-.+\.xml$/.test(f) && !(tool === "maven" && isSurefireSummary(f))) return false;
     if (tool !== "maven") return true;
@@ -1334,14 +1417,27 @@ export function checkTestsRan(
       return false;
     }
   });
-  const reportOf = new Map<string, string[]>();
-  for (const f of reports) {
-    const cls = f.endsWith(".xml") ? f.slice("TEST-".length, -".xml".length) : f.slice(0, -".txt".length);
-    reportOf.set(cls, [...(reportOf.get(cls) ?? []), f]);
-  }
   const testRoot = path.join(mod.moduleRoot, "src", "test", "java");
   const sourceOf = (name: string) => path.join(testRoot, ...name.replace(/[$-].*$/, "").split(".")) + ".java";
   const isClass = (name: string) => fs.existsSync(sourceOf(name));
+  // Each report by the name it goes by: its file name, when that is a class of the module (after it a
+  // @Nested class's "$", a reportNameSuffix's "-"); otherwise — a phrased file name, a suite's — the name
+  // inside it (reportNameInside). One whose inside cannot be read keeps its file name, which may have
+  // lost characters: `lossy`.
+  const reportOf = new Map<string, string[]>();
+  const lossy = new Set<string>();
+  let unnamed = false;
+  for (const f of reports) {
+    const fileName = f.endsWith(".xml") ? f.slice("TEST-".length, -".xml".length) : f.slice(0, -".txt".length);
+    let name = fileName;
+    if (!isClass(fileName)) {
+      if (f.endsWith(".xml")) unnamed = true;
+      const inner = reportNameInside(path.join(dir, f));
+      if (inner) name = inner;
+      else lossy.add(fileName);
+    }
+    reportOf.set(name, [...(reportOf.get(name) ?? []), f]);
+  }
   // The log covers the whole reactor: only this module's executions say anything about this module —
   // an upstream module's class of the same name is not this one.
   const logged = tool === "maven" ? classesRunInModuleLog(out, moduleArtifactId(mod)).filter(isClass) : [];
@@ -1380,9 +1476,11 @@ export function checkTestsRan(
       if (!none) return undefined;
     }
   }
-  // The class-level @DisplayName of every test class in the module, read only when a report's file
-  // name has lost characters: a name that more than one of them fits says which class it is of none.
-  let shownInModule: Array<{ fqcn: string; shown: string }> | undefined;
+  // The class-level @DisplayName of each test class of the module, read only when a report goes by one.
+  // A name another class goes by too names neither: surefire writes one report for a name, and the last
+  // class's is the one there. A class whose name cannot be read (a constant, an unreadable source) may
+  // go by any.
+  let shownInModule: Array<{ fqcn: string; shown?: string }> | undefined;
   const displayNames = () => {
     if (shownInModule) return shownInModule;
     shownInModule = [];
@@ -1400,8 +1498,9 @@ export function checkTestsRan(
           try {
             const t = expectedTestOf(decodeJavaSource(fs.readFileSync(f), charset), f, "untouched");
             if (t?.displayName) shownInModule!.push({ fqcn: t.fqcn, shown: t.displayName });
+            else if (t?.displayNameUnread) shownInModule!.push({ fqcn: t.fqcn });
           } catch {
-            /* unreadable: not a name */
+            shownInModule!.push({ fqcn: path.relative(testRoot, f).slice(0, -".java".length).split(path.sep).join(".") });
           }
         }
       }
@@ -1409,28 +1508,51 @@ export function checkTestsRan(
     walk(testRoot);
     return shownInModule;
   };
+  // The other classes that go by t's @DisplayName.
+  const sharing = (t: ExpectedTest) =>
+    displayNames()
+      .filter((o) => o.fqcn !== t.fqcn && o.shown !== undefined && sameShown(o.shown, t.displayName!))
+      .map((o) => o.fqcn);
+  const shownAs = (t: ExpectedTest, n: string) => !!t.displayName && sameShown(n, t.displayName) && !sharing(t).length;
   const ranAs = (t: ExpectedTest, n: string) => names(t.fqcn, n) || shownAs(t, n);
+  // A file name that lost characters is t's only when t's @DisplayName fits it and no other class's
+  // can: one that fits it too, or one that cannot be read.
   const lossyAs = (t: ExpectedTest, fileName: string) =>
     !!t.displayName &&
+    lossy.has(fileName) &&
     lossyFileNameOf(fileName, t.displayName) &&
-    !displayNames().some((o) => o.fqcn !== t.fqcn && lossyFileNameOf(fileName, o.shown));
+    !displayNames().some((o) => o.fqcn !== t.fqcn && (o.shown === undefined || lossyFileNameOf(fileName, o.shown)));
   let notRun = expected.filter((t) => !seen.some((n) => ranAs(t, n)));
   if (notRun.length && reports.length) notRun = notRun.filter((t) => !scanInside().names.some((n) => ranAs(t, n)));
-  if (notRun.length) notRun = notRun.filter((t) => !fileNames.some((n) => lossyAs(t, n)));
-  // A class listed by name only (it ran before the writer): what its source says, for the report.
+  if (notRun.length && lossy.size) notRun = notRun.filter((t) => ![...lossy].some((n) => lossyAs(t, n)));
   notRun = notRun.map((t) => {
-    if (t.framework) return t;
-    try {
-      const read = expectedTestOf(fs.readFileSync(t.file, "latin1"), t.file, t.origin);
-      return read ? { ...t, framework: read.framework, disabled: read.disabled } : t;
-    } catch {
-      return t;
+    let read: ExpectedTest | undefined;
+    // A class listed by name only (it ran before the writer): what its source says, for the report.
+    if (!t.framework) {
+      try {
+        read = expectedTestOf(decodeJavaSource(fs.readFileSync(t.file), charset), t.file, t.origin);
+      } catch {
+        read = undefined;
+      }
     }
+    const withSource = read ? { ...t, framework: read.framework, disabled: read.disabled } : t;
+    // A report goes by its @DisplayName, and another class goes by that too: which of them it is,
+    // nothing tells — a name of its own is what does.
+    const shown = t.displayName;
+    if (!shown || !(fileNames.some((n) => sameShown(n, shown)) || (reports.length && scanInside().names.some((n) => sameShown(n, shown))))) {
+      return withSource;
+    }
+    const shared = sharing(t);
+    return shared.length ? { ...withSource, sharedName: shared } : withSource;
   });
   const allSkipped: RanCheck["allSkipped"] = [];
+  let logCounts: Map<string, { tests: number; skipped: number }> | undefined;
   for (const t of expected) {
     if (t.origin !== "created" || notRun.some((n) => n.fqcn === t.fqcn)) continue;
-    const files = [...reportOf].filter(([n]) => ranAs(t, n) || lossyAs(t, n)).flatMap(([, f]) => f);
+    // Its reports: the ones that go by its name; by its @DisplayName only when it has none of those —
+    // the report of that name can be another class's (a disabled one's, every test skipped).
+    const own = [...reportOf].filter(([n]) => names(t.fqcn, n)).flatMap(([, f]) => f);
+    const files = own.length ? own : [...reportOf].filter(([n]) => shownAs(t, n) || lossyAs(t, n)).flatMap(([, f]) => f);
     let { tests, skipped } = files.length ? skippedCounts(dir, files) : { tests: 0, skipped: 0 };
     if (!files.length) {
       // No report of its own: it ran inside a suite's — TestNG's TestSuite, a JUnit 4 Suite — whose
@@ -1441,13 +1563,24 @@ export function checkTestsRan(
         tests += c.tests;
         skipped += c.skipped;
       }
+      // In no report at all (they are written elsewhere): what surefire printed of it.
+      if (!tests && tool === "maven") {
+        logCounts ??= testCountsInLog(moduleSurefireLog(out, moduleArtifactId(mod)));
+        for (const [cls, c] of logCounts) {
+          if (!names(t.fqcn, cls)) continue;
+          tests += c.tests;
+          skipped += c.skipped;
+        }
+      }
     }
     if (tests > 0 && skipped >= tests) allSkipped.push({ test: t, tests });
   }
   // What ran, and in which framework — read only when something did not run. A suite report names
-  // its classes inside: TestNG's one TEST-TestSuite.xml, a JUnit 4 suite's members.
-  const outer = new Set(seen.map((n) => n.replace(/[$-].*$/, "")));
-  if (members || reports.some((f) => f.endsWith(".xml") && !isClass(f.slice("TEST-".length, -".xml".length)))) {
+  // its classes inside: TestNG's one TEST-TestSuite.xml, a JUnit 4 suite's members. A name that is no
+  // class of the module (a @DisplayName, "滿 NT$1000 折 NT$100") is kept whole.
+  const outerOf = (n: string) => (isClass(n) ? n.replace(/[$-].*$/, "") : n);
+  const outer = new Set(seen.map(outerOf));
+  if (members || unnamed) {
     for (const n of scanInside().names) if (isClass(n)) outer.add(n.replace(/[$-].*$/, ""));
   }
   // The classes that did not run are no evidence of what runs — before the writer, their source
@@ -1459,7 +1592,7 @@ export function checkTestsRan(
       if (found.length >= 200) break;
       let src: string;
       try {
-        src = fs.readFileSync(sourceOf(fqcn), "latin1");
+        src = decodeJavaSource(fs.readFileSync(sourceOf(fqcn)), charset);
       } catch {
         continue; // another module's, or not a class (TestNG's "TestSuite")
       }
@@ -1505,8 +1638,12 @@ export function renderRanCheck(check: RanCheck, tool: BuildTool): string | null 
     grown: "你在這個既有類別裡加了測試，但這個模組的建置沒有執行它（writer 介入前也沒有）——加在這裡的測試不會被執行",
     untouched: "既有的測試類別，writer 介入前有被執行，這次沒有——你的變更讓它不再被執行（例如測試資源裡的設定、共用的基底類別）",
   };
+  const shared = (t: ExpectedTest) =>
+    t.sharedName?.length
+      ? `（它的 @DisplayName「${t.displayName}」與 ${t.sharedName.join("、")} 相同：報告以這個名字寫、只有一份，分不出是哪一個類別的——請給它一個這個模組裡獨一無二的名字）`
+      : "";
   const listed = [
-    ...check.notRun.map((t) => `  - ${t.fqcn}${fw(t)}：${WHAT[t.origin]}`),
+    ...check.notRun.map((t) => `  - ${t.fqcn}${fw(t)}：${WHAT[t.origin]}${shared(t)}`),
     ...check.allSkipped.map(({ test, tests }) => `  - ${test.fqcn}：你新寫的測試類別，${tests} 個測試全部被略過（skipped）`),
   ];
   const lines = [
@@ -1602,8 +1739,9 @@ export function surefireSummaryLines(out: string): string {
   // What comes before the first header is Maven's preamble — or, with no header at all, everything.
   const sections: Array<{ surefire: boolean; lines: string[] }> = [{ surefire: true, lines: [] }];
   for (const line of out.split(/\r?\n/)) {
-    if (/--- \S.*? @ \S+ ---/.test(line)) {
-      sections.push({ surefire: /--- (?:maven-)?surefire(?:-plugin)?:[^:\s]+:test\b/.test(line), lines: [] });
+    const header = PLUGIN_HEADER.exec(line);
+    if (header) {
+      sections.push({ surefire: isSurefireTest(header[1]), lines: [] });
       continue;
     }
     sections[sections.length - 1].lines.push(line);
@@ -1661,13 +1799,25 @@ export function mavenRedDespiteExit0(out: string, reported: boolean): string | u
 /**
  * Pure: Gradle's counterpart — a test task with ignoreFailures = true says there were failing tests
  * ("…See the report at", or "…See the results at" with the HTML report off; only the count with
- * logging quiet) and succeeds. `reported`: the test results record a failing test — all an
- * up-to-date test task leaves to go by, since it prints nothing.
+ * logging quiet) and succeeds. `reported`: the test results record a failing test that no retry of it
+ * passed (gradleFailingSuites). `results`: there are test results to go by — and then they, not the
+ * log, decide: the test-retry plugin's green build says "3 tests completed, 1 failed" and "There were
+ * failing tests" all the same (measured: Gradle 8.14.3, test-retry 1.6.2, mergeReruns or not), and a
+ * test whose retry passed is not failing.
  */
-export function gradleRedDespiteExit0(out: string, reported = false): string | undefined {
-  return reported || /There were failing tests\b|^\d+ tests? completed, \d+ failed/m.test(out)
+export function gradleRedDespiteExit0(out: string, reported = false, results = false): string | undefined {
+  return reported || (!results && /There were failing tests\b|^\d+ tests? completed, \d+ failed/m.test(out))
     ? "Gradle 以 exit=0 結束，但有測試失敗——test 任務設定了 ignoreFailures = true，測試失敗不會讓建置失敗"
     : undefined;
+}
+
+/** Whether this Gradle build left test results in the module to go by. */
+function gradleHasResults(mod: ModuleInfo): boolean {
+  try {
+    return fs.readdirSync(path.join(mod.moduleRoot, "build", "test-results", "test")).some((f) => /^TEST-.+\.xml$/.test(f));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1875,21 +2025,18 @@ export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOpti
     const wrapper = isWin ? "gradlew.bat" : "gradlew";
     const wrapperAt = fs.existsSync(path.join(REPO_ROOT, wrapper));
     const cmd = wrapperAt ? (isWin ? wrapper : `./${wrapper}`) : "gradle";
-    const args = [
-      ...(mod.multiModule ? ["-p", mod.moduleRel] : []),
-      // The test task must execute, not be skipped as UP-TO-DATE (nothing changed since its last
-      // execution) or FROM-CACHE (the build cache holds its outputs for these inputs): either way it
-      // leaves results that no test run of this tree produced, and what did not run proves nothing —
-      // a baseline like that is no evidence for resuming (loop.ts), and a test that fails only when
-      // run passes. cleanTest deletes the task's outputs, which ends UP-TO-DATE but not FROM-CACHE;
-      // the property turns the build cache off for this build (gradle.properties and ~/.gradle's
-      // lose to it), where --no-build-cache is an unknown option to a Gradle before 4 and fails the
-      // build, and --rerun needs 7.6. Measured on Gradle 8.14.3 with org.gradle.caching=true.
-      "cleanTest",
-      "test",
-      "-Dorg.gradle.caching=false",
-      "--console=plain",
-    ];
+    // The target's test task must execute, not be skipped as UP-TO-DATE (nothing changed since its last
+    // execution) or FROM-CACHE (the build cache holds its outputs for these inputs): either way it
+    // leaves results that no test run of this tree produced, and what did not run proves nothing — a
+    // baseline like that is no evidence for resuming (loop.ts), and a test that fails only when run
+    // passes. Deleting its results — an output of the task — ends UP-TO-DATE, for this project only:
+    // `cleanTest` does the same in every subproject the task name reaches, and their tests ran again
+    // every round (a root project that includes others, a -p project with its own), where a stateful
+    // one turned rounds red that the writer could neither see nor touch. The property turns the build
+    // cache off for this build (gradle.properties and ~/.gradle's lose to it): --no-build-cache is an
+    // unknown option to a Gradle before 4, and --rerun needs 7.6. Measured on Gradle 8.14.3.
+    fs.rmSync(path.join(mod.moduleRoot, "build", "test-results", "test"), { recursive: true, force: true });
+    const args = [...(mod.multiModule ? ["-p", mod.moduleRel] : []), "test", "-Dorg.gradle.caching=false", "--console=plain"];
     r = await shLive(cmd, args, "[gradle]", REPO_ROOT, BUILD_TIMEOUT_MS);
   }
 
@@ -1932,7 +2079,7 @@ export async function runBuild(tool: BuildTool, mod: ModuleInfo, opts: BuildOpti
       ? undefined
       : tool === "maven"
         ? mavenRedDespiteExit0(r.out, reportsRecordFailure(mod.moduleRoot, startedAt))
-        : gradleRedDespiteExit0(r.out, gradleFailingSuites(mod).length > 0);
+        : gradleRedDespiteExit0(r.out, gradleFailingSuites(mod).length > 0, gradleHasResults(mod));
   // Not "FAIL" here: under UT_ALLOW_DIRTY_BASELINE the failures may all be tolerated ones.
   if (ignoredBy) log(`[WARN] ${ignoredBy}——loop 不看 exit code，以測試報告與建置工具自己的判定為準`);
 

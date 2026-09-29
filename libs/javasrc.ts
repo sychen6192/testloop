@@ -142,6 +142,11 @@ export function javaStringValue(body: string): string {
 
 // Java's names for the double-byte charsets of older repos, as the WHATWG labels Node's TextDecoder
 // knows them by. Other names it takes as they are: GBK, GB18030, Shift_JIS, EUC-KR, windows-1252.
+// Measured on every two-byte sequence against JDK 21: each decoder splits the bytes javac accepts
+// exactly as javac does — a lead byte and the one after it, "\" (0x5C) or not — which is what the
+// lexer needs; the characters are javac's for MS950 and EUC-KR, while a few rare ones come out as
+// others elsewhere (IBM's cp950 364, GBK 101, MS932 63, MS949's Hangul beyond KS X 1001 as two
+// characters): a string's value there — a @DisplayName — can differ from what javac compiles.
 const DECODER_LABELS: Record<string, string> = {
   ms950: "big5",
   cp950: "big5",
@@ -165,14 +170,21 @@ const DECODER_LABELS: Record<string, string> = {
 };
 
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+// When the name is not known (set in a parent pom outside the repo): the double-byte encodings of
+// older repos, each tried whole, the first that decodes every byte taken. One that is not the file's
+// still splits its bytes as the file's does wherever it decodes them all — lead byte, then the next —
+// and lexing is what the text is for: read byte for byte, MS950's 功 ends in a "\" that escapes the
+// quote after it.
+const SNIFFED = ["big5", "gbk", "shift_jis", "euc-kr"].map((label) => new TextDecoder(label, { fatal: true }));
 
 /**
  * Pure: a Java source's text, decoded as javac decodes it — in `charset` (Java's name for the module's
  * source encoding) when that is known and Node has a decoder for it; else as UTF-8, when the bytes are
- * that. Otherwise byte for byte (latin1): every ASCII character where it is. That is not enough for
- * the lexer: MS950 has "\" (0x5C) as the second byte of 功, 許 and 蓋, so the quote after "處理成功"
- * reads as escaped and the string runs to the end of the line, the code after it with it; and a
- * string literal or a @DisplayName read so is not the one javac compiles.
+ * that; else in the first of the double-byte encodings (SNIFFED) that decodes them all. Otherwise byte
+ * for byte (latin1): every ASCII character where it is. That is not enough for the lexer: MS950 has
+ * "\" (0x5C) as the second byte of 功, 許 and 蓋, so the quote after "處理成功" reads as escaped and the
+ * string runs to the end of the line, the code after it with it; and a string literal or a
+ * @DisplayName read so is not the one javac compiles.
  */
 export function decodeJavaSource(buf: Buffer, charset?: string): string {
   const name = charset?.trim().toLowerCase().replace(/_/g, "-");
@@ -189,11 +201,14 @@ export function decodeJavaSource(buf: Buffer, charset?: string): string {
     }
   }
   if (decoder) return decoder.decode(buf);
-  try {
-    return strictUtf8.decode(buf);
-  } catch {
-    return buf.toString("latin1");
+  for (const d of [strictUtf8, ...SNIFFED]) {
+    try {
+      return d.decode(buf);
+    } catch {
+      /* not this one */
+    }
   }
+  return buf.toString("latin1");
 }
 
 // javac's line terminators: CR LF, a lone LF, and a lone CR.

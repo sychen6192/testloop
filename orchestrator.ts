@@ -67,7 +67,9 @@ import {
   BuildRun,
   ExpectedTest,
   expectedTestOf,
+  flakyTestClasses,
   NOT_RUN_HEADER,
+  outerClassName,
   ranTestClasses,
   testOnlyFailures,
 } from "./gates/build";
@@ -112,6 +114,9 @@ export interface OrchestratorConfig {
   ranAtBaseline?: string[];
   // What the writer changed, for a batch that does not pass: see WriterTrace.
   trace?: WriterTrace;
+  // Told the moment tests are found to fail and then pass when run again: a pass that hangs on them is
+  // written down as void there and then, not when the batch ends (which an interrupt never reaches).
+  onFlaky?: (classes: string[]) => void;
 }
 
 /**
@@ -159,13 +164,16 @@ function testsThatMustRun(
   wholeModule: boolean,
   // The module's source encoding: a @DisplayName is compared with what surefire reports, as javac read it.
   charset: string | undefined,
+  // The encoding `preexisting` was counted in: a file's count now is taken the same way, or a file
+  // read better now than then "grew".
+  countedIn: string | undefined,
 ): ExpectedTest[] {
   const before = new Set(ranBefore ?? []);
   const out = new Map<string, ExpectedTest>();
   const writtenFiles = new Set<string>();
   const read = (file: string) => {
     try {
-      return decodeJavaSource(fs.readFileSync(file), charset);
+      return fs.readFileSync(file);
     } catch {
       return undefined; // deleted
     }
@@ -174,20 +182,20 @@ function testsThatMustRun(
     if (!rel.endsWith(".java") || rel.startsWith("resources/")) continue;
     const file = path.join(testRoot, rel);
     writtenFiles.add(path.resolve(file));
-    const src = read(file);
+    const bytes = read(file);
     const had = preexisting[rel];
-    const t = src === undefined ? undefined : expectedTestOf(src, file, had ? "changed" : "created");
+    const t = bytes === undefined ? undefined : expectedTestOf(decodeJavaSource(bytes, charset), file, had ? "changed" : "created");
     if (!t) continue;
     if (!had) out.set(t.fqcn, t);
     else if (before.has(t.fqcn)) out.set(t.fqcn, t);
-    else if (testMetrics(src!).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
+    else if (testMetrics(decodeJavaSource(bytes!, countedIn)).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
   }
   if (wholeModule) {
     for (const fqcn of before) {
       const file = path.join(testRoot, ...fqcn.split(".")) + ".java";
       if (out.has(fqcn) || writtenFiles.has(path.resolve(file))) continue; // the writer's: judged above
-      const src = read(file);
-      const t = src === undefined ? undefined : expectedTestOf(src, file, "untouched");
+      const bytes = read(file);
+      const t = bytes === undefined ? undefined : expectedTestOf(decodeJavaSource(bytes, charset), file, "untouched");
       if (t) out.set(fqcn, t);
     }
   }
@@ -407,6 +415,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const everWritten = new Set<string>();
   // Untouched test classes that failed a build and passed its rebuild (see recheckUntouched).
   const flakyTests = new Set<string>();
+  const noteFlaky = (classes: string[]) => {
+    classes.forEach((c) => flakyTests.add(c));
+    cfg.onFlaky?.(classes);
+  };
   const flakyField = () => (flakyTests.size ? { flakyTests: [...flakyTests].sort() } : {});
   // The untouched classes the last build failed in twice, when that is what its report was about.
   let lastCollateral: string[] | undefined;
@@ -414,8 +426,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
   // What every pre-existing test file had before round 1. The writer may reshape the files it
-  // creates, but may not take anything away from these — see libs/testmetrics.ts.
-  const originalMetrics = collectTestMetrics(testRoot);
+  // creates, but may not take anything away from these — see libs/testmetrics.ts. Counted in the
+  // encoding known now, and every count after it in the same one: a later build that tells the
+  // encoding better changes what is read, not what was taken away.
+  const countedIn = cfg.sourceEncoding?.name;
+  const originalMetrics = collectTestMetrics(testRoot, countedIn);
 
   // Scoped iterations: surefire runs only the target classes' tests, and the module-wide run
   // is deferred to a single verification before success rather than skipped. Maven only —
@@ -494,6 +509,16 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       return untouched ? failing : undefined;
     };
     const names = (failures: Array<{ cls: string }>) => [...new Set(failures.map((f) => f.cls))];
+    // Tests surefire ran again after they failed (rerunFailingTestsCount), or Gradle's test-retry did:
+    // the build is green, and they are no more reliable than the ones a rebuild turned green.
+    const rerunFlakes = (b: BuildRun) => {
+      if (b.aborted) return;
+      const found = flakyTestClasses(cfg.buildTool, cfg.mod, b.startedAt, b.gate.raw ?? "").filter((c) => !flakyTests.has(c));
+      if (!found.length) return;
+      log(`[WARN] 失敗之後被重跑才通過（surefire 的 rerunFailingTestsCount 或 Gradle 的 test-retry）：${found.join("、")} 是不穩定的測試，需要人檢視`);
+      noteFlaky(found);
+      save("flaky.txt", [...flakyTests].sort().join("\n"));
+    };
     const recheckUntouched = async (
       first: BuildRun,
       opts: BuildOptions,
@@ -512,8 +537,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         const cleared = names(suspects).filter((c) => !failingAgain.has(c));
         const flaky = cleared.length ? cleared : names(suspects);
         log(`[WARN] 重跑後通過：${flaky.join("、")} 是不穩定的測試（flaky），需要人檢視`);
-        flaky.forEach((c) => flakyTests.add(c));
-        save("flaky.txt", flaky.join("\n"));
+        noteFlaky(flaky);
+        save("flaky.txt", [...flakyTests].sort().join("\n"));
         return again;
       }
       const still = untouchedFailures(again);
@@ -666,7 +691,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     // Shrink guard: to the build gate, "fixed the failing test" and "deleted the failing test"
     // are the same green. The round fails before any build, with the numbers, so the writer
     // puts back what it removed instead of the loop validating a hollowed-out suite.
-    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot, countedIn));
     if (shrunk.length) {
       const report = renderShrinkFeedback(shrunk);
       save("test-shrink.txt", report);
@@ -696,7 +721,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const buildOpts: BuildOptions = {
       onlyTests,
       tolerate: cfg.tolerate,
-      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped, sourceEncoding?.name),
+      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped, sourceEncoding?.name, countedIn),
       ranBefore: cfg.ranAtBaseline,
       charset: sourceEncoding?.name,
     };
@@ -704,6 +729,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const firstBuild = await runBuild(cfg.buildTool, cfg.mod, buildOpts);
     save("build.log", firstBuild.gate.raw ?? firstBuild.gate.report);
     const built = await recheckUntouched(firstBuild, buildOpts, "build-rerun.log");
+    rerunFlakes(built);
     const build = built.gate;
     // The coverage gate only trusts a report written after the build that counts started.
     const buildStartedAt = built.startedAt;
@@ -834,13 +860,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
         const verifyOpts: BuildOptions = {
           tolerate: cfg.tolerate,
-          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true, sourceEncoding?.name),
+          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true, sourceEncoding?.name, countedIn),
           ranBefore: cfg.ranAtBaseline,
           charset: sourceEncoding?.name,
         };
         const firstVerify = await runBuild(cfg.buildTool, cfg.mod, verifyOpts);
         save("final-verify.log", firstVerify.gate.raw ?? firstVerify.gate.report);
         const verified = await recheckUntouched(firstVerify, verifyOpts, "final-verify-rerun.log");
+        rerunFlakes(verified);
         const full = verified.gate;
         if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verified.startedAt, full.raw ?? "");
         if (verified.elsewhere) {
@@ -964,7 +991,7 @@ function repoRelTest(mod: ModuleInfo, changed: string): string {
 // (an inner class lives in its outer class's file).
 function brokenItemFile(mod: ModuleInfo, item: string): string {
   if (item.endsWith(".java")) return (path.isAbsolute(item) ? path.relative(REPO_ROOT, item) : item).replace(/\\/g, "/");
-  return repoRelTest(mod, `${item.replace(/\$.*$/, "").replace(/\./g, "/")}.java`);
+  return repoRelTest(mod, `${outerClassName(item).replace(/\./g, "/")}.java`);
 }
 
 // Could this round's edits have broken `file` without touching it? Yes when it names a class
@@ -995,11 +1022,12 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const writableTree = path.join(cfg.mod.moduleRoot, "src", "test");
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
-  const originalMetrics = collectTestMetrics(testRoot);
+  const countedIn = cfg.sourceEncoding?.name;
+  const originalMetrics = collectTestMetrics(testRoot, countedIn);
   const touched = new Set<string>();
   let current = cfg.baseline;
   // What ran before the repair — the failing classes included — has to be running when it is green.
-  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map((c) => c.replace(/\$.*$/, ""))])];
+  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map(outerClassName)])];
   let testStack = cfg.testStack;
   let sourceEncoding = cfg.sourceEncoding;
   const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -1141,7 +1169,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
           cfg.buildTool,
           cfg.mod,
           "repair",
-          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name),
+          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name, countedIn),
           ranBefore,
           sourceEncoding?.name,
         );
@@ -1170,7 +1198,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       return giveUp("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), true), round);
     }
 
-    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot, countedIn));
     if (shrunk.length) {
       const shrinkReport = renderShrinkFeedback(shrunk);
       save("test-shrink.txt", shrinkReport);
@@ -1193,7 +1221,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       cfg.buildTool,
       cfg.mod,
       "repair",
-      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name),
+      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name, countedIn),
       ranBefore,
       sourceEncoding?.name,
     );

@@ -366,6 +366,14 @@ const GRADLE_CALC_XML = (failing: boolean) => `<?xml version="1.0" encoding="UTF
   <system-err><![CDATA[]]></system-err>
 </testsuite>
 `;
+const GRADLE_EXISTING_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.x.ExistingTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-28T09:41:19.030Z" hostname="vm" time="0.01">
+  <properties/>
+  <testcase name="div_byOne_returnsSameValue()" classname="com.x.ExistingTest" time="0.01"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
+`;
 const EXISTING_BROKEN_BY_NEW = untouchedRed("expected: <1,5> but was: <1.5>（預設 Locale 被新測試改成 de_DE）");
 
 // A @Data class with a method someone wrote. JaCoCo's lines for it, shaped as the real report is
@@ -501,6 +509,11 @@ const JACOCO_GREETER_RED = { pkg: "com/x", file: "Greeter.java", line: [4, 0] as
 const BASE_EXISTING = { exit: 0, out: BUILD_SUCCESS(2), cleanSurefire: true, surefire: ran("com.x.ExistingTest") };
 /** Calc's round: CalcTest and ExistingTest ran, Calc fully covered. Also the rerun's baseline once CalcTest is there. */
 const CALC_BUILD = { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.CalcTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN };
+/** CalcTest as a test that starts a Spring context. */
+const CALC_TEST_SPRING = CALC_TEST.replace(
+  "import org.junit.jupiter.api.Test;",
+  "import org.junit.jupiter.api.Test;\nimport org.springframework.boot.test.context.SpringBootTest;",
+).replace("class CalcTest {", "@SpringBootTest\nclass CalcTest {");
 const RESUME_WRITE_CALC: ApiTurn[] = [
   { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST } }] },
   { content: "已建立 CalcTest.java" },
@@ -689,6 +702,77 @@ const RUNNING = (...classes: string[]) =>
 const PHRASED_XML = (shown: string, method: string) => `<?xml version="1.0" encoding="UTF-8"?>
 <testsuite name="${shown}" time="0.01" tests="1" errors="0" skipped="0" failures="0">
   <testcase name="${method}" classname="${shown}" time="0.003"/>
+</testsuite>
+`;
+/** A surefire .txt summary with its counts. */
+const SUREFIRE_TXT = (cls: string, tests: number, skipped: number) =>
+  [
+    "-------------------------------------------------------------------------------",
+    `Test set: ${cls}`,
+    "-------------------------------------------------------------------------------",
+    `Tests run: ${tests}, Failures: 0, Errors: 0, Skipped: ${skipped}, Time elapsed: {{elapsed}} s -- in ${cls}`,
+  ].join("\n");
+/** A green build's console, with each class's counts. */
+const RUN_COUNTS = (...classes: Array<[string, number, number]>) =>
+  [
+    "[INFO] Scanning for projects...",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+    ...classes.flatMap(([c, n, sk]) => [
+      `[INFO] Running ${c}`,
+      `[${sk ? "WARNING" : "INFO"}] Tests run: ${n}, Failures: 0, Errors: 0, Skipped: ${sk}, Time elapsed: {{elapsed}} s -- in ${c}`,
+    ]),
+    `[INFO] Tests run: ${classes.reduce((a, [, n]) => a + n, 0)}, Failures: 0, Errors: 0, Skipped: ${classes.reduce((a, [, , sk]) => a + sk, 0)}`,
+    "[INFO] BUILD SUCCESS",
+  ].join("\n");
+/** Reports written elsewhere (a custom reportsDirectory): the log is all there is. A test logs "[INFO] Building …". */
+const SECTION_LOG = [
+  "[INFO] Scanning for projects...",
+  "[INFO] ----------------------------< com.x:fixture >----------------------------",
+  "[INFO] Building fixture 1.0",
+  "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+  "[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider",
+  "[INFO] Running com.x.ExistingTest",
+  "[INFO] Building monthly report for 2026-09",
+  "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in com.x.ExistingTest",
+  "[INFO] Running com.x.CalcTest",
+  "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in com.x.CalcTest",
+  "[INFO] ",
+  "[INFO] Results:",
+  "[INFO] ",
+  "[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0",
+  "[INFO] BUILD SUCCESS",
+].join("\n");
+const NOOP_EXT_PATH = `${TEST_DIR}/NoopExtension.java`;
+const NOOP_EXT = "package com.x;\n\nimport org.junit.jupiter.api.extension.Extension;\n\npublic class NoopExtension implements Extension {}\n";
+const ORDER_SERVICE_PATH = `${TEST_DIR}/OrderServiceTest.java`;
+/** Its class-level @DisplayName comes before an annotation with an array initializer. */
+const ORDER_SERVICE = (disabled: boolean, shown = "訂單服務測") => `package com.x;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@DisplayName("${shown}")
+@ExtendWith({NoopExtension.class})
+${disabled ? '@Disabled("等 DB 環境")\n' : ""}class OrderServiceTest {
+    @Test
+    void total() {
+        assertEquals(2, new Calc().add(1, 1));
+    }
+}
+`;
+/** What surefire 3.2.5 wrote for it (measured, LANG=C: TEST-?????.xml): the display name inside, whole. */
+const ORDER_SERVICE_XML = (skipped: boolean, shown = "訂單服務測") => `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite version="3.0" name="${shown}" time="0.001" tests="1" errors="0" skipped="${skipped ? 1 : 0}" failures="0">
+  <testcase name="total" classname="${skipped ? "com.x.OrderServiceTest" : shown}" time="0.0">${skipped ? '\n    <skipped message="等 DB 環境"/>\n  ' : ""}</testcase>
+</testsuite>
+`;
+const CALC_PHRASED_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite version="3.0" name="計算機測試" time="0.02" tests="2" errors="0" skipped="0" failures="0">
+  <testcase name="add_twoPositives_returnsSum" classname="計算機測試" time="0.01"/>
+  <testcase name="div_byZero_throwsIllegalArgument" classname="計算機測試" time="0.01"/>
 </testsuite>
 `;
 /** A test that failed once and passed when surefire ran it again (rerunFailingTestsCount): a green build. */
@@ -1700,7 +1784,7 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "gradle-retry-passed-green",
-    desc: "Gradle 的 test-retry plugin：ExistingTest 第一次失敗、重試通過，每一次各寫成一個 test case，建置綠 → 不得判紅",
+    desc: "Gradle 的 test-retry plugin：ExistingTest 第一次失敗、重試通過，每一次各寫成一個 test case，建置綠——log 照樣說「1 failed」「There were failing tests」（實測 test-retry 1.6.2）→ 不得判紅",
     entry: "orchestrate",
     buildTool: "gradle",
     env: { UT_SKIP_REVIEW: "1" },
@@ -1708,7 +1792,7 @@ export const SCENARIOS: Scenario[] = [
     mvn: [
       {
         exit: 0,
-        out: "> Task :test\n\nBUILD SUCCESSFUL in 3s",
+        out: "> Task :test\n3 tests completed, 1 failed\nThere were failing tests. See the report at: file:///w/build/reports/tests/test/index.html\n\nBUILD SUCCESSFUL in 3s",
         writeFiles: {
           "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false),
           "build/test-results/test/TEST-com.x.ExistingTest.xml": `<?xml version="1.0" encoding="UTF-8"?>
@@ -1747,6 +1831,117 @@ export const SCENARIOS: Scenario[] = [
         exit: 0,
         out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
         writeFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false) },
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "ran-check-section-not-cut-by-test-output",
+    desc: "報告寫到別處（自訂 reportsDirectory），log 的 Running 行是唯一證據；ExistingTest 印了一行「[INFO] Building monthly report…」→ CalcTest 的 Running 行仍在目標模組的 surefire 區段裡，第 1 輪通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }],
+    mvn: [{ exit: 0, out: SECTION_LOG, cleanSurefire: true, jacoco: JACOCO_GREEN }],
+  },
+  {
+    name: "ran-check-lossy-report-of-disabled-class",
+    desc: "phrased XML 檔名、POSIX 檔名編碼：CalcTest（「計算機測試」）有跑、2 個都過；@Disabled 的 OrderServiceTest（「訂單服務測」，寫在 @ExtendWith({…}) 之前）最後寫了同一個 TEST-?????.xml → 那份是它的，CalcTest 不算全部被略過，第 1 輪通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [NOOP_EXT_PATH]: NOOP_EXT, [ORDER_SERVICE_PATH]: ORDER_SERVICE(true) },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST_CJK } }],
+    mvn: [
+      {
+        exit: 0,
+        out: RUN_COUNTS(["com.x.CalcTest", 2, 0], ["com.x.ExistingTest", 2, 0], ["com.x.OrderServiceTest", 1, 1]),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_TXT("com.x.CalcTest", 2, 0) },
+          { cls: "com.x.ExistingTest", body: SUREFIRE_TXT("com.x.ExistingTest", 2, 0) },
+          { cls: "com.x.OrderServiceTest", body: SUREFIRE_TXT("com.x.OrderServiceTest", 1, 1) },
+        ],
+        surefireXml: [{ suite: "?????", body: ORDER_SERVICE_XML(true) }],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "ran-check-exact-report-of-disabled-class",
+    desc: "phrased XML 檔名、UTF-8 檔名編碼：CalcTest 與 @Disabled 的 OrderServiceTest 都叫「服務測試」，後者最後寫了 TEST-服務測試.xml；CalcTest 有跑、2 個都過 → 以它自己的報告為準，不算全部被略過，第 1 輪通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [NOOP_EXT_PATH]: NOOP_EXT, [ORDER_SERVICE_PATH]: ORDER_SERVICE(true, "服務測試") },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST_CJK.replace("計算機測試", "服務測試") } }],
+    mvn: [
+      {
+        exit: 0,
+        out: RUN_COUNTS(["com.x.CalcTest", 2, 0], ["com.x.ExistingTest", 2, 0], ["com.x.OrderServiceTest", 1, 1]),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_TXT("com.x.CalcTest", 2, 0) },
+          { cls: "com.x.ExistingTest", body: SUREFIRE_TXT("com.x.ExistingTest", 2, 0) },
+          { cls: "com.x.OrderServiceTest", body: SUREFIRE_TXT("com.x.OrderServiceTest", 1, 1) },
+        ],
+        surefireXml: [{ suite: "服務測試", body: ORDER_SERVICE_XML(true, "服務測試") }],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "ran-check-lossy-report-credited",
+    desc: "phrased XML 檔名、POSIX 檔名編碼：CalcTest（「計算機測試」）第 1 輪沒被執行；有跑的 OrderServiceTest（「訂單服務測」）寫了 TEST-?????.xml → 那不是 CalcTest 的報告：第 1 輪判 FAIL，第 2 輪 CalcTest 有跑才通過",
+    entry: "orchestrate",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { [NOOP_EXT_PATH]: NOOP_EXT, [ORDER_SERVICE_PATH]: ORDER_SERVICE(false) },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST_CJK } }, { write: { [CALC_TEST_PATH]: `${CALC_TEST_CJK}// 第 2 輪\n` } }],
+    mvn: [
+      {
+        exit: 0,
+        out: RUN_COUNTS(["com.x.ExistingTest", 2, 0], ["com.x.OrderServiceTest", 1, 0]),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.ExistingTest", body: SUREFIRE_TXT("com.x.ExistingTest", 2, 0) },
+          { cls: "com.x.OrderServiceTest", body: SUREFIRE_TXT("com.x.OrderServiceTest", 1, 0) },
+        ],
+        surefireXml: [{ suite: "?????", body: ORDER_SERVICE_XML(false) }],
+        jacoco: JACOCO_GREEN,
+      },
+      {
+        exit: 0,
+        out: RUN_COUNTS(["com.x.CalcTest", 2, 0], ["com.x.ExistingTest", 2, 0], ["com.x.OrderServiceTest", 1, 0]),
+        cleanSurefire: true,
+        surefire: [
+          { cls: "com.x.CalcTest", body: SUREFIRE_TXT("com.x.CalcTest", 2, 0) },
+          { cls: "com.x.ExistingTest", body: SUREFIRE_TXT("com.x.ExistingTest", 2, 0) },
+          { cls: "com.x.OrderServiceTest", body: SUREFIRE_TXT("com.x.OrderServiceTest", 1, 0) },
+        ],
+        surefireXml: [{ suite: "?????", body: CALC_PHRASED_XML }],
+        jacoco: JACOCO_GREEN,
+      },
+    ],
+  },
+  {
+    name: "gradle-stale-results-not-evidence",
+    desc: "上一次建置留在 build/test-results/test 的 TEST-com.x.CalcTest.xml（通過）；這次的建置沒有執行 CalcTest → 舊的結果不算它有跑：第 1 輪判 FAIL，第 2 輪真的執行了才通過",
+    entry: "orchestrate",
+    buildTool: "gradle",
+    env: { UT_SKIP_REVIEW: "1" },
+    extraFiles: { "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false) },
+    writer: [{ write: { [CALC_TEST_PATH]: CALC_TEST } }, { write: { [CALC_TEST_PATH]: `${CALC_TEST}// 第 2 輪\n` } }],
+    mvn: [
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: { "build/test-results/test/TEST-com.x.ExistingTest.xml": GRADLE_EXISTING_XML },
+        jacoco: JACOCO_GREEN,
+      },
+      {
+        exit: 0,
+        out: "> Task :test\n\nBUILD SUCCESSFUL in 2s",
+        writeFiles: {
+          "build/test-results/test/TEST-com.x.CalcTest.xml": GRADLE_CALC_XML(false),
+          "build/test-results/test/TEST-com.x.ExistingTest.xml": GRADLE_EXISTING_XML,
+        },
         jacoco: JACOCO_GREEN,
       },
     ],
@@ -3926,6 +4121,23 @@ export const SCENARIOS: Scenario[] = [
     ],
   }),
   resumeCalc({
+    name: "loop-resume-nested-display-name-flaky",
+    desc: "phrased 報告：CalcTest（「計算機測試」）裡的 @Nested「加法」這次預檢失敗一次、surefire 重跑才過，報告點名「計算機測試 加法」（實測 surefire 3.2.5）→ 認得是 CalcTest 的，重新產生",
+    firstApi: [{ toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_CJK } }] }, { content: "已建立 CalcTest.java" }],
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      {
+        exit: 0,
+        out: RUNNING("com.x.CalcTest", "com.x.ExistingTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest", "com.x.ExistingTest"),
+        surefireXml: [{ suite: "計算機測試 加法", body: FLAKY_CALC_XML.replace(/com\.x\.CalcTest(?=")/g, "計算機測試 加法") }],
+        jacoco: JACOCO_GREEN,
+      },
+      CALC_BUILD,
+    ],
+  }),
+  resumeCalc({
     name: "loop-resume-surefire-flaky",
     desc: "這次預檢時 CalcTest 失敗一次、surefire 自己重跑才過（rerunFailingTestsCount：綠燈，報告裡是 <flakyFailure>）→ 不穩定，重新產生",
     rerun: { api: RESUME_REWRITE_CALC },
@@ -4438,6 +4650,383 @@ export const SCENARIOS: Scenario[] = [
       GREETER_ROUND,
     ],
   },
+  // ── Round 5: resume evidence that has to outlive the run that found it, and what a record must hold ──
+  {
+    name: "loop-resume-flaky-redo-interrupted",
+    desc: "第二次的預檢發現 CalcTest 不穩定（surefire 重跑才過）→ 排定重做 Calc，重做時被 Ctrl-C；第三次的預檢剛好沒有 flake → 不接續 Calc：第二次就把它的紀錄記成作廢了",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1" },
+    api: RESUME_WRITE_CALC,
+    rerun: { api: [{ interrupt: true, content: "（被中斷）" }] },
+    rerun2: { api: RESUME_REWRITE_CALC },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      { exit: 0, out: FLAKY_OUT, cleanSurefire: true, surefire: ran("com.x.ExistingTest"), surefireXml: [{ suite: "com.x.CalcTest", body: FLAKY_CALC_XML }], jacoco: JACOCO_GREEN },
+      CALC_BUILD,
+      CALC_BUILD,
+    ],
+  },
+  {
+    name: "loop-resume-flaky-redo-failed",
+    desc: "資料夾 Calc、Greeter 都通過；第二次的預檢 CalcTest 不穩定 → 重做 Calc，那批沒過、撤回（CalcTest 回到第一次的內容）；第三次的預檢剛好沒有 flake → 不接續 Calc",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerun2: { api: RESUME_REWRITE_CALC },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      GREETER_ROUND,
+      {
+        exit: 0,
+        out: FLAKY_OUT,
+        cleanSurefire: true,
+        surefire: ran("com.x.ExistingTest", "com.x.GreeterTest"),
+        surefireXml: [{ suite: "com.x.CalcTest", body: FLAKY_CALC_XML }],
+        jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+      },
+      { ...GREETER_ROUND, jacoco: [JACOCO_RED, JACOCO_GREETER] }, // Calc's redo falls short: set aside
+      GREETER_ROUND, // the third run's baseline
+      GREETER_ROUND,
+    ],
+  },
+  {
+    name: "loop-resume-flaky-before-pass",
+    desc: "資料夾 Calc、Greeter，GreeterTest 本來就在；第 1 批（Calc）的建置失敗在 GreeterTest、重跑才過（flaky）；第 2 批 Greeter 帶著沒改的 GreeterTest 通過 → Greeter 的紀錄記成作廢，重跑不接續",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA, [GREETER_TEST_PATH]: GREETER_TEST },
+    api: [
+      ...RESUME_WRITE_CALC,
+      {
+        toolCalls: [
+          {
+            name: "write_file",
+            args: { path: `${TEST_DIR}/GreeterEdgeTest.java`, content: GREETER_TEST.replace("class GreeterTest", "class GreeterEdgeTest") },
+          },
+        ],
+      },
+      { content: "已建立 GreeterEdgeTest.java" },
+    ],
+    rerun: { api: [{ toolCalls: [{ name: "write_file", args: { path: `${TEST_DIR}/GreeterEdgeTest.java`, content: `${GREETER_TEST.replace("class GreeterTest", "class GreeterEdgeTest")}// again\n` } }] }, { content: "已更新" }] },
+    mvn: [
+      { exit: 0, out: BUILD_SUCCESS(4), cleanSurefire: true, surefire: ran("com.x.ExistingTest", "com.x.GreeterTest") },
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.GreeterTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest", "com.x.ExistingTest"),
+        surefireXml: [{ suite: "com.x.GreeterTest", body: SUREFIRE_XML("com.x.GreeterTest", 2, [{ nested: "", method: "greet_withName_saysHello", message: "flaky", line: 9 }]) }],
+      },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest") },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest", "com.x.GreeterEdgeTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER] },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest", "com.x.GreeterEdgeTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER] },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest", "com.x.GreeterEdgeTest"), jacoco: [JACOCO_GREEN, JACOCO_GREETER] },
+    ],
+  },
+  {
+    name: "loop-resume-surefire-flaky-later-batch",
+    desc: "資料夾 Calc、Greeter；Calc 那批通過；Greeter 那批的建置是綠的，但 CalcTest 在報告裡是 <flakyFailure>（surefire 重跑才過）→ Calc 的紀錄記成作廢，重跑不接續",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: { api: RESUME_REWRITE_CALC },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      {
+        exit: 0,
+        out: FLAKY_OUT,
+        cleanSurefire: true,
+        surefire: ran("com.x.ExistingTest", "com.x.GreeterTest"),
+        surefireXml: [{ suite: "com.x.CalcTest", body: FLAKY_CALC_XML }],
+        jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+      },
+      GREETER_ROUND,
+      GREETER_ROUND,
+    ],
+  },
+  {
+    name: "loop-resume-phrased-flaky-later-batch",
+    desc: "同上，但 CalcTest 有 @DisplayName(\"計算機測試\")，phrased 報告以這個名字點名重跑才過的它 → 照樣認得是 Calc 的測試：紀錄記成作廢，重跑不接續",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_CJK } }] },
+      { content: "已建立 CalcTest.java" },
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+    ],
+    rerun: { api: RESUME_REWRITE_CALC },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      {
+        exit: 0,
+        out: FLAKY_OUT,
+        cleanSurefire: true,
+        surefire: ran("com.x.CalcTest", "com.x.ExistingTest", "com.x.GreeterTest"),
+        surefireXml: [{ suite: "計算機測試", body: FLAKY_CALC_XML.replace(/com\.x\.CalcTest(?=")/g, "計算機測試") }],
+        jacoco: [JACOCO_GREEN, JACOCO_GREETER],
+      },
+      GREETER_ROUND,
+      GREETER_ROUND,
+    ],
+  },
+  resumeCalc({
+    name: "loop-resume-spring-config-between-runs",
+    desc: "CalcTest（@SpringBootTest）的 context 會載入測試目錄裡的 @Configuration（component scan，沒有測試點名它）；兩次執行之間有人改了它 → 重跑不接續",
+    extraFiles: { [TEST_CONFIG_PATH]: TEST_CONFIG.replace("@TestConfiguration", "@org.springframework.context.annotation.Configuration") },
+    firstApi: [{ toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_SPRING } }] }, { content: "已建立 CalcTest.java" }],
+    rerun: {
+      between: { [TEST_CONFIG_PATH]: TEST_CONFIG.replace("@TestConfiguration", "@org.springframework.context.annotation.Configuration").replace("class TestConfig {\n}", "class TestConfig {\n    // a stub bean now answers every call with a default\n}") },
+      api: RESUME_REWRITE_CALC,
+    },
+  }),
+  resumeCalc({
+    name: "loop-resume-application-yml-between-runs",
+    desc: "CalcTest 是 @SpringBootTest；src/test/resources/application.yml（Spring Boot 自己載入，沒有字串點名）在兩次執行之間被改 → 重跑不接續",
+    extraFiles: { "src/test/resources/application.yml": "feature:\n  pricing: strict\n" },
+    firstApi: [{ toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST_SPRING } }] }, { content: "已建立 CalcTest.java" }],
+    rerun: { between: { "src/test/resources/application.yml": "feature:\n  pricing: off\n" }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-application-yml-not-spring",
+    desc: "對照：CalcTest 不起 Spring context；application.yml 在兩次執行之間被改 → 它讀不到那個檔，照樣接續",
+    extraFiles: { "src/test/resources/application.yml": "feature:\n  pricing: strict\n" },
+    rerun: { between: { "src/test/resources/application.yml": "feature:\n  pricing: off\n" }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-two-top-level-types",
+    desc: "CalcTest 用 Orders.one()，Orders 是 TestData.java 裡的第二個 top-level 類別；通過後 Orders 被改 → 紀錄有 TestData.java，重跑不接續",
+    extraFiles: { [`${TEST_DIR}/TestData.java`]: "package com.x;\n\nclass TestData {\n}\n\nclass Orders {\n    static int one() { return 1; }\n}\n" },
+    firstApi: [
+      { toolCalls: [{ name: "write_file", args: { path: CALC_TEST_PATH, content: CALC_TEST.replace("assertEquals(3, new Calc().add(1, 2));", "assertEquals(3, new Calc().add(Orders.one(), 2));") } }] },
+      { content: "已建立 CalcTest.java" },
+    ],
+    rerun: {
+      between: { [`${TEST_DIR}/TestData.java`]: "package com.x;\n\nclass TestData {\n}\n\nclass Orders {\n    static int one() { return 0; }\n}\n" },
+      api: RESUME_REWRITE_CALC,
+    },
+  }),
+  resumeCalc({
+    name: "loop-resume-import-folder-mismatch",
+    desc: "CalcTest import com.x.support.Support，Support.java 放在 com/x/（package 與目錄不符，javac 照樣編）；通過後 Support 改了 → 紀錄有它，重跑不接續",
+    extraFiles: { [SUPPORT_PATH]: "package com.x.support;\n\npublic class Support {\n    public static int one() { return 1; }\n}\n" },
+    firstApi: [
+      {
+        toolCalls: [
+          {
+            name: "write_file",
+            args: {
+              path: CALC_TEST_PATH,
+              content: CALC_TEST.replace("package com.x;", "package com.x;\n\nimport com.x.support.Support;").replace("assertEquals(3, new Calc().add(1, 2));", "assertEquals(3, new Calc().add(Support.one(), 2));"),
+            },
+          },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+    ],
+    rerun: {
+      between: { [SUPPORT_PATH]: "package com.x.support;\n\npublic class Support {\n    public static int one() { return 2; }\n}\n" },
+      api: RESUME_REWRITE_CALC,
+    },
+  }),
+  resumeCalc({
+    name: "loop-resume-red-baseline-flake-then-repair",
+    desc: "重跑的預檢紅在 LegacyTest，同一次建置裡 CalcTest 失敗後 surefire 重跑才過（<flakyFailure>）；修復迴圈修好 LegacyTest → 修復那次建置的報告蓋掉了證據，但預檢一結束就記下了：重跑不接續",
+    rerun: {
+      between: { [LEGACY_PATH]: LEGACY_FIXED },
+      api: [
+        { toolCalls: [{ name: "write_file", args: { path: LEGACY_HELPER_PATH, content: LEGACY_HELPER } }] },
+        { content: "已補上 LegacyHelper" },
+        ...RESUME_REWRITE_CALC,
+      ],
+    },
+    rerunMvn: [
+      {
+        exit: 1,
+        out: `${TEST_FAILURE(LEGACY)}\n${FLAKY_OUT}`,
+        cleanSurefire: true,
+        surefireXml: [
+          { suite: LEGACY, body: SUREFIRE_XML(LEGACY, 4, [LEGACY_CASE]) },
+          { suite: "com.x.CalcTest", body: FLAKY_CALC_XML },
+        ],
+      },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+    ],
+  }),
+  (() => {
+    // CalcTest as a zh-TW repo keeps it (MS950), its encoding set in a parent outside the repo: sniffed.
+    const pre = 'package com.x;\n\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\nclass CalcTest {\n    @Test\n    void add_twoPositives_returnsSum() {\n        assertEquals(3, new Calc().add(1, 2));\n        assertEquals("';
+    const post = '", Messages.success());\n    }\n}\n';
+    const calcTestMs950 = [...Buffer.from(pre), 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, ...Buffer.from(post)]; // 處理成功
+    const MESSAGES_PATH = `${TEST_DIR}/Messages.java`;
+    const messages = (v: string) => `package com.x;\n\nclass Messages {\n    static String success() { return "${v}"; }\n}\n`;
+    const unitTest = CALC_TEST.replace("class CalcTest", "class CalcUnitTest");
+    const round = { exit: 0, out: BUILD_SUCCESS(5), cleanSurefire: true, surefire: ran("com.x.CalcTest", "com.x.CalcUnitTest", "com.x.ExistingTest"), jacoco: JACOCO_GREEN };
+    return {
+      name: "loop-resume-sniffed-ms950-helper",
+      desc: "模組編碼設在 repo 外的 parent（sniffed，名稱不明），既有的 MS950 CalcTest 在「處理成功」之後呼叫 Messages；通過後 Messages 被改 → 以雙位元組編碼讀，功 的 \\ 不會吃掉後面的程式碼：紀錄有 Messages，重跑不接續",
+      entry: "loop",
+      env: { UT_SKIP_REVIEW: "1" },
+      extraFiles: { "pom.xml": CORP_POM, [MESSAGES_PATH]: messages("OK") },
+      extraBytes: { [CALC_TEST_PATH]: calcTestMs950 },
+      api: [{ toolCalls: [{ name: "write_file", args: { path: `${TEST_DIR}/CalcUnitTest.java`, content: unitTest } }] }, { content: "已建立 CalcUnitTest.java" }],
+      rerun: {
+        between: { [MESSAGES_PATH]: messages("") },
+        api: [{ toolCalls: [{ name: "write_file", args: { path: `${TEST_DIR}/CalcUnitTest.java`, content: `${unitTest}// again\n` } }] }, { content: "已更新" }],
+      },
+      mvn: [{ ...round, surefire: ran("com.x.CalcTest", "com.x.ExistingTest") }, round, round, round],
+    } as Scenario;
+  })(),
+  (() => {
+    const suite = (calcFails: boolean, greeter: boolean) => `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="TestSuite" time="0.5" tests="${greeter ? 5 : 3}" errors="0" skipped="0" failures="${calcFails ? 1 : 0}">
+  <testcase name="add_twoPositives_returnsSum" classname="com.x.CalcTest" time="0.03">${calcFails ? `
+    <failure message="flaky" type="java.lang.AssertionError"><![CDATA[java.lang.AssertionError: flaky
+\tat com.x.CalcTest.add_twoPositives_returnsSum(CalcTest.java:10)
+]]></failure>
+  ` : ""}</testcase>
+  <testcase name="div_byZero_throwsIllegalArgument" classname="com.x.CalcTest" time="0.01"/>
+  <testcase name="add_twoPositives_returnsSum" classname="com.x.ExistingTest" time="0.01"/>${greeter ? `
+  <testcase name="greet_withName_saysHello" classname="com.x.GreeterTest" time="0.01"/>
+  <testcase name="greet_withoutName_greetsStranger" classname="com.x.GreeterTest" time="0.01"/>` : ""}
+</testsuite>
+`;
+    const out = (fail: boolean) =>
+      [
+        "[INFO] Scanning for projects...",
+        "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+        "[INFO] Running TestSuite",
+        `[${fail ? "ERROR" : "INFO"}] Tests run: 5, Failures: ${fail ? 1 : 0}, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in TestSuite`,
+        ...(fail
+          ? ["[ERROR] Failures: ", "[ERROR]   CalcTest.add_twoPositives_returnsSum:10 flaky", "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0", "[INFO] BUILD FAILURE"]
+          : ["[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0", "[INFO] BUILD SUCCESS"]),
+      ].join("\n");
+    const green = (greeter: boolean) => ({ exit: 0, out: out(false), cleanSurefire: true, surefireXml: [{ suite: "TestSuite", body: suite(false, greeter) }], jacoco: [JACOCO_GREEN, JACOCO_GREETER] });
+    return {
+      name: "loop-resume-testng-flake-later-batch",
+      desc: "TestNG（只有 TEST-TestSuite.xml）：Calc 那批通過；Greeter 那批的建置失敗在沒碰過的 CalcTest（重跑會過）→ suite 報告裡的失敗算在 CalcTest 身上，重跑確認是 flaky，Calc 的紀錄記成作廢",
+      entry: "loop",
+      env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "1" },
+      extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+      api: [
+        ...RESUME_WRITE_CALC,
+        { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+        { content: "已建立 GreeterTest.java" },
+      ],
+      rerun: { api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }, ...RESUME_REWRITE_CALC] },
+      mvn: [
+        BASE_EXISTING,
+        green(false),
+        { exit: 1, out: out(true), cleanSurefire: true, surefireXml: [{ suite: "TestSuite", body: suite(true, true) }] },
+        green(true),
+        green(true),
+        green(true),
+        green(true),
+      ],
+    } as Scenario;
+  })(),
+  resumeCalc({
+    name: "loop-resume-log-only-all-skipped",
+    desc: "surefire 報告寫到別處（reportsDirectory 改過），只有 log；這次預檢 CalcTest 的測試全部被略過（Skipped: 2）→ 看 log 的略過數，重跑不接續",
+    rerun: { api: RESUME_REWRITE_CALC },
+    rerunMvn: [
+      {
+        exit: 0,
+        out: [
+          "[INFO] Scanning for projects...",
+          "[INFO] --- surefire:3.2.5:test (default-test) @ fixture ---",
+          "[INFO] Running com.x.CalcTest",
+          "[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: {{elapsed}} s -- in com.x.CalcTest",
+          "[INFO] Running com.x.ExistingTest",
+          "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: {{elapsed}} s -- in com.x.ExistingTest",
+          "[WARNING] Tests run: 4, Failures: 0, Errors: 0, Skipped: 2",
+          "[INFO] BUILD SUCCESS",
+        ].join("\n"),
+        cleanSurefire: true,
+        jacoco: JACOCO_GREEN,
+      },
+      CALC_BUILD,
+    ],
+  }),
+  {
+    name: "loop-resume-flaky-then-interrupted",
+    desc: "資料夾 Calc、Greeter；Calc 那批通過；Greeter 那批第 1 輪的建置失敗在 CalcTest、重跑才過（flaky），覆蓋率沒過，第 2 輪 writer 執行中 Ctrl-C → 判定 flaky 的當下就記下 Calc 的紀錄作廢，重跑不接續",
+    entry: "loop",
+    env: { UT_SKIP_REVIEW: "1", UT_MAX_ITER: "2" },
+    extraFiles: { [GREETER_PATH]: GREETER_JAVA },
+    api: [
+      ...RESUME_WRITE_CALC,
+      { toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] },
+      { content: "已建立 GreeterTest.java" },
+      { interrupt: true, content: "（被中斷）" },
+    ],
+    rerun: {
+      api: [{ toolCalls: [{ name: "write_file", args: { path: GREETER_TEST_PATH, content: GREETER_TEST } }] }, { content: "已建立 GreeterTest.java" }, ...RESUME_REWRITE_CALC],
+    },
+    mvn: [
+      BASE_EXISTING,
+      CALC_BUILD,
+      {
+        exit: 1,
+        out: TEST_FAILURE("com.x.CalcTest"),
+        cleanSurefire: true,
+        surefire: ran("com.x.ExistingTest", "com.x.GreeterTest"),
+        surefireXml: [{ suite: "com.x.CalcTest", body: SUREFIRE_XML("com.x.CalcTest", 2, [{ nested: "", method: "add_twoPositives_returnsSum", message: "flaky", line: 10 }]) }],
+      },
+      { ...GREETER_ROUND, jacoco: [JACOCO_GREEN, JACOCO_GREETER_RED] },
+      GREETER_ROUND, // the rerun's baseline (GreeterTest set aside by then: it only has to run what exists)
+      GREETER_ROUND,
+      GREETER_ROUND,
+    ],
+  },
+  resumeCalc({
+    name: "loop-resume-new-file-shadows",
+    desc: "CalcTest 以 import com.y.* 用 Support（紀錄記下 com/y/Support.java，連同當時不存在的 com/x/Support.java）；通過後有人在 com/x 加了 Support.java → javac 改綁同 package 的那個：重跑不接續",
+    extraFiles: { [OTHER_SUPPORT_PATH]: OTHER_SUPPORT.replace("class Support", "public class Support").replace("static int one()", "public static int one()") },
+    firstApi: [
+      {
+        toolCalls: [
+          {
+            name: "write_file",
+            args: { path: CALC_TEST_PATH, content: CALC_TEST_WITH_SUPPORT.replace("package com.x;", "package com.x;\n\nimport com.y.*;") },
+          },
+        ],
+      },
+      { content: "已建立 CalcTest.java" },
+    ],
+    rerun: { between: { [SUPPORT_PATH]: SUPPORT_JAVA.replace("return 1;", "return 0;") }, api: RESUME_REWRITE_CALC },
+  }),
+  resumeCalc({
+    name: "loop-resume-repair-deleted-config",
+    desc: "重跑的預檢在 LegacyTest 紅燈，修復迴圈（能刪檔的 writer runtime）刪掉測試目錄裡的 @Configuration 才轉綠 → 刪掉它也改變了每個 context 載入的東西：重跑不接續",
+    extraFiles: { [TEST_CONFIG_PATH]: TEST_CONFIG.replace("@TestConfiguration", "@org.springframework.context.annotation.Configuration") },
+    rerun: {
+      between: { [LEGACY_PATH]: LEGACY_FIXED },
+      api: [{ sideDelete: [TEST_CONFIG_PATH], content: "刪掉了壞掉的 TestConfig" }, ...RESUME_REWRITE_CALC],
+    },
+    rerunMvn: [
+      LEGACY_RED(),
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+      { ...CALC_BUILD, surefire: ran("com.x.CalcTest", "com.x.ExistingTest", LEGACY) },
+    ],
+  }),
 ];
 
 export const byName = (name: string): Scenario => {
