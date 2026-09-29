@@ -365,8 +365,13 @@ export const JOURNAL_DIR = "inflight";
 /** Where a process runs: its pid means something only on the same host, since the same boot. */
 export interface JournalHost {
   host: string;
-  /** Boot time, in minutes since the epoch. */
+  /**
+   * Boot time, in minutes since the epoch — an estimate, the clock now less the uptime: a clock
+   * stepped by NTP or corrected after a suspend moves it. Compared only where there is no bootId.
+   */
   boot: number;
+  /** Linux: the boot's own id (/proc/sys/kernel/random/boot_id), which no clock change moves. */
+  bootId?: string;
   /**
    * Linux: the pid namespace (/proc/self/ns/pid). Containers on one machine can share its host name
    * and boot (host networking) and still number their processes apart: a pid written in another one
@@ -376,6 +381,7 @@ export interface JournalHost {
 }
 
 let pidNamespace: string | null | undefined;
+let bootId: string | null | undefined;
 
 export function thisHost(): JournalHost {
   if (pidNamespace === undefined) {
@@ -385,19 +391,31 @@ export function thisHost(): JournalHost {
       pidNamespace = null;
     }
   }
+  if (bootId === undefined) {
+    try {
+      bootId = process.platform === "linux" ? fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null : null;
+    } catch {
+      bootId = null;
+    }
+  }
   const here: JournalHost = { host: os.hostname(), boot: Math.round((Date.now() / 1000 - os.uptime()) / 60) };
+  if (bootId) here.bootId = bootId;
   if (pidNamespace) here.pidns = pidNamespace;
   return here;
 }
 
+/**
+ * Pure: whether `there` was recorded since the boot `here` is in — by the boot's id where both have
+ * one; else by the estimated boot time, within two minutes.
+ */
+export function sameBoot(there: { boot?: unknown; bootId?: unknown }, here: JournalHost): boolean {
+  if (typeof there.bootId === "string" && there.bootId && here.bootId) return there.bootId === here.bootId;
+  return typeof there.boot === "number" && Math.abs(there.boot - here.boot) <= 2;
+}
+
 /** Pure: whether a pid recorded `there` still means a process here — the same host, boot and pid namespace. */
-export function samePids(there: { host?: unknown; boot?: unknown; pidns?: unknown }, here: JournalHost): boolean {
-  return (
-    there.host === here.host &&
-    typeof there.boot === "number" &&
-    Math.abs(there.boot - here.boot) <= 2 &&
-    (there.pidns ?? "") === (here.pidns ?? "")
-  );
+export function samePids(there: { host?: unknown; boot?: unknown; bootId?: unknown; pidns?: unknown }, here: JournalHost): boolean {
+  return there.host === here.host && sameBoot(there, here) && (there.pidns ?? "") === (here.pidns ?? "");
 }
 
 /**
@@ -537,6 +555,7 @@ export function openJournal(
       start: j.start,
       host: j.host,
       boot: j.boot,
+      ...(j.bootId ? { bootId: j.bootId } : {}),
       ...(j.pidns ? { pidns: j.pidns } : {}),
     };
     writeAtomic(path.join(dir, "owner.json"), JSON.stringify(owner));
@@ -658,14 +677,14 @@ export interface ProcessProbe {
  * this machine's name), its pid names nobody here: only its heartbeat can tell.
  */
 export function mayBeRunning(
-  owner: { pid?: number; start?: string; boot?: number; pidns?: string },
+  owner: { pid?: number; start?: string; boot?: number; bootId?: string; pidns?: string },
   lastSeen: number,
   here: JournalHost,
   probe: ProcessProbe,
   now: number,
   staleAfterMs: number,
 ): boolean {
-  if (owner.boot === undefined || Math.abs(owner.boot - here.boot) > 2) return false;
+  if (!sameBoot(owner, here)) return false;
   if ((owner.pidns ?? "") !== (here.pidns ?? "")) return now - lastSeen < staleAfterMs;
   const pid = owner.pid ?? -1;
   if (pid === process.pid) return false;
@@ -720,20 +739,33 @@ export function isInside(parent: string, p: string): boolean {
 }
 
 /**
- * Whether what a journal of this checkout points at is where one can point: its test tree inside the
- * checkout (not the checkout itself), and every file it names inside the tree. A runs directory can
- * be shared; what someone else wrote there must not make a rollback write outside src/test. (Its
- * artifacts are taken from where it was found, and build outputs outside the checkout are dropped.)
+ * Whether what a journal of this checkout points at is where one can point: its test tree a module's
+ * src/test inside the checkout, and every file it names inside the tree. A runs directory can be
+ * shared; what someone else wrote there must not make a rollback write outside src/test. (Its
+ * artifacts are taken from where it was found, and its build outputs are kept only where that
+ * module's builds put tests — journalOutputDirs.)
  */
 export function journalContained(j: BatchJournal, repoRoot: string): boolean {
   return (
     isInside(repoRoot, j.testTree) &&
     realOr(j.testTree) !== realOr(repoRoot) &&
+    path.basename(j.testTree) === "test" &&
+    path.basename(path.dirname(j.testTree)) === "src" &&
     j.outputs.every((o) => o.files.every(safeRel)) &&
     j.capture.kept.every((k) => safeRel(k[0])) &&
     Object.keys(j.capture.tooLarge).every(safeRel) &&
     j.capture.dirs.every(safeRel)
   );
+}
+
+/**
+ * The build outputs a journal may name: where the module of its test tree compiles and copies tests
+ * (Maven's or Gradle's). A set-aside empties an output directory the batch started without — any
+ * other directory named there, src/main included, would be emptied with it.
+ */
+export function journalOutputDirs(testTree: string): Set<string> {
+  const moduleRoot = path.dirname(path.dirname(testTree));
+  return new Set([...testOutputDirs(moduleRoot, "maven"), ...testOutputDirs(moduleRoot, "gradle")].map(realOr));
 }
 
 function readTrace(dir: string): JournalTrace | undefined {
@@ -824,12 +856,14 @@ export function findJournals(
         dropOrLeave("內容損毀");
         continue;
       }
-      // Its artifacts are where it was found, whatever it says; its build outputs only in the checkout.
+      // Its artifacts are where it was found, whatever it says; its build outputs only where its
+      // module's builds put tests.
+      const outputDirs = journalOutputDirs(raw.testTree);
       const journal: BatchJournal = {
         ...raw,
         runDir: path.join(runsDir, run),
         dir: path.join(runsDir, run, batch),
-        outputs: raw.outputs.filter((o) => isInside(checkout.repoRoot, o.dir)),
+        outputs: raw.outputs.filter((o) => isInside(checkout.repoRoot, o.dir) && outputDirs.has(realOr(o.dir))),
       };
       if (!journalContained(journal, checkout.repoRoot)) {
         dropOrLeave("內容不合法（指向這個 checkout 的測試目錄之外）");
@@ -953,7 +987,8 @@ export function movesAfterDeath(
   const digest = (b: Buffer) => createHash("sha1").update(b).digest("hex");
   for (const rel of undecided) {
     const original = start.files.get(rel);
-    if (!original) continue;
+    // An empty file says nothing about where it went: any empty file the writer made would match.
+    if (!original?.length) continue;
     const k = digest(original);
     gone.set(k, [...(gone.get(k) ?? []), rel]);
   }

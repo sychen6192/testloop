@@ -1043,7 +1043,12 @@ async function runBatches(o: BatchRunInput): Promise<number> {
     // A batch that passed is done with its journal before its pass is recorded: killed in between,
     // the next run finds neither, and the class is written again on top of its tests. The other
     // order had the next run set aside tests that passed every gate.
-    if (r.success) closeBatchJournal(journal);
+    if (r.success) {
+      closeBatchJournal(journal);
+      // Passed: nothing of it is for the interrupt or crash path to set aside from here on — not even
+      // when recording the pass throws (a file it hashes removed by an IDE or git meanwhile).
+      run.inFlight = undefined;
+    }
     if (r.success && r.ranTests) ranBefore = [...new Set([...(ranBefore ?? []), ...r.ranTests])].sort();
     if (r.success) o.recordPass(batch, trace.written, r.finalVerdict, dir);
     const rec: BatchRecord = {

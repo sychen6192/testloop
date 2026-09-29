@@ -558,7 +558,15 @@ const ORPHAN_REWRITES: Record<string, Partial<NonNullable<Scenario["rerun"]>>> =
   "loop-killed-orphan-pid-reused": { rewrite: { file: "{{firstRun}}/children.json", from: /"start":"[^"]*"(?=,"cmd":"[^"]*mvnw)/, to: '"start":"1"' } },
   "loop-killed-orphan-other-checkout": { rewrite: { file: "{{firstRun}}/children.json", from: /"repoRoot":"[^"]*"/, to: '"repoRoot":"/elsewhere"' } },
   "loop-killed-orphan-other-host": { rewrite: { file: "{{firstRun}}/children.json", from: /"host":"[^"]*"/, to: '"host":"another-machine"' } },
-  "loop-killed-orphan-rebooted": { rewrite: { file: "{{firstRun}}/children.json", from: /"boot":\d+/, to: '"boot":1' } },
+  "loop-killed-orphan-rebooted": {
+    rewrite: [
+      { file: "{{firstRun}}/children.json", from: /"boot":\d+/, to: '"boot":1' },
+      { file: "{{firstRun}}/children.json", from: /"bootId":"[^"]*"/, to: '"bootId":"00000000-0000-0000-0000-000000000000"' },
+    ],
+  },
+  // The clock stepped between the runs (NTP, a resume from suspend): the estimated boot time moved,
+  // the boot did not.
+  "loop-killed-orphan-clock-stepped": { rewrite: { file: "{{firstRun}}/children.json", from: /"boot":(\d+)/, to: '"boot":1$1' } },
   "loop-killed-orphan-other-container": { rewrite: { file: "{{firstRun}}/children.json", from: /"pidns":"[^"]*"/, to: '"pidns":"pid:[1]"' } },
   // Stopping a build left running says nothing about src/test: the developer's fix made after the
   // crash to a file the killed writer had touched stays theirs.
@@ -3907,6 +3915,7 @@ export const SCENARIOS: Scenario[] = [
       "loop-killed-orphan-other-checkout",
       "loop-killed-orphan-other-host",
       "loop-killed-orphan-rebooted",
+      "loop-killed-orphan-clock-stepped",
       "loop-killed-orphan-other-container",
       "loop-killed-orphan-build-keeps-fix",
       "loop-killed-orphan-corrupt-record",
@@ -3922,6 +3931,8 @@ export const SCENARIOS: Scenario[] = [
         "loop-killed-orphan-other-checkout": "同上，但那份子程序紀錄屬於共用 runs 目錄的另一個 checkout → 不碰",
         "loop-killed-orphan-other-host": "同上，但紀錄是另一台機器寫的（共用的 runs 目錄）→ 那些 pid 在這台沒有意義，不碰",
         "loop-killed-orphan-rebooted": "同上，但紀錄是重開機前寫的 → 那些程序不可能還在，現在用那些 pid 的都不是，不碰",
+        "loop-killed-orphan-clock-stepped":
+          "同上，但兩次執行之間時鐘被校正過（估算的開機時間差了很多）→ boot_id 相同就是同一次開機：照樣結束留下的建置",
         "loop-killed-orphan-corrupt-record": "同上，但子程序紀錄解析得了、children 卻不是清單（損毀）→ 認不出任何子程序，不碰、不當掉，照常收尾",
         "loop-killed-orphan-build-keeps-fix":
           "同上，重跑在 10 分鐘後；那之間開發者修了被終止的 writer 改過的 ExistingTest.java → 結束留下的建置不代表 writer 活到那時：開發者的修正留著",

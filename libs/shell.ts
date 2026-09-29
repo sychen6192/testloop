@@ -512,6 +512,7 @@ export interface ChildrenJournal {
   repoRoot: string;
   host: string;
   boot: number;
+  bootId?: string;
   pidns?: string;
   /** The run itself: its pid and processStart(). */
   pid: number;

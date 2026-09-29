@@ -2181,6 +2181,16 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
   "loop-killed-orphan-other-checkout": (c) => orphanLeftAlone(c, { recordKept: true }),
   "loop-killed-orphan-other-host": (c) => orphanLeftAlone(c, { recordKept: true }),
   "loop-killed-orphan-rebooted": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-clock-stepped": (c) => {
+    if (process.platform !== "linux") return; // a boot id is Linux's; elsewhere the estimate is all there is
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("時鐘校正不影響：留下的建置照樣被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+    } finally {
+      stopPid(pid);
+    }
+  },
   "loop-killed-orphan-corrupt-record": (c) => {
     if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
     check("損毀的子程序紀錄不讓重跑當掉：照常撤回那批、接續到通過", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stderr.slice(-600)}`);

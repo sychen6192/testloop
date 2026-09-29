@@ -17,7 +17,8 @@
   （切換分支、拉進別人的刪除）就不放回，原本的內容存在那批的 `deleted/`；之後的移動（內容一模一樣）兩邊都不動。
   有檔案放不回去時這次執行停下（`killed-batch-not-restored`），日誌留著，重試照第一次的判斷做。這個 checkout 的
   日誌還有動靜時（剛被重啟的容器、另一個容器掛同一個 checkout）先等它停止（`UT_OTHER_RUN_WAIT_MS`），等不到就以
-  `checkout-busy` 停下。checkout 以目錄的 inode 與建立時間認（不看裝置號碼：重開機會變）：別台機器或同一台機器上
+  `checkout-busy` 停下。開機以 Linux 的 boot_id 認（時鐘被校正也認得），建置輸出只認那個模組放測試的目錄。
+  checkout 以目錄的 inode 與建立時間認（不看裝置號碼：重開機會變）：別台機器或同一台機器上
   另一個容器、描述它自己的 checkout 的日誌不動，證明是同一個目錄時照樣撤回；同一個路徑重新 clone 過、測試目錄
   重建過、內容損毀或指向範圍外的日誌丟掉並說明；trace 讀不了時改撤回那批死前的所有變更。
   它啟動而還在跑的子程序（Maven 連同 surefire fork 的 JVM、opencode session）也不再留著和下一次執行搶同一個

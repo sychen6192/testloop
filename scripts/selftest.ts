@@ -123,6 +123,7 @@ import {
   readDecision,
   removeBatchOutputs,
   rollbackTree,
+  sameBoot,
   sameDirectory,
   samePids,
   testOutputDirs,
@@ -5521,6 +5522,24 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
       !mayBeRunning(owner, old, inBox, probeOf({ 4242: "563817" }), now, stale),
   );
   check("mayBeRunning：同一個 pid namespace → 照樣問 pid", mayBeRunning({ ...owner, pidns: inBox.pidns }, old, inBox, probeOf({ 4242: "563817" }), now, stale));
+  // A clock stepped between two runs (NTP, a resume from suspend) moves the estimated boot time; the
+  // boot's own id does not move.
+  const booted = { ...here, bootId: "b-1" };
+  check(
+    "sameBoot / samePids / mayBeRunning：兩邊都有 boot_id 就只看它——時鐘被校正、估算的開機時間差了 10 分鐘，照樣是同一次開機；boot_id 不同就算估算相同也不是",
+    sameBoot({ boot: here.boot + 10, bootId: "b-1" }, booted) &&
+      !sameBoot({ boot: here.boot, bootId: "b-2" }, booted) &&
+      sameBoot({ boot: here.boot + 1 }, booted) &&
+      !sameBoot({ boot: here.boot + 10 }, booted) &&
+      samePids({ host: "box", boot: here.boot + 10, bootId: "b-1" }, booted) &&
+      mayBeRunning({ ...owner, boot: owner.boot + 10, bootId: "b-1" }, old, booted, probeOf({ 4242: "563817" }), now, stale) &&
+      !mayBeRunning({ ...owner, bootId: "b-2" }, fresh, booted, probeOf({ 4242: "563817" }), now, stale),
+  );
+  check(
+    "thisHost：Linux 上帶著這次開機的 boot_id",
+    process.platform !== "linux" || /^[0-9a-f-]{36}$/.test(thisHost().bootId ?? ""),
+    JSON.stringify(thisHost()),
+  );
   check(
     "samePids：同一台、同一次開機、同一個 pid namespace 才算；都沒有 namespace（Windows、macOS）也算同一個",
     samePids({ host: "box", boot: 29_000_001 }, here) &&
@@ -5601,6 +5620,11 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
     JSON.stringify(moves) === '[{"from":"resources/fixtures/order.json","to":"resources/data/order.json"}]',
     JSON.stringify(moves),
   );
+  const emptyStart: TreeCapture = { root: "/t", files: new Map([["resources/empty.txt", Buffer.alloc(0)]]), fingerprints: new Map(), dirs: new Set(["resources"]) };
+  check(
+    "movesAfterDeath：空檔不算移動的證據（writer 新建的任何空檔都會對上）",
+    movesAfterDeath(new Set(["resources/new.txt"]), ["resources/empty.txt"], emptyStart, () => Buffer.alloc(0)).length === 0,
+  );
   check(
     "movesAfterDeath：沒有無法判斷的刪除 → 沒有移動（writer 自己在死前的改名照樣撤回）",
     movesAfterDeath(new Set(["resources/data/order.json"]), [], moveStart, (rel) => (rel in nowFiles ? Buffer.from(nowFiles[rel]) : undefined)).length === 0,
@@ -5656,6 +5680,11 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
     50,
   );
   const jdir = handle.dir;
+  check(
+    "openJournal：owner.json 也記下開機的 boot_id（寫到一半的日誌只有它可以判斷那次執行活著沒）",
+    process.platform !== "linux" || JSON.parse(fs.readFileSync(path.join(handle.dir, "owner.json"), "utf8")).bootId === thisHost().bootId,
+    fs.readFileSync(path.join(handle.dir, "owner.json"), "utf8"),
+  );
   check(
     "openJournal：批次開始時的內容寫成單一檔案（不是一個檔一份）",
     fs.existsSync(path.join(jdir, "start.bin")) && !fs.existsSync(path.join(jdir, "start")),
@@ -5768,12 +5797,24 @@ console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日�
     outsideTree.dead.length === 0 && /不合法/.test(outsideTree.stale[0]?.why ?? "") && escaping.dead.length === 0 && /不合法/.test(escaping.stale[0]?.why ?? ""),
     JSON.stringify({ outsideTree: outsideTree.stale, escaping: escaping.stale }),
   );
-  const movedArtifacts = tamper({ runDir: "/somewhere/else", dir: "/somewhere/else/batch-2-A", outputs: [{ dir: "/etc", files: ["passwd"] }, ...JSON.parse(journalOk).outputs] });
+  const notATestTree = tamper({ testTree: path.join(repoRoot, "src", "main") });
   check(
-    "findJournals：它的 artifacts 以找到它的位置為準，checkout 外的建置輸出不理",
+    "findJournals：測試目錄不是某個模組的 src/test（例如 src/main）→ 內容不合法，丟掉",
+    notATestTree.dead.length === 0 && /不合法/.test(notATestTree.stale[0]?.why ?? ""),
+    JSON.stringify(notATestTree.stale),
+  );
+  const mainSrc = path.join(repoRoot, "src", "main", "java");
+  const movedArtifacts = tamper({
+    runDir: "/somewhere/else",
+    dir: "/somewhere/else/batch-2-A",
+    outputs: [{ dir: "/etc", files: ["passwd"] }, { dir: mainSrc, files: [] }, ...JSON.parse(journalOk).outputs],
+  });
+  check(
+    "findJournals：它的 artifacts 以找到它的位置為準；建置輸出只認它那個模組放測試的地方（checkout 外的、src/main 這種都不理——撤回會清空它）",
     movedArtifacts.dead[0]?.journal.runDir === runDir &&
       movedArtifacts.dead[0]?.journal.dir === batchDir &&
-      movedArtifacts.dead[0]?.journal.outputs.every((o) => o.dir !== "/etc"),
+      movedArtifacts.dead[0]?.journal.outputs.length === 1 &&
+      movedArtifacts.dead[0]?.journal.outputs[0].dir === out,
     JSON.stringify(movedArtifacts.dead[0]?.journal ?? {}).slice(0, 300),
   );
   const journalText = fs.readFileSync(path.join(jdir, "journal.json"), "utf8");
