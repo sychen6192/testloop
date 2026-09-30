@@ -15,12 +15,19 @@
  * of the file vanish — every test in it "removed" — so its opener is blanked alone and the rest is
  * read as code, which is what the source was before the stray opener went in. The build reports
  * the error itself.
+ *
+ * `keepLiterals`: the literals' contents stay and only the comments go — a Gradle script's plugin id
+ * is a string, and one commented out applies nothing.
  */
-export function codeOnly(src: string): string {
+export function codeOnly(src: string, keepLiterals = false): string {
   const out: string[] = [];
   const n = src.length;
   const blank = (from: number, to: number) => {
     for (let k = from; k < to; k++) out.push(src[k] === "\n" || src[k] === "\r" ? src[k] : " ");
+  };
+  const literal = (from: number, to: number) => {
+    if (!keepLiterals) return blank(from, to);
+    for (let k = from; k < to; k++) out.push(src[k]);
   };
   let i = 0;
   while (i < n) {
@@ -48,7 +55,7 @@ export function codeOnly(src: string): string {
         i += 3;
         continue;
       }
-      blank(i + 3, j);
+      literal(i + 3, j);
       out.push('"', '"', '"');
       i = j + 3;
     } else if (c === '"' || c === "'") {
@@ -57,7 +64,7 @@ export function codeOnly(src: string): string {
       while (j < n && src[j] !== c && src[j] !== "\n" && src[j] !== "\r") j += src[j] === "\\" ? 2 : 1;
       j = Math.min(j, n);
       out.push(c);
-      blank(i + 1, j);
+      literal(i + 1, j);
       if (j < n && src[j] === c) {
         out.push(c);
         i = j + 1;
@@ -172,10 +179,15 @@ const DECODER_LABELS: Record<string, string> = {
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
 // When the name is not known (set in a parent pom outside the repo): the double-byte encodings of
 // older repos, each tried whole, the first that decodes every byte taken. One that is not the file's
-// still splits its bytes as the file's does wherever it decodes them all — lead byte, then the next —
+// mostly splits its bytes as the file's does wherever it decodes them all — lead byte, then the next —
 // and lexing is what the text is for: read byte for byte, MS950's 功 ends in a "\" that escapes the
-// quote after it.
+// quote after it. Not so Shift_JIS's half-width katakana, one byte each that Big5 and GBK take as a
+// lead byte, the byte after it — a "\" among them — as its second: a Shift_JIS text is taken as one when
+// it decodes and says something in kana, which Big5's and GBK's bytes never do (its hiragana and
+// katakana lead with 0x82 and 0x83, below every Big5 lead byte, and GBK text read so is noise).
 const SNIFFED = ["big5", "gbk", "shift_jis", "euc-kr"].map((label) => new TextDecoder(label, { fatal: true }));
+const SHIFT_JIS = SNIFFED[2];
+const KANA = /[\u3041-\u3096\u30a1-\u30fa]{2}/;
 
 /**
  * Pure: a Java source's text, decoded as javac decodes it — in `charset` (Java's name for the module's
@@ -201,7 +213,18 @@ export function decodeJavaSource(buf: Buffer, charset?: string): string {
     }
   }
   if (decoder) return decoder.decode(buf);
-  for (const d of [strictUtf8, ...SNIFFED]) {
+  try {
+    return strictUtf8.decode(buf);
+  } catch {
+    /* not UTF-8 */
+  }
+  try {
+    const text = SHIFT_JIS.decode(buf);
+    if (KANA.test(text)) return text;
+  } catch {
+    /* not Shift_JIS */
+  }
+  for (const d of SNIFFED) {
     try {
       return d.decode(buf);
     } catch {

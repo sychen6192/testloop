@@ -119,12 +119,16 @@ const BASE_ENV: Record<string, string> = {
 // 127.0.0.1 in it, the fixture proxy never saw a connection and the scenario failed there.
 const PROXY_ENV = /^(?:https?_proxy|no_proxy|all_proxy)$/i;
 
+// A Gradle user home that does not exist: an init script in the developer's own (~/.gradle/init.d)
+// can configure test retries (gates/build.ts gradleRetriesTests), and no scenario may depend on it.
+const NO_GRADLE_HOME = path.join(os.tmpdir(), "testgen-itest-no-gradle-home");
+
 function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (!k.startsWith("UT_") && !PROXY_ENV.test(k)) env[k] = v;
   }
-  return { ...env, ...BASE_ENV, ...extra };
+  return { ...env, GRADLE_USER_HOME: NO_GRADLE_HOME, ...BASE_ENV, ...extra };
 }
 
 // ─── Child process plumbing ──────────────────────────────────────────────────
@@ -230,13 +234,23 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
           function: { name: t.name, arguments: JSON.stringify(t.args) },
         }));
       }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          choices: [{ message, ...(turn.finishReason ? { finish_reason: turn.finishReason } : {}) }],
-          usage: { completion_tokens: 11 },
-        }),
-      );
+      const respond = () => {
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message, ...(turn.finishReason ? { finish_reason: turn.finishReason } : {}) }],
+            usage: { completion_tokens: 11 },
+          }),
+        );
+      };
+      // An interrupt turn's answer waits: sent at once, it raced the signal — the run read it and went
+      // on to its next step (a build, the next batch) before its handler ran. The run ends meanwhile.
+      if (turn.interrupt && process.platform !== "win32") {
+        setTimeout(respond, 15_000).unref();
+        return;
+      }
+      respond();
     });
   });
   return new Promise((resolve) => {
@@ -244,7 +258,11 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
       const port = (server.address() as { port: number }).port;
       resolve({
         url: `http://127.0.0.1:${port}/v1`,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () =>
+          new Promise<void>((r) => {
+            server.close(() => r());
+            server.closeAllConnections?.();
+          }),
       });
     });
   });
@@ -341,14 +359,14 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
       fs.symlinkSync(process.execPath, path.join(bin, "node"));
       noJdkEnv = { JAVA_HOME: "", PATH: bin };
     }
-    const runLoop = async (turns: ApiTurn[], env: Record<string, string> = {}) => {
+    const runLoop = async (turns: ApiTurn[], env: Record<string, string> = {}, target?: string) => {
       const api = await startFakeApi(turns, root);
       const proxy = sc.proxy ? await startProxy() : undefined;
       proxySeen = proxy?.seen;
       const apiHost = new URL(api.url).host;
       const done = await runTsx(
         path.join(TESTGEN_ROOT, "loop.ts"),
-        [targetDirOf(sc)],
+        [target ?? targetDirOf(sc)],
         root,
         childEnv({
           ...sc.env,
@@ -434,7 +452,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
           fs.writeFileSync(p, content);
         }
       }
-      run = await runLoop(sc.rerun.api ?? [], sc.rerun.env);
+      run = await runLoop(sc.rerun.api ?? [], sc.rerun.env, sc.rerun.target);
       if (sc.rerun2) {
         second = { result: run.result, runDir: run.runDir, code: run.out.code, stdout: run.out.stdout };
         fs.rmSync(path.join(root, ".itest", "api-requests.jsonl"), { force: true });
@@ -446,7 +464,7 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
             fs.writeFileSync(p, content);
           }
         }
-        run = await runLoop(sc.rerun2.api ?? [], sc.rerun2.env);
+        run = await runLoop(sc.rerun2.api ?? [], sc.rerun2.env, sc.rerun2.target);
       }
     }
     if (lock) fs.rmSync(lock, { force: true });
@@ -1376,6 +1394,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("writer 自己的測試失敗不重跑", c.mvnCalls === 2 && !c.runExists("iter-1/build-rerun.log"), `mvnCalls=${c.mvnCalls}`);
   },
 
+  "build-test-failure-ignored-timestamped-log": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2 && gates(c)[0] === "build/fail", JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說明 Maven 以 exit 0 結束是因為 testFailureIgnore", fb.includes("testFailureIgnore"), fb.slice(0, 400));
+  },
+
+  "writer-own-flaky-final-verify": (c) => {
+    check("第 1 輪最終驗收判 FAIL、第 2 輪才通過", gates(c)[0] === "build/final-verify-fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說它在完整模組重跑時不穩定，附上第一次失敗的訊息", fb.includes("完整模組") && fb.includes("不穩定") && fb.includes("expected: <3> but was: <4>"), fb.slice(0, 900));
+  },
+
   "build-test-failure-ignored-reports-only": (c) => {
     check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
     check("回饋附上報告裡的錯誤", c.runRead("iter-1/feedback.md").includes("this.calc"), c.runRead("iter-1/feedback.md").slice(0, 600));
@@ -1398,6 +1428,59 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("回饋說明是 --fail-never", fb.includes("--fail-never"), fb.slice(0, 400));
     check("回饋是編譯錯誤，不是「沒有執行任何測試」", fb.includes("cannot find symbol") && !fb.includes("0 個測試"), fb.slice(0, 600));
   },
+
+  // Evidence against a pass kept past the run that found it; what a test reaches, walked again.
+  "loop-resume-evidence-dirty-stop": (c) => evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("dirty-baseline"), "預檢紅燈中止（dirty-baseline）"),
+  "loop-resume-evidence-repair-failed": (c) => evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("repair-failed"), "修復失敗中止（repair-failed:*）"),
+  "loop-resume-evidence-repair-interrupted": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted"), "修復途中被中斷");
+  },
+  "loop-resume-evidence-dirty-allowed": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted"), "放行紅燈、重做 Calc 時被中斷");
+  },
+  "loop-resume-flaky-non-target": (c) =>
+    evidenceKept(
+      c,
+      (s) => s?.code === 0 && (s?.stdout ?? "").includes("com.x.CalcTest 是不穩定的測試"),
+      "只做 Greeter、建置判定 CalcTest 不穩定、Greeter 通過",
+      true,
+    ),
+  // The report names the nested class: the record is its outer class's, and void all the same.
+  "loop-resume-flaky-nested-non-target": (c) =>
+    evidenceKept(
+      c,
+      (s) => s?.code === 0 && (s?.stdout ?? "").includes("com.x.CalcTest$Add 是不穩定的測試"),
+      "只做 Greeter、建置判定 CalcTest$Add 不穩定、Greeter 通過",
+      true,
+    ),
+  "loop-resume-ondemand-lib-shadow": (c) => redone(c, "它的測試現在會用到 src/test/java/com/x/Assertions.java"),
+  "loop-resume-spring-external-base": (c) => redone(c, "src/test/resources/application.yml 在上次通過之後改過"),
+  "loop-resume-external-base-no-spring": (c) => resumedCalc(c, "src/test/java/com/x/CalcTest.java", CALC_TEST_TEXT.replace("import org.junit.jupiter.api.Test;", "import org.junit.jupiter.api.Test;\nimport com.corp.test.AbstractTest;").replace("class CalcTest {", "class CalcTest extends AbstractTest {")),
+  "loop-resume-xml-import": (c) => redone(c, "src/test/resources/stubs-context.xml 在上次通過之後改過"),
+  "loop-resume-fixture-dir": (c) => redone(c, "src/test/resources/cases/c1.json 在上次通過之後改過"),
+  "loop-resume-shadow-declared-elsewhere": (c) => redone(c, ""),
+  "loop-resume-flaky-pending": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    const ZETA = "src/main/java/com/x/Zeta.java";
+    check("第一次：三批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("第二次：第 1 批判定 ZetaTest 不穩定，之後被 Ctrl-C", (c.second?.stdout ?? "").includes("com.x.ZetaTest 是不穩定的測試") && String(c.second?.result.stopReason).startsWith("interrupted"), `${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").slice(-1500)}`);
+    const l2 = ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>;
+    check("第二次的 passed.json 記下 Zeta 的作廢紀錄", l2.some((e) => e.cls === ZETA && !!e.invalid), JSON.stringify(l2.map((e) => [e.cls, e.invalid ?? null])));
+    check("第三次：不接續 Zeta", !resumedOf(c).includes(ZETA), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(resumedOf(c))}`);
+  },
+  "loop-resume-repair-round-flaky": (c) => {
+    check("重跑：修復以 flaky-baseline 結束、log 點名 CalcTest 不穩定", c.stdout.includes("判定為不穩定的測試（flaky）：com.x.CalcTest"), c.stdout.split("\n").filter((l) => l.includes("flaky") || l.includes("修復")).join("\n").slice(-900));
+    check("重跑：不接續 Calc", resumedOf(c).length === 0, `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(resumedOf(c))}`);
+  },
+  "loop-resume-evidence-review-toggle": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted") && (s?.stdout ?? "").includes("的預檢建置中不穩定"), "預檢記下 CalcTest 不穩定（不因 review 開關而跳過）、重做時被中斷");
+  },
+  "loop-resume-nested-display-flaky": (c) => redoneBy(c, "CalcTest 加法", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-new-global-extension": (c) => redone(c, ""),
+  "loop-resume-new-spring-component": (c) => redone(c, ""),
 
   "gradle-test-failure-ignored": (c) => {
     check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.crashed]));
@@ -1429,6 +1512,66 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("沒有通過", c.result.success === false, JSON.stringify([c.result.stopReason, c.result.iterations]));
     const fb = c.runRead("iter-1/feedback.md");
     check("回報目標模組執行了 0 個測試", fb.includes("0 個測試"), fb.slice(0, 400));
+  },
+
+  "gradle-same-name-params-failing": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「[2] -1」", fb.includes("[2] -1") && fb.includes("ignoreFailures"), fb.slice(0, 600));
+    check("不記成不穩定的測試", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
+  },
+
+  "gradle-same-display-name-failing": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    check("不記成不穩定的測試", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
+  },
+
+  "gradle-same-name-quiet-log": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2 && gates(c)[0] === "build/fail", JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「[2] -1」", fb.includes("[2] -1"), fb.slice(0, 600));
+  },
+
+  "gradle-log-says-failed": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說明是 ignoreFailures", fb.includes("ignoreFailures"), fb.slice(0, 600));
+  },
+
+  "gradle-retry-failed-again": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「除法」", fb.includes("除法"), fb.slice(0, 600));
+  },
+
+  "gradle-retry-passed-fails-task": (c) => {
+    check("第 1 輪判 build/fail、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "回饋說「除法」重試才通過、附第一次失敗的訊息",
+      fb.includes("重試才通過") && fb.includes("com.x.CalcTest › 除法") && fb.includes("第一次失敗：org.opentest4j.AssertionFailedError: expected: <true> but was: <false>"),
+      fb.slice(0, 900),
+    );
+    check("不把它列成失敗的測試（沒有失敗的測試類別、沒有引用原始的 <failure>）", !fb.includes("----- com.x.CalcTest（") && !fb.includes("----- TEST-com.x.CalcTest.xml -----"), fb.slice(0, 900));
+  },
+
+  "writer-own-flaky-test": (c) => {
+    check("第 1 輪判 build/flaky、第 2 輪才通過", gates(c)[0] === "build/flaky" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名不穩定的測試與它第一次失敗的訊息", fb.includes("com.x.CalcTest") && fb.includes("div_byZero_throwsIllegalArgument") && fb.includes("depends on test order"), fb.slice(0, 800));
+    check("writer 自己的測試不記成「需要人檢視的不穩定測試」", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
+  },
+
+  "phrased-all-display-names-not-run": (c) => {
+    check("第 1 輪判 build/fail（CalcTest 沒被執行）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說 CalcTest 這次沒有被執行", fb.includes("com.x.CalcTest") && fb.includes("沒有執行"), fb.slice(0, 600));
+  },
+
+  "display-name-spoofs-class": (c) => {
+    check("第 1 輪判 build/fail（CalcTest 沒被執行）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說 CalcTest 這次沒有被執行", fb.includes("com.x.CalcTest") && fb.includes("沒有執行"), fb.slice(0, 600));
   },
 
   "gradle-retry-passed-green": (c) => {
@@ -2102,9 +2245,9 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
   "loop-resume-touched-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
   "loop-resume-second-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
   "loop-resume-tests-all-skipped": (c) => redone(c, "com.x.CalcTest（全部被略過）"),
-  "loop-resume-own-test-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
-  "loop-resume-testng-suite-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
-  "loop-resume-package-differs-failed": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中失敗過"),
+  "loop-resume-own-test-failed": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中失敗過"),
+  "loop-resume-testng-suite-failed": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中失敗過"),
+  "loop-resume-package-differs-failed": (c) => redoneBy(c, "com.y.CalcTest", "預檢建置中失敗過"),
   "loop-resume-concat-resource": (c) => {
     check(
       "第一次的通過紀錄記下 CalcTest 以字串相加點名的 fixture",
@@ -2142,9 +2285,9 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     resumedCalc(c, undefined, CALC_TEST_CJK_TEXT);
     check("沒有找 agent", apiRequests(c).length === 0, `${apiRequests(c).length} 個請求`);
   },
-  "loop-resume-cjk-display-name-flaky": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中不穩定：失敗之後重跑才通過"),
-  "loop-resume-nested-display-name-flaky": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中不穩定：失敗之後重跑才通過"),
-  "loop-resume-surefire-flaky": (c) => redone(c, "它的測試（CalcTest）在這次的預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-cjk-display-name-flaky": (c) => redoneBy(c, "計算機測試", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-nested-display-name-flaky": (c) => redoneBy(c, "計算機測試 加法", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-surefire-flaky": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中不穩定：失敗之後重跑才通過"),
   "loop-resume-cjk-fixture": (c) => {
     check(
       "第一次的通過紀錄記下 CalcTest 點名的 fixtures/訂單.json",
@@ -2296,7 +2439,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("第一次：Calc 通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
     check(
       "第二次：預檢說 CalcTest 不穩定、要重做 Calc，然後被 Ctrl-C",
-      (c.second?.stdout ?? "").includes("在這次的預檢建置中不穩定") && c.second?.result.stopReason === "interrupted:SIGINT",
+      (c.second?.stdout ?? "").includes("的預檢建置中不穩定") && c.second?.result.stopReason === "interrupted:SIGINT",
       `${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n")}`,
     );
     const calc = (ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
@@ -2312,7 +2455,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     const b = (c.second?.result.batches ?? []) as Array<Record<string, unknown>>;
     check(
       "第二次：預檢說 CalcTest 不穩定、接續 Greeter、重做 Calc 那批沒過而撤回",
-      (c.second?.stdout ?? "").includes("在這次的預檢建置中不穩定") && b.length === 1 && b[0].success === false && !!b[0].rolledBack,
+      (c.second?.stdout ?? "").includes("的預檢建置中不穩定") && b.length === 1 && b[0].success === false && !!b[0].rolledBack,
       `${String(c.second?.result.stopReason)} ${JSON.stringify(b.map((x) => [x.targetClasses, x.success, x.stopReason]))}`,
     );
     check(
@@ -2377,7 +2520,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("重跑的預檢紅燈、修復迴圈修好", c.stdout.includes("修復") && c.exists("src/test/java/com/x/LegacyHelper.java"), c.stdout.slice(0, 1500));
     check(
       "重跑：不接續 Calc（這次的預檢裡 CalcTest 失敗後 surefire 重跑才過）",
-      resumedOf(c).length === 0 && c.stdout.includes("在這次的預檢建置中不穩定"),
+      resumedOf(c).length === 0 && c.stdout.includes("的預檢建置中不穩定"),
       `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
     );
   },
@@ -2405,12 +2548,12 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
   },
   "loop-resume-new-file-shadows": (c) => {
     const files = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java")?.files ?? {};
+    check("第一次的紀錄記下 on-demand import 取到的 com/y/Support.java", typeof files["src/test/java/com/y/Support.java"] === "string", JSON.stringify(files));
     check(
-      "第一次的紀錄記下 on-demand import 取到的 com/y/Support.java，連同當時不存在、會蓋過它的 com/x/Support.java（null）",
-      typeof files["src/test/java/com/y/Support.java"] === "string" && "src/test/java/com/x/Support.java" in files && files["src/test/java/com/x/Support.java"] === null,
-      JSON.stringify(files),
+      "重跑：不接續 Calc，說它的測試現在會用到之後才出現的 com/x/Support.java（重新走一次引用）",
+      resumedOf(c).length === 0 && c.stdout.includes("它的測試現在會用到 src/test/java/com/x/Support.java"),
+      `resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n")}`,
     );
-    check("重跑：不接續 Calc，說 com/x/Support.java 是之後才出現的", resumedOf(c).length === 0 && c.stdout.includes("src/test/java/com/x/Support.java 在上次通過之後才出現"), `resumed=${JSON.stringify(c.result.resumed)}`);
   },
   "loop-resume-repair-deleted-config": (c) => {
     check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
@@ -2791,6 +2934,17 @@ function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java", con
   );
 }
 
+/** redone, for evidence a build found against it: "它的測試 <test> 在 <run> 的<what>". */
+function redoneBy(c: Ctx, test: string, what: string): void {
+  redone(c, "");
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  check(
+    `說明為什麼要重新產生：它的測試 ${test} 在 … 的${what}`,
+    new RegExp(`它的測試 ${esc(test)} 在 \\S+ 的${esc(what)}`).test(c.stdout),
+    c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-1200),
+  );
+}
+
 /** The rerun found Calc's pass no longer holding, said why, and wrote Calc again. */
 function redone(c: Ctx, why: string): void {
   check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
@@ -2804,6 +2958,28 @@ function redone(c: Ctx, why: string): void {
     `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`,
   );
   check("writer 被叫來重寫", apiRequests(c).length > 0);
+}
+
+/** Run 1 passed Calc, run 2 found evidence against it and stopped, run 3's baseline is green. */
+function evidenceKept(c: Ctx, secondOk: (s: Ctx["second"]) => boolean, what: string, firstPartial = false): void {
+  const CALC = "src/main/java/com/x/Calc.java";
+  check(
+    "第一次：Calc 通過",
+    ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === CALC && !(e as { invalid?: string }).invalid) && (firstPartial || c.first?.code === 0),
+    `first=${c.first?.code} ${String(c.first?.result.stopReason)}`,
+  );
+  check(
+    `第二次：${what}`,
+    secondOk(c.second),
+    `second=${c.second?.code} ${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").slice(-1500)}`,
+  );
+  const l2 = ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>;
+  check("第二次的 passed.json 記下 Calc 的作廢紀錄", l2.some((e) => e.cls === CALC && !!e.invalid), `passed.json=${JSON.stringify(l2.map((e) => [e.cls, e.invalid ?? null]))}`);
+  check(
+    "第三次：不接續 Calc",
+    !resumedOf(c).includes(CALC),
+    `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
+  );
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────

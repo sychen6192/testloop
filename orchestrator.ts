@@ -30,6 +30,7 @@ import {
   TEST_SCOPE,
   RUNNER_KIND,
   RUNS_DIR,
+  MAX_FAILURE_CASES,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
@@ -67,7 +68,8 @@ import {
   BuildRun,
   ExpectedTest,
   expectedTestOf,
-  flakyTestClasses,
+  FlakyCase,
+  flakyTestCases,
   NOT_RUN_HEADER,
   outerClassName,
   ranTestClasses,
@@ -509,16 +511,47 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       return untouched ? failing : undefined;
     };
     const names = (failures: Array<{ cls: string }>) => [...new Set(failures.map((f) => f.cls))];
-    // Tests surefire ran again after they failed (rerunFailingTestsCount), or Gradle's test-retry did:
-    // the build is green, and they are no more reliable than the ones a rebuild turned green.
-    const rerunFlakes = (b: BuildRun) => {
-      if (b.aborted) return;
-      const found = flakyTestClasses(cfg.buildTool, cfg.mod, b.startedAt, b.gate.raw ?? "").filter((c) => !flakyTests.has(c));
-      if (!found.length) return;
-      log(`[WARN] 失敗之後被重跑才通過（surefire 的 rerunFailingTestsCount 或 Gradle 的 test-retry）：${found.join("、")} 是不穩定的測試，需要人檢視`);
-      noteFlaky(found);
-      save("flaky.txt", [...flakyTests].sort().join("\n"));
+    // Whether a class a report names is one the writer wrote or changed: by its path, by the class its
+    // file declares, by the @DisplayName a phrased report goes by ("<that> <nested's>" for a @Nested one).
+    const writersClass = (name: string): boolean => {
+      const java = [...everWritten].map((f) => f.replace(/\\/g, "/")).filter((f) => f.endsWith(".java"));
+      if (java.includes(`${outerClassName(name).replace(/\./g, "/")}.java`)) return true;
+      const n = name.normalize("NFC");
+      return java.some((f) => {
+        const abs = path.join(testRoot, f);
+        try {
+          const t = expectedTestOf(decodeJavaSource(fs.readFileSync(abs), sourceEncoding?.name), abs, "created");
+          const shown = t?.displayName?.normalize("NFC");
+          return !!t && (outerClassName(name) === t.fqcn || (!!shown && (n === shown || n.startsWith(`${shown} `))));
+        } catch {
+          return false;
+        }
+      });
     };
+    // Tests surefire ran again after they failed (rerunFailingTestsCount), or Gradle's test-retry did,
+    // or TestNG's retry analyzer, in any build that finished — a green one hides them, a red one names
+    // only what failed at the last: they are no more reliable than the ones a rebuild turned green. Those
+    // the writer wrote are its to fix — returned, the build gate fails on them; the others are noted.
+    const rerunFlakes = (b: BuildRun): FlakyCase[] => {
+      if (b.aborted) return [];
+      const all = flakyTestCases(cfg.buildTool, cfg.mod, b.startedAt, b.gate.raw ?? "");
+      const own = all.filter((c) => writersClass(c.cls));
+      const found = [...new Set(all.filter((c) => !own.includes(c)).map((c) => outerClassName(c.cls)))].filter((c) => !flakyTests.has(c)).sort();
+      if (found.length) {
+        log(`[WARN] 失敗之後被重跑才通過（surefire 的 rerunFailingTestsCount、Gradle 的 test-retry 或 TestNG 的 retry analyzer）：${found.join("、")} 是不穩定的測試，需要人檢視`);
+        noteFlaky(found);
+        save("flaky.txt", [...flakyTests].sort().join("\n"));
+      }
+      return own;
+    };
+    const ownFlakyReport = (own: FlakyCase[]) =>
+      [
+        "你寫的測試在這次建置中失敗、重跑之後才通過（surefire 的 rerunFailingTestsCount、Gradle 的 test-retry 或 TestNG 的 retry analyzer）——" +
+          "它不穩定，建置綠了也不算通過：",
+        ...own.slice(0, MAX_FAILURE_CASES).map((c) => `  ✗ ${c.cls}${c.test ? ` › ${c.test}` : ""}${c.message ? `\n    第一次失敗：${clampText(c.message, 500)}` : ""}`),
+        ...(own.length > MAX_FAILURE_CASES ? [`  （另有 ${own.length - MAX_FAILURE_CASES} 個未列出，見 build.log）`] : []),
+        "常見原因：測試之間共用可變的狀態（static 欄位、單例、檔案、資料庫）、依賴執行順序、時間或亂數、沒有等到非同步的結果。請讓它每一次都得到相同的結果，不要靠重試。",
+      ].join("\n");
     const recheckUntouched = async (
       first: BuildRun,
       opts: BuildOptions,
@@ -729,7 +762,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const firstBuild = await runBuild(cfg.buildTool, cfg.mod, buildOpts);
     save("build.log", firstBuild.gate.raw ?? firstBuild.gate.report);
     const built = await recheckUntouched(firstBuild, buildOpts, "build-rerun.log");
-    rerunFlakes(built);
+    const ownFlaky = rerunFlakes(built);
     const build = built.gate;
     // The coverage gate only trusts a report written after the build that counts started.
     const buildStartedAt = built.startedAt;
@@ -752,6 +785,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       const stop = failRound(build.report, "連續兩輪得到完全相同的失敗報告，判定迴圈卡住，提前結束。");
       if (stop) return stop;
       log("→ 帶著失敗報告進入下一輪");
+      continue;
+    }
+    if (ownFlaky.length) {
+      log(`[FAIL] 編譯與測試 gate：writer 寫的測試不穩定（${[...new Set(ownFlaky.map((c) => c.cls))].join("、")}）`);
+      record({ gate: "build", outcome: "flaky", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      const stop = failRound(ownFlakyReport(ownFlaky), "連續兩輪 writer 的測試都以同樣的方式不穩定，判定迴圈卡住，提前結束。");
+      if (stop) return stop;
+      log("→ 帶著不穩定測試的報告進入下一輪");
       continue;
     }
 
@@ -867,7 +908,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         const firstVerify = await runBuild(cfg.buildTool, cfg.mod, verifyOpts);
         save("final-verify.log", firstVerify.gate.raw ?? firstVerify.gate.report);
         const verified = await recheckUntouched(firstVerify, verifyOpts, "final-verify-rerun.log");
-        rerunFlakes(verified);
+        const ownVerifyFlaky = rerunFlakes(verified);
         const full = verified.gate;
         if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verified.startedAt, full.raw ?? "");
         if (verified.elsewhere) {
@@ -888,6 +929,17 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
               ? "目標類別的測試本身全部通過，但以完整模組範圍重跑時，有該執行的測試沒有被執行，請修正。\n"
               : "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——新測試打壞了既有測試，請修正。\n") +
               full.report,
+            "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
+          );
+          if (stop) return stop;
+          log("→ 帶著最終驗收失敗進入下一輪");
+          continue;
+        }
+        if (ownVerifyFlaky.length) {
+          log("[FAIL] 最終驗收：writer 寫的測試在完整模組重跑時不穩定");
+          record({ gate: "build", outcome: "final-verify-fail", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+          const stop = failRound(
+            `目標類別的測試本身全部通過，但以完整模組範圍重跑時不穩定——多半是和其他測試共用了狀態。\n${ownFlakyReport(ownVerifyFlaky)}`,
             "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
           );
           if (stop) return stop;
@@ -960,6 +1012,11 @@ export interface RepairConfig {
   baseline: BaselineResult;
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
+  // Each build the repair runs, the moment it is done (`startedAt`: when it started — its reports are
+  // the ones written since), and each round's changes to the test tree, as the writer's are named:
+  // what they say against the passes on record goes down before the repair can end or be stopped.
+  onBuild?: (b: BaselineResult, startedAt: number) => void;
+  onChanged?: (changed: string[]) => void;
 }
 
 export interface RepairResult {
@@ -1131,6 +1188,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     const changed = writerChanges(rawChanged);
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
+    if (changed.length) cfg.onChanged?.(changed);
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
     if (outOfScope.length) {
@@ -1165,6 +1223,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       // while another test failed flakily looked like a flaky red, and turned green here.
       if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0 && !current.notRun) {
         log("writer 沒有改任何檔案——重跑一次建置，確認紅燈是否穩定重現（flaky 測試會在這裡消失）");
+        const recheckStartedAt = Date.now();
         const recheck = await runBaseline(
           cfg.buildTool,
           cfg.mod,
@@ -1174,6 +1233,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
           sourceEncoding?.name,
         );
         save("recheck-build.log", recheck.raw);
+        if (!recheck.aborted) cfg.onBuild?.(recheck, recheckStartedAt);
         if (recheck.clean) {
           log(`[WARN] 預檢的紅燈重跑後消失，判定為不穩定的測試（flaky）：${current.failingTestClasses.join("、")}——這些測試需要人檢視`);
           return {
@@ -1226,6 +1286,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       sourceEncoding?.name,
     );
     save("build.log", current.raw);
+    if (!current.aborted) cfg.onBuild?.(current, rebuildStartedAt);
     testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
     sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, current.raw));
     save("build-summary.md", current.summary);

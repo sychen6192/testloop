@@ -298,32 +298,38 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 每一批（或單一類別的 run）通過時，loop 把它通過時的樣子記在該次 artifacts 的 `passed.json`：類別原始碼、
 它的測試檔、那批 writer 寫的其他檔（共用的 helper、`src/test/resources` 裡的檔），以及這些測試引用到的
 測試目錄裡的檔（繼承的基底類別、呼叫的 helper——名字照 javac 的方式解析，以檔案**宣告**的 package 與 top-level 型別為準
-（package 與目錄不符、一個檔裡的第二個類別、中文類別名都認得）：import 的、同 package 的、on-demand import 的（連同
-自己 package 裡會蓋過它的同名檔，當時不存在也記下：之後加了它就是 javac 選的）、寫了完整類名的；哪裡都看不到的
-名字不是測試目錄裡的類別——、字串裡點名的資源（`src/test/java` 裡的非 .java 檔也算）與完整類名
-（`@MethodSource("com.x.Fixtures#cases")`）、記下的資源裡點名的類別（context XML 的 `<bean class>`）、以測試命名的檔
-（`CalcTest.sql`、`@Nested` 的 `CalcTest$Add.sql`、`CalcTest-context.xml`、approval／snapshot 檔）；symlink 的
-fixture 目錄照樣走進去；原始碼以模組的編碼讀，編碼名稱不明時先試 Big5、GBK、Shift_JIS、EUC-KR；類別與資源各記
-最近的 400 個，超過的紀錄不接續），再加上沒有測試點名、卻是每個測試都帶著跑的：JUnit／Mockito／logging 自己讀的
-設定（`junit-platform.properties`、`META-INF/services` 與它點名的類別、`mockito-extensions`、`logback-test.xml`），
-起 Spring context 的測試另記 Spring Boot 自己載入的（`application*.yml`／`.properties` 與 `config/` 下的、
-`schema*.sql`／`data*.sql`、`META-INF/spring*`、測試目錄裡 top-level 的 `@Configuration`／`@Component`／`@Entity`……）
-——以上全部的 sha256，reviewer 的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別（看它最新的一筆紀錄）：
+（package 與目錄不符、一個檔裡的第二個類別、中文類別名、註解裡以 `\u000a` 藏起來的程式碼都認得）：import 的、同 package
+的、on-demand import 的、寫了完整類名的；哪裡都看不到的名字不是測試目錄裡的類別——、字串裡點名的資源
+（`src/test/java` 裡的非 .java 檔也算；點名的是目錄或 pattern——`src/test/resources/cases`、`classpath*:cases/**/*.json`
+——就記下底下每一個檔；從模組根算起的路徑——`testdata/orders.json`、`src/test/data/`——記下那裡的檔）與完整類名
+（`@MethodSource("com.x.Fixtures#cases")`）、記下的資源裡點名的類別與資源（context XML 的 `<bean class>` 與
+`<import resource>`、`spring.config.import`、`data-locations`；UTF-16 的檔照 BOM 讀，4 MB 以上讀不完的讓紀錄不接續）、
+以測試命名的檔（`CalcTest.sql`、`@Nested` 的 `CalcTest$Add.sql`、`CalcTest-context.xml`、approval／snapshot 檔）；
+Gradle 的 `src/testFixtures` 與 pom `<testResources>` 的目錄也在測試的 classpath 上；symlink 的 fixture 目錄照樣走進去；
+Windows／macOS 上資源名稱不分大小寫；原始碼以模組的編碼讀，編碼名稱不明時先試 Big5、GBK、Shift_JIS、EUC-KR（讀得出
+假名的 Shift_JIS 優先）；類別與資源各記最近的 400 個，超過的紀錄不接續），再加上沒有測試點名、卻是每個測試都帶著跑的：
+JUnit／Mockito／logging 自己讀的設定（`junit-platform.properties`、`META-INF/services` 與它點名的類別、
+`mockito-extensions`、`logback-test.xml`），起 Spring context 的測試另記 Spring 自己載入的（`application*.yml`／
+`.properties` 與 `config/` 下的、`schema*.sql`／`data*.sql`、`META-INF/spring*`、`spring.properties`、
+`messages*.properties`、`logback-spring.xml`、Flyway／Liquibase 的 `db/migration`、`db/changelog`，以及測試目錄裡
+component scan 找得到的類別：top-level 的 `@Configuration`／`@Component`／`@Entity`……、一般 helper 裡巢狀的也算，
+模組自己帶 `@Component` 的自訂註解也認得）。測試相依有 spring-test 時，測試類別繼承或掛著模組外（不是 JUnit、Mockito、
+AssertJ 這類測試函式庫）的型別——另一個模組的 `@SpringBootTest` 基底類別、jar 裡的 meta-annotation——也當成會起
+Spring context。以上全部的 sha256，reviewer 的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別（看它最新的
+一筆紀錄）：
 
-- **紀錄仍描述現在的樹**：類別與上面那些檔一個 byte 都沒變、沒有多出當時沒有的測試檔（reviewer 沒看過它）。
-  有人把測試用的 helper 掏空，建置照樣綠、覆蓋率照樣在，只有這一項看得到。
+- **紀錄仍描述現在的樹**：類別與上面那些檔一個 byte 都沒變、沒有多出當時沒有的測試檔（reviewer 沒看過它），而且從它的
+  測試重新走一次引用，走到的檔和當時一樣——之後才加的檔不在任何指紋裡：同 package 的類別蓋過 on-demand import 或
+  `java.lang` 的（javac 改綁它）、新的 `junit-platform.properties` 或 `META-INF/services` 的 extension、測試目錄裡新的
+  `@Component` 或 `data.sql`，都只有重新走一次才看得到。有人把測試用的 helper 掏空，建置照樣綠、覆蓋率照樣在，
+  只有這一項看得到。
 - **建置**：這次的預檢建置是綠的（或修復後轉綠），而且它的**每一個**測試類別（它自己的測試檔與那批 writer 寫的；
   只是被引用的基底類別與 helper 只比對內容）都確實執行了、不是全部被略過（TestNG 與 JUnit 4 `Suite` 的報告裡它的
-  每個 case 都 skipped 也算；報告寫到別處時看 log 的略過數；`@DisplayName` 命名的報告以報告裡寫的名字認、只算模組裡
-  只有它叫這個名字的，巢狀類別的「外層 內層」也認得）。它的測試在這次預檢時失敗過（不穩定、重跑才過，或是修復迴圈
-  修好的；TestNG 與 JUnit 4 `Suite` 的報告看失敗案例自己的類別）、失敗之後 surefire 自己重跑才過
-  （`rerunFailingTestsCount` 的 `Flakes`，預檢紅燈、修復迴圈之後才轉綠也算；Gradle 的 test-retry；TestNG 的
-  retry analyzer 把失敗的那次記成 skipped、再記一次通過）、修復迴圈改過測試資源或 Spring 會自己載入的類別
-  （`@Component`、`@Configuration`、`@TestConfiguration`……，刪掉的也算），或 Gradle 目標專案的 test task 這次沒有
-  實際執行時重新產生（Gradle 的建置前一律刪掉目標專案的 `build/test-results/test`、關掉 build cache，test task
-  每次都真的執行）。
-  預檢紅燈而以
-  `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1` 時，沒有東西可以證明它們現在仍然通過，全部重新產生。
+  每個 case 都 skipped 也算；報告寫到別處時看 log 的略過數；`@DisplayName` 命名的報告與 `Running` 行以寫的名字對回
+  類別，一個名字只算給唯一能叫這個名字的類別，巢狀類別的「外層 內層」也認得）。Gradle 目標專案的 test task 這次沒有
+  實際執行時重新產生（Gradle 的建置前一律刪掉目標專案的 `build/test-results/test`、關掉 build cache，test task 每次都
+  真的執行）。預檢紅燈而以 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1` 時，沒有東西可以證明它們現在仍然
+  通過，全部重新產生。
 - **覆蓋率**：從這次預檢建置的 JaCoCo 報告以現在的門檻重新量——別的測試或它呼叫的類別改了，覆蓋率會變，
   即使這兩個檔都沒動。
 - **review**：不重跑 reviewer（那正是略過要省下的），但只在它看過的東西都沒變、rubric 也沒換時沿用，
@@ -335,12 +341,16 @@ fixture 目錄照樣走進去；原始碼以模組的編碼讀，編碼名稱不
 `stopReason: "already-passed"` exit 0。reviewer 的模型與工具版本不在比對之內：換了模型、或升級工具後想重新審，
 設 `UT_RESUME=0` 全部重新產生；刪掉 `runs/<repo>/` 也一樣（紀錄就在裡面）。
 
-同一次執行裡，後面的批次改了前面通過紀錄裡的檔（擴充共用的 helper、把測試加進 suite），前面那筆就不再相符——
-它的審查沒看過新的版本：log 在那一批通過時就說，下一次重跑重新產生那個類別。發現一個類別的測試不穩定（失敗、
-重跑才過——在預檢、在後面批次的建置，包括 surefire 自己重跑才過的綠建置），或預檢時失敗過、修復迴圈改過資源，
-當下就把它的紀錄記成作廢、寫進這次的 `passed.json`：之後被 Ctrl-C、那次重做沒過，下一次也不會拿更舊的紀錄接續；
-這次執行裡之後才通過、帶著同一個不穩定測試的類別也一樣作廢。`passed.json` 讀不了、是別的版本寫的、格式不對時，
-裡面點名的類別當成沒有可用的紀錄（不會回頭用更舊的）；寫入以整份寫完、fsync 之後才換上。比對的是內容：git 的 autocrlf 改了換行也算改過；
+**不利於紀錄的證據，看到的當下就寫下來。** 一個類別的測試在建置中失敗過、或失敗之後重跑才通過（surefire 的
+`rerunFailingTestsCount`；有設定 test-retry 的 Gradle 建置裡同名的先敗後過；TestNG 的 retry analyzer 把失敗的那次記成
+skipped、再記一次通過），它的某個檔編譯失敗，或修復迴圈改過測試資源或 Spring 會自己載入的類別（刪掉的也算）——
+在預檢、在修復迴圈的每一次建置、在之後每一批的建置——當下就把**所有執行記過的類別**裡被點到的那些的最新紀錄記成
+作廢、寫進這次的 `passed.json`，不論這次是不是目標、`UT_RESUME` 開不開：這次停在紅燈的預檢、修復途中被 Ctrl-C、
+重做沒過，下一次也不會拿更舊的紀錄接續；這次執行裡之後才通過、帶著同一個不穩定測試的類別也一樣作廢。同一次執行
+裡，後面的批次改了前面通過紀錄裡的檔（擴充共用的 helper、把測試加進 suite），前面那筆就不再相符——它的審查沒看過
+新的版本：log 在那一批通過時就說，下一次重跑重新產生那個類別。`passed.json` 讀不了、是別的版本寫的、格式不對時，
+裡面點名的類別當成沒有可用的紀錄（不會回頭用更舊的）；它是個目錄、FIFO 或沒有權限讀時，還沒找到紀錄的類別都一樣
+（修好或刪掉那個檔之前）；寫入以整份寫完、fsync 之後才換上。比對的是內容：git 的 autocrlf 改了換行也算改過；
 `runs/<repo 名>` 以 repo 目錄名區分，同名的另一個 checkout 共用紀錄（只會少接續，不會誤接續）；路徑大小寫
 不敏感的檔案系統上，目標要用和上次同樣的大小寫。
 
@@ -367,10 +377,12 @@ fixture 目錄照樣走進去；原始碼以模組的編碼讀，編碼名稱不
   類別層級的 `@Disabled` / `@Ignore`。回饋會列出這次實際執行了哪些類別、各是什麼框架，writer 照著改寫。
   writer 加了測試的既有類別在清單上時，那個類別本來就沒被執行——加在那裡的測試等於沒寫。writer 沒改過的既有
   類別也在清單上時，是這輪的變更讓它們不再被執行（例如測試資源裡的設定；分批時也包括前面批次寫好的測試）。
-  以類別層級 `@DisplayName` 命名的報告（surefire 的 phrased reporter）以報告裡寫的名字對回類別——檔名在 POSIX
-  locale 下每個中文字都成了 `?`，兩個類別同名時也只留最後寫的那一份，所以類別自己以 FQCN 命名的報告（.txt、log 的
-  Running 行）優先，只看 `@DisplayName` 的報告時只算模組裡只有它叫這個名字的；回饋說「與 com.x.OrderTest 相同」
-  時，給它一個獨一無二的名字就好。報告關掉、或完全對不到任何類別時 loop 看不出來，只印 WARN、不判。
+  以類別層級 `@DisplayName` 命名的報告與 `Running` 行（surefire 的 phrased reporter）以寫的名字對回類別——檔名在
+  POSIX locale 下每個中文字都成了 `?`，兩個類別同名時也只留最後寫的那一份，所以類別自己以 FQCN 命名的報告優先；
+  一個名字只算給唯一能叫這個名字的類別：兩個類別的 `@DisplayName` 一樣、或某個類別的 `@DisplayName` 就是另一個
+  類別的 FQCN（`@DisplayName("com.x.HiddenSpec")`），這個名字誰都不算（報告檔一律以類別命名時，檔名照樣算數）；
+  reportNameSuffix 下的「計算機測試(unit)」也認得。回饋說「與 com.x.OrderTest 相同」時，給它一個獨一無二的名字就好。
+  報告關掉、或完全對不到任何類別時 loop 看不出來，只印 WARN、不判。
 - **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
   MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，
@@ -417,8 +429,12 @@ fixture 目錄照樣走進去；原始碼以模組的編碼讀，編碼名稱不
   `gates-passed` 收場（以真的專案重現過）。log 與 `baseline.md` 會寫明是哪一種。之後照一般的紅燈處理：修復
   迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試（Gradle 也一樣）。`-fn` 下只算編譯與測試的失敗，別的
   plugin（copy-resources、checkstyle）失敗不算；失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，log 裡的
-  `Flakes`；Gradle 的 test-retry plugin——它的綠建置 log 照樣印 `1 failed` 與 `There were failing tests`，有測試
-  結果時以結果為準）也不算失敗，但記成不穩定的測試（summary 的 `flakyTests`）。
+  `Flakes`；Gradle 設定了 test-retry plugin 時——它的綠建置 log 照樣印 `1 failed` 與 `There were failing tests`，這時
+  以測試結果為準、同名的測試失敗之後又通過才算重試通過；沒設定時同名的一敗一過是兩個測試，照樣是紅的）也不算失敗，
+  但記成不穩定的測試（summary 的 `flakyTests`）——writer 自己寫的測試例外：它失敗之後重跑才通過，那一輪判 FAIL，
+  回饋附上第一次失敗的訊息，要它讓測試每次都得到相同的結果。Maven 的 log 每行前面有時間或 thread 名稱
+  （`.mvn/maven.config` 的 `-Dorg.slf4j.simpleLogger.showDateTime=true`、`showThreadName`）時，照 Maven 自己第一行的
+  樣子拿掉再判讀。
 - **中止，說「目標模組一個測試都沒有執行」（stopReason `tests-skipped`）。** pom、settings.xml 或
   `.mvn/maven.config` 設了 `skipTests` 或 `maven.test.skip`，surefire 只印一行 `Tests are skipped.`——每一輪都
   一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session（模組還沒有任何測試原始碼時例外：

@@ -174,6 +174,8 @@ export interface Scenario {
     api?: ApiTurn[];
     /** On top of the scenario's env. */
     env?: Record<string, string>;
+    /** This run's target, repo-relative (default: the scenario's). */
+    target?: string;
     /** Files written (a string) or deleted (null) between the two runs, repo-relative; `{{firstRun}}` in a
      *  path is the first run's artifacts directory. */
     between?: Record<string, string | null>;
@@ -202,6 +204,8 @@ export interface Scenario {
     api?: ApiTurn[];
     /** On top of the scenario's env. */
     env?: Record<string, string>;
+    /** This run's target, repo-relative (default: the scenario's). */
+    target?: string;
     /** Files written (a string) or deleted (null) between the second run and the third, repo-relative. */
     between?: Record<string, string | null>;
   };

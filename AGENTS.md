@@ -29,8 +29,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   每一個測試類別都要在這次的預檢中執行（不是全部略過）而且沒有失敗過（重跑才過也算）、覆蓋率從這次的報告重新量、
   review 分數以現在的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，`UT_RESUME=0` 關閉；
   引用照 javac 的方式、以檔案宣告的 package 與型別解析（`indexTestTree`），原始碼以模組的編碼讀，另記下每個測試都
-  帶著跑的 JUnit／Mockito／logging 設定與起 Spring context 的測試會載入的；同一次執行裡後面的批次改了前面紀錄裡的檔，
-  那筆下次重做；發現不能接續的證據——預檢失敗、不穩定、修復改過資源——當下就寫成作廢的紀錄，`voidEntry`）。
+  帶著跑的 JUnit／Mockito／logging 設定與起 Spring context 的測試會載入的；接續前從它的測試重新走一次引用，走到當時
+  沒有的檔就重做（`reachMismatch`）；同一次執行裡後面的批次改了前面紀錄裡的檔，那筆下次重做；不利於紀錄的證據——
+  建置中失敗、不穩定、編譯失敗、修復改過資源——在預檢、修復的每一次建置、之後每一批的建置看到的當下，就把所有
+  執行記過的類別裡被點到的寫成作廢的紀錄，`voidMatching`，不論是不是目標、`UT_RESUME` 開不開）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
   正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
@@ -46,7 +48,8 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
      並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`
      （只算編譯與測試的 goal）、Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`：surefire 在測試
      跑完後自己印的判定，不含測試自己的輸出；報告以 `<failure>`/`<error>` 元素判定、CDATA 是文字，重跑後通過的
-     flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）。
+     flaky 不算；Gradle 只在設定了 test-retry 時才把同名的先敗後過當重試，`gradleRetriesTests`）；目標模組的測試被
+     設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）。
      Gradle 建置前一律刪掉目標專案的 `build/test-results/test`、以 `-Dorg.gradle.caching=false` 跑 `test`：`UP-TO-DATE`／
      `FROM-CACHE` 的 test task 沒有執行，結果不是這次的（不用 `cleanTest`：它在每一個子專案都執行）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
@@ -80,12 +83,15 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    新寫的測試類別、改過且 writer 介入前有執行的類別、加了測試的既有類別（介入前就沒執行也算——加在
    不會被執行的類別裡的測試等於沒寫）、以及跑完整模組時**每一個** writer 介入前有執行的類別
    （`ranAtBaseline`，分批時加上前面批次通過後執行的；測試資源裡的 discovery filter 也擋得到），都要在
-   這次建置的 surefire 報告或 log 的 `Running` 行（只算目標模組的 surefire 區段）裡出現；只要求來源仍是可執行的
-   測試類別（沒有測試方法的類別改成 abstract 是對的修法）。writer 新寫而測試全部 skipped 的也不算（suite 報告裡它的
-   每個 case 都 skipped 也是；只有 log 時看它那行的 `Skipped:`）。類別層級 `@DisplayName` 命名的報告以報告**裡面**
-   寫的名字對回類別，類別自己以 FQCN 命名的報告優先，只看 `@DisplayName` 的報告時只算模組裡只有它叫這個名字的
-   （同名的在回饋裡點名；讀不到內容時檔名的 `?` 一個字對一個、沒有別的類別對得上才算）；報告完全對不到任何類別
-   （報告關了、寫到別處）時只印 WARN、不判——判錯會讓每一輪都 FAIL。
+   這次建置的 surefire 報告或 log 的 `Running` 行（只算目標模組的 surefire 區段；Maven logger 的時間／thread 前綴
+   先拿掉，`normalizeMavenLog`）裡出現；只要求來源仍是可執行的測試類別（沒有測試方法的類別改成 abstract 是對的
+   修法）。writer 新寫而測試全部 skipped 的也不算（suite 報告裡它的每個 case 都 skipped 也是；只有 log 時看它那行的
+   `Skipped:`）；writer 自己的測試失敗之後重跑才過（rerunFailingTestsCount、test-retry、TestNG retry analyzer），那一輪
+   判 FAIL（`build/flaky`）。類別層級 `@DisplayName` 命名的報告與 phrased 的 `Running` 行以寫的名字對回類別：一個
+   名字只算給唯一能叫這個名字的類別（它的 FQCN、別的類別的 `@DisplayName`、讀不到的 `@DisplayName` 都算候選；報告檔
+   一律以類別命名時檔名照樣算數），類別自己以 FQCN 命名的報告優先（同名的在回饋裡點名；讀不到內容時檔名的 `?`
+   一個字對一個、沒有別的類別對得上才算）；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯
+   會讓每一輪都 FAIL。
    修復迴圈同樣套用，flaky 確認重跑也是。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
