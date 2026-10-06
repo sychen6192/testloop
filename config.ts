@@ -83,6 +83,10 @@ export const MAX_ITER = intEnv("UT_MAX_ITER", 5, 1);
 // reliably finish; a whole package in one session outgrew the model's context and the agent
 // timeout, and one class that would not go green ended the run for every other class.
 export const BATCH_SIZE = intEnv("UT_BATCH_SIZE", 1, 1);
+// A class an earlier run of this repo passed every gate for is not written again, as long as the
+// class and its tests are what passed and this run's baseline shows them still passing (libs/resume.ts).
+// An interrupted folder run used to redo every class it had already finished. 0 = write every target.
+export const RESUME = process.env.UT_RESUME !== "0";
 // Upper bound on the failure report fed back to the writer each round. A build log grows with
 // the module, not with the writer's mistake — an unbounded report crowds the model's context
 // out with maven boilerplate and leaves no room to actually fix anything.
@@ -186,6 +190,12 @@ export const REVIEWER_TEMPERATURE = 0;
 // Build/test gate wall-clock timeout. A hung mvn (unreachable repo, a test with a real
 // socket) was the one unbounded wait left in the pipeline.
 export const BUILD_TIMEOUT_MS = numEnv("UT_BUILD_TIMEOUT_MS", 30 * 60 * 1000, 1000, MAX_TIMER_MS);
+// How long a run waits, before it starts, for a batch of this checkout that another testgen may still
+// be running — its journal still beating: a container restarted within the heartbeat's window, a run
+// that bypassed the repo lock (loop.ts recoverKilledBatches). The default outlasts the five minutes a
+// heartbeat is trusted for, so a killed run's journal goes quiet and its batch is set aside; still
+// busy after it, the run stops (checkout-busy). 0: stop at once.
+export const OTHER_RUN_WAIT_MS = numEnv("UT_OTHER_RUN_WAIT_MS", 6 * 60 * 1000, 0, MAX_TIMER_MS);
 // How much build output is kept in memory for the gates (characters). Beyond it the head is
 // dropped and only its [ERROR] / "Tests run:" lines survive. An unbounded capture crashed the
 // whole tool at V8's ~512M-character string limit when a test logged heavily.

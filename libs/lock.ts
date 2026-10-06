@@ -38,6 +38,18 @@ export function holderAlive(signal: string, lockIsThisUsers: boolean, sinceBeatM
   return !lockIsThisUsers || sinceBeatMs < LOCK_FRESH_MS;
 }
 
+/**
+ * A repo's canonical path: the same repo reached through a symlink, or as a Windows 8.3 short name,
+ * is the same repo — for its lock, and for telling its runs from another checkout's.
+ */
+export function canonicalRoot(repoRoot: string): string {
+  try {
+    return fs.realpathSync.native(repoRoot);
+  } catch {
+    return path.resolve(repoRoot);
+  }
+}
+
 /** The lock file for a repo, from its canonical path. */
 export function repoLockFile(canonicalRoot: string): string {
   const key = createHash("sha1").update(canonicalRoot).digest("hex").slice(0, 16);
@@ -59,15 +71,7 @@ export function acquireRepoLock(
   // For the selftest, which cannot wait a quarter of a minute or half a minute to see either happen.
   timing: { waitMs: number; heartbeatMs: number } = { waitMs: LOCK_WAIT_MS, heartbeatMs: LOCK_HEARTBEAT_MS },
 ): RepoLockBusy | undefined {
-  // Canonical path: the same repo reached through a symlink, or as a Windows 8.3 short name,
-  // must map to the same lock.
-  let canonical = path.resolve(repoRoot);
-  try {
-    canonical = fs.realpathSync.native(repoRoot);
-  } catch {
-    /* keep the resolved path */
-  }
-  const lock = repoLockFile(canonical);
+  const lock = repoLockFile(canonicalRoot(repoRoot));
   const ours = () => {
     try {
       return JSON.parse(fs.readFileSync(lock, "utf8")).pid === process.pid;

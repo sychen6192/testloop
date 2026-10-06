@@ -25,9 +25,21 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
   只有常數的 enum、沒有本體的 record、Spring Boot 進入點——不當目標，`libs/utils.ts` 的 `codelessTypeReason`）、
   rubric 載入、runner 設定檢查（預檢建置之前，`runners/runner.ts` 的 `runnerConfigProblems`）、startup guard、
   版本戳記、既有測試偵測、預檢基準（baseline）、測試相依與原始碼編碼量測、建立 `runs/<repo 名>/<ts>/`。
+  預檢之後略過先前的執行已通過、類別與測試檔（連同測試引用到的 helper 與資源，sha256）都沒變的目標類別——它們的
+  每一個測試類別都要在這次的預檢中執行（不是全部略過）而且沒有失敗過（重跑才過也算）、覆蓋率從這次的報告重新量、
+  review 分數以現在的門檻重新判定（`libs/resume.ts`，紀錄在各次 artifacts 的 `passed.json`，`UT_RESUME=0` 關閉；
+  引用照 javac 的方式、以檔案宣告的 package 與型別解析（`indexTestTree`），原始碼以模組的編碼讀，另記下每個測試都
+  帶著跑的 JUnit／Mockito／logging 設定與起 Spring context 的測試會載入的；接續前從它的測試重新走一次引用，走到當時
+  沒有的檔就重做（`reachMismatch`）；同一次執行裡後面的批次改了前面紀錄裡的檔，那筆下次重做；不利於紀錄的證據——
+  建置中失敗、不穩定、編譯失敗、修復改過資源——在預檢、修復的每一次建置、之後每一批的建置看到的當下，就把所有
+  執行記過的類別裡被點到的寫成作廢的紀錄，`voidMatching`，不論是不是目標、`UT_RESUME` 開不開）。
   目標是資料夾時依 `UT_BATCH_SIZE` 分批，每批一次完整的 `orchestrate()`，沒通過的批次撤回它的 writer 對
   `src/test` 的變更（session 被打斷前寫的也算，`WriterTrace`）與它留在 `target/test-classes` 的輸出，被中斷時
-  正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。
+  正在跑的那批也一樣（`libs/batch.ts`；rationale 見 DESIGN.md「已採納：資料夾目標分批」）。被強制終止（SIGKILL、
+  斷電）而沒機會撤回的那批，由下一次對同一個 checkout 的執行依它的復原日誌撤回（`libs/batch.ts` 的 journal、
+  `recoverKilledBatches`；撤回不完整就停下，這個 checkout 還有 testgen 在跑就先等、等不到就停下；DESIGN.md
+  「已採納：替被強制終止的 run 收尾」），它留下還在跑的建置與 agent 也在那之前結束（`stopOrphans`，只結束確定是
+  同一個程序的）。
 - **`orchestrator.ts`** — 唯一的迭代 loop controller（deterministic，零 SDK import）。
   每輪四步，任一 hard gate FAIL 就把失敗報告餵回下一輪 writer：
   1. Writer agent 產生/修正測試（首輪 generate prompt，之後 fix prompt）
@@ -36,7 +48,10 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
      並在宣告成功前補一次完整模組重跑當驗收）。綠燈看報告不看 exit code：`testFailureIgnore`、`--fail-never`
      （只算編譯與測試的 goal）、Gradle `ignoreFailures` 下 exit 0 照樣是紅（`mavenRedDespiteExit0`：surefire 在測試
      跑完後自己印的判定，不含測試自己的輸出；報告以 `<failure>`/`<error>` 元素判定、CDATA 是文字，重跑後通過的
-     flaky 不算）；目標模組的測試被設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）
+     flaky 不算；Gradle 只在設定了 test-retry 時才把同名的先敗後過當重試，`gradleRetriesTests`）；目標模組的測試被
+     設定跳過時預檢就以 `tests-skipped` 中止（模組還沒有測試原始碼時只 WARN）。
+     Gradle 建置前一律刪掉目標專案的 `build/test-results/test`、以 `-Dorg.gradle.caching=false` 跑 `test`：`UP-TO-DATE`／
+     `FROM-CACHE` 的 test task 沒有執行，結果不是這次的（不用 `cleanTest`：它在每一個子專案都執行）
   3. Hard gate：`gates/coverage.ts` 解析該模組 `target/.../jacoco.xml`——從逐行資料重算，不計沒有初始值的
      欄位宣告、型別宣告與它們上方只有註解的行（Lombok 與編譯器產生的程式碼記在那些行上，`declarationOnlyLines`）
   4. Review gate：唯讀 reviewer 依注入的 rubric 輸出 JSON 判決（`gates/review.ts`）
@@ -68,9 +83,15 @@ process 實際執行並解析原始報告——這是 loop 能收斂的前提。
    新寫的測試類別、改過且 writer 介入前有執行的類別、加了測試的既有類別（介入前就沒執行也算——加在
    不會被執行的類別裡的測試等於沒寫）、以及跑完整模組時**每一個** writer 介入前有執行的類別
    （`ranAtBaseline`，分批時加上前面批次通過後執行的；測試資源裡的 discovery filter 也擋得到），都要在
-   這次建置的 surefire 報告或 log 的 `Running` 行裡出現；只要求來源仍是可執行的測試類別（沒有測試方法的
-   類別改成 abstract 是對的修法）。writer 新寫而測試全部 skipped 的也不算。類別層級 `@DisplayName` 命名的
-   報告會對回類別；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯會讓每一輪都 FAIL。
+   這次建置的 surefire 報告或 log 的 `Running` 行（只算目標模組的 surefire 區段；Maven logger 的時間／thread 前綴
+   先拿掉，`normalizeMavenLog`）裡出現；只要求來源仍是可執行的測試類別（沒有測試方法的類別改成 abstract 是對的
+   修法）。writer 新寫而測試全部 skipped 的也不算（suite 報告裡它的每個 case 都 skipped 也是；只有 log 時看它那行的
+   `Skipped:`）；writer 自己的測試失敗之後重跑才過（rerunFailingTestsCount、test-retry、TestNG retry analyzer），那一輪
+   判 FAIL（`build/flaky`）。類別層級 `@DisplayName` 命名的報告與 phrased 的 `Running` 行以寫的名字對回類別：一個
+   名字只算給唯一能叫這個名字的類別（它的 FQCN、別的類別的 `@DisplayName`、讀不到的 `@DisplayName` 都算候選；報告檔
+   一律以類別命名時檔名照樣算數），類別自己以 FQCN 命名的報告優先（同名的在回饋裡點名；讀不到內容時檔名的 `?`
+   一個字對一個、沒有別的類別對得上才算）；報告完全對不到任何類別（報告關了、寫到別處）時只印 WARN、不判——判錯
+   會讓每一輪都 FAIL。
    修復迴圈同樣套用，flaky 確認重跑也是。
 2. **Runtime adapter 隔離 SDK。** 核心零 SDK import，一切 agent 互動經由
    `AgentRunner` interface（`libs/types.ts`）。換 runtime = 換一個 `runners/*.ts`
@@ -185,29 +206,30 @@ independence / readability / fast_reliable / mock_appropriateness。`weightedSco
 
 ## 目錄結構
 ```
-loop.ts               entry point（參數驗證/目標分流/rubric 載入/runner 設定檢查/guard/預檢基準/runs 建立/版本戳記）
+loop.ts               entry point（參數驗證/目標分流/rubric 載入/runner 設定檢查/guard/預檢基準/接續/runs 建立/版本戳記）
 orchestrator.ts       迭代迴圈＋既有紅燈修復迴圈（零 SDK import）＋範圍/防掏空 assert＋artifacts
 config.ts             所有設定 SSOT（.env 自動載入）
 prompts.ts            writer/reviewer 參數化 prompt（standards/rubric 注入）
-gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋綠燈看報告不看 exit code（testFailureIgnore／-fn／ignoreFailures）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
+gates/build.ts        多模組感知 build gate（mvn -pl -am / gradle -p test、建置前刪掉目標的測試結果、關 build cache；建置前清掉會累加的 JaCoCo exec）＋失敗摘要（surefire XML 優先、掃整個 reactor）＋綠燈看報告不看 exit code（testFailureIgnore／-fn／ignoreFailures）＋預檢基準與可修範圍分類＋「該跑的測試有跑」檢查
 gates/coverage.ts     JaCoCo 定位＋解析（sourcefile 彙總優先；逐行資料齊全時不計只有宣告的行、列出未覆蓋的行與分支）
 gates/review.ts       fail-closed 判決解析＋門檻判定＋review gate 組裝
 runners/…             factory（含啟動前的 runner 設定檢查）＋三個 AgentRunner 實作（opencode / api / qwen；SDK 隔離邊界）
 runners/api-tools.ts  api runner 的工具集＝其權限模型（read/list/search；寫入限 src/test）
 libs/types.ts         共用型別（GateResult, ReviewVerdict, AgentRunner, ModuleInfo）
 libs/log.ts           elapsed/log/banner/die/tail/startHeartbeat
-libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾
+libs/shell.ts         shLive（子行程逐行轉印、輸出有上限）＋程序樹終止＋SIGINT/SIGTERM/SIGHUP 收尾＋子程序紀錄（children.json：被強制終止時由下一次執行結束留下的建置與 agent）
 libs/proxy.ts         公司 proxy（Node fetch 不吃 HTTPS_PROXY）＋ undici 逾時覆寫
 libs/tls.ts           TLS 攔截時的額外 CA 信任（執行時載入，不靠 NODE_EXTRA_CA_CERTS）
 libs/utils.ts         共用工具（含 skillDirCandidates / runsDirFor / findExistingTests / codelessTypeReason / clampText / snapshotTree / splitForeignChanges——後者會呼叫 git）
 libs/conventions.ts   專案慣例掃描（測試類別可見性、class-symbol 測試套件）
 libs/testmetrics.ts   既有測試檔的 @Test / 斷言 / 略過標記計數（防掏空 guard 的量尺）
-libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）＋註解參數清除與只有宣告的行
+libs/javasrc.ts       Java 原始碼的 lexer 等級清理（註解、字串、text block 清成空白，給 pattern 比對用）＋註解參數清除與只有宣告的行＋以模組的編碼解碼原始碼
 libs/guard.ts         startup guard（agent 解析 repo→global + frontmatter assert）
 libs/rubric.ts        rubric loader（只注入 references/rubric.md，禁 SKILL.md 全文）
 libs/version.ts       工具版本戳記
 libs/lock.ts          同一 repo 單一執行鎖（鎖檔在系統暫存目錄；過期的鎖在互斥下接手；持有者心跳；等不到就視為忙碌）
-libs/batch.ts         資料夾目標分批（chunk）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
+libs/resume.ts        接續先前的執行：通過紀錄（passed.json，類別與測試檔的 sha256、判決）的寫入、讀取與比對＋測試目錄的索引與引用走訪（indexTestTree / referencedTestFiles）
+libs/batch.ts         資料夾目標分批（chunk）＋批次復原日誌（被強制終止時由下一次執行撤回：openJournal / findJournals / killedWriterChanges）＋失敗批次撤回 src/test 變更與它留下的建置輸出（captureTree / rollbackTree / removeBatchOutputs）＋跨批失敗比對
 libs/teststack.ts     測試相依量測（surefire classpath，退回 pom）＋ Java 語言層級
 libs/encoding.ts      原始碼編碼量測＋非 UTF-8 模組的 ASCII 視圖（session 前 \uXXXX、session 後以 JDK 寫回模組編碼）
 libs/java/Transcode.java  JDK 轉碼器（decode / encode / probe；Java 8 相容，執行時編譯並快取在系統暫存目錄）
@@ -228,7 +250,7 @@ runs/<repo>/<ts>/     artifacts（gitignore）
 ```bash
 npm install
 npm run check                          # tsc --noEmit + selftest + itest
-npm run itest                          # 只跑整合自測；加情境名可單跑一個
+npm run itest                          # 只跑整合自測；加情境名可單跑一個，`前綴*` 跑一組（'loop-resume-*'）
 npm run setup                          # agents+skill → ~/.config/opencode/
 # 在目標 Java repo 根執行：
 npx tsx <clone>/scripts/doctor.ts [目標路徑] [--smoke]

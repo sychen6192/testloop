@@ -50,6 +50,33 @@ import {
 } from "../prompts";
 import { testMetrics, findShrunk, collectTestMetrics, runnableTests } from "../libs/testmetrics";
 import {
+  entryMismatch,
+  findPass,
+  hashFile,
+  LEDGER_FILE,
+  ledgerEntry,
+  passedEntries,
+  PassedEntry,
+  readLedgers,
+  MAX_REFERENCED_CLASSES,
+  MAX_REFERENCED_RESOURCES,
+  referencedTestFiles,
+  reachMismatch,
+  indexTestTree,
+  testClassInTree,
+  resourcesUnder,
+  springStereotypes,
+  resourcesNamed,
+  safeLedgerPath,
+  springLoaded,
+  declaredTypes,
+  stringLiterals,
+  sha256,
+  testClassOf,
+  voidEntry,
+  writeLedger,
+} from "../libs/resume";
+import {
   countTestsRun,
   detectEnvFailures,
   failingTestIds,
@@ -83,7 +110,38 @@ import {
 import { runnerCannotRunHint } from "../orchestrator";
 import { execTool, resolveInside, toOpenAiTools, toolsFor } from "../runners/api-tools";
 import { acquireRepoLock, holderAlive, repoLockFile } from "../libs/lock";
-import { batchFailureFingerprint, captureOutputs, captureTree, chunk, removeBatchOutputs, rollbackTree, testOutputDirs } from "../libs/batch";
+import {
+  batchFailureFingerprint,
+  captureOutputs,
+  captureTree,
+  chunk,
+  BatchJournal,
+  closeJournal,
+  decideRecovery,
+  dirIdentity,
+  findJournals,
+  isJournal,
+  JOURNAL_DIR,
+  journalCapture,
+  journalOutputs,
+  killedWriterChanges,
+  mayBeRunning,
+  movesAfterDeath,
+  openJournal,
+  provenSameDirectory,
+  readDecision,
+  removeBatchOutputs,
+  rollbackTree,
+  sameBoot,
+  sameDirectory,
+  samePids,
+  testOutputDirs,
+  thisHost,
+  traceJournal,
+  TreeCapture,
+  waitWhileBusy,
+  writeDecision,
+} from "../libs/batch";
 import {
   closeEncodingView,
   escapeNonAscii,
@@ -121,8 +179,26 @@ import {
   surefireVersionFromLog,
   surefireProviderFromLog,
 } from "../libs/teststack";
-import { codeOnly, declarationOnlyLines, decodeUnicodeEscapes } from "../libs/javasrc";
-import { planSpawn, resolveWindowsCommand, findOnPath, explainSpawnError, planKill, killTree, shLive, assembleCapture } from "../libs/shell";
+import { codeOnly, declarationOnlyLines, decodeJavaSource, decodeUnicodeEscapes, javaStringValue } from "../libs/javasrc";
+import {
+  planSpawn,
+  resolveWindowsCommand,
+  findOnPath,
+  explainSpawnError,
+  planKill,
+  killTree,
+  shLive,
+  assembleCapture,
+  DETACH_CHILDREN,
+  groupAlive,
+  groupMembers,
+  journalChildren,
+  orphanAction,
+  parseStat,
+  processStart,
+  startMsOf,
+  trackForShutdown,
+} from "../libs/shell";
 import { runnerConfigProblems } from "../runners/runner";
 import {
   appendingJacocoExecFiles,
@@ -132,8 +208,23 @@ import {
   targetModuleSkipped,
   mavenRedDespiteExit0,
   gradleRedDespiteExit0,
+  gradleRetriesTests,
+  gradleMayRunTestNG,
+  failingAfterRetries,
+  normalizeMavenLog,
+  gradleTestTaskRan,
   testsSkippedInLog,
   classesRunInLog,
+  classesRunInModuleLog,
+  flakyClassesInLog,
+  flakyClassesInReport,
+  flakyTestClasses,
+  lossyFileNameOf,
+  outerClassName,
+  testCountsInLog,
+  testOnlyFailures,
+  reportContents,
+  surefireSections,
   classifyEnvFailures,
   crashedTestClasses,
   expectedTestOf,
@@ -1715,6 +1806,22 @@ class T {
     JSON.stringify(snap),
   );
   check("collectTestMetrics：不存在的目錄 → 空", Object.keys(collectTestMetrics(path.join(tmp, "nope"))).length === 0);
+  // An MS950 test: 功 is 0xA5 0x5C, and read as UTF-8 that "\" escapes the closing quote.
+  const ms950Test = Buffer.concat([
+    Buffer.from('package com.x;\nimport org.junit.jupiter.api.*;\nclass LegacyTest {\n    @DisplayName("'),
+    Buffer.from([0xb7, 0x73, 0xbc, 0x57, 0xa6, 0xa8, 0xa5, 0x5c]), // 新增成功
+    Buffer.from('") @Test void add() { Assertions.assertEquals(3, 1 + 2); }\n    @DisplayName("'),
+    Buffer.from([0xa7, 0x52, 0xb0, 0xa3, 0xa6, 0xa8, 0xa5, 0x5c]), // 刪除成功
+    Buffer.from('") @Test void remove() { Assertions.assertEquals(1, 0 + 1); }\n}\n'),
+  ]);
+  fs.rmSync(path.join(tmp, "com", "x", "FooTest.java"));
+  fs.writeFileSync(path.join(tmp, "com", "x", "LegacyTest.java"), ms950Test);
+  const legacy = collectTestMetrics(tmp, "MS950")["com/x/LegacyTest.java"];
+  check(
+    "collectTestMetrics：MS950 的測試以 MS950 讀——「成功」的 \\ 不會吃掉引號，2 個 @Test、2 個斷言都數得到",
+    legacy?.tests === 2 && legacy.assertions === 2,
+    JSON.stringify(legacy),
+  );
   fs.rmSync(tmp, { recursive: true, force: true });
 
   const rp = buildRepairPrompt({
@@ -4399,8 +4506,11 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     fs.writeFileSync(f("com/x/AsciiTest.java"), "class AsciiTest {}\n");
     // All ASCII, with an escape its author wrote on purpose.
     fs.writeFileSync(f("com/x/PlainTest.java"), 'class PlainTest {\n  String e = "\\u4e2d";\n}\n');
-    const old = new Date(Date.now() - 3_600_000);
-    fs.utimesSync(f("com/x/UntouchedTest.java"), old, old);
+    // A time a fraction of a millisecond past the half: put back through a Date, it rounds up, and the
+    // file the writer never touched reads as changed to every snapshot after.
+    const oldS = Math.floor(Date.now() / 1000) - 3600 + 0.5847;
+    fs.utimesSync(f("com/x/UntouchedTest.java"), oldS, oldS);
+    const oldMs = fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs;
     const ms950 = { name: "MS950", source: "pom" as const };
     const view = openEncodingView(ms950, tree)!;
     const shown = fs.readFileSync(f("com/x/EditedTest.java"), "latin1");
@@ -4422,7 +4532,8 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     const big5 = new TextDecoder("big5");
     check(
       "closeEncodingView：沒改的檔拿回原本的 bytes 與修改時間（建置看不到變化）",
-      fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && Math.abs(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs - old.getTime()) < 2000,
+      fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && Math.floor(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs) === Math.floor(oldMs),
+      `${oldMs} → ${fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs}`,
     );
     const edited = fs.readFileSync(f("com/x/EditedTest.java"));
     check(
@@ -4513,6 +4624,7 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
     fs.rmSync(lostFile);
 
     // A run killed with the view open: the next run puts the originals back from the journal.
+    fs.utimesSync(f("com/x/UntouchedTest.java"), oldS, oldS);
     const kv = openEncodingView(ms950, tree)!;
     check("被砍掉之前：檔案是 ASCII 形式", !fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && kv.viewed.size > 0);
     const recoveredFiles = recoverEncodingViews(tree);
@@ -4520,6 +4632,13 @@ console.log("\n[26] 原始碼編碼（MS950 等非 UTF-8）");
       "recoverEncodingViews：下一次執行從復原日誌把原本的 bytes 放回",
       fs.readFileSync(f("com/x/UntouchedTest.java")).equals(orig) && recoveredFiles.map((p) => path.basename(p)).includes("UntouchedTest.java"),
       JSON.stringify(recoveredFiles.map((p) => path.basename(p))),
+    );
+    // And its time: put back with the time of the recovery, it read as changed after the killed run died
+    // — someone else's — and that run's batch was left in place (libs/batch.ts killedWriterChanges).
+    check(
+      "recoverEncodingViews：修改時間也放回原本的（到毫秒以下）",
+      Math.floor(fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs) === Math.floor(oldMs),
+      `${oldMs} → ${fs.statSync(f("com/x/UntouchedTest.java")).mtimeMs}`,
     );
     check("recoverEncodingViews：日誌用過就刪（再跑一次什麼都不做）", recoverEncodingViews(tree).length === 0);
     restoreOpenViews();
@@ -4669,6 +4788,14 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     JSON.stringify(lexed),
   );
   check("codeOnly：字串裡的 \\\" 不結束字串", codeOnly('s = "a\\"b // c"; d();').endsWith("d();"));
+  check(
+    "codeOnly(keepLiterals)：只拿掉註解，字串與 text block 的內容留著（Gradle 腳本的 plugin id 是字串）；長度與換行不變",
+    (() => {
+      const src = "plugins { id 'org.gradle.test-retry' } // id 'x.y'\n/* retry { } */ def s = \"\"\"\n  a\n\"\"\"\n";
+      const kept = codeOnly(src, true);
+      return kept.length === src.length && kept.includes("'org.gradle.test-retry'") && !kept.includes("x.y") && !kept.includes("retry {") && kept.includes("\n  a\n") && !codeOnly(src).includes("test-retry");
+    })(),
+  );
   check(
     "codeOnly：沒結束的區塊註解只清掉開頭的 /*，後面照樣當程式碼讀（編不過的檔交給建置報錯，不是讓後面的測試全部「消失」）",
     codeOnly("a(); /* x").length === 9 && codeOnly("a(); /* x").endsWith(" x"),
@@ -4900,14 +5027,67 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
       ) === undefined,
   );
   check(
-    "gradleRedDespiteExit0：「There were failing tests」（report 或 results）、安靜時只有的「N tests completed, M failed」、測試結果記著失敗（up-to-date 什麼都不印）→ 紅；一般輸出 → undefined",
+    "gradleRedDespiteExit0：「There were failing tests」（report 或 results）、安靜時只有的「N tests completed, M failed」、測試結果記著失敗（up-to-date 什麼都不印）→ 紅；一般輸出 → undefined；有測試結果時以結果為準（test-retry 重試通過時 log 照樣說失敗）",
     (gradleRedDespiteExit0("1 test completed, 1 failed\nThere were failing tests. See the report at: file:///w/build/reports/tests/test/index.html\nBUILD SUCCESSFUL in 2s") ?? "").includes("ignoreFailures") &&
       !!gradleRedDespiteExit0("There were failing tests. See the results at: file:///w/build/test-results/test\nBUILD SUCCESSFUL in 2s") &&
       !!gradleRedDespiteExit0("2 tests completed, 1 failed") &&
       !!gradleRedDespiteExit0("> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms", true) &&
       gradleRedDespiteExit0("BUILD SUCCESSFUL in 2s") === undefined &&
-      gradleRedDespiteExit0("> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms", false) === undefined,
+      gradleRedDespiteExit0("> Task :test UP-TO-DATE\n\nBUILD SUCCESSFUL in 827ms", false) === undefined &&
+      // test-retry passed the retry: the log still says failed, the results (retries folded) do not.
+      gradleRedDespiteExit0("3 tests completed, 1 failed\nThere were failing tests. See the report at: file:///w/index.html\nBUILD SUCCESSFUL in 2s", false, true) === undefined &&
+      !!gradleRedDespiteExit0("3 tests completed, 1 failed\nBUILD SUCCESSFUL in 2s", true, true),
   );
+  {
+    // What says a Gradle build retries a failing test, or may run TestNG — and what does not.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-gradle-cfg-"));
+    const home = path.join(tmp, "home");
+    const build = (name: string, files: Record<string, string>) => {
+      const root = path.join(tmp, name);
+      for (const [rel, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+        fs.writeFileSync(path.join(root, rel), text);
+      }
+      return root;
+    };
+    const plain = build("plain", { "build.gradle": "plugins { id 'java' }\ntest { useJUnitPlatform(); ignoreFailures = true }\n" });
+    const byId = build("by-id", { "build.gradle": "plugins {\n  id 'java'\n  id 'org.gradle.test-retry' version '1.6.2'\n}\n" });
+    const commented = build("commented", { "build.gradle": "plugins {\n  id 'java'\n  // id 'org.gradle.test-retry' version '1.6.2'\n}\n/* test { retry { maxRetries = 2 } } */\n" });
+    const catalog = build("catalog", { "build.gradle.kts": "plugins { alias(libs.plugins.retry) }\n", "gradle/libs.versions.toml": "[plugins]\nretry = { id = \"org.gradle.test-retry\", version = \"1.6.2\" }\n" });
+    const catalogOff = build("catalog-off", { "build.gradle.kts": "plugins { java }\n", "gradle/libs.versions.toml": "[plugins]\n# retry = { id = \"org.gradle.test-retry\", version = \"1.6.2\" }\n" });
+    const conventions = build("conventions", {
+      "settings.gradle.kts": 'includeBuild("build-logic")\n',
+      "app/build.gradle.kts": 'plugins { id("my.java-conventions") }\n',
+      "build-logic/src/main/kotlin/my.java-conventions.gradle.kts": "plugins { java }\ntasks.test { develocity.testRetry { maxRetries = 2 } }\n",
+    });
+    const fixture = build("fixture", {
+      "build.gradle": "plugins { id 'java' }\n",
+      "src/test/resources/projects/retry/build.gradle": "plugins { id 'org.gradle.test-retry' }\n",
+      "src/main/java/com/x/Retry.gradle": "retry { }\n",
+    });
+    const nexus = build("nexus", { "build.gradle": "nexusPublishing { transitionCheckOptions { maxRetries.set(40) } }\n" });
+    const buildDir = build("build-dir", { "build.gradle": "plugins { id 'java' }\n", "build/tmp/retry.gradle": "retry { maxRetries = 1 }\n" });
+    const initHome = path.join(tmp, "init-home");
+    fs.mkdirSync(path.join(initHome, "init.d"), { recursive: true });
+    fs.writeFileSync(path.join(initHome, "init.d", "retry.gradle"), "allprojects { tasks.withType(Test).configureEach { retry { maxRetries = 1 } } }\n");
+    const ng = build("ng", { "build.gradle": "dependencies { testImplementation 'org.testng:testng:7.5' }\ntest { useTestNG() }\n" });
+    check(
+      "gradleRetriesTests：plugin id、version catalog、included build 的 precompiled script plugin（Develocity testRetry）、Gradle user home 的 init.d → 會重試；沒有、註解掉的、測試用的 fixture 腳本、build 目錄、別的 plugin 的 maxRetries → 不會",
+      !gradleRetriesTests(plain, home) &&
+        gradleRetriesTests(byId, home) &&
+        !gradleRetriesTests(commented, home) &&
+        gradleRetriesTests(catalog, home) &&
+        !gradleRetriesTests(catalogOff, home) &&
+        gradleRetriesTests(conventions, home) &&
+        !gradleRetriesTests(fixture, home) &&
+        !gradleRetriesTests(nexus, home) &&
+        !gradleRetriesTests(buildDir, home) &&
+        gradleRetriesTests(plain, initHome),
+      JSON.stringify([plain, byId, commented, catalog, catalogOff, conventions, fixture, nexus, buildDir].map((r) => gradleRetriesTests(r, home))),
+    );
+    check("gradleMayRunTestNG：useTestNG／org.testng → 會；只有 JUnit Platform → 不會", gradleMayRunTestNG(ng, home) && !gradleMayRunTestNG(plain, home));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
   check(
     "crashedTestClasses：testFailureIgnore 下 surefire 2.x 的 Crashed tests 那幾行沒有 [ERROR] 前綴，照樣點名",
     JSON.stringify(crashedTestClasses("[ERROR] ExecutionException The forked VM terminated\nCrashed tests:\ncom.x.ExitTest\norg.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated")) ===
@@ -4951,9 +5131,43 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
         '  <testcase name="flaky()" classname="com.x.RetryTest" time="0.01"/>\n  <testcase name="later()" classname="com.x.RetryTest" time="0.0">\n    <skipped/>\n  </testcase>\n</testsuite>',
     )!;
     check(
-      "parseSurefireXml：通過的 test case 記在 passed（重試的每一次各是一個 test case；skipped 不算通過）",
-      JSON.stringify(retried.passed) === '["flaky()"]' && retried.cases.length === 1 && retried.cases[0].name === "flaky()",
-      JSON.stringify([retried.passed, retried.cases.map((c) => c.name)]),
+      "parseSurefireXml：每個 test case 依文件順序記在 runs（重試的每一次各是一個 test case；skipped 不算通過）",
+      JSON.stringify(retried.runs) === '[{"name":"flaky()","outcome":"failed"},{"name":"flaky()","outcome":"passed"},{"name":"later()","outcome":"skipped"}]' &&
+        retried.cases.length === 1 &&
+        retried.cases[0].name === "flaky()",
+      JSON.stringify([retried.runs, retried.cases.map((c) => c.name)]),
+    );
+    // Gradle 8.14.3 with ignoreFailures (measured): two @ParameterizedTest methods called with the same
+    // arguments both report "[2] -1"; @DisplayName given twice, the same. No retry ran.
+    const sameName = parseSurefireXml(
+      '<testsuite name="com.x.CalcTest" tests="4" failures="1" errors="0" skipped="0">\n  <testcase name="[1] 1" classname="com.x.CalcTest"/>\n' +
+        '  <testcase name="[2] -1" classname="com.x.CalcTest"><failure message="expected: &lt;true&gt; but was: &lt;false&gt;">x</failure></testcase>\n' +
+        '  <testcase name="[1] 1" classname="com.x.CalcTest"/>\n  <testcase name="[2] -1" classname="com.x.CalcTest"/>\n</testsuite>',
+    )!;
+    const names = (cs: { name: string }[]) => JSON.stringify(cs.map((c) => c.name));
+    // Retried: a failure, the other test of that name, then the retry of the failure — which failed again.
+    const againFailed = parseSurefireXml(
+      '<testsuite name="com.x.T" tests="3" failures="2" errors="0" skipped="0"><testcase name="x" classname="com.x.T"><failure message="first"/></testcase>' +
+        '<testcase name="x" classname="com.x.T"/><testcase name="x" classname="com.x.T"><failure message="second"/></testcase></testsuite>',
+    )!;
+    const passFirst = parseSurefireXml(
+      '<testsuite name="com.x.T" tests="2" failures="1" errors="0" skipped="0"><testcase name="x" classname="com.x.T"/><testcase name="x" classname="com.x.T"><failure message="late"/></testcase></testsuite>',
+    )!;
+    // Two tests of one name failed; one retry passed.
+    const twoFailedOnePassed = parseSurefireXml(
+      '<testsuite name="com.x.T" tests="3" failures="2" errors="0" skipped="0"><testcase name="x" classname="com.x.T"><failure message="a"/></testcase>' +
+        '<testcase name="x" classname="com.x.T"><failure message="b"/></testcase><testcase name="x" classname="com.x.T"/></testsuite>',
+    )!;
+    check(
+      "failingAfterRetries：build 會重試時，失敗之後同名的通過才是重試通過（一個通過只抵一個在它之前的失敗）；不會重試時同名的通過不抵任何失敗（兩個參數化方法同樣的參數、重複的 @DisplayName）",
+      names(failingAfterRetries(retried, true)) === "[]" &&
+        names(failingAfterRetries(retried, false)) === '["flaky()"]' &&
+        names(failingAfterRetries(sameName, false)) === '["[2] -1"]' &&
+        names(failingAfterRetries(sameName, true)) === "[]" &&
+        JSON.stringify(failingAfterRetries(againFailed, true).map((c) => c.message)) === '["second"]' &&
+        names(failingAfterRetries(passFirst, true)) === '["x"]' &&
+        JSON.stringify(failingAfterRetries(twoFailedOnePassed, true).map((c) => c.message)) === '["b"]',
+      JSON.stringify([failingAfterRetries(sameName, false), failingAfterRetries(againFailed, true), failingAfterRetries(passFirst, true), failingAfterRetries(twoFailedOnePassed, true)].map(names)),
     );
     const real = parseSurefireXml(cdataReal)!;
     check(
@@ -5050,6 +5264,511 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
     phrased.join("、"),
   );
   for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+
+  // Two Chinese display names under a POSIX locale: both files are all "?"s, and the XML holds each
+  // name whole. One of them not run is not the other's report.
+  const calcShown = src("CalcShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass CalcShownTest { @Test void a() {} }\n');
+  const orderShown = src("OrderShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("訂單測試")\nclass OrderShownTest { @Test void a() {} }\n');
+  const calcT = expectedTestOf(fs.readFileSync(calcShown, "utf8"), calcShown, "created")!;
+  const orderT = expectedTestOf(fs.readFileSync(orderShown, "utf8"), orderShown, "created")!;
+  // Windows allows no "?" in a file name (and keeps the characters there): these are POSIX's.
+  if (process.platform !== "win32") {
+    report("TEST-com.x.OldTest.xml");
+    report("TEST-????.xml", '<testsuite name="訂單測試" tests="1"><testcase name="a" classname="訂單測試"/></testsuite>');
+    const cjk = checkTestsRan("maven", mi, since, "", [calcT, orderT]);
+    check(
+      "checkTestsRan：只有「訂單測試」有報告（檔名在 POSIX locale 下是 ????）→「計算機測試」沒執行，別的類別的 display name 不算它的",
+      cjk?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+      JSON.stringify(cjk?.notRun.map((t) => t.fqcn)),
+    );
+    // No XML (disableXmlReport): the file name is all there is, one "?" for each character it lost.
+    for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+    report("com.x.OldTest.txt", "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0");
+    report("????.txt", "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0");
+    const byFile = checkTestsRan("maven", mi, since, "", [calcT, orderT]);
+    check(
+      "checkTestsRan：只有 .txt、檔名 ????——四個字的「訂單測試」算有執行，五個字的「計算機測試」不算",
+      byFile?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+      JSON.stringify(byFile?.notRun.map((t) => t.fqcn)),
+    );
+    const sameShape = src("PayShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("付款測試")\nclass PayShownTest { @Test void a() {} }\n');
+    const ambiguous = checkTestsRan("maven", mi, since, "", [orderT]);
+    check(
+      "checkTestsRan：模組裡另一個類別的 display name（「付款測試」）也寫得成 ???? → 這個檔名認不出是誰的，不算",
+      ambiguous?.notRun.map((t) => t.fqcn).join() === "com.x.OrderShownTest",
+      JSON.stringify(ambiguous?.notRun.map((t) => t.fqcn)),
+    );
+    fs.rmSync(sameShape);
+    for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  }
+  report("TEST-com.x.OldTest.xml");
+  report("計算機測試.txt", "Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.01 s");
+  const shownSkipped = checkTestsRan("maven", mi, since, "", [calcT]);
+  check(
+    "checkTestsRan：以 @DisplayName 命名的它自己的報告（.txt 摘要）說全部被略過 → 全部被略過",
+    shownSkipped?.notRun.length === 0 && shownSkipped.allSkipped.length === 1 && shownSkipped.allSkipped[0].tests === 2,
+    JSON.stringify(shownSkipped),
+  );
+  // An MS950 module: the display name is what javac reads, not what the bytes read as UTF-8 or latin1 are.
+  const big5Name = Buffer.from([0xad, 0x70, 0xba, 0xe2, 0xbe, 0xf7, 0xb4, 0xfa, 0xb8, 0xd5]); // 計算機測試
+  const ms950 = path.join(m, "src", "test", "java", "com", "x", "CalcShownTest.java");
+  fs.writeFileSync(
+    ms950,
+    Buffer.concat([Buffer.from('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("'), big5Name, Buffer.from('")\nclass CalcShownTest { @Test void a() {} }\n')]),
+  );
+  check(
+    "decodeJavaSource + expectedTestOf：MS950 原始碼的 @DisplayName 以 MS950 讀出（計算機測試）",
+    expectedTestOf(decodeJavaSource(fs.readFileSync(ms950), "MS950"), ms950, "created")?.displayName === "計算機測試",
+  );
+  fs.writeFileSync(calcShown, 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass CalcShownTest { @Test void a() {} }\n');
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  check(
+    "expectedTestOf：@DisplayName 照 JUnit 的讀法——\\u 跳脫、value =、前後空白去掉；空白的不算名字",
+    et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("\\u8a08\\u7b97 ")\nclass FooTest { @Test void a() {} }')?.displayName === "計算" &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName(value = "Calc \\"x\\"")\nclass FooTest { @Test void a() {} }')?.displayName === 'Calc "x"' &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("  ")\nclass FooTest { @Test void a() {} }')?.displayName === undefined,
+  );
+  check(
+    "lossyFileNameOf：一個字一個 ?；ASCII 要一樣；沒有 ? 的檔名不用這條",
+    lossyFileNameOf("?????", "計算機測試") &&
+      !lossyFileNameOf("????", "計算機測試") &&
+      lossyFileNameOf("Calc ??", "Calc 加法") &&
+      !lossyFileNameOf("Calx ??", "Calc 加法") &&
+      !lossyFileNameOf("計算", "計算") &&
+      !lossyFileNameOf("a?", "ab"),
+  );
+  check(
+    "javaStringValue / decodeJavaSource：跳脫照 javac；MS950 的「處理成功」（第二個 byte 是 \\）不會把引號吃掉；不認得的編碼、不是 UTF-8 → 先試雙位元組編碼（Big5 讀得通就是它），都不行才逐 byte",
+    javaStringValue("\\u8a08 \\\\u0041 \\\\\\u0041 \\t\\101") === "計 \\u0041 \\A \tA" &&
+      decodeJavaSource(Buffer.from([0x22, 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, 0x22]), "x-windows-950") === '"處理成功"' &&
+      decodeJavaSource(Buffer.from([0x22, 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, 0x22]), "no-such-charset") === '"處理成功"' &&
+      decodeJavaSource(Buffer.from([0x22, 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, 0x22])) === '"處理成功"' &&
+      decodeJavaSource(Buffer.from([0x41, 0xfd]), "no-such-charset") === "A\u00fd" &&
+      decodeJavaSource(Buffer.from("\ufeff計", "utf8")) === "計",
+  );
+  check(
+    "decodeJavaSource（編碼名稱不明）：Shift_JIS 讀得通、而且讀出假名 → 就是它（半形片假名後面的 \\ 不會被 Big5 當成第二個 byte 吃掉）；Big5 的「處理成功」照樣是 Big5",
+    // class A { String a = "ﾃｽﾄ\\"; String b = "テストです"; }
+    decodeJavaSource(Buffer.from("636c6173732041207b20537472696e672061203d2022c3bdc45c5c223b20537472696e672062203d202283658358836782c582b7223b207d0a", "hex")) ===
+      'class A { String a = "ﾃｽﾄ\\\\"; String b = "テストです"; }\n' &&
+      decodeJavaSource(Buffer.from([0x22, 0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c, 0x22])) === '"處理成功"',
+  );
+
+  // Round 5: a report goes by the name inside it; a class by its own reports first, and by its
+  // @DisplayName only when no other class of the module goes by it too.
+  const svcFile = src(
+    "OrderServiceTest",
+    'package com.x;\nimport org.junit.jupiter.api.*;\nimport org.junit.jupiter.api.extension.ExtendWith;\n@DisplayName("訂單服務測")\n@ExtendWith({NoopExtension.class})\n@Disabled("等 DB 環境")\nclass OrderServiceTest { @Test void total() {} }\n',
+  );
+  const svc = expectedTestOf(fs.readFileSync(svcFile, "utf8"), svcFile, "untouched");
+  check(
+    "expectedTestOf：@DisplayName 在 @ExtendWith({…}) 之前也讀得到（註解參數裡的 } 不是類別自己的註解開始的地方），之後的 @Disabled 也算",
+    svc?.displayName === "訂單服務測" && svc.disabled === true,
+    JSON.stringify(svc),
+  );
+  check(
+    "expectedTestOf：@DisplayName 照 Java 的 trim——只去掉 U+0020 以下的字，全形空白留著；不是一個字串常值（常數、相加）→ 讀不到的名字",
+    et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("\\t\\u3000計算\\u3000\\n")\nclass FooTest { @Test void a() {} }')?.displayName === "　計算　" &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName(Names.CALC)\nclass FooTest { @Test void a() {} }')?.displayNameUnread === true &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("a" + "b")\nclass FooTest { @Test void a() {} }')?.displayNameUnread === true &&
+      et('package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayNameGeneration(X.class)\nclass FooTest { @Test void a() {} }')?.displayNameUnread === undefined,
+  );
+  // Two classes of one @DisplayName: surefire writes one TEST-服務測試.xml, the last one's — here the
+  // disabled one's, every test skipped.
+  const dupCalcFile = src("CalcDupTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("服務測試")\nclass CalcDupTest { @Test void a() {} @Test void b() {} }\n');
+  src("OrderDupTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@Disabled\n@DisplayName("服務測試")\nclass OrderDupTest { @Test void a() {} }\n');
+  const dupCalc = expectedTestOf(fs.readFileSync(dupCalcFile, "utf8"), dupCalcFile, "created")!;
+  const dupXml = '<testsuite name="服務測試" tests="1" skipped="1"><testcase name="a" classname="com.x.OrderDupTest"><skipped/></testcase></testsuite>';
+  report("com.x.CalcDupTest.txt", "Test set: com.x.CalcDupTest\nTests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.x.CalcDupTest");
+  report("com.x.OrderDupTest.txt", "Test set: com.x.OrderDupTest\nTests run: 1, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.01 s -- in com.x.OrderDupTest");
+  report("TEST-服務測試.xml", dupXml);
+  const dup = checkTestsRan("maven", mi, since, "", [dupCalc]);
+  check(
+    "checkTestsRan：同一個 @DisplayName 的報告是另一個（@Disabled）類別最後寫的 → 以它自己的 .txt 為準：2 個都跑了，不是全部被略過",
+    dup?.notRun.length === 0 && dup.allSkipped.length === 0,
+    JSON.stringify(dup),
+  );
+  fs.rmSync(path.join(reports, "com.x.CalcDupTest.txt"));
+  fs.rmSync(path.join(reports, "com.x.OrderDupTest.txt"));
+  report("TEST-com.x.OldTest.xml");
+  const dupOnly = checkTestsRan("maven", mi, since, "", [dupCalc]);
+  const dupText = dupOnly ? (renderRanCheck(dupOnly, "maven") ?? "") : "";
+  check(
+    "checkTestsRan：只有那份同名的報告 → 分不出是誰的，不算它有執行；回饋點名另一個同名的類別、要它取獨一無二的名字",
+    dupOnly?.notRun.map((t) => t.fqcn).join() === "com.x.CalcDupTest" &&
+      dupOnly.notRun[0].sharedName?.join() === "com.x.OrderDupTest" &&
+      dupText.includes("與 com.x.OrderDupTest 相同") &&
+      dupText.includes("獨一無二"),
+    dupText,
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  fs.rmSync(path.join(m, "src", "test", "java", "com", "x", "CalcDupTest.java"));
+  fs.rmSync(path.join(m, "src", "test", "java", "com", "x", "OrderDupTest.java"));
+  // Its own report (by FQCN) says both ran; one by its @DisplayName, alone in the module, says otherwise:
+  // its own is what counts.
+  report("TEST-com.x.OldTest.xml");
+  report("com.x.CalcShownTest.txt", "Test set: com.x.CalcShownTest\nTests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s");
+  report("TEST-計算機測試.xml", '<testsuite name="計算機測試" tests="2" skipped="2"><testcase name="a" classname="計算機測試"><skipped/></testcase><testcase name="b" classname="計算機測試"><skipped/></testcase></testsuite>');
+  const ownFirst = checkTestsRan("maven", mi, since, "", [calcT]);
+  check(
+    "checkTestsRan：有以 FQCN 命名的它自己的報告 → 只算那些，以 @DisplayName 命名的那份不算進去",
+    ownFirst?.notRun.length === 0 && ownFirst.allSkipped.length === 0,
+    JSON.stringify(ownFirst),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  // A @DisplayName with "$": no class name, kept whole.
+  report("TEST-com.x.OldTest.xml");
+  report("TEST-滿 NT$1000 折 NT$100.xml", '<testsuite name="滿 NT$1000 折 NT$100" tests="1"><testcase name="a" classname="滿 NT$1000 折 NT$100"/></testsuite>');
+  const dollar = checkTestsRan("maven", mi, since, "", [], [], true);
+  check(
+    "checkTestsRan：「滿 NT$1000 折 NT$100」這種 @DisplayName 不是類別名稱，照原樣列出、不在 $ 切斷",
+    !!dollar?.reported.includes("滿 NT$1000 折 NT$100") && !dollar.reported.includes("滿 NT"),
+    JSON.stringify(dollar?.reported),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  if (process.platform !== "win32") {
+    // Under a POSIX locale: the file name is "?????" whatever the name was; what is inside says whose.
+    report("TEST-com.x.OldTest.xml");
+    report("com.x.CalcShownTest.txt", "Test set: com.x.CalcShownTest\nTests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s");
+    report("TEST-?????.xml", '<testsuite name="訂單服務測" tests="1" skipped="1"><testcase name="total" classname="com.x.OrderServiceTest"><skipped/></testcase></testsuite>');
+    const lossyOther = checkTestsRan("maven", mi, since, "", [calcT]);
+    check(
+      "checkTestsRan：「?????」這份 XML 裡寫的是 @Disabled 的「訂單服務測」→ 不是「計算機測試」的，它不算全部被略過",
+      lossyOther?.notRun.length === 0 && lossyOther.allSkipped.length === 0,
+      JSON.stringify(lossyOther),
+    );
+    fs.rmSync(path.join(reports, "com.x.CalcShownTest.txt"));
+    report("TEST-?????.xml", '<testsuite name="五個字名字" tests="1"><testcase name="total" classname="五個字名字"/></testsuite>');
+    const credited = checkTestsRan("maven", mi, since, "", [calcT]);
+    check(
+      "checkTestsRan：「?????」裡的名字是別的（模組裡沒有類別叫這個）→ 不因為檔名剛好五個 ? 就算「計算機測試」有執行",
+      credited?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+      JSON.stringify(credited?.notRun.map((t) => t.fqcn)),
+    );
+    report("TEST-?????.xml", '<testsuite name="計算機??" tests="1"><testcase name="total" classname="計算機??"/></testsuite>');
+    check(
+      "checkTestsRan：裡面寫的名字本來就是「計算機??」（讀得到的名字不是遺失了字的檔名）→ 不算「計算機測試」",
+      checkTestsRan("maven", mi, since, "", [calcT])?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+    );
+    report("?????.txt", "Test set: 計算機測試\nTests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s");
+    fs.rmSync(path.join(reports, "TEST-?????.xml"));
+    check(
+      "checkTestsRan：「?????.txt」裡的 Test set 是「計算機測試」→ 它有執行",
+      checkTestsRan("maven", mi, since, "", [calcT])?.notRun.length === 0,
+    );
+    // Nothing inside to read: the file name is all there is — its only when no other class can be it.
+    report("?????.txt", "");
+    fs.rmSync(svcFile);
+    check("checkTestsRan：裡面讀不到名字、模組裡只有「計算機測試」寫得成 ????? → 算它的", checkTestsRan("maven", mi, since, "", [calcT])?.notRun.length === 0);
+    const constFile = src("ConstShownTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName(Names.SHOWN)\nclass ConstShownTest { @Test void a() {} }\n');
+    check(
+      "checkTestsRan：另一個類別的 @DisplayName 是常數、讀不到 → 它也可能是 ?????，這個檔名不算「計算機測試」的",
+      checkTestsRan("maven", mi, since, "", [calcT])?.notRun.map((t) => t.fqcn).join() === "com.x.CalcShownTest",
+    );
+    fs.rmSync(constFile);
+    for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+  }
+  if (fs.existsSync(svcFile)) fs.rmSync(svcFile);
+  // A name read inside a report is whole: "計算機??" is a class that goes by that, every test of it skipped —
+  // not a file name that lost the characters of 計算機測試, which ran (the log says so) with none skipped.
+  report("TEST-other.xml", '<testsuite name="計算機??" tests="2" skipped="2"><testcase name="a" classname="計算機??"><skipped/></testcase><testcase name="b" classname="計算機??"><skipped/></testcase></testsuite>');
+  const namedInside = checkTestsRan(
+    "maven",
+    mi,
+    since,
+    "[INFO] Running com.x.CalcShownTest\n[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.CalcShownTest",
+    [calcT],
+  );
+  check(
+    "checkTestsRan：報告裡寫的名字「計算機??」是完整的名字，不是遺失了字的檔名 → 它全部略過不算「計算機測試」的",
+    namedInside?.notRun.length === 0 && namedInside.allSkipped.length === 0,
+    JSON.stringify(namedInside),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+
+  {
+    // Round 6: a name counts for the one class it can be — by its name, or by its @DisplayName.
+    const m6 = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-ran6-"));
+    const mi6 = { moduleRoot: m6, moduleRel: "", multiModule: false };
+    const src6 = (name: string, body: string) => {
+      const p = path.join(m6, "src", "test", "java", "com", "x", `${name}.java`);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, body);
+      return expectedTestOf(body, p, "created")!;
+    };
+    const reports6 = path.join(m6, "target", "surefire-reports");
+    fs.mkdirSync(reports6, { recursive: true });
+    const report6 = (name: string, body: string) => fs.writeFileSync(path.join(reports6, name), body);
+    const clear6 = () => fs.readdirSync(reports6).forEach((e) => fs.rmSync(path.join(reports6, e)));
+    const suite6 = (name: string) => `<testsuite name="${name}" tests="1" skipped="0"><testcase name="a" classname="${name}"/></testsuite>`;
+    const since6 = Date.now() - 10_000;
+    const calc6 = src6("CalcTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass CalcTest { @Test void a() {} }\n');
+    src6("OrderTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("訂單測試")\nclass OrderTest { @Test void a() {} }\n');
+    // Every report by a @DisplayName (usePhrasedFileName): what goes by which class is still known.
+    report6("TEST-訂單測試.xml", suite6("訂單測試"));
+    const allPhrased = checkTestsRan("maven", mi6, since6, "[INFO] Running 訂單測試\n[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in 訂單測試", [calc6]);
+    check(
+      "checkTestsRan：報告全都以 @DisplayName 命名、模組裡每個類別都有 @DisplayName → 對得回類別（不是看不到）：沒被執行的 CalcTest 判沒執行；reported 列的是類別名",
+      allPhrased?.notRun.map((t) => t.fqcn).join() === "com.x.CalcTest" && JSON.stringify(allPhrased.reported) === '["com.x.OrderTest"]',
+      JSON.stringify([allPhrased?.notRun.map((t) => t.fqcn), allPhrased?.reported]),
+    );
+    clear6();
+    // Reports written elsewhere: the phrased "Running" lines are all there is.
+    const runningOnly = checkTestsRan(
+      "maven",
+      mi6,
+      since6,
+      "[INFO] Running 計算機測試\n[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in 計算機測試\n[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0",
+      [calc6],
+    );
+    check(
+      "checkTestsRan：報告寫到別處、只有 phrased 的 Running 行（「Running 計算機測試」）→ 對回 CalcTest，它有執行",
+      runningOnly?.notRun.length === 0 && JSON.stringify(runningOnly.reported) === '["com.x.CalcTest"]',
+      JSON.stringify(runningOnly),
+    );
+    report6("TEST-計算機測試(unit).xml", suite6("計算機測試(unit)"));
+    check(
+      "checkTestsRan：reportNameSuffix 下 phrased 的名字是「計算機測試(unit)」→ 算 CalcTest 的",
+      checkTestsRan("maven", mi6, since6, "", [calc6])?.notRun.length === 0,
+    );
+    clear6();
+    // A @DisplayName that is another class's name: "com.x.HiddenSpec" is two classes' name, and neither's.
+    const hidden6 = src6("HiddenSpec", "package com.x;\nimport org.junit.jupiter.api.*;\nclass HiddenSpec { @Test void a() { Assertions.fail(); } }\n");
+    src6("SpoofTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("com.x.HiddenSpec")\nclass SpoofTest { @Test void a() {} }\n');
+    report6("TEST-com.x.SpoofTest.xml", suite6("com.x.HiddenSpec"));
+    report6("TEST-com.x.OrderTest.xml", suite6("com.x.OrderTest"));
+    const spoofLog = "[INFO] Running com.x.HiddenSpec\n[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.HiddenSpec";
+    const spoofed = checkTestsRan("maven", mi6, since6, spoofLog, [hidden6], [], true);
+    check(
+      "checkTestsRan：@DisplayName(\"com.x.HiddenSpec\") 的 SpoofTest 跑了（報告裡、Running 行都叫 com.x.HiddenSpec）→ HiddenSpec 本身沒執行；報告檔名以類別命名時，SpoofTest 自己的檔照樣算它的",
+      spoofed?.notRun.map((t) => t.fqcn).join() === "com.x.HiddenSpec" && spoofed.reported.includes("com.x.SpoofTest") && !spoofed.reported.includes("com.x.HiddenSpec"),
+      JSON.stringify([spoofed?.notRun.map((t) => t.fqcn), spoofed?.reported]),
+    );
+    report6("TEST-com.x.HiddenSpec.xml", suite6("com.x.HiddenSpec"));
+    check(
+      "checkTestsRan：HiddenSpec 真的有以它的類別命名的報告（檔名都以類別命名）→ 算它有執行",
+      checkTestsRan("maven", mi6, since6, spoofLog, [hidden6])?.notRun.length === 0,
+    );
+    clear6();
+    // Two classes by one @DisplayName, every report file by its class (not phrased): not run is not about a shared name.
+    src6("OrderTwinTest", 'package com.x;\nimport org.junit.jupiter.api.*;\n@DisplayName("計算機測試")\nclass OrderTwinTest { @Test void a() {} }\n');
+    report6("TEST-com.x.OrderTwinTest.xml", suite6("計算機測試"));
+    const twin = checkTestsRan("maven", mi6, since6, "", [calc6]);
+    check(
+      "checkTestsRan：同一個 @DisplayName 的另一個類別跑了、報告檔以類別命名 → CalcTest 沒執行，回饋不說是名字撞了",
+      twin?.notRun.map((t) => t.fqcn).join() === "com.x.CalcTest" && twin.notRun[0].sharedName === undefined,
+      JSON.stringify(twin?.notRun),
+    );
+    fs.rmSync(m6, { recursive: true, force: true });
+  }
+  check(
+    "normalizeMavenLog：Maven logger 的前綴（showDateTime 的各種格式、showThreadName 的 [main]／[ThreadedStreamConsumer]）照 Maven 自己第一行的樣子拿掉；沒有前綴、或不是 Maven 自己的行 → 原樣",
+    normalizeMavenLog("2026-09-30T11:57:23.042Z [INFO] Scanning for projects...\n2026-09-30T11:57:24.001Z [ERROR] Tests run: 1, Failures: 1\nhello 12:00\n") ===
+      "[INFO] Scanning for projects...\n[ERROR] Tests run: 1, Failures: 1\nhello 12:00\n" &&
+      normalizeMavenLog("2026-09-30 11:56:24 [INFO] Scanning for projects...\n2026-09-30 11:56:25 [WARNING] Tests run: 2\n") === "[INFO] Scanning for projects...\n[WARNING] Tests run: 2\n" &&
+      normalizeMavenLog("11:56:24,123 [INFO] Scanning for projects...\n11:56:25,004 [INFO] --- surefire:3.2.5:test (default-test) @ web ---\n") ===
+        "[INFO] Scanning for projects...\n[INFO] --- surefire:3.2.5:test (default-test) @ web ---\n" &&
+      normalizeMavenLog("[main] [INFO] Scanning for projects...\n[ThreadedStreamConsumer] [INFO] Running com.x.CalcTest\n[stdout] [x] hi\n") ===
+        "[INFO] Scanning for projects...\n[INFO] Running com.x.CalcTest\n[stdout] [x] hi\n" &&
+      normalizeMavenLog("[INFO] Scanning for projects...\n[main] [INFO] odd\n") === "[INFO] Scanning for projects...\n[main] [INFO] odd\n",
+  );
+
+  // A TestNG class skipped whole (a SkipException in its @BeforeClass): only TEST-TestSuite.xml, every case of it skipped.
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3" skipped="2"><testcase name="a" classname="com.x.NewTest"><skipped/></testcase><testcase name="b" classname="com.x.NewTest"><skipped message="no db"/></testcase><testcase name="c" classname="com.x.OldTest"/></testsuite>');
+  const ngSkipped = checkTestsRan("maven", mi, since, "", [newTest]);
+  check(
+    "checkTestsRan：只在 TestNG 的 TEST-TestSuite.xml 裡、它的每個 case 都 skipped → 全部被略過（suite 的總數不算）",
+    ngSkipped?.notRun.length === 0 && ngSkipped.allSkipped.length === 1 && ngSkipped.allSkipped[0].tests === 2,
+    JSON.stringify(ngSkipped?.allSkipped),
+  );
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="3" skipped="1"><testcase name="a" classname="com.x.NewTest"><skipped/></testcase><testcase name="b" classname="com.x.NewTest"><system-out><![CDATA[<skipped/>]]></system-out></testcase><testcase name="c" classname="com.x.OldTest"/></testsuite>');
+  check(
+    "checkTestsRan：suite 裡它有一個 case 真的跑了（輸出裡的 <skipped/> 是文字）→ 不算全部被略過",
+    checkTestsRan("maven", mi, since, "", [newTest])?.allSkipped.length === 0,
+  );
+  fs.rmSync(path.join(reports, "TEST-TestSuite.xml"));
+  // A JUnit 4 Suite member skipped by an assumption in its @BeforeClass: one case, no name, skipped.
+  report("TEST-com.x.AllTests.xml", '<testsuite name="com.x.AllTests" tests="2" skipped="1"><testcase name="" classname="com.x.NewTest"><skipped/></testcase><testcase name="a" classname="com.x.OldTest"/></testsuite>');
+  const suiteSkipped = checkTestsRan("maven", mi, since, "", [newTest]);
+  check(
+    "checkTestsRan：JUnit 4 Suite 的成員，報告裡只有一個沒有名字、skipped 的 case → 全部被略過",
+    suiteSkipped?.notRun.length === 0 && suiteSkipped.allSkipped.length === 1,
+    JSON.stringify(suiteSkipped),
+  );
+  fs.rmSync(path.join(reports, "TEST-com.x.AllTests.xml"));
+  // A suite's failure is its failing cases' classes', where the module has their source.
+  report(
+    "TEST-TestSuite.xml",
+    '<testsuite name="TestSuite" tests="3" failures="2"><testcase name="a" classname="com.x.NewTest"><failure message="x"/></testcase><testcase name="b" classname="com.x.OldTest"/><testcase name="c" classname="org.other.ElsewhereTest"><failure/></testcase></testsuite>',
+  );
+  check(
+    "testOnlyFailures：suite 報告（TEST-TestSuite.xml）的失敗算在失敗案例自己的類別上（模組裡有它的原始碼時）",
+    JSON.stringify(testOnlyFailures("maven", mi, since, "")?.map((f) => f.cls)) === JSON.stringify(["com.x.NewTest"]),
+    JSON.stringify(testOnlyFailures("maven", mi, since, "")),
+  );
+  report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="1" failures="1"><testcase name="c" classname="org.other.ElsewhereTest"><failure/></testcase></testsuite>');
+  check(
+    "testOnlyFailures：失敗案例的類別在模組裡沒有原始碼 → 照舊是 suite 名",
+    JSON.stringify(testOnlyFailures("maven", mi, since, "")?.map((f) => f.cls)) === JSON.stringify(["TestSuite"]),
+    JSON.stringify(testOnlyFailures("maven", mi, since, "")),
+  );
+  fs.rmSync(path.join(reports, "TEST-TestSuite.xml"));
+  check(
+    "testCountsInLog：每個類別那行的 Tests run 與 Skipped（3.x 的「-- in」、2.x 的「- in」），同一個類別加總",
+    JSON.stringify([
+      ...testCountsInLog(
+        [
+          "[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.01 s -- in com.x.CalcTest",
+          "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s - in com.x.OldTest",
+          "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.01 s -- in com.x.CalcTest$Inner",
+          "[WARNING] Tests run: 6, Failures: 0, Errors: 0, Skipped: 3",
+        ].join("\n"),
+      ),
+    ]) === JSON.stringify([["com.x.CalcTest", { tests: 2, skipped: 2 }], ["com.x.OldTest", { tests: 3, skipped: 0 }], ["com.x.CalcTest$Inner", { tests: 1, skipped: 1 }]]),
+  );
+  check(
+    "outerClassName：Java 類名在 $ 切到外層類別；不是類名的名字（有空白、標點的 @DisplayName；$ 後面接數字的「NT$1000折扣」）原樣",
+    outerClassName("com.x.CalcTest$Inner") === "com.x.CalcTest" &&
+      outerClassName("com.x.計算$內") === "com.x.計算" &&
+      outerClassName("com.x.CalcTest$_Inner") === "com.x.CalcTest" &&
+      outerClassName("滿 NT$1000 折 NT$100") === "滿 NT$1000 折 NT$100" &&
+      outerClassName("NT$1000折扣") === "NT$1000折扣" &&
+      outerClassName("計算機測試 加法") === "計算機測試 加法",
+  );
+  check(
+    "reportContents：testsuite 的名字、每個 classname 的 case 數與 skipped 數；CDATA 裡的標記是文字",
+    (() => {
+      const r = reportContents('<testsuite name="S"><testcase name="a" classname="p.A"/><testcase name="b" classname="p.A"><skipped/></testcase><testcase name="c" classname="p.B"><system-out><![CDATA[<testcase classname="p.C"/>]]></system-out></testcase></testsuite>');
+      return JSON.stringify(r.names.sort()) === JSON.stringify(["S", "p.A", "p.B"]) && r.cases.get("p.A")?.tests === 2 && r.cases.get("p.A")?.skipped === 1 && r.cases.get("p.B")?.skipped === 0 && !r.cases.has("p.C");
+    })(),
+  );
+
+  // Tests that failed and then passed when run again: green, and no evidence that they pass.
+  {
+    const retryXml =
+      '<testsuite name="com.x.RetryTest"><testcase name="a" classname="com.x.RetryTest"><failure message="1"/></testcase><testcase name="a" classname="com.x.RetryTest"/>' +
+      '<testcase name="b" classname="com.x.StillTest"><failure/></testcase><testcase name="c" classname="com.x.SkipTest"><skipped/></testcase><testcase name="c" classname="com.x.SkipTest"><failure/></testcase>' +
+      '<testcase name="e" classname="com.x.LateTest"/><testcase name="e" classname="com.x.LateTest"><failure/></testcase>' +
+      '<testcase name="d" classname="com.x.TextTest"><system-out><![CDATA[<flakyFailure/>]]></system-out></testcase></testsuite>';
+    check(
+      "flakyClassesInReport：surefire 的 <flakyFailure>/<flakyError>；會重試的 Gradle 建置裡失敗之後同名的通過；不會重試時同名一敗一過不算、通過在失敗之前不算；真的失敗、略過、輸出裡的文字都不算",
+      JSON.stringify(
+        flakyClassesInReport(
+          '<testsuite name="com.x.CalcTest"><testcase name="a" classname="com.x.CalcTest"><flakyFailure message="x"/></testcase>' +
+            '<testcase name="b" classname="com.x.CalcTest$Inner"><flakyError/></testcase></testsuite>',
+        ),
+      ) === JSON.stringify(["com.x.CalcTest"]) &&
+        JSON.stringify(flakyClassesInReport(retryXml, true)) === JSON.stringify(["com.x.RetryTest"]) &&
+        JSON.stringify(flakyClassesInReport(retryXml, false)) === "[]",
+      JSON.stringify([flakyClassesInReport(retryXml, true), flakyClassesInReport(retryXml, false)]),
+    );
+  }
+  {
+    // Measured: TestNG 7.5 on surefire 2.22.2 and 3.2.5, a retry analyzer that retries once.
+    const cp = (jars: string) => `<properties><property name="surefire.test.class.path" value="/w/target/test-classes:${jars}"/></properties>`;
+    const ngXml = (props: string) =>
+      `<testsuite name="com.x.NgTest" tests="4" skipped="2">${props}<testcase name="add" classname="com.x.NgTest"><skipped message="expected [2] but found [1]"/></testcase><testcase name="add" classname="com.x.NgTest"/>` +
+      '<testcase name="other" classname="com.x.NgTest"/><testcase name="off" classname="com.x.OffTest"><skipped message="not today"/></testcase></testsuite>';
+    // JUnit 5 under the phrased reporter: a @DisplayName given twice, one of the two @Disabled.
+    const disabledTwin =
+      `<testsuite name="計算機測試" tests="2" skipped="1">${cp("/m2/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar")}` +
+      '<testcase name="加法" classname="計算機測試"><skipped message="void com.x.CalcTest.old() is @Disabled"/></testcase><testcase name="加法" classname="計算機測試"/></testsuite>';
+    check(
+      "flakyClassesInReport：TestNG 的 retry analyzer 把失敗的那次記成 skipped、再記一次同名的通過 → 不穩定（實測 TestNG 7.5）——TestNG 在 test classpath 上、報告沒有 classpath、或呼叫端說會跑 TestNG；JUnit 5 同一個 @DisplayName 一個 @Disabled 一個通過不算",
+      JSON.stringify(flakyClassesInReport(ngXml(""))) === JSON.stringify(["com.x.NgTest"]) &&
+        JSON.stringify(flakyClassesInReport(ngXml(cp("/m2/org/testng/testng/7.5/testng-7.5.jar")))) === JSON.stringify(["com.x.NgTest"]) &&
+        JSON.stringify(flakyClassesInReport(ngXml(cp("/m2/junit/junit/4.13.2/junit-4.13.2.jar")))) === "[]" &&
+        JSON.stringify(flakyClassesInReport(disabledTwin)) === "[]" &&
+        JSON.stringify(flakyClassesInReport(ngXml(""), false, false)) === "[]" &&
+        JSON.stringify(flakyClassesInReport(ngXml(cp("/m2/junit/junit/4.13.2/junit-4.13.2.jar")), false, true)) === JSON.stringify(["com.x.NgTest"]),
+      JSON.stringify([flakyClassesInReport(ngXml("")), flakyClassesInReport(disabledTwin)]),
+    );
+  }
+  check(
+    "flakyClassesInLog：3.x 的「Flakes:」（類別.方法）、2.22 的（類別.方法(類別)）與 2.20 以前的「Flaked tests:」；讀到 Tests run 就停",
+    JSON.stringify(
+      flakyClassesInLog(
+        [
+          "[INFO] Results:",
+          "[INFO] ",
+          "[WARNING] Flakes: ",
+          "[WARNING] com.x.CalcTest.add",
+          "[ERROR]   Run 1: CalcTest.add:11 expected: <3> but was: <4>",
+          "[INFO]   Run 2: PASS",
+          "[INFO] ",
+          "[WARNING] com.x.OrderTest.total(com.x.OrderTest)",
+          "[ERROR]   Run 1: OrderTest.total:9 expected:<3> but was:<4>",
+          "[INFO]   Run 2: PASS",
+          "[INFO] ",
+          "[INFO] ",
+          "[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 2",
+          "[INFO] Running com.x.LaterTest.after",
+        ].join("\n"),
+      ),
+    ) === JSON.stringify(["com.x.CalcTest", "com.x.OrderTest"]) &&
+      JSON.stringify(
+        flakyClassesInLog(
+          ["[INFO] Flaked tests: ", "[INFO] com.x.CalcTest.add(com.x.CalcTest)", "[INFO]   Run 1: CalcTest.add:11 expected:<3> but was:<4>", "[INFO]   Run 2: PASS", "[INFO] ", "[WARNING] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1"].join("\n"),
+        ),
+      ) === JSON.stringify(["com.x.CalcTest"]),
+  );
+  report("TEST-com.x.NewTest.xml", '<testsuite name="com.x.NewTest" tests="1"><testcase name="a" classname="com.x.NewTest"><flakyFailure message="x"/></testcase></testsuite>');
+  report("TEST-com.x.OldTest.xml", '<testsuite name="com.x.OldTest" tests="1"><testcase name="a" classname="com.x.OldTest"><flakyFailure message="x"/></testcase></testsuite>', 60_000);
+  check(
+    "flakyTestClasses：這次建置的報告裡重跑才過的類別（之前的建置留下的不算）；沒有 XML 時看 log 的 Flakes 段",
+    JSON.stringify(flakyTestClasses("maven", mi, since, "")) === JSON.stringify(["com.x.NewTest"]) &&
+      JSON.stringify(flakyTestClasses("maven", mi, Date.now() + 60_000, "[WARNING] Flakes: \n[WARNING] com.x.OldTest.a\n[INFO]   Run 2: PASS\n")) === JSON.stringify(["com.x.OldTest"]),
+  );
+  for (const e of fs.readdirSync(reports)) fs.rmSync(path.join(reports, e));
+
+  // A reactor: an upstream module has a class of the same name, and only its ran.
+  const reactorLog = [
+    "[INFO] -------------------------< com.x:common >--------------------------",
+    "[INFO] Building common 1.0                                           [1/2]",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ common ---",
+    "[INFO] Running com.x.NewTest",
+    "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.NewTest",
+    "[INFO] --- jar:3.3.0:jar (default-jar) @ common ---",
+    "[INFO] -------------------------< com.x:web >--------------------------",
+    "[INFO] Building web 1.0                                           [2/2]",
+    "[INFO] --- surefire:3.2.5:test (default-test) @ web ---",
+    "[INFO] Running com.x.OldTest",
+    "[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s -- in com.x.OldTest",
+  ].join("\n");
+  check(
+    "classesRunInModuleLog：只看目標模組的 surefire 區段；不知道 artifactId 就看最後建置的模組；沒有區段標頭就看整份",
+    classesRunInModuleLog(reactorLog, "web").join() === "com.x.OldTest" &&
+      classesRunInModuleLog(reactorLog, "common").join() === "com.x.NewTest" &&
+      classesRunInModuleLog(reactorLog).join() === "com.x.OldTest" &&
+      classesRunInModuleLog("[INFO] Running com.x.NewTest\n").join() === "com.x.NewTest" &&
+      surefireSections(reactorLog).map((x) => `${x.artifact}:${x.lines.length}`).join() === "common:2,web:2",
+    JSON.stringify(surefireSections(reactorLog)),
+  );
+  check(
+    "surefireSections：測試自己印的「[INFO] Building …」、句中的「--- x @ y ---」、logger 前綴之後或後面還有字的 Maven 標頭都不會切斷區段；時間戳記開頭的標頭照樣認得",
+    classesRunInModuleLog(
+      [
+        "[INFO] --- surefire:3.2.5:test (default-test) @ web ---",
+        "[INFO] Running com.x.AaaReportTest",
+        "[INFO] Building monthly report for 2026-09",
+        "report --- totals @ page ---",
+        // A test that runs an embedded build logs Maven's own lines — after its logger's prefix, or with more after them.
+        "10:00:01.123 [main] INFO  com.x.EmbeddedMaven - [INFO] --- maven-jar-plugin:3.3.0:jar (default-jar) @ inner ---",
+        "[INFO] --- surefire:3.2.5:test (default-test) @ inner --- (quoted by a test)",
+        "[INFO] Running com.x.NewTest",
+        "10:00:01,234 [INFO] --- jacoco:0.8.12:report (report) @ web ---",
+        "[INFO] Running com.x.NotSurefire",
+      ].join("\n"),
+      "web",
+    ).join() === "com.x.AaaReportTest,com.x.NewTest",
+    JSON.stringify(surefireSections("[INFO] --- surefire:3.2.5:test (default-test) @ web ---\n[INFO] Building x\n[INFO] Running com.x.NewTest")),
+  );
+  const upstreamOnly = checkTestsRan("maven", mi, since, reactorLog, [newTest]);
+  check(
+    "checkTestsRan：上游模組跑了同名的 com.x.NewTest，目標模組沒有 → 不算目標模組的執行過",
+    upstreamOnly?.notRun.map((t) => t.fqcn).join() === "com.x.NewTest",
+    JSON.stringify(upstreamOnly),
+  );
   // TestNG: one TEST-TestSuite.xml for everything — its classes are what ran, and what to protect.
   src("NgTest", "package com.x;\nimport org.testng.annotations.Test;\npublic class NgTest { @Test public void a() {} }\n");
   report("TEST-TestSuite.xml", '<testsuite name="TestSuite" tests="1"><testcase name="a" classname="com.x.NgTest" time="0"/></testsuite>');
@@ -5088,6 +5807,1602 @@ console.log("\n[27] writer 的測試有沒有真的被執行（checkTestsRan）�
   );
   fs.rmSync(g, { recursive: true, force: true });
   fs.rmSync(m, { recursive: true, force: true });
+}
+
+console.log("\n[28] 接續先前的執行（libs/resume.ts：通過紀錄與比對）");
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-resume-"));
+  const put = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), content);
+  };
+  const FOO = "m/src/main/java/com/x/Foo.java";
+  const BAR = "m/src/main/java/com/x/Bar.java";
+  const FOO_T = "m/src/test/java/com/x/FooTest.java";
+  const BAR_T = "m/src/test/java/com/x/BarTest.java";
+  const HELPER = "m/src/test/java/com/x/Helper.java";
+  const RES = "m/src/test/resources/data.json";
+  const GONE = "m/src/test/java/com/x/OldFooTest.java";
+  for (const [rel, c] of [[FOO, "class Foo {}"], [BAR, "class Bar {}"], [FOO_T, "class FooTest {}"], [BAR_T, "class BarTest {}"], [HELPER, "class Helper {}"], [RES, "{}"]]) put(rel, c);
+
+  check("hashFile：沒有檔案 → null", hashFile(path.join(root, "nope.java")) === null);
+  check("hashFile：檔案內容的 sha256", hashFile(path.join(root, FOO)) === sha256("class Foo {}"));
+  const dirHash = hashFile(path.join(root, "m"));
+  check("hashFile：讀不了的（目錄）→ 一個誰都對不上的值，不是 null", dirHash !== null && dirHash.startsWith("unreadable:"), String(dirHash));
+
+  const testsOf = (cls: string) => (cls === FOO ? [FOO_T] : cls === BAR ? [BAR_T.replace(/\//g, "\\")] : []);
+  const entries = passedEntries({
+    classes: [FOO, BAR],
+    repoRoot: root,
+    testsOf,
+    written: [FOO_T, BAR_T, HELPER.replace(/\//g, "\\"), RES, GONE],
+    testTree: "m/src/test",
+    rubric: "r1",
+    verdict: { scores: { effectiveness: 8 }, blockers: [] },
+    dir: "/runs/a/batch-1-Foo",
+    at: "2026-01-01T00:00:00.000Z",
+  });
+  const foo = entries.find((e) => e.cls === FOO)!;
+  const bar = entries.find((e) => e.cls === BAR)!;
+  check(
+    "passedEntries：每個類別記下自己的測試檔與那批寫的共用檔，不含別的類別的測試",
+    JSON.stringify(Object.keys(foo.files)) === JSON.stringify([FOO_T, HELPER, GONE, RES].sort()) &&
+      JSON.stringify(Object.keys(bar.files)) === JSON.stringify([BAR_T, HELPER, GONE, RES].sort()),
+    JSON.stringify([Object.keys(foo.files), Object.keys(bar.files)]),
+  );
+  check("passedEntries：Windows 的反斜線路徑一律存成 /", !JSON.stringify(entries).includes("\\\\"), JSON.stringify(entries).slice(0, 300));
+  check("passedEntries：那批刪掉的檔記成 null（之後也必須不存在）", foo.files[GONE] === null);
+  check("passedEntries：類別與檔案都記內容的 sha256", foo.source === sha256("class Foo {}") && foo.files[FOO_T] === sha256("class FooTest {}"));
+
+  const hashOf = (rel: string) => hashFile(path.join(root, rel));
+  check("entryMismatch：什麼都沒變 → 相符", entryMismatch(foo, hashOf, [FOO_T]) === undefined);
+  put(FOO, "class Foo { int x; }");
+  check("entryMismatch：類別改過 → 說出來", entryMismatch(foo, hashOf, [FOO_T]) === "Foo.java 在上次通過之後改過", String(entryMismatch(foo, hashOf, [FOO_T])));
+  put(FOO, "class Foo {}");
+  put(HELPER, "class Helper { int y; }");
+  check("entryMismatch：那批寫的共用檔改過", entryMismatch(foo, hashOf, [FOO_T]) === `${HELPER} 在上次通過之後改過`, String(entryMismatch(foo, hashOf, [FOO_T])));
+  put(HELPER, "class Helper {}");
+  fs.rmSync(path.join(root, FOO_T));
+  check("entryMismatch：測試檔被刪了", entryMismatch(foo, hashOf, []) === `${FOO_T} 在上次通過之後被刪除`, String(entryMismatch(foo, hashOf, [])));
+  put(FOO_T, "class FooTest {}");
+  put(GONE, "class OldFooTest {}");
+  check("entryMismatch：當時被刪掉的檔又出現了", entryMismatch(foo, hashOf, [FOO_T]) === `${GONE} 在上次通過之後才出現`, String(entryMismatch(foo, hashOf, [FOO_T])));
+  fs.rmSync(path.join(root, GONE));
+  // Two failed reads say nothing about whether the content is the same.
+  const locked = { ...foo, files: { ...foo.files, [HELPER]: "unreadable:EACCES" } };
+  const lockedNow = (rel: string) => (rel === HELPER ? "unreadable:EACCES" : hashOf(rel));
+  check(
+    "entryMismatch：讀不了的檔（兩次都讀不了）也不算沒變",
+    entryMismatch(locked, lockedNow, [FOO_T]) === `${HELPER} 讀不了，無法確認它沒變`,
+    String(entryMismatch(locked, lockedNow, [FOO_T])),
+  );
+  check(
+    "entryMismatch：類別本身讀不了 → 不算沒變",
+    entryMismatch({ ...foo, source: "unreadable:EACCES" }, (rel) => (rel === FOO ? "unreadable:EACCES" : hashOf(rel)), [FOO_T]) ===
+      "Foo.java 讀不了，無法確認它沒變",
+  );
+  const unit = "m/src/test/java/com/x/FooUnitTest.java";
+  check(
+    "entryMismatch：多了一個當時沒有的測試檔（reviewer 沒看過）",
+    entryMismatch(foo, hashOf, [FOO_T, unit]) === `多了上次通過時沒有的測試檔 ${unit}`,
+    String(entryMismatch(foo, hashOf, [FOO_T, unit])),
+  );
+
+  // Newest run first; an older pass counts when the tree is back to what it passed with.
+  const runs = path.join(root, "runs");
+  const older = path.join(runs, "2026-01-01T00-00-00-000Z");
+  const newer = path.join(runs, "2026-02-01T00-00-00-000Z");
+  const broken = path.join(runs, "2026-03-01T00-00-00-000Z");
+  const future = path.join(runs, "2026-04-01T00-00-00-000Z");
+  const current = path.join(runs, "2026-05-01T00-00-00-000Z");
+  for (const d of [older, newer, broken, future, current]) fs.mkdirSync(d, { recursive: true });
+  writeLedger(older, [foo]);
+  const fooEdited = { ...foo, files: { ...foo.files, [FOO_T]: sha256("class FooTest { edited }") }, dir: "/runs/b/batch-1-Foo" };
+  writeLedger(newer, [fooEdited, { ...bar, verdict: { scores: {}, blockers: "x" } } as unknown as PassedEntry]);
+  fs.writeFileSync(path.join(broken, LEDGER_FILE), "{ not json");
+  fs.writeFileSync(path.join(future, LEDGER_FILE), JSON.stringify({ version: 99, entries: [foo] }));
+  writeLedger(current, [foo]);
+  check("writeLedger：不留下 .tmp", !fs.existsSync(path.join(older, `${LEDGER_FILE}.tmp`)));
+  const ledger = readLedgers(runs, current);
+  check(
+    "readLedgers：新的執行在前；讀不了的、別的版本寫的、欄位不對的、這次自己的都略過",
+    JSON.stringify(ledger.map((e) => [path.basename(e.run), e.cls])) === JSON.stringify([[path.basename(newer), FOO], [path.basename(older), FOO]]),
+    JSON.stringify(ledger.map((e) => [path.basename(e.run), e.cls])),
+  );
+  check("readLedgers：runs 目錄不存在 → 沒有紀錄", readLedgers(path.join(root, "no-runs")).length === 0);
+  const found = findPass(FOO, ledger, hashOf, [FOO_T]);
+  check(
+    "findPass：只看最新的紀錄——它對不上就重做，不退回較舊、記得比較少檔案的那筆",
+    !found.entry && found.mismatch === `${FOO_T} 在上次通過之後改過`,
+    JSON.stringify(found),
+  );
+  check("findPass：最新的紀錄對得上 → 用它", findPass(FOO, readLedgers(runs, newer), hashOf, [FOO_T]).entry?.dir === "/runs/a/batch-1-Foo");
+  put(FOO_T, "class FooTest { something else }");
+  const none = findPass(FOO.replace(/\//g, "\\"), ledger, hashOf, [FOO_T]);
+  check(
+    "findPass：都對不上 → 沒有 entry，理由取最新那筆的；類別路徑用反斜線也認得",
+    !none.entry && none.mismatch === `${FOO_T} 在上次通過之後改過`,
+    JSON.stringify(none),
+  );
+  check("findPass：從沒通過過的類別 → 什麼都沒有（不算要重做）", JSON.stringify(findPass(BAR, ledger, hashOf, [BAR_T])) === "{}");
+  check(
+    "ledgerEntry：只留自己的欄位（讀的時候加上的 run 不帶進新的紀錄）",
+    !("run" in ledgerEntry(ledger[0])) && ledgerEntry(ledger[0]).cls === FOO,
+  );
+
+  check("testClassOf：模組 src/test/java 底下的 .java → 類別名", testClassOf("m/src/test/java/com/x/FooTest.java", "m/src/test/java") === "com.x.FooTest");
+  check("testClassOf：反斜線路徑、根目錄結尾的斜線都行", testClassOf("m\\src\\test\\java\\com\\x\\FooTest.java", "m\\src\\test\\java\\") === "com.x.FooTest");
+  check(
+    "testClassOf：資源檔、別的模組、只是前綴相同的目錄 → 不是測試類別",
+    testClassOf(RES, "m/src/test/java") === undefined &&
+      testClassOf("n/src/test/java/com/x/FooTest.java", "m/src/test/java") === undefined &&
+      testClassOf("m/src/test/javax/FooTest.java", "m/src/test/java") === undefined,
+  );
+  check("testClassOf：模組就是 repo 根", testClassOf("src/test/java/FooTest.java", "src/test/java") === "FooTest");
+
+  // What a test reaches in its tree is part of what it passed with.
+  const T = "m/src/test";
+  put(`${T}/java/com/x/QuxTest.java`, 'package com.x;\nclass QuxTest extends BaseTest { void t() { Fixtures.build(); load("/data/qux.json"); } }\n');
+  put(`${T}/java/com/x/BaseTest.java`, "package com.x;\nabstract class BaseTest { Asserts a; }\n");
+  put(`${T}/java/com/x/Asserts.java`, "package com.x;\nclass Asserts {}\n");
+  put(`${T}/java/com/x/Fixtures.java`, "package com.x;\nclass Fixtures { static void build() {} }\n");
+  put(`${T}/java/com/x/Unrelated.java`, "package com.x;\nclass Unrelated {}\n");
+  put(`${T}/java/com/x/Mentioned.java`, "package com.x;\nclass Mentioned {}\n");
+  put(`${T}/resources/data/qux.json`, "{}");
+  put(`${T}/resources/data/other.json`, "{}");
+  put(`${T}/java/com/x/CommentOnly.java`, "package com.x;\n// see Mentioned\nclass CommentOnly {}\n");
+  const reached = referencedTestFiles([`${T}/java/com/x/QuxTest.java`], root, T);
+  check(
+    "referencedTestFiles：它繼承的、呼叫的（連同那些再引用的）與字串裡點名的資源；沒用到的不算",
+    !reached.partial &&
+      JSON.stringify(reached.files) ===
+        JSON.stringify([`${T}/java/com/x/Asserts.java`, `${T}/java/com/x/BaseTest.java`, `${T}/java/com/x/Fixtures.java`, `${T}/resources/data/qux.json`].sort()),
+    JSON.stringify(reached),
+  );
+  check(
+    "referencedTestFiles：只在註解裡提到的名字不算",
+    !referencedTestFiles([`${T}/java/com/x/CommentOnly.java`], root, T).files.includes(`${T}/java/com/x/Mentioned.java`),
+  );
+  put(
+    `${T}/java/com/x/SqlTest.java`,
+    'package com.x;\n@Sql("classpath:seed.sql")\nclass SqlTest { void t() { load("data\\\\win.json"); load("myqux.json"); } }\n',
+  );
+  put(`${T}/resources/seed.sql`, "");
+  put(`${T}/resources/data/win.json`, "{}");
+  const sql = referencedTestFiles([`${T}/java/com/x/SqlTest.java`], root, T).files;
+  check(
+    "referencedTestFiles：classpath: 開頭、Windows 反斜線路徑裡點名的資源也算；只是名字結尾相同（myqux.json）的不算",
+    JSON.stringify(sql) === JSON.stringify([`${T}/resources/data/win.json`, `${T}/resources/seed.sql`]),
+    JSON.stringify(sql),
+  );
+  // One string after another on a line: each is its own literal (the closing quote of one is not the
+  // opening of a match that swallows the next one's).
+  put(
+    `${T}/java/com/x/ConcatTest.java`,
+    'package com.x;\nclass ConcatTest { char q = \'"\'; void t() { load("fixtures/" + "order.json"); load("classpath:" + "seed.sql"); ' +
+      'assertEquals("expected:", read("expected.txt")); } } // "comment.json"\n',
+  );
+  put(`${T}/resources/fixtures/order.json`, "{}");
+  put(`${T}/resources/expected.txt`, "x");
+  put(`${T}/resources/comment.json`, "{}");
+  const concat = referencedTestFiles([`${T}/java/com/x/ConcatTest.java`], root, T).files;
+  check(
+    "referencedTestFiles：同一行的幾個字串各算各的（\"fixtures/\" + \"order.json\"、\"classpath:\" + \"seed.sql\"）；char 常值裡的引號、註解裡的名字不算",
+    JSON.stringify(concat) ===
+      JSON.stringify([`${T}/resources/expected.txt`, `${T}/resources/fixtures/order.json`, `${T}/resources/seed.sql`]),
+    JSON.stringify(concat),
+  );
+  check(
+    "stringLiterals：一般字串與 text block 的內容，照原文",
+    JSON.stringify(stringLiterals('a("x/y.json"); String t = """\n  {"k": 1}\n  """; char c = \'"\'; b("")')) ===
+      JSON.stringify(["x/y.json", '\n  {"k": 1}\n  ', ""]),
+    JSON.stringify(stringLiterals('a("x/y.json"); String t = """\n  {"k": 1}\n  """; char c = \'"\'; b("")')),
+  );
+  const byName = new Map([["expected.json", ["m/src/test/resources/golden/a/expected.json", "m/src/test/resources/golden/b/expected.json"]]]);
+  check(
+    "resourcesNamed：有路徑就只算那個路徑的（不是每個 expected.json）；只有檔名、或路徑對不上時算同名的每一個",
+    JSON.stringify(resourcesNamed("golden/b/expected.json", byName)) === '["m/src/test/resources/golden/b/expected.json"]' &&
+      JSON.stringify(resourcesNamed("classpath:/golden/a/expected.json", byName)) === '["m/src/test/resources/golden/a/expected.json"]' &&
+      resourcesNamed("expected.json", byName).length === 2 &&
+      resourcesNamed("../elsewhere/expected.json", byName).length === 2 &&
+      resourcesNamed("golden/", byName).length === 0,
+  );
+  check(
+    "resourcesNamed / resourcesUnder：不分大小寫的檔案系統（Windows、macOS）上「Golden/B/Expected.JSON」讀的就是 golden/b/expected.json；分大小寫的不是",
+    JSON.stringify(resourcesNamed("Golden/B/Expected.JSON", byName, true)) === '["m/src/test/resources/golden/b/expected.json"]' &&
+      resourcesNamed("Golden/B/Expected.JSON", byName, false).length === 0 &&
+      JSON.stringify(resourcesUnder("CASES", { dirs: new Map([["cases", ["a/cases/1.json"]]]) }, true)) === '["a/cases/1.json"]' &&
+      resourcesUnder("CASES", { dirs: new Map([["cases", ["a/cases/1.json"]]]) }, false).length === 0,
+  );
+  // A helper naming many same-named fixtures must not use up what the helpers it calls need.
+  const B = "b/src/test";
+  put(
+    `${B}/java/com/x/GoldenTest.java`,
+    'package com.x;\nclass GoldenTest { void t() { Golden.check("expected.json"); } }\n',
+  );
+  put(`${B}/java/com/x/Golden.java`, "package com.x;\nclass Golden { static void check(String n) { JsonCompare.same(n); } }\n");
+  put(`${B}/java/com/x/JsonCompare.java`, "package com.x;\nclass JsonCompare { static void same(String n) {} }\n");
+  for (let i = 0; i < MAX_REFERENCED_RESOURCES + 20; i++) put(`${B}/resources/golden/case${i}/expected.json`, "{}");
+  const golden = referencedTestFiles([`${B}/java/com/x/GoldenTest.java`], root, B);
+  check(
+    "referencedTestFiles：資源超過上限 → 標記 partial，但它呼叫的 helper（連同 helper 呼叫的）照樣記下",
+    golden.partial &&
+      golden.files.includes(`${B}/java/com/x/Golden.java`) &&
+      golden.files.includes(`${B}/java/com/x/JsonCompare.java`) &&
+      golden.files.filter((f) => f.endsWith("expected.json")).length === MAX_REFERENCED_RESOURCES,
+    JSON.stringify({ partial: golden.partial, n: golden.files.length, helpers: golden.files.filter((f) => f.endsWith(".java")) }),
+  );
+  const C = "c/src/test";
+  for (let i = 0; i <= MAX_REFERENCED_CLASSES + 5; i++) put(`${C}/java/com/x/Chain${i}.java`, `package com.x;\nclass Chain${i} { Chain${i + 1} next; }\n`);
+  const chain = referencedTestFiles([`${C}/java/com/x/Chain0.java`], root, C);
+  check(
+    "referencedTestFiles：類別超過上限 → 標記 partial，記下最近的那些",
+    chain.partial && chain.files.length === MAX_REFERENCED_CLASSES && chain.files.includes(`${C}/java/com/x/Chain1.java`),
+    JSON.stringify({ partial: chain.partial, n: chain.files.length }),
+  );
+  const qux = passedEntries({
+    classes: ["m/src/main/java/com/x/Qux.java"],
+    repoRoot: root,
+    testsOf: () => [`${T}/java/com/x/QuxTest.java`],
+    written: [],
+    testTree: T,
+    rubric: "r",
+    verdict: null,
+    dir: "/d",
+    at: "t",
+  })[0];
+  check(
+    "passedEntries：通過紀錄也記下測試引用到的 helper 與資源——事後有人把 helper 掏空，重跑會看到",
+    `${T}/java/com/x/Asserts.java` in qux.files && `${T}/resources/data/qux.json` in qux.files && !(`${T}/java/com/x/Unrelated.java` in qux.files),
+    JSON.stringify(Object.keys(qux.files)),
+  );
+  check(
+    "passedEntries：只因為被引用才記下的檔列在 refs（比對內容，但不是它的測試：不要求執行）；它自己的測試不在其中",
+    JSON.stringify(qux.refs) ===
+      JSON.stringify([`${T}/java/com/x/Asserts.java`, `${T}/java/com/x/BaseTest.java`, `${T}/java/com/x/Fixtures.java`, `${T}/resources/data/qux.json`]) &&
+      !qux.partial &&
+      JSON.stringify(ledgerEntry(qux).refs) === JSON.stringify(qux.refs),
+    JSON.stringify({ refs: qux.refs, partial: qux.partial }),
+  );
+  const goldenEntry = passedEntries({
+    classes: ["b/src/main/java/com/x/Golden.java"],
+    repoRoot: root,
+    testsOf: () => [`${B}/java/com/x/GoldenTest.java`],
+    written: [],
+    testTree: B,
+    rubric: "r",
+    verdict: null,
+    dir: "/d",
+    at: "t",
+  })[0];
+  check(
+    "passedEntries / entryMismatch：引用到的檔超過上限 → 紀錄標記 partial，重跑不接續它（說明原因）",
+    goldenEntry.partial === true &&
+      ledgerEntry(goldenEntry).partial === true &&
+      /超過記錄的上限/.test(entryMismatch(goldenEntry, (rel) => hashFile(path.join(root, rel)), []) ?? ""),
+    entryMismatch(goldenEntry, (rel) => hashFile(path.join(root, rel)), []) ?? "(matched)",
+  );
+
+  // Names resolved as javac resolves them: a helper every package has is the one of the test's own
+  // package, or the one it imports — not every one of that name.
+  const P = "p/src/test";
+  for (const pkg of ["com/x", "com/y", "com/z"]) {
+    const name = pkg.replace(/\//g, ".");
+    put(`${P}/java/${pkg}/Support.java`, `package ${name};\nclass Support { static int one() { return 1; } }\n`);
+  }
+  put(`${P}/java/com/x/SameTest.java`, "package com.x;\nclass SameTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/x/ImportTest.java`, "package com.x;\nimport com.y.Support;\nclass ImportTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/w/DemandTest.java`, "package com.w;\nimport com.z.*;\nclass DemandTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/w/QualifiedTest.java`, "package com.w;\nclass QualifiedTest { void t() { com.y.Support.one(); } }\n");
+  put(`${P}/java/com/w/StaticTest.java`, "package com.w;\nimport static com.z.Support.one;\nclass StaticTest { void t() { one(); } }\n");
+  put(`${P}/java/com/v/NowhereTest.java`, "package com.v;\nclass NowhereTest { void t() { Support.one(); } }\n");
+  put(`${P}/java/com/y/Outer.java`, "package com.y;\nclass Outer { static class Inner {} }\n");
+  put(`${P}/java/com/w/NestedTest.java`, "package com.w;\nimport com.y.Outer.Inner;\nclass NestedTest { Inner i; }\n");
+  put(`${P}/java/com/x/ForeignStaticTest.java`, "package com.x;\nimport static org.acme.Support.one;\nclass ForeignStaticTest { void t() { one(); } }\n");
+  const refsOf = (cls: string) => referencedTestFiles([`${P}/java/${cls}.java`], root, P).files.map((f) => f.slice(`${P}/java/`.length));
+  check(
+    "referencedTestFiles：同名的 helper 以 javac 的解析取——同 package、import、on-demand import、完整類名、static import、巢狀類別的 import；import 的是樹外的同名類別就不是樹裡的；哪裡都看不到的名字不是樹裡的類別",
+    JSON.stringify(refsOf("com/x/SameTest")) === '["com/x/Support.java"]' &&
+      JSON.stringify(refsOf("com/x/ImportTest")) === '["com/y/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/DemandTest")) === '["com/z/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/QualifiedTest")) === '["com/y/Support.java"]' &&
+      JSON.stringify(refsOf("com/w/StaticTest")) === '["com/z/Support.java"]' &&
+      JSON.stringify(refsOf("com/v/NowhereTest")) === "[]" &&
+      JSON.stringify(refsOf("com/w/NestedTest")) === '["com/y/Outer.java"]' &&
+      JSON.stringify(refsOf("com/x/ForeignStaticTest")) === "[]",
+    JSON.stringify(
+      ["com/x/SameTest", "com/x/ImportTest", "com/w/DemandTest", "com/w/QualifiedTest", "com/w/StaticTest", "com/v/NowhereTest", "com/w/NestedTest", "com/x/ForeignStaticTest"].map((c) => [c, refsOf(c)]),
+    ),
+  );
+  // What a test reaches now, walked again: a class added since that javac takes over an import on
+  // demand or java.lang's, a configuration every test runs with — in no fingerprint of the record.
+  {
+    const R = "r/src/test";
+    put(`${R}/java/com/x/ShadowTest.java`, "package com.x;\nimport org.junit.jupiter.api.*;\nclass ShadowTest { @Test void t() { Assertions.assertEquals(1, Math.abs(-1)); Support.one(); } }\n");
+    put(`${R}/java/com/y/Support.java`, "package com.y;\npublic class Support { public static int one() { return 1; } }\n");
+    put(`${R}/java/com/x/UsesY.java`, "package com.x;\nimport com.y.*;\nclass UsesY { int v = Support.one(); }\n");
+    const rec = (tests: string[]) =>
+      passedEntries({
+        classes: ["r/src/main/java/com/x/Shadow.java"],
+        repoRoot: root,
+        testsOf: () => tests,
+        written: [],
+        testTree: R,
+        rubric: "r",
+        verdict: null,
+        dir: "d",
+        at: "t",
+      })[0];
+    const shadowRec = rec([`${R}/java/com/x/ShadowTest.java`]);
+    const usesRec = rec([`${R}/java/com/x/UsesY.java`]);
+    const now = () => indexTestTree(root, R);
+    const same = [reachMismatch(shadowRec, root, now()), reachMismatch(usesRec, root, now())];
+    put(`${R}/java/com/x/Assertions.java`, "package com.x;\nclass Assertions { static void assertEquals(Object a, Object b) {} }\n");
+    const byAssertions = reachMismatch(shadowRec, root, now());
+    fs.rmSync(path.join(root, `${R}/java/com/x/Assertions.java`));
+    put(`${R}/java/com/x/Math.java`, "package com.x;\nclass Math { static int abs(int a) { return 1; } }\n");
+    const byMath = reachMismatch(shadowRec, root, now());
+    fs.rmSync(path.join(root, `${R}/java/com/x/Math.java`));
+    // Declared in another file of the package: javac takes it all the same.
+    put(`${R}/java/com/x/Helpers.java`, "package com.x;\nclass Helpers {}\nclass Support { static int one() { return 0; } }\n");
+    const byOtherFile = reachMismatch(usesRec, root, now());
+    fs.rmSync(path.join(root, `${R}/java/com/x/Helpers.java`));
+    put(`${R}/resources/junit-platform.properties`, "junit.jupiter.extensions.autodetection.enabled=true\n");
+    const byGlobal = reachMismatch(shadowRec, root, now());
+    fs.rmSync(path.join(root, `${R}/resources/junit-platform.properties`));
+    // A record that kept no refs (an older version's) and one that holds a path as absent that nothing reaches now.
+    const noRefs = { ...usesRec, files: { [`${R}/java/com/x/UsesY.java`]: usesRec.files[`${R}/java/com/x/UsesY.java`] }, refs: undefined };
+    const noRefsWhole = { ...usesRec, refs: undefined };
+    const absentRef = { ...usesRec, files: { ...usesRec.files, [`${R}/java/com/x/Support.java`]: null }, refs: [...(usesRec.refs ?? []), `${R}/java/com/x/Support.java`] };
+    check(
+      "reachMismatch：從紀錄的測試重新走一次——沒變 → 相符；之後加的同 package 類別蓋過 on-demand import（org.junit.jupiter.api.* 的 Assertions）、java.lang（Math）、宣告在別的檔的同名類別、新的 junit-platform.properties → 不相符並點名；沒記 refs 的舊紀錄走到它沒記的檔 → 不相符、都記了 → 相符；紀錄說不存在、現在也沒人用到的路徑 → 不影響",
+      same.every((m) => m === undefined) &&
+        /com\/x\/Assertions\.java/.test(byAssertions ?? "") &&
+        /com\/x\/Math\.java/.test(byMath ?? "") &&
+        /com\/x\/Helpers\.java/.test(byOtherFile ?? "") &&
+        /junit-platform\.properties/.test(byGlobal ?? "") &&
+        /com\/y\/Support\.java/.test(reachMismatch(noRefs, root, now()) ?? "") &&
+        reachMismatch(noRefsWhole, root, now()) === undefined &&
+        reachMismatch(absentRef, root, now()) === undefined,
+      JSON.stringify([same, byAssertions, byMath, byOtherFile, byGlobal, reachMismatch(noRefs, root, now()), reachMismatch(absentRef, root, now())]),
+    );
+    // What its tests reach now is more than a walk records: a change beyond it would not be seen.
+    put(`${R}/java/com/x/DirTest.java`, 'package com.x;\nclass DirTest { @org.junit.jupiter.api.Test void t() { String d = "cases/"; } }\n');
+    put(`${R}/resources/cases/c0.json`, "{}\n");
+    const dirRec = rec([`${R}/java/com/x/DirTest.java`]);
+    const dirSame = reachMismatch(dirRec, root, now());
+    for (let k = 1; k <= MAX_REFERENCED_RESOURCES; k++) put(`${R}/resources/cases/c${k}.json`, "{}\n");
+    const dirGrown = reachMismatch(dirRec, root, now());
+    check(
+      "reachMismatch：它的測試現在走到的檔超過記錄的上限（點名的目錄長大了）→ 無法確認，不相符",
+      dirSame === undefined && /超過記錄的上限/.test(dirGrown ?? ""),
+      JSON.stringify([dirSame, dirGrown]),
+    );
+    check(
+      "testClassInTree：任何模組 src/test/java 底下的測試檔 → 類名；其他地方 → undefined",
+      testClassInTree("web/src/test/java/com/x/CalcTest.java") === "com.x.CalcTest" &&
+        testClassInTree("src/test/java/CalcTest.java") === "CalcTest" &&
+        testClassInTree("web/src/main/java/com/x/Calc.java") === undefined &&
+        testClassInTree("web/src/test/resources/a.java.txt") === undefined,
+    );
+  }
+  // Decoded before it is lexed: an MS950 "\" second byte does not end a literal early, and names
+  // outside ASCII are the names on disk.
+  const E = "e/src/test";
+  const big5 = (text: string) =>
+    Buffer.concat(
+      text.split(/(處理成功)/).map((part) => (part === "處理成功" ? Buffer.from([0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c]) : Buffer.from(part))),
+    );
+  fs.mkdirSync(path.join(root, `${E}/java/com/x`), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, `${E}/java/com/x/Ms950Test.java`),
+    big5('package com.x;\nclass Ms950Test { void t() { assertEquals("處理成功", Fixtures.load("expected.json")); } }\n'),
+  );
+  put(`${E}/java/com/x/Fixtures.java`, "package com.x;\nclass Fixtures { static String load(String n) { return n; } }\n");
+  put(`${E}/resources/expected.json`, "{}");
+  put(`${E}/java/com/x/CjkTest.java`, 'package com.x;\nclass CjkTest { String a = "fixtures/訂單.json"; String b = "caf\u00e9.json"; }\n');
+  put(`${E}/resources/fixtures/訂單.json`, "{}");
+  put(`${E}/resources/cafe\u0301.json`, "{}");
+  const ms950Refs = referencedTestFiles([`${E}/java/com/x/Ms950Test.java`], root, E, "MS950").files;
+  check(
+    "referencedTestFiles：以模組的編碼（MS950）解碼後才 lex——「處理成功」第二個 byte 是 \\，同一行後面的 helper 與資源照樣記下",
+    JSON.stringify(ms950Refs) === JSON.stringify([`${E}/java/com/x/Fixtures.java`, `${E}/resources/expected.json`]),
+    JSON.stringify(ms950Refs),
+  );
+  put(`${E}/java/com/x/EscapedTest.java`, 'package com.x;\nclass EscapedTest { String a = "golden\\u002Fescaped.json"; String b = """\n    golden/block.json\n    golden/second.json\n    """; }\n');
+  put(`${E}/resources/golden/escaped.json`, "{}");
+  put(`${E}/resources/golden/block.json`, "{}");
+  put(`${E}/resources/golden/second.json`, "{}");
+  const escapedRefs = referencedTestFiles([`${E}/java/com/x/EscapedTest.java`], root, E).files;
+  check(
+    "referencedTestFiles：字串照 javac 的讀法（\\u002F 是 /）、text block 一行一行看",
+    JSON.stringify(escapedRefs) === JSON.stringify([`${E}/resources/golden/block.json`, `${E}/resources/golden/escaped.json`, `${E}/resources/golden/second.json`]),
+    JSON.stringify(escapedRefs),
+  );
+  const cjkRefs = referencedTestFiles([`${E}/java/com/x/CjkTest.java`], root, E).files;
+  check(
+    "referencedTestFiles：非 ASCII 的資源名（fixtures/訂單.json；檔名是分解形式的 café.json）照樣對得上",
+    JSON.stringify(cjkRefs) === JSON.stringify([`${E}/resources/cafe\u0301.json`, `${E}/resources/fixtures/訂單.json`]),
+    JSON.stringify(cjkRefs),
+  );
+  // Named after the test, never in a string: Spring's CalcTest.sql and CalcTest-context.xml, an
+  // approval file beside the test.
+  const N = "n/src/test";
+  put(`${N}/java/com/x/CalcTest.java`, "package com.x;\nclass CalcTest { void t() {} }\n");
+  put(`${N}/java/com/x/CalcTest.add.approved.txt`, "3");
+  put(`${N}/java/com/x/snapshot.json`, "{}");
+  put(`${N}/java/com/x/UsesSnapshotTest.java`, 'package com.x;\nclass UsesSnapshotTest { String s = "com/x/snapshot.json"; }\n');
+  put(`${N}/resources/com/x/CalcTest.sql`, "");
+  put(`${N}/resources/com/x/CalcTest-context.xml`, "");
+  put(`${N}/resources/CalcTest_expected.json`, "{}");
+  put(`${N}/resources/CalcTestHelper.json`, "{}");
+  put(`${N}/resources/Other.sql`, "");
+  const named = referencedTestFiles([`${N}/java/com/x/CalcTest.java`], root, N).files;
+  check(
+    "referencedTestFiles：以測試命名的檔（CalcTest.sql、CalcTest-context.xml、CalcTest_expected.json、src/test/java 裡的 CalcTest.add.approved.txt）也算；只是開頭相同的名字不算",
+    JSON.stringify(named) ===
+      JSON.stringify(
+        [`${N}/java/com/x/CalcTest.add.approved.txt`, `${N}/resources/CalcTest_expected.json`, `${N}/resources/com/x/CalcTest-context.xml`, `${N}/resources/com/x/CalcTest.sql`].sort(),
+      ),
+    JSON.stringify(named),
+  );
+  check(
+    "referencedTestFiles：src/test/java 裡的非 .java 檔以字串點名也算",
+    JSON.stringify(referencedTestFiles([`${N}/java/com/x/UsesSnapshotTest.java`], root, N).files) === JSON.stringify([`${N}/java/com/x/snapshot.json`]),
+  );
+
+  // What a ledger names is read from inside the repo only; and what is not a regular file is never opened.
+  check(
+    "safeLedgerPath：相對、在 repo 裡；.. 、絕對路徑、磁碟代號都不行",
+    safeLedgerPath("m/src/test/java/A.java") &&
+      !safeLedgerPath("../outside.java") &&
+      !safeLedgerPath("m/../../outside.java") &&
+      !safeLedgerPath("m\\..\\..\\x") &&
+      !safeLedgerPath("/etc/passwd") &&
+      !safeLedgerPath("C:/x") &&
+      !safeLedgerPath(""),
+  );
+  check(
+    "entryMismatch：紀錄裡的路徑跑出 repo → 不讀它、不接續",
+    /不在 repo 裡/.test(entryMismatch({ ...foo, files: { "../../etc/hosts": "x" } }, () => "x", []) ?? ""),
+  );
+  check(
+    "entryMismatch：作廢的紀錄（後來發現它的測試不穩定）→ 說出原因，不接續",
+    entryMismatch({ ...foo, invalid: "它的測試 com.x.FooTest 不穩定" }, hashOf, [FOO_T]) === "它的測試 com.x.FooTest 不穩定" &&
+      ledgerEntry({ ...foo, invalid: "x" }).invalid === "x",
+  );
+  const fifo = path.join(root, "pipe.json");
+  const mk = spawnSync("mkfifo", [fifo]);
+  if (mk.status === 0) {
+    const t0 = Date.now();
+    const h = hashFile(fifo);
+    check("hashFile：FIFO 不打開（會一直等寫入端）→ 讀不了", h === "unreadable:not-a-file" && Date.now() - t0 < 2000, String(h));
+    fs.rmSync(fifo);
+  }
+  const big = Buffer.alloc(3 * 1024 * 1024 + 17, 7);
+  fs.writeFileSync(path.join(root, "big.bin"), big);
+  check("hashFile：分段讀（大檔一樣）", hashFile(path.join(root, "big.bin")) === sha256(big));
+  // A write that cannot finish (a full disk; here a file-size limit): the ledger in place stays whole —
+  // one write(2) can take fewer bytes than it was given, and a cut ledger lets older records count again.
+  if (process.platform !== "win32" && spawnSync("sh", ["-c", "command -v bash"]).status === 0) {
+    const full = path.join(root, "full-disk");
+    fs.mkdirSync(full, { recursive: true });
+    const loaderUrl = new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
+    const resumeUrl = new URL("../libs/resume.ts", import.meta.url).href;
+    const code =
+      `process.on("SIGXFSZ", () => {}); const { writeLedger } = await import(${JSON.stringify(resumeUrl)});` +
+      `try { writeLedger(${JSON.stringify(full)}, Array.from({ length: 200 }, (_, i) => ({ cls: "m/src/main/java/C" + i + ".java", source: "x".repeat(64), files: {}, rubric: "r", verdict: null, dir: "/d", at: "t" }))); console.log("written"); }` +
+      ` catch (e) { console.log("threw " + e.code); }`;
+    const child = spawnSync(
+      "bash",
+      ["-c", `ulimit -f 16; exec ${JSON.stringify(process.execPath)} --import ${loaderUrl} --input-type=module -e ${JSON.stringify(code)}`],
+      { encoding: "utf8" },
+    );
+    const ledgerPath = path.join(full, LEDGER_FILE);
+    let whole = !fs.existsSync(ledgerPath);
+    try {
+      if (!whole) whole = JSON.parse(fs.readFileSync(ledgerPath, "utf8")).entries.length === 200;
+    } catch {
+      whole = false;
+    }
+    check(
+      "writeLedger：寫不完（磁碟滿；這裡以 ulimit -f）→ 丟出錯誤、不換上半份的 passed.json",
+      whole && /threw/.test(child.stdout),
+      `${child.stdout} ${child.stderr.slice(-300)} exists=${fs.existsSync(ledgerPath)}`,
+    );
+  }
+  check(
+    "springLoaded：Spring 會自己載入的（@Component、@TestConfiguration、@Configuration、完整類名的註解）；@ConfigurationProperties 與一般類別不算",
+    springLoaded("@Component class A {}") &&
+      springLoaded("@TestConfiguration\nclass Cfg {}") &&
+      springLoaded("@org.springframework.context.annotation.Configuration class C {}") &&
+      !springLoaded("@ConfigurationProperties class P {}") &&
+      !springLoaded("class Plain { @Test void t() {} }"),
+  );
+  check(
+    "springLoaded：只看 top-level 類別的註解（測試類別裡巢狀的 @TestConfiguration 是它自己的）；JSR-330 的 @Named、@ManagedBean 與 JPA 的 @Entity 也算",
+    springLoaded("@javax.inject.Named class A {}") &&
+      springLoaded("@ManagedBean class B {}") &&
+      springLoaded("@Entity\nclass Order {}") &&
+      !springLoaded("class CalcTest {\n  @TestConfiguration static class Cfg {}\n  @Test void t() {}\n}") &&
+      springLoaded("@ExtendWith({X.class})\n@Configuration\nclass Wired {}\nclass Other {}"),
+  );
+  check(
+    "declaredTypes：package 與每一個 top-level 型別，連同寫在它前面的註解（註解參數裡的 } 不是起點）；巢狀的不算",
+    JSON.stringify(declaredTypes(codeOnly('package com.x;\nimport a.B;\n@A({1, 2})\n@B\npublic class First { class Inner {} record R(int a) {} }\ninterface Second {}\n@interface Third {}\nrecord Fourth(int a) {}\nenum Fifth { X }\n'))) ===
+      JSON.stringify({
+        pkg: "com.x",
+        types: [
+          { name: "First", annotations: "\n@A({1, 2})\n@B\npublic " },
+          { name: "Second", annotations: "\n" },
+          { name: "Third", annotations: "\n@" },
+          { name: "Fourth", annotations: "\n" },
+          { name: "Fifth", annotations: "\n" },
+        ],
+      }),
+    JSON.stringify(declaredTypes(codeOnly('package com.x;\nimport a.B;\n@A({1, 2})\n@B\npublic class First { class Inner {} record R(int a) {} }\ninterface Second {}\n@interface Third {}\nrecord Fourth(int a) {}\nenum Fifth { X }\n'))),
+  );
+
+  // Round 5: names resolved by what the files declare, and what else a test runs with.
+  const W = "w/src/test";
+  const walkOf = (tree: string, files: Record<string, string | Buffer>, charset?: string) => {
+    for (const [rel, content] of Object.entries(files)) put(`${tree}/${rel}`, content as string);
+    return referencedTestFiles([`${tree}/java/com/x/CalcTest.java`], root, tree, charset).files.map((f) => f.slice(tree.length + 1));
+  };
+  const calcUsing = (body: string, head = "") => `package com.x;\n${head}class CalcTest {\n  @org.junit.jupiter.api.Test void t() { ${body} }\n}\n`;
+  check(
+    "referencedTestFiles：一個檔裡的第二個 top-level 類別（Orders 在 TestData.java）照樣找到那個檔；static import 它的成員也是",
+    JSON.stringify(walkOf(`${W}1`, { "java/com/x/CalcTest.java": calcUsing("Orders.total();"), "java/com/x/TestData.java": "package com.x;\nclass TestData {}\nclass Orders { static int total() { return 3; } }\n" })) ===
+      '["java/com/x/TestData.java"]' &&
+      JSON.stringify(walkOf(`${W}2`, { "java/com/x/CalcTest.java": calcUsing("total();", "import static com.x.Orders.total;\n"), "java/com/x/TestData.java": "package com.x;\nclass TestData {}\nclass Orders { static int total() { return 3; } }\n" })) ===
+        '["java/com/x/TestData.java"]',
+  );
+  check(
+    "referencedTestFiles：import 的類別放在和 package 不符的目錄（com/x/Support.java 宣告 com.x.support）→ 以檔案宣告的 package 找到它",
+    JSON.stringify(walkOf(`${W}3`, { "java/com/x/CalcTest.java": calcUsing("Support.one();", "import com.x.support.Support;\n"), "java/com/x/Support.java": "package com.x.support;\npublic class Support { public static int one() { return 1; } }\n" })) ===
+      '["java/com/x/Support.java"]',
+  );
+  check(
+    "referencedTestFiles：以 $ 接在測試名後的資源（@Nested 類別的 CalcTest$Add.sql）也算以測試命名",
+    JSON.stringify(walkOf(`${W}4`, { "java/com/x/CalcTest.java": calcUsing(""), "resources/com/x/CalcTest$Add.sql": "insert into t values (1);\n" })) === '["resources/com/x/CalcTest$Add.sql"]',
+  );
+  check(
+    "referencedTestFiles：非 ASCII 的類別名（測試資料）照樣解析",
+    JSON.stringify(walkOf(`${W}5`, { "java/com/x/CalcTest.java": calcUsing("測試資料.one();"), "java/com/x/測試資料.java": "package com.x;\nclass 測試資料 { static int one() { return 1; } }\n" })) === '["java/com/x/測試資料.java"]',
+  );
+  check(
+    "referencedTestFiles：字串裡的完整類名（@MethodSource(\"com.x.Fixtures#cases\")、Class.forName 的 com.x.Outer$Inner）也算",
+    JSON.stringify(
+      walkOf(`${W}6`, {
+        "java/com/x/CalcTest.java": 'package com.x;\nclass CalcTest {\n  @ParameterizedTest @MethodSource("com.x.Fixtures#cases") void t(int a) {}\n  Object o = Class.forName("com.x.Outer$Inner");\n}\n',
+        "java/com/x/Fixtures.java": "package com.x;\nclass Fixtures { static int[] cases() { return new int[] {1}; } }\n",
+        "java/com/x/Outer.java": "package com.x;\nclass Outer { static class Inner {} }\n",
+      }),
+    ) === '["java/com/x/Fixtures.java","java/com/x/Outer.java"]',
+  );
+  check(
+    "referencedTestFiles：記下的資源（CalcTest-context.xml）裡以完整類名宣告的 stub bean 也跟著記",
+    JSON.stringify(
+      walkOf(`${W}7`, {
+        "java/com/x/CalcTest.java": calcUsing(""),
+        "resources/com/x/CalcTest-context.xml": '<beans><bean id="repo" class="com.x.StubRepo"/></beans>\n',
+        "java/com/x/StubRepo.java": "package com.x;\nclass StubRepo {}\n",
+      }),
+    ) === '["java/com/x/StubRepo.java","resources/com/x/CalcTest-context.xml"]',
+  );
+  const sniffedTest = Buffer.concat([
+    Buffer.from('package com.x;\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() {\n    assertEquals("'),
+    Buffer.from([0xb3, 0x42, 0xb2, 0x7a, 0xa6, 0xa8, 0xa5, 0x5c]), // 處理成功
+    Buffer.from('", Messages.success());\n    String f = "fixtures/'),
+    Buffer.from([0xad, 0x71, 0xb3, 0xe6]), // 訂單
+    Buffer.from('.json";\n  }\n}\n'),
+  ]);
+  put(`${W}8/java/com/x/CalcTest.java`, sniffedTest as unknown as string);
+  check(
+    "referencedTestFiles：模組編碼名稱不明（sniffed）的 MS950 測試——「成功」的 \\ 不會吃掉後面的程式碼，中文的 fixture 名也對得上",
+    JSON.stringify(
+      walkOf(`${W}8`, { "java/com/x/Messages.java": "package com.x;\nclass Messages { static String success() { return null; } }\n", "resources/fixtures/訂單.json": "{}\n" }, "非 UTF-8（名稱不明）"),
+    ) === '["java/com/x/Messages.java","resources/fixtures/訂單.json"]',
+  );
+  check(
+    "referencedTestFiles：看不到的名字（java.lang 的 Math）不是別的 package 的同名類別",
+    JSON.stringify(walkOf(`${W}9`, { "java/com/x/CalcTest.java": calcUsing("Math.max(1, 2);"), "java/com/y/Math.java": "package com.y;\npublic class Math {}\n" })) === "[]",
+  );
+  if (process.platform !== "win32") {
+    const shared = path.join(root, "shared-fixtures");
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(path.join(shared, "order.json"), "{}\n");
+    fs.mkdirSync(path.join(root, `${W}10/resources`), { recursive: true });
+    fs.symlinkSync(shared, path.join(root, `${W}10/resources/fixtures`));
+    fs.symlinkSync(path.join(root, `${W}10/resources`), path.join(shared, "loop")); // a cycle: read once
+    check(
+      "referencedTestFiles：resources 裡的 symlink 目錄照樣走進去（繞回來的只走一次）",
+      JSON.stringify(walkOf(`${W}10`, { "java/com/x/CalcTest.java": calcUsing('String f = "fixtures/order.json";') })) === '["resources/fixtures/order.json"]',
+    );
+  }
+  const globals = {
+    "resources/junit-platform.properties": "junit.jupiter.extensions.autodetection.enabled=true\n",
+    "resources/META-INF/services/org.junit.jupiter.api.extension.Extension": "com.x.GlobalExtension\n",
+    "java/com/x/GlobalExtension.java": "package com.x;\npublic class GlobalExtension implements org.junit.jupiter.api.extension.Extension {}\n",
+    "resources/application.yml": "feature: on\n",
+    "resources/config/application-test.properties": "a=b\n",
+    "resources/schema.sql": "create table t (id int);\n",
+    "resources/other.yml": "x: 1\n",
+    "java/com/x/TestConfig.java": "package com.x;\n@org.springframework.context.annotation.Configuration\nclass TestConfig {}\n",
+    "java/com/x/OtherTest.java": "package com.x;\nclass OtherTest {\n  @TestConfiguration static class Cfg {}\n  @Test void t() {}\n}\n",
+  };
+  const plain = walkOf(`${W}11`, { ...globals, "java/com/x/CalcTest.java": calcUsing("") });
+  const spring = walkOf(`${W}12`, { ...globals, "java/com/x/CalcTest.java": `package com.x;\n@SpringBootTest\nclass CalcTest {\n  @Test void t() {}\n}\n` });
+  check(
+    "referencedTestFiles：每個測試都記下 JUnit／Mockito／logging 自己讀的設定（junit-platform.properties、META-INF/services 與它點名的類別）；不起 Spring 的測試不記 Spring 的",
+    JSON.stringify(plain) === '["java/com/x/GlobalExtension.java","resources/META-INF/services/org.junit.jupiter.api.extension.Extension","resources/junit-platform.properties"]',
+    JSON.stringify(plain),
+  );
+  check(
+    "referencedTestFiles：起 Spring context 的測試另外記下 Spring Boot 自己載入的（application*.yml／config/ 下的、schema.sql、top-level 的 @Configuration）；測試類別裡巢狀的設定與無關的 yml 不記",
+    JSON.stringify(spring) ===
+      JSON.stringify(
+        [
+          "java/com/x/GlobalExtension.java",
+          "java/com/x/TestConfig.java",
+          "resources/META-INF/services/org.junit.jupiter.api.extension.Extension",
+          "resources/application.yml",
+          "resources/config/application-test.properties",
+          "resources/junit-platform.properties",
+          "resources/schema.sql",
+        ].sort(),
+      ),
+    JSON.stringify(spring),
+  );
+
+  {
+    // Spring, beyond what the test's own code says.
+    const walkSpring = (tree: string, files: Record<string, string>, springOn = true) => {
+      for (const [rel, content] of Object.entries(files)) put(`${tree}/${rel}`, content);
+      return referencedTestFiles([`${tree}/java/com/x/CalcTest.java`], root, tree, undefined, undefined, springOn).files.map((f) => f.slice(tree.length + 1));
+    };
+    const springFiles = {
+      "resources/application.yml": "feature: on\n",
+      "resources/spring.properties": "spring.test.constructor.autowire.mode=all\n",
+      "resources/messages_zh_TW.properties": "hello=你好\n",
+      "resources/logback-spring.xml": "<configuration/>\n",
+      "resources/db/migration/V1__init.sql": "create table t (id int);\n",
+      "resources/db/changelog/changes.yaml": "databaseChangeLog: []\n",
+    };
+    const ext = (base: string, imp: string) => ({ ...springFiles, "java/com/x/CalcTest.java": `package com.x;\n${imp}class CalcTest extends ${base} {\n  @org.junit.jupiter.api.Test void t() {}\n}\n` });
+    const external = walkSpring(`${W}20`, ext("AbstractSpringTest", "import com.corp.test.AbstractSpringTest;\n"));
+    const noSpring = walkSpring(`${W}21`, ext("AbstractSpringTest", "import com.corp.test.AbstractSpringTest;\n"), false);
+    const junit3 = walkSpring(`${W}22`, ext("TestCase", "import junit.framework.TestCase;\n"));
+    const metaAnnotated = walkSpring(`${W}23`, {
+      ...springFiles,
+      "java/com/x/CalcTest.java": "package com.x;\nimport com.corp.test.IntegrationTest;\n@IntegrationTest\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() {}\n}\n",
+    });
+    const viaInterface = walkSpring(`${W}24`, ext("Object implements com.corp.test.SpringTestSupport", ""));
+    const wsServer = walkSpring(`${W}25`, { ...springFiles, "java/com/x/CalcTest.java": "package com.x;\n@WebServiceServerTest\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() {}\n}\n" }, false);
+    const all = Object.keys(springFiles).sort();
+    check(
+      "referencedTestFiles(spring)：測試相依有 spring-test 時，繼承模組外的基底類別、掛模組外的註解、實作模組外介面的測試當成會起 Spring context（記下 application.yml、spring.properties、messages*.properties、logback-spring.xml、Flyway／Liquibase 的 migration）；沒有 spring-test、或基底是 JUnit 3 的 TestCase → 不記；@WebServiceServerTest 本身就會起",
+      JSON.stringify(external) === JSON.stringify(all) &&
+        JSON.stringify(metaAnnotated) === JSON.stringify(all) &&
+        JSON.stringify(viaInterface) === JSON.stringify(all) &&
+        JSON.stringify(wsServer) === JSON.stringify(all) &&
+        JSON.stringify(noSpring) === "[]" &&
+        JSON.stringify(junit3) === "[]",
+      JSON.stringify({ external, noSpring, junit3, metaAnnotated, viaInterface, wsServer }),
+    );
+  }
+  check(
+    "springLoaded：一般 helper 裡巢狀的 @Configuration 也算（component scan 會找到它）；測試類別裡巢狀的不算；springStereotypes：帶 @Component 的自訂註解",
+    springLoaded("class Helpers {\n  @Configuration static class Cfg {}\n}\n") &&
+      !springLoaded("class CalcTest {\n  @Configuration static class Cfg {}\n  @Test void t() {}\n}\n") &&
+      JSON.stringify(springStereotypes(codeOnly("package com.x;\n@Component\n@Retention(RUNTIME)\npublic @interface UseCase {}\n@interface Plain {}\n"))) === '["UseCase"]',
+  );
+  {
+    // A stereotype of the module's own, declared in its main sources: a test-tree class carrying it is scanned.
+    put("st/src/main/java/com/x/UseCase.java", "package com.x;\nimport org.springframework.stereotype.Component;\n@Component\npublic @interface UseCase {}\n");
+    put("st/src/test/java/com/x/FakePricing.java", "package com.x;\n@UseCase\nclass FakePricing {}\n");
+    put("st/src/test/java/com/x/CalcTest.java", "package com.x;\n@SpringBootTest\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() {}\n}\n");
+    const idx = indexTestTree(root, "st/src/test");
+    check(
+      "indexTestTree：模組 main 裡宣告的自訂 stereotype（@UseCase 帶 @Component）→ 測試目錄裡掛它的類別算 Spring 會自己載入的",
+      idx.springLoaded.includes("st/src/test/java/com/x/FakePricing.java") &&
+        referencedTestFiles(["st/src/test/java/com/x/CalcTest.java"], root, "st/src/test", undefined, idx).files.includes("st/src/test/java/com/x/FakePricing.java"),
+      JSON.stringify(idx.springLoaded),
+    );
+  }
+  {
+    // Resources named in other ways.
+    const big = "x".repeat(4 * 1024 * 1024 + 1);
+    const t = "rs/src/test";
+    put(`${t}/resources/test-context.xml`, '<beans>\n  <import resource="classpath:stubs-context.xml"/>\n</beans>\n');
+    put(`${t}/resources/stubs-context.xml`, '<beans>\n  <bean class="com.x.StubRepo"/>\n</beans>\n');
+    put(`${t}/java/com/x/StubRepo.java`, "package com.x;\npublic class StubRepo {}\n");
+    put(`${t}/resources/app.properties`, "spring.config.import=classpath:extra.yml\nspring.sql.init.data-locations=classpath:seed.sql\n");
+    put(`${t}/resources/extra.yml`, "a: 1\n");
+    put(`${t}/resources/seed.sql`, "insert into t values (1);\n");
+    put(`${t}/resources/cases/c1.json`, "{}\n");
+    put(`${t}/resources/cases/deep/c2.json`, "{}\n");
+    put(`${t}/resources/other/c3.json`, "{}\n");
+    put(`${t}/resources/golden/a.json`, "{}\n");
+    put("rs/testdata/orders.json", "{}\n");
+    put("rs/src/test/data/rates.csv", "a,b\n");
+    put(`${t}/resources/huge.json`, big);
+    fs.mkdirSync(path.join(root, `${t}/resources`), { recursive: true });
+    fs.writeFileSync(path.join(root, `${t}/resources/utf16.xml`), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<bean class="com.x.Utf16Bean"/>', "utf16le")]));
+    put(`${t}/java/com/x/Utf16Bean.java`, "package com.x;\npublic class Utf16Bean {}\n");
+    const walk = (body: string) => {
+      put(`${t}/java/com/x/CalcTest.java`, `package com.x;\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() { ${body} }\n}\n`);
+      return referencedTestFiles([`${t}/java/com/x/CalcTest.java`], root, t);
+    };
+    const xml = walk('String c = "classpath:test-context.xml";');
+    const props = walk('String c = "app.properties";');
+    const dir = walk('java.nio.file.Path p = java.nio.file.Paths.get("src/test/resources/cases");');
+    const glob = walk('String p = "classpath*:cases/**/*.json";');
+    const moduleRoot = walk('String a = "testdata/orders.json"; String b = "src/test/data/";');
+    const words = walk('String a = "."; String b = "error"; String c = "a.b";');
+    const dirWord = walk('String c = "golden";');
+    const huge = walk('String h = "huge.json";');
+    for (let k = 0; k <= MAX_REFERENCED_RESOURCES; k++) put(`rs/bigdata/case${k}.json`, "{}\n");
+    const bigDir = walk('String d = "bigdata/";');
+    const utf16 = walk('String u = "utf16.xml";');
+    const has = (r: { files: string[] }, ...fs: string[]) => fs.every((f) => r.files.includes(f));
+    check(
+      "referencedTestFiles：資源裡點名的資源（XML 的 <import resource>、properties 的 spring.config.import／data-locations）照樣記；字串是目錄（或 classpath*: 的 pattern）→ 底下每個檔；從模組根算起的路徑（testdata/、src/test/data/）→ 那裡的檔；「.」「error」這種字不是路徑（classpath 上的目錄名「golden」是）；讀不完的大檔、超過上限的目錄 → partial；UTF-16（BOM）的資源照樣讀",
+      has(xml, `${t}/resources/test-context.xml`, `${t}/resources/stubs-context.xml`, `${t}/java/com/x/StubRepo.java`) &&
+        has(props, `${t}/resources/extra.yml`, `${t}/resources/seed.sql`) &&
+        has(dir, `${t}/resources/cases/c1.json`, `${t}/resources/cases/deep/c2.json`) &&
+        !dir.files.includes(`${t}/resources/other/c3.json`) &&
+        has(glob, `${t}/resources/cases/c1.json`, `${t}/resources/cases/deep/c2.json`) &&
+        has(moduleRoot, "rs/testdata/orders.json", "rs/src/test/data/rates.csv") &&
+        !words.partial &&
+        words.files.length === 0 &&
+        has(dirWord, `${t}/resources/golden/a.json`) &&
+        huge.partial &&
+        bigDir.partial &&
+        has(utf16, `${t}/java/com/x/Utf16Bean.java`) &&
+        !xml.partial,
+      JSON.stringify({ xml, props, dir, glob, moduleRoot, words, huge: huge.partial, utf16 }),
+    );
+    fs.rmSync(path.join(root, `${t}/resources/huge.json`));
+  }
+  {
+    // What the build puts on the test classpath beside src/test: Gradle's test fixtures, the pom's testResources.
+    put("tf/src/testFixtures/java/com/x/Fixtures.java", "package com.x;\npublic class Fixtures { public static int one() { return 1; } }\n");
+    put("tf/src/testFixtures/resources/fixture.json", "{}\n");
+    put("tf/src/test/java/com/x/CalcTest.java", 'package com.x;\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() { Fixtures.one(); String f = "fixture.json"; String d = "rates.csv"; }\n}\n');
+    put("tf/pom.xml", "<project><build><testResources><testResource><directory>${project.basedir}/src/test/data</directory></testResource></testResources></build></project>\n");
+    put("tf/src/test/data/rates.csv", "a,b\n");
+    put("tf/src/test/data/junit-platform.properties", "x=y\n");
+    const got = referencedTestFiles(["tf/src/test/java/com/x/CalcTest.java"], root, "tf/src/test").files;
+    check(
+      "referencedTestFiles：Gradle 的 src/testFixtures（類別與資源）與 pom <testResources> 的目錄也在測試的 classpath 上——點名的照樣記，那裡的 junit-platform.properties 也是每個測試都讀的",
+      ["tf/src/testFixtures/java/com/x/Fixtures.java", "tf/src/testFixtures/resources/fixture.json", "tf/src/test/data/rates.csv", "tf/src/test/data/junit-platform.properties"].every((f) => got.includes(f)),
+      JSON.stringify(got),
+    );
+  }
+  {
+    // A resource the batch's writer wrote is one of the record's own files — read for what it names too.
+    put("dr/src/test/resources/cases.json", '{"type": "com.x.CaseBuilder"}\n');
+    put("dr/src/test/java/com/x/CaseBuilder.java", "package com.x;\npublic class CaseBuilder {}\n");
+    put("dr/src/test/java/com/x/CalcTest.java", "package com.x;\nclass CalcTest {\n  @org.junit.jupiter.api.Test void t() {}\n}\n");
+    const got = referencedTestFiles(["dr/src/test/java/com/x/CalcTest.java", "dr/src/test/resources/cases.json"], root, "dr/src/test").files;
+    check(
+      "referencedTestFiles：那批 writer 寫的資源（紀錄自己的檔）裡點名的類別照樣記",
+      got.includes("dr/src/test/java/com/x/CaseBuilder.java") && !got.includes("dr/src/test/resources/cases.json"),
+      JSON.stringify(got),
+    );
+  }
+  check(
+    "resourcesUnder：目錄、結尾的 /、pattern（*、**、classpath*:）→ 底下的檔；不是目錄 → 沒有",
+    (() => {
+      const index = { dirs: new Map([["cases", ["a/cases/1.json", "a/cases/x/2.json"]], ["cases/x", ["a/cases/x/2.json"]]]) };
+      return (
+        JSON.stringify(resourcesUnder("cases", index)) === '["a/cases/1.json","a/cases/x/2.json"]' &&
+        JSON.stringify(resourcesUnder("classpath:cases/", index)) === '["a/cases/1.json","a/cases/x/2.json"]' &&
+        JSON.stringify(resourcesUnder("classpath*:cases/**/*.json", index)) === '["a/cases/1.json","a/cases/x/2.json"]' &&
+        JSON.stringify(resourcesUnder("cases/x/*.json", index)) === '["a/cases/x/2.json"]' &&
+        JSON.stringify(resourcesUnder("nothing", index)) === "[]" &&
+        JSON.stringify(resourcesUnder("*.json", index)) === "[]"
+      );
+    })(),
+  );
+
+  // Only the newest record of a class counts: once each wanted class has one, older ledgers are not read.
+  const L = path.join(root, "ledgers");
+  const [l1, l2, l3] = ["2026-01-01T00-00-00-000Z", "2026-02-01T00-00-00-000Z", "2026-03-01T00-00-00-000Z"].map((d) => path.join(L, d));
+  for (const d of [l1, l2, l3]) fs.mkdirSync(d, { recursive: true });
+  writeLedger(l1, [{ ...foo, dir: "l1" }, { ...bar, dir: "l1" }]);
+  writeLedger(l2, [{ ...bar, dir: "l2" }]);
+  writeLedger(l3, [{ ...foo, dir: "l3" }]);
+  // The oldest one cannot be read at all — opening a FIFO waits for a writer: it must not be opened.
+  const l0 = path.join(L, "2025-12-01T00-00-00-000Z");
+  fs.mkdirSync(l0, { recursive: true });
+  const blocking = spawnSync("mkfifo", [path.join(l0, LEDGER_FILE)]).status === 0;
+  const wantFoo = readLedgers(L, undefined, [FOO]);
+  const wantBoth = readLedgers(L, undefined, [FOO, BAR]);
+  check(
+    `readLedgers(wanted)：只留要的類別、每個只到它最新的那筆為止；都找到了就不再讀更舊的${blocking ? "（更舊的一份打開就會卡住，沒有被打開）" : ""}`,
+    JSON.stringify(wantFoo.map((e) => [e.cls, e.dir])) === JSON.stringify([[FOO, "l3"]]) &&
+      JSON.stringify(wantBoth.map((e) => [e.cls, e.dir])) === JSON.stringify([[FOO, "l3"], [BAR, "l2"]]),
+    JSON.stringify([wantFoo.map((e) => [e.cls, e.dir]), wantBoth.map((e) => [e.cls, e.dir])]),
+  );
+  check(
+    "findPass：最新的紀錄作廢了 → 不退回較舊、仍然相符的那筆",
+    (() => {
+      writeLedger(l3, [{ ...foo, dir: "l3", invalid: "它的測試不穩定" }]);
+      const r = findPass(FOO, readLedgers(L, undefined, [FOO]), hashOf, [FOO_T]);
+      return !r.entry && r.mismatch === "它的測試不穩定";
+    })(),
+  );
+
+  // A ledger that names a class and cannot be read is that class's newest record all the same: void.
+  const unreadableNewest = (content: string) => {
+    fs.writeFileSync(path.join(l3, LEDGER_FILE), content);
+    const r = findPass(FOO, readLedgers(L, undefined, [FOO]), hashOf, [FOO_T]);
+    return r.entry ? "(entry)" : (r.mismatch ?? "(none)");
+  };
+  const good = JSON.stringify({ version: 1, entries: [{ ...foo, dir: "l3" }] }, null, 2);
+  const cut = unreadableNewest(good.slice(0, good.length - 40));
+  const otherVersion = unreadableNewest(JSON.stringify({ version: 2, entries: [{ ...foo, dir: "l3" }] }));
+  const malformed = unreadableNewest(JSON.stringify({ version: 1, entries: [{ cls: FOO, files: "nope" }] }));
+  check(
+    "readLedgers / findPass：最新一份點名了它、卻讀不了（寫到一半、別的版本、那筆格式不對）→ 當成它最新的紀錄、作廢，不回頭用較舊的",
+    /讀不了/.test(cut) && /另一個版本/.test(otherVersion) && /格式不對/.test(malformed),
+    JSON.stringify([cut, otherVersion, malformed]),
+  );
+  {
+    // Newest of all, and no ledger this can read: a directory in its place, a FIFO (it must not wait for a writer).
+    const L2 = path.join(root, "ledgers-unreadable");
+    const [older, newest] = ["2026-01-01T00-00-00-000Z", "2026-02-01T00-00-00-000Z"].map((d) => path.join(L2, d));
+    for (const d of [older, newest]) fs.mkdirSync(d, { recursive: true });
+    writeLedger(older, [{ ...foo, dir: "older" }]);
+    fs.mkdirSync(path.join(newest, LEDGER_FILE));
+    const asDir = findPass(FOO, readLedgers(L2, undefined, [FOO]), hashOf, [FOO_T]);
+    fs.rmSync(path.join(newest, LEDGER_FILE), { recursive: true });
+    const fifo = spawnSync("mkfifo", [path.join(newest, LEDGER_FILE)]).status === 0;
+    const t0 = Date.now();
+    const asFifo = fifo ? findPass(FOO, readLedgers(L2, undefined, [FOO]), hashOf, [FOO_T]) : { mismatch: "讀不了（no mkfifo）" };
+    const quick = Date.now() - t0 < 5000;
+    fs.rmSync(path.join(newest, LEDGER_FILE), { force: true });
+    // A file beside the runs is no run: it holds no ledger.
+    fs.writeFileSync(path.join(L2, "notes.txt"), "x");
+    const beside = readLedgers(L2, undefined, [FOO]);
+    check(
+      "readLedgers：最新的 passed.json 是目錄或 FIFO（讀不了、不等）→ 還沒找到的類別都當作廢，不回頭用較舊的；runs 旁邊的一般檔不是一次執行",
+      !asDir.entry && /讀不了/.test(asDir.mismatch ?? "") && !asFifo.entry && /讀不了/.test(asFifo.mismatch ?? "") && quick && beside.length === 1 && beside[0].dir === "older" && !beside[0].invalid,
+      JSON.stringify([asDir, asFifo, quick, beside]),
+    );
+  }
+  {
+    // javac reads Unicode escapes first: "\u000a" ends the line comment it is in, and what follows is code.
+    const U = "u/src/test";
+    put(`${U}/java/com/x/Hidden.java`, "package com.x;\npublic class Hidden { public static int one() { return 1; } }\n");
+    put(`${U}/java/com/x/CalcTest.java`, "package com.x;\nclass CalcTest {\n  // setup \\u000a int v = Hidden.one();\n  @org.junit.jupiter.api.Test void t() {}\n}\n");
+    check(
+      "referencedTestFiles：註解裡的 \\u000a 是換行（javac 先解開 Unicode 跳脫）→ 它後面的 Hidden 照樣記",
+      referencedTestFiles([`${U}/java/com/x/CalcTest.java`], root, U).files.includes(`${U}/java/com/x/Hidden.java`),
+      JSON.stringify(referencedTestFiles([`${U}/java/com/x/CalcTest.java`], root, U).files),
+    );
+  }
+  const voided = voidEntry({ ...foo, dir: "l3" }, "它的測試 com.x.FooTest 不穩定");
+  check(
+    "voidEntry：留著類別、寫下原因；source 換成讀不了的值（不認得 invalid 的舊版本也不接續）",
+    voided.cls === FOO &&
+      voided.invalid === "它的測試 com.x.FooTest 不穩定" &&
+      voided.source.startsWith("unreadable:") &&
+      entryMismatch(voided, hashOf, [FOO_T]) === "它的測試 com.x.FooTest 不穩定" &&
+      /讀不了/.test(entryMismatch({ ...voided, invalid: undefined }, hashOf, [FOO_T]) ?? ""),
+  );
+
+  // TimeUnitTest.java is TimeUnit's test when there is a TimeUnit, not Time's.
+  put("m/src/main/java/com/x/Time.java", "class Time {}");
+  put("m/src/test/java/com/x/TimeTest.java", "class TimeTest {}");
+  put("m/src/test/java/com/x/TimeUnitTest.java", "class TimeUnitTest {}");
+  check(
+    "findExistingTests：沒有 TimeUnit 這個類別時，TimeUnitTest.java 照舊算 Time 的",
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)) ===
+      JSON.stringify(["m/src/test/java/com/x/TimeTest.java", "m/src/test/java/com/x/TimeUnitTest.java"]),
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)),
+  );
+  put("m/src/main/java/com/x/TimeUnit.java", "class TimeUnit {}");
+  check(
+    "findExistingTests：同一個套件有 TimeUnit 時，TimeUnitTest.java 是它的、不是 Time 的",
+    JSON.stringify(findExistingTests("m/src/main/java/com/x/Time.java", root)) === '["m/src/test/java/com/x/TimeTest.java"]' &&
+      JSON.stringify(findExistingTests("m/src/main/java/com/x/TimeUnit.java", root)) === '["m/src/test/java/com/x/TimeUnitTest.java"]',
+    JSON.stringify([findExistingTests("m/src/main/java/com/x/Time.java", root), findExistingTests("m/src/main/java/com/x/TimeUnit.java", root)]),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+
+  check("gradleTestTaskRan：> Task :test（沒有結果標記）→ 這次有執行", gradleTestTaskRan("> Task :compileTestJava\n> Task :test\n> Task :jacocoTestReport\n") === true);
+  check("gradleTestTaskRan：多模組的 :core:test 也認得", gradleTestTaskRan("> Task :core:test\n") === true);
+  check(
+    "gradleTestTaskRan：UP-TO-DATE／SKIPPED／NO-SOURCE／FROM-CACHE → 這次沒有執行（結果是之前的）",
+    ["UP-TO-DATE", "SKIPPED", "NO-SOURCE", "FROM-CACHE"].every((o) => gradleTestTaskRan(`> Task :test ${o}\n`) === false),
+  );
+  check("gradleTestTaskRan：log 沒有列出 test task（quiet）→ 看不出來（undefined）", gradleTestTaskRan("BUILD SUCCESSFUL in 3s\n") === undefined);
+  check("gradleTestTaskRan：:testClasses、:integrationTest 不是 :test", gradleTestTaskRan("> Task :testClasses\n> Task :integrationTest\n") === undefined);
+  const testng = parseSurefireXml(
+    '<?xml version="1.0"?><testsuite name="TestSuite" tests="2" failures="1" errors="0">' +
+      '<testcase name="add" classname="com.x.CalcTest"><failure message="boom"/></testcase>' +
+      '<testcase name="ok" classname="com.x.OtherTest"/></testsuite>',
+  );
+  check(
+    "parseSurefireXml：TestNG 的 TEST-TestSuite.xml（JUnit 4 的 Suite 也是）——失敗的案例記下它自己的類別（@classname），不只有 suite 名",
+    testng?.suite === "TestSuite" && testng.cases.length === 1 && testng.cases[0].className === "com.x.CalcTest",
+    JSON.stringify(testng),
+  );
+  check(
+    "gradleTestTaskRan：看的是目標自己的 test task（最淺的那個）——子專案或 buildSrc 的 test 有跑，目標的 UP-TO-DATE／SKIPPED 照樣不算",
+    gradleTestTaskRan("> Task :buildSrc:test\n> Task :app:test SKIPPED\n> Task :app:sub:test\n") === false &&
+      gradleTestTaskRan("> Task :buildSrc:test\n> Task :test UP-TO-DATE\n") === false &&
+      gradleTestTaskRan("> Task :app:test\n> Task :app:sub:test UP-TO-DATE\n") === true &&
+      gradleTestTaskRan("> Task :buildSrc:test\n") === undefined,
+  );
+}
+
+console.log("\n[29] 被強制終止的 run（libs/batch.ts：批次的復原日誌）");
+{
+  const here = { host: "box", boot: 29_000_000 };
+  const probeOf = (running: Record<number, string | undefined>, alive: number[] = []) => ({
+    alive: (pid: number) => pid in running || alive.includes(pid),
+    start: (pid: number) => running[pid],
+  });
+  const now = 1_000_000_000_000;
+  const fresh = now - 60_000;
+  const old = now - 10 * 60_000;
+  const stale = 5 * 60_000;
+  const owner = { boot: 29_000_000, pid: 4242, start: "563817" };
+  check("mayBeRunning：同一次開機、那個 pid 還是同一個程序（啟動時間相同）→ 還在跑", mayBeRunning(owner, old, here, probeOf({ 4242: "563817" }), now, stale));
+  check(
+    "mayBeRunning：pid 還在、心跳也新鮮，但啟動時間不同（pid 被重用）→ 已經死了",
+    !mayBeRunning(owner, fresh, here, probeOf({ 4242: "999" }), now, stale),
+  );
+  check("mayBeRunning：pid 已經不在 → 已經死了", !mayBeRunning(owner, fresh, here, probeOf({}), now, stale));
+  check(
+    "mayBeRunning：pid 就是自己的（容器裡 pid 從頭編號）→ 那次執行不可能是自己，已經死了",
+    !mayBeRunning({ ...owner, pid: process.pid }, fresh, here, probeOf({ [process.pid]: "563817" }), now, stale),
+  );
+  check("mayBeRunning：重開機過（開機時間差兩分鐘以上）→ 已經死了", !mayBeRunning({ ...owner, boot: 28_000_000 }, fresh, here, probeOf({ 4242: "563817" }), now, stale));
+  check("mayBeRunning：沒記開機時間 → 已經死了", !mayBeRunning({ pid: 4242, start: "563817" }, fresh, here, probeOf({ 4242: "563817" }), now, stale));
+  check(
+    "mayBeRunning：讀不到啟動時間（Windows）→ pid 還在而且心跳新鮮才算還在跑",
+    mayBeRunning({ ...owner, start: "" }, fresh, here, probeOf({}, [4242]), now, stale) &&
+      !mayBeRunning({ ...owner, start: "" }, old, here, probeOf({}, [4242]), now, stale) &&
+      !mayBeRunning({ ...owner, start: "" }, fresh, here, probeOf({}), now, stale),
+  );
+  // A container sharing the machine's name and boot (host networking) numbers its processes apart.
+  const inBox = { ...here, pidns: "pid:[4026531836]" };
+  check(
+    "mayBeRunning：別的 pid namespace 寫的（共用主機名稱的另一個容器）→ 不問 pid，只看心跳",
+    mayBeRunning({ ...owner, pidns: "pid:[4026532999]" }, fresh, inBox, probeOf({}), now, stale) &&
+      !mayBeRunning({ ...owner, pidns: "pid:[4026532999]" }, old, inBox, probeOf({ 4242: "563817" }), now, stale) &&
+      !mayBeRunning(owner, old, inBox, probeOf({ 4242: "563817" }), now, stale),
+  );
+  check("mayBeRunning：同一個 pid namespace → 照樣問 pid", mayBeRunning({ ...owner, pidns: inBox.pidns }, old, inBox, probeOf({ 4242: "563817" }), now, stale));
+  // A clock stepped between two runs (NTP, a resume from suspend) moves the estimated boot time; the
+  // boot's own id does not move.
+  const booted = { ...here, bootId: "b-1" };
+  check(
+    "sameBoot / samePids / mayBeRunning：兩邊都有 boot_id 就只看它——時鐘被校正、估算的開機時間差了 10 分鐘，照樣是同一次開機；boot_id 不同就算估算相同也不是",
+    sameBoot({ boot: here.boot + 10, bootId: "b-1" }, booted) &&
+      !sameBoot({ boot: here.boot, bootId: "b-2" }, booted) &&
+      sameBoot({ boot: here.boot + 1 }, booted) &&
+      !sameBoot({ boot: here.boot + 10 }, booted) &&
+      samePids({ host: "box", boot: here.boot + 10, bootId: "b-1" }, booted) &&
+      mayBeRunning({ ...owner, boot: owner.boot + 10, bootId: "b-1" }, old, booted, probeOf({ 4242: "563817" }), now, stale) &&
+      !mayBeRunning({ ...owner, bootId: "b-2" }, fresh, booted, probeOf({ 4242: "563817" }), now, stale),
+  );
+  check(
+    "thisHost：Linux 上帶著這次開機的 boot_id",
+    process.platform !== "linux" || /^[0-9a-f-]{36}$/.test(thisHost().bootId ?? ""),
+    JSON.stringify(thisHost()),
+  );
+  check(
+    "samePids：同一台、同一次開機、同一個 pid namespace 才算；都沒有 namespace（Windows、macOS）也算同一個",
+    samePids({ host: "box", boot: 29_000_001 }, here) &&
+      samePids({ host: "box", boot: 29_000_000, pidns: inBox.pidns }, inBox) &&
+      !samePids({ host: "box", boot: 29_000_000, pidns: "pid:[4026532999]" }, inBox) &&
+      !samePids({ host: "box", boot: 29_000_000 }, inBox) &&
+      !samePids({ host: "other", boot: 29_000_000 }, here) &&
+      !samePids({ host: "box", boot: 28_000_000 }, here) &&
+      !samePids({ host: "box", boot: "29000000" }, here),
+  );
+  check(
+    "thisHost：Linux 上帶著自己的 pid namespace",
+    process.platform !== "linux" || /^pid:\[\d+\]$/.test(thisHost().pidns ?? ""),
+    JSON.stringify(thisHost()),
+  );
+
+  const dead = { trace: { written: ["java/com/x/A.java", "java/com/x/B.java"], session: { "java/com/x/C.java": "1:1", "java/com/x/D.java": "1:1", "java/com/y/G.java": "1:1" } }, lastSeen: 5_000 };
+  const nowTree = { "java/com/x/A.java": "2:2", "java/com/x/B.java": "2:2", "java/com/x/C.java": "1:1", "java/com/x/E.java": "3:3" };
+  const mtimes: Record<string, number> = { "java/com/x/A.java": 4_000, "java/com/x/B.java": 5_000 + 60_000 + 1, "java/com/x/E.java": 5_500, "java/com/x": 4_500 };
+  const startedWith = (rel: string) => ["java/com/x/C.java", "java/com/x/D.java", "java/com/y/G.java"].includes(rel);
+  const changed = killedWriterChanges(dead, nowTree, (rel) => mtimes[rel], 60_000, startedWith);
+  check(
+    "killedWriterChanges：日誌記下的，加上開著的 session 之後的差異；死後才改的（超過心跳加寬限）不算",
+    JSON.stringify([...changed.only].sort()) === JSON.stringify(["java/com/x/A.java", "java/com/x/D.java", "java/com/x/E.java"]),
+    JSON.stringify([...changed.only].sort()),
+  );
+  check(
+    "killedWriterChanges：不見了的檔，所在目錄在那之後沒動過 → 算 writer 刪的、放回；目錄也不見了 → 無法判斷，不放回",
+    changed.only.has("java/com/x/D.java") && JSON.stringify(changed.undecided) === '["java/com/y/G.java"]',
+    JSON.stringify(changed),
+  );
+  const later = killedWriterChanges(dead, nowTree, (rel) => ({ ...mtimes, "java/com/x": 5_000 + 60_000 + 1 })[rel], 60_000, startedWith);
+  check(
+    "killedWriterChanges：不見了的檔，所在目錄在那次執行死後又被改過（分支切換、別人刪的）→ 無法判斷，不放回",
+    !later.only.has("java/com/x/D.java") && later.undecided.includes("java/com/x/D.java"),
+    JSON.stringify(later),
+  );
+  check(
+    "killedWriterChanges：沒有開著的 session → 只有日誌記下的",
+    JSON.stringify([...killedWriterChanges({ trace: { written: ["java/X.java"] }, lastSeen: 0 }, nowTree, () => 0, 0, () => true).only]) === '["java/X.java"]',
+  );
+  const createdGone = killedWriterChanges(
+    { trace: { written: ["java/com/x/H.java"] }, lastSeen: 5_000 },
+    {},
+    (rel) => (rel === "java/com/x" ? 9_999_999 : undefined),
+    60_000,
+    () => false,
+  );
+  check(
+    "killedWriterChanges：writer 新增、後來又不見了的檔 → 沒有東西要放回，也不列為「開始時存在、現在不見了」",
+    createdGone.only.size === 0 && createdGone.undecided.length === 0,
+    JSON.stringify({ only: [...createdGone.only], undecided: createdGone.undecided }),
+  );
+  // A move after the death keeps the file's time: new name as old as the writer's own files.
+  const moveStart: TreeCapture = {
+    root: "/t",
+    files: new Map<string, Buffer | null>([
+      ["resources/fixtures/order.json", Buffer.from('{"id":1}')],
+      ["resources/fixtures/empty.json", Buffer.from("")],
+      ["java/com/x/ATest.java", Buffer.from("class ATest {}")],
+    ]),
+    fingerprints: new Map(),
+    dirs: new Set(["resources/fixtures", "java/com/x"]),
+  };
+  const nowFiles: Record<string, string> = {
+    "resources/data/order.json": '{"id":1}',
+    "java/com/x/GreeterTest.java": "class GreeterTest {}",
+    "java/com/x/Copy.java": "class ATest {}",
+  };
+  const moves = movesAfterDeath(
+    new Set(["resources/data/order.json", "java/com/x/GreeterTest.java", "java/com/x/Copy.java"]),
+    ["resources/fixtures/order.json"],
+    moveStart,
+    (rel) => (rel in nowFiles ? Buffer.from(nowFiles[rel]) : undefined),
+  );
+  check(
+    "movesAfterDeath：新檔的內容和一個「無法判斷誰刪的」原檔一模一樣 → 是之後的移動；writer 新寫的、和還在的原檔內容相同的不算",
+    JSON.stringify(moves) === '[{"from":"resources/fixtures/order.json","to":"resources/data/order.json"}]',
+    JSON.stringify(moves),
+  );
+  const emptyStart: TreeCapture = { root: "/t", files: new Map([["resources/empty.txt", Buffer.alloc(0)]]), fingerprints: new Map(), dirs: new Set(["resources"]) };
+  check(
+    "movesAfterDeath：空檔不算移動的證據（writer 新建的任何空檔都會對上）",
+    movesAfterDeath(new Set(["resources/new.txt"]), ["resources/empty.txt"], emptyStart, () => Buffer.alloc(0)).length === 0,
+  );
+  check(
+    "movesAfterDeath：沒有無法判斷的刪除 → 沒有移動（writer 自己在死前的改名照樣撤回）",
+    movesAfterDeath(new Set(["resources/data/order.json"]), [], moveStart, (rel) => (rel in nowFiles ? Buffer.from(nowFiles[rel]) : undefined)).length === 0,
+  );
+
+  // A journal written and read back: what setAside needs, from disk.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-journal-"));
+  const repoRoot = path.join(root, "repo");
+  const tree = path.join(repoRoot, "src", "test");
+  fs.mkdirSync(path.join(tree, "java", "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "ATest.java"), "class ATest {}");
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "BTest.java"), "class BTest { int b; }");
+  fs.writeFileSync(path.join(tree, "java", "com", "x", "Big.json"), "x".repeat(64));
+  const out = path.join(repoRoot, "target", "test-classes");
+  fs.mkdirSync(path.join(out, "com", "x"), { recursive: true });
+  fs.writeFileSync(path.join(out, "com", "x", "ATest.class"), "cafebabe");
+  check("dirIdentity：目錄的 inode@建立時間（不含裝置號碼）；不存在的 → \"\"", /^\d+@\d+$/.test(dirIdentity(repoRoot)) && dirIdentity(path.join(root, "nope")) === "", dirIdentity(repoRoot));
+  check(
+    "sameDirectory：inode 相同、建立時間相同或有一邊不知道 → 同一個；inode 不同、或建立時間都有卻不同 → 不同；舊版的 dev:ino 或空的 → 無從判斷",
+    sameDirectory("12@34", "12@34") === true &&
+      sameDirectory("12@0", "12@34") === true &&
+      sameDirectory("12@34", "13@34") === false &&
+      sameDirectory("12@34", "12@35") === false &&
+      sameDirectory("41:2663439", "12@34") === undefined &&
+      sameDirectory("", "12@34") === undefined,
+  );
+  check(
+    "provenSameDirectory：只有 inode 與（有記錄的）建立時間都相同才算證明——跨機器時唯一的依據",
+    provenSameDirectory("12@34", "12@34") && !provenSameDirectory("12@0", "12@0") && !provenSameDirectory("12@34", "12@35") && !provenSameDirectory("", ""),
+  );
+  const cap = captureTree(tree, { file: 32, total: 1024 });
+  const runs = path.join(root, "runs");
+  const runDir = path.join(runs, "2026-01-01T00-00-00-000Z");
+  const batchDir = path.join(runDir, "batch-2-A");
+  const checkout = { repoRoot, rootId: dirIdentity(repoRoot) };
+  const handle = openJournal(
+    {
+      repoRoot,
+      rootId: checkout.rootId,
+      treeId: dirIdentity(tree),
+      pid: 4243,
+      start: "777",
+      ...thisHost(),
+      runDir,
+      batch: 2,
+      dir: batchDir,
+      targetClasses: ["src/main/java/com/x/A.java"],
+      testTree: tree,
+      treeRel: "src/test",
+    },
+    cap,
+    captureOutputs([out]),
+    50,
+  );
+  const jdir = handle.dir;
+  check(
+    "openJournal：owner.json 也記下開機的 boot_id（寫到一半的日誌只有它可以判斷那次執行活著沒）",
+    process.platform !== "linux" || JSON.parse(fs.readFileSync(path.join(handle.dir, "owner.json"), "utf8")).bootId === thisHost().bootId,
+    fs.readFileSync(path.join(handle.dir, "owner.json"), "utf8"),
+  );
+  check(
+    "openJournal：批次開始時的內容寫成單一檔案（不是一個檔一份）",
+    fs.existsSync(path.join(jdir, "start.bin")) && !fs.existsSync(path.join(jdir, "start")),
+    fs.readdirSync(jdir).join(","),
+  );
+  traceJournal(handle, { written: ["java/com/x/ATest.java"] });
+  // The heartbeat: the journal's time moves while its run lives, and stops once it is closed.
+  const t0 = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(path.join(jdir, "journal.json"), t0, t0);
+  const beatWait = Date.now() + 2_000;
+  while (fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000 && Date.now() < beatWait) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  check("openJournal：心跳在執行期間更新日誌的時間", fs.statSync(path.join(jdir, "journal.json")).mtimeMs > t0.getTime() + 1_000);
+  const nobody = { alive: () => false, start: () => undefined };
+  const found = findJournals(runs, checkout, nobody);
+  const d = found.dead[0];
+  check("findJournals：死掉的 run 留下的日誌找得到，連同 writer 的變更", found.dead.length === 1 && d.trace.written[0] === "java/com/x/ATest.java", JSON.stringify(found).slice(0, 300));
+  const back = d ? journalCapture(d) : undefined;
+  check(
+    "journalCapture：批次開始時的樹原樣讀回（每個檔的內容、太大沒留的指紋、目錄）",
+    !!back &&
+      back.files.get("java/com/x/ATest.java")?.toString() === "class ATest {}" &&
+      back.files.get("java/com/x/BTest.java")?.toString() === "class BTest { int b; }" &&
+      back.files.get("java/com/x/Big.json") === null &&
+      back.fingerprints.get("java/com/x/Big.json") === cap.fingerprints.get("java/com/x/Big.json") &&
+      back.dirs.has("java/com/x") &&
+      back.root === tree,
+  );
+  check("journalOutputs：建置輸出的清單讀回", !!d && [...journalOutputs(d).dirs[0].files].includes("com/x/ATest.class"));
+  const none = (r: ReturnType<typeof findJournals>) => r.dead.length === 0 && r.stale.length === 0 && r.busy.length === 0;
+  check("findJournals：別的 repo 路徑的日誌不理（不算死的、也不丟）", none(findJournals(runs, { ...checkout, repoRoot: "/elsewhere" }, nobody)));
+  const otherMachine = { host: "another-machine", boot: thisHost().boot };
+  const other = findJournals(runs, { ...checkout, rootId: "1@1" }, nobody, otherMachine);
+  check(
+    "findJournals：別台機器寫的日誌（共用 runs 目錄、同一個路徑、它自己的 checkout）→ 不碰、不丟，只計數",
+    none(other) && other.elsewhere === 1,
+    JSON.stringify(other),
+  );
+  // The same inode with no birth time on one side reads as the same directory here — not proof enough
+  // for another machine, whose checkout's inode numbers can coincide (disks provisioned alike).
+  const inodeOnly = findJournals(runs, { ...checkout, rootId: checkout.rootId.replace(/@\d+$/, "@0") }, nobody, otherMachine);
+  check(
+    "findJournals：別台機器的日誌、只有 inode 相同（沒有建立時間可以證明）→ 不當成這個 checkout：不碰、不等",
+    none(inodeOnly) && inodeOnly.elsewhere === 1,
+    JSON.stringify(inodeOnly),
+  );
+  const sameDirsFresh = findJournals(runs, checkout, nobody, otherMachine);
+  const sameDirsDied = findJournals(runs, checkout, nobody, otherMachine, Date.now() + 10 * 60_000);
+  check(
+    "findJournals：別的主機名稱、但證明是同一個目錄（inode 與建立時間都相同：每次換名字的容器掛同一個 volume）→ 只看心跳：新鮮是還在跑，停了就撤回",
+    !provenSameDirectory(checkout.rootId, checkout.rootId) || (sameDirsFresh.busy.length === 1 && sameDirsDied.dead.length === 1),
+    JSON.stringify({ fresh: sameDirsFresh.busy, died: sameDirsDied.dead.length }),
+  );
+  check(
+    "findJournals：這個 checkout 的日誌、它的執行還是同一個程序（啟動時間相同）→ busy（這次不能在它上面開始）",
+    JSON.stringify(findJournals(runs, checkout, { alive: () => true, start: (pid) => (pid === 4243 ? "777" : undefined) }).busy) === JSON.stringify([jdir]),
+  );
+  check(
+    "findJournals：記了啟動時間、現在讀不到（程序已經結束，zombie 照樣回應 kill 0）→ 死了",
+    findJournals(runs, checkout, { alive: () => true, start: () => undefined }).dead.length === 1,
+  );
+  const recloned = findJournals(runs, { ...checkout, rootId: "1@1" }, nobody);
+  check("findJournals：這個路徑現在是另一個 checkout（重新 clone 過）→ 丟掉，不撤回", recloned.dead.length === 0 && /重新 clone/.test(recloned.stale[0]?.why ?? ""), JSON.stringify(recloned));
+  // Read from another container on this machine: same name and boot, its own pid namespace.
+  const container = { ...thisHost(), pidns: "pid:[1]" };
+  const theirCheckout = findJournals(runs, { ...checkout, rootId: "1@1" }, nobody, container, Date.now() + 10 * 60_000);
+  check(
+    "findJournals：另一個容器寫的、checkout 不是這一個（它自己同路徑的 checkout）→ 不丟，只計數",
+    none(theirCheckout) && theirCheckout.elsewhere === 1,
+    JSON.stringify(theirCheckout),
+  );
+  const fromContainer = findJournals(runs, checkout, { alive: () => true, start: () => "777" }, container);
+  check(
+    "findJournals：另一個容器寫的、同一個 checkout（共用的 volume）→ pid 不算數，心跳還新鮮就是還在跑（busy）",
+    fromContainer.busy.length === 1 && fromContainer.dead.length === 0,
+    JSON.stringify(fromContainer),
+  );
+  const containerDied = findJournals(runs, checkout, { alive: () => true, start: () => "777" }, container, Date.now() + 10 * 60_000);
+  check(
+    "findJournals：另一個容器寫的、同一個 checkout、心跳停了 → 死了，撤回",
+    containerDied.dead.length === 1,
+    JSON.stringify(containerDied).slice(0, 300),
+  );
+  fs.writeFileSync(path.join(runDir, "summary.json"), "{}");
+  const ended = findJournals(runs, checkout, nobody);
+  check("findJournals：那次執行有 summary.json（有收尾）→ 日誌是剩下的，列為可丟", ended.dead.length === 0 && ended.stale[0]?.dir === jdir, JSON.stringify(ended));
+  fs.rmSync(path.join(runDir, "summary.json"));
+  fs.writeFileSync(path.join(jdir, "trace.json"), "");
+  const lost = findJournals(runs, checkout, nobody);
+  check(
+    "findJournals：trace.json 讀不了（斷電後的空檔、損毀）→ 不丟日誌：照樣撤回，標記 trace 不見了（改用那批開始之後的所有變更）",
+    lost.dead.length === 1 && lost.dead[0].traceLost === true && lost.stale.length === 0,
+    JSON.stringify(lost).slice(0, 300),
+  );
+  fs.writeFileSync(path.join(jdir, "trace.json"), '{"written":["../../../outside.txt"]}');
+  check("findJournals：trace 點名測試目錄以外的路徑 → 當成讀不了", findJournals(runs, checkout, nobody).dead[0]?.traceLost === true);
+  fs.rmSync(path.join(jdir, "trace.json"));
+  const journalOk = fs.readFileSync(path.join(jdir, "journal.json"), "utf8");
+  const tamper = (patch: Record<string, unknown>) => {
+    fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ ...JSON.parse(journalOk), ...patch }));
+    const r = findJournals(runs, checkout, nobody);
+    fs.writeFileSync(path.join(jdir, "journal.json"), journalOk);
+    return r;
+  };
+  const outsideTree = tamper({ testTree: root });
+  const escaping = tamper({ capture: { ...JSON.parse(journalOk).capture, kept: [["../../../outside.txt", 0, 1]] } });
+  check(
+    "findJournals：測試目錄在這個 checkout 之外、或檔名跳出測試目錄（..）→ 內容不合法，丟掉，不拿它撤回（共用的 runs 目錄裡別人寫的）",
+    outsideTree.dead.length === 0 && /不合法/.test(outsideTree.stale[0]?.why ?? "") && escaping.dead.length === 0 && /不合法/.test(escaping.stale[0]?.why ?? ""),
+    JSON.stringify({ outsideTree: outsideTree.stale, escaping: escaping.stale }),
+  );
+  const notATestTree = tamper({ testTree: path.join(repoRoot, "src", "main") });
+  check(
+    "findJournals：測試目錄不是某個模組的 src/test（例如 src/main）→ 內容不合法，丟掉",
+    notATestTree.dead.length === 0 && /不合法/.test(notATestTree.stale[0]?.why ?? ""),
+    JSON.stringify(notATestTree.stale),
+  );
+  const mainSrc = path.join(repoRoot, "src", "main", "java");
+  const movedArtifacts = tamper({
+    runDir: "/somewhere/else",
+    dir: "/somewhere/else/batch-2-A",
+    outputs: [{ dir: "/etc", files: ["passwd"] }, { dir: mainSrc, files: [] }, ...JSON.parse(journalOk).outputs],
+  });
+  check(
+    "findJournals：它的 artifacts 以找到它的位置為準；建置輸出只認它那個模組放測試的地方（checkout 外的、src/main 這種都不理——撤回會清空它）",
+    movedArtifacts.dead[0]?.journal.runDir === runDir &&
+      movedArtifacts.dead[0]?.journal.dir === batchDir &&
+      movedArtifacts.dead[0]?.journal.outputs.length === 1 &&
+      movedArtifacts.dead[0]?.journal.outputs[0].dir === out,
+    JSON.stringify(movedArtifacts.dead[0]?.journal ?? {}).slice(0, 300),
+  );
+  const journalText = fs.readFileSync(path.join(jdir, "journal.json"), "utf8");
+  fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ ...JSON.parse(journalText), capture: null }));
+  check("findJournals：journal.json 解析得了、但欄位不對 → 丟掉（每次啟動都當掉不是選項）", /損毀/.test(findJournals(runs, checkout, nobody).stale[0]?.why ?? ""));
+  check("isJournal：欄位齊全才算", isJournal(JSON.parse(journalText)) && !isJournal({ ...JSON.parse(journalText), outputs: [null] }) && !isJournal(null));
+  fs.writeFileSync(path.join(jdir, "journal.json"), journalText);
+  fs.renameSync(tree, `${tree}-moved`);
+  const gone = findJournals(runs, checkout, nobody);
+  check("findJournals：它的測試目錄不見了 → 丟掉，不重建", gone.dead.length === 0 && /測試目錄/.test(gone.stale[0]?.why ?? ""), JSON.stringify(gone));
+  fs.mkdirSync(tree, { recursive: true });
+  const rebuilt = findJournals(runs, checkout, nobody);
+  check(
+    "findJournals：它的測試目錄被刪掉又建了一個（不是同一個目錄）→ 丟掉",
+    dirIdentity(tree) === "" || (rebuilt.dead.length === 0 && /測試目錄/.test(rebuilt.stale[0]?.why ?? "")),
+    JSON.stringify(rebuilt),
+  );
+  fs.rmSync(tree, { recursive: true, force: true });
+  fs.renameSync(`${tree}-moved`, tree);
+  fs.rmSync(path.join(jdir, "journal.json"));
+  const cut = findJournals(runs, checkout, nobody);
+  check("findJournals：寫到一半就被終止的日誌（沒有 journal.json）→ 可丟", cut.dead.length === 0 && cut.stale[0]?.dir === jdir, JSON.stringify(cut));
+  check(
+    "findJournals：寫到一半、但寫它的執行還活著 → 不丟（busy）",
+    findJournals(runs, checkout, { alive: () => true, start: (pid) => (pid === 4243 ? "777" : undefined) }).busy.length === 1,
+  );
+  const cutElsewhere = findJournals(runs, { ...checkout, rootId: "1@1" }, { alive: () => true, start: (pid) => (pid === 4243 ? "777" : undefined) });
+  check(
+    "findJournals：寫到一半、寫它的執行還活著，但它是另一個 checkout 的（owner 記的目錄不同）→ 不擋這次，只計數",
+    cutElsewhere.busy.length === 0 && cutElsewhere.elsewhere === 1,
+    JSON.stringify(cutElsewhere),
+  );
+  fs.writeFileSync(path.join(jdir, "journal.json"), JSON.stringify({ version: 99, repoRoot, pid: 4243, runDir }));
+  check("findJournals：別的版本寫的日誌 → 不理", none(findJournals(runs, checkout, nobody)));
+  closeJournal(handle);
+  check("closeJournal：日誌目錄刪掉", !fs.existsSync(jdir));
+  fs.mkdirSync(jdir, { recursive: true });
+  fs.writeFileSync(path.join(jdir, "journal.json"), "{}");
+  fs.utimesSync(path.join(jdir, "journal.json"), t0, t0);
+  await new Promise((r) => setTimeout(r, 200));
+  check("closeJournal：心跳跟著停（不再碰同一個路徑）", fs.statSync(path.join(jdir, "journal.json")).mtimeMs < t0.getTime() + 1_000);
+  // A journal that cannot be written is not left behind half-written: its batch dir is a file here.
+  fs.writeFileSync(path.join(root, "not-a-dir"), "");
+  let threw = false;
+  try {
+    openJournal(
+      { repoRoot, rootId: "", treeId: "", pid: 1, start: "", ...thisHost(), runDir, batch: 3, dir: path.join(root, "not-a-dir"), targetClasses: [], testTree: tree, treeRel: "src/test" },
+      cap,
+      captureOutputs([]),
+      50,
+    );
+  } catch {
+    threw = true;
+  }
+  check("openJournal：寫不進去就丟出（呼叫端警告、照常往下），不留下半份日誌", threw && fs.statSync(path.join(root, "not-a-dir")).isFile());
+  // Cut short partway — the disk full while the tree is copied in: nothing of it is left behind.
+  const exploding = {
+    *[Symbol.iterator]() {
+      yield ["java/com/x/ATest.java", Buffer.from("class ATest {}")] as [string, Buffer];
+      throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+    },
+  } as unknown as Map<string, Buffer | null>;
+  const halfDir = path.join(runDir, "batch-4-H");
+  let halfThrew = false;
+  try {
+    openJournal(
+      { repoRoot, rootId: "", treeId: "", pid: 1, start: "", ...thisHost(), runDir, batch: 4, dir: halfDir, targetClasses: [], testTree: tree, treeRel: "src/test" },
+      { ...cap, files: exploding },
+      captureOutputs([]),
+      50,
+    );
+  } catch {
+    halfThrew = true;
+  }
+  check(
+    "openJournal：寫到一半失敗（磁碟滿）→ 丟出，已經寫了的那一半刪掉",
+    halfThrew && fs.existsSync(halfDir) && !fs.existsSync(path.join(halfDir, JOURNAL_DIR)),
+    fs.existsSync(halfDir) ? fs.readdirSync(halfDir, { recursive: true }).join(",") : "(no batch dir)",
+  );
+
+  // What a recovery decided, kept for a retry.
+  const decisionDir = path.join(root, "decision");
+  fs.mkdirSync(decisionDir, { recursive: true });
+  check("readDecision：還沒有判斷過 → undefined", readDecision(decisionDir) === undefined);
+  const decided = { at: 123, only: ["java/com/x/GreeterTest.java"], undecided: ["resources/a.json"], moves: [{ from: "resources/b.json", to: "resources/c/b.json" }] };
+  writeDecision(decisionDir, decided);
+  check("writeDecision / readDecision：原樣讀回", JSON.stringify(readDecision(decisionDir)) === JSON.stringify(decided));
+  fs.writeFileSync(path.join(decisionDir, "decision.json"), JSON.stringify({ ...decided, only: ["../../outside.txt"] }));
+  check("readDecision：點名測試目錄以外的路徑 → 不採用", readDecision(decisionDir) === undefined);
+
+  // A retry decides as the first attempt did: that attempt's own changes are not someone else's.
+  const retryDir = path.join(root, "retry");
+  fs.mkdirSync(retryDir, { recursive: true });
+  const retryCap: TreeCapture = {
+    root: "/t",
+    files: new Map<string, Buffer | null>([["java/com/x/OtherTest.java", Buffer.from("class OtherTest {}")], ["java/com/x/Kept.java", Buffer.from("k")]]),
+    fingerprints: new Map(),
+    dirs: new Set(["java/com/x"]),
+  };
+  const deadRetry = {
+    path: retryDir,
+    journal: {} as BatchJournal,
+    trace: { written: ["java/com/x/OtherTest.java", "java/com/x/GreeterTest.java", "java/com/x/Kept.java"] },
+    lastSeen: 1_000_000,
+  };
+  let times: Record<string, number | undefined> = { "java/com/x": 999_000, "java/com/x/GreeterTest.java": 998_000, "java/com/x/Kept.java": 998_000 };
+  const view = () => ({
+    snapshot: () => ({}),
+    mtimeOf: (rel: string) => times[rel],
+    read: () => undefined,
+  });
+  const first = decideRecovery(deadRetry, retryCap, deadRetry.lastSeen, 60_000, view(), 1_000_500);
+  // The first attempt moved GreeterTest out (its directory changed) and could not put OtherTest back;
+  // someone then edited Kept.java.
+  times = { "java/com/x": 1_070_000, "java/com/x/Kept.java": 1_000_500 + 60_001 };
+  const retry = decideRecovery(deadRetry, retryCap, deadRetry.lastSeen, 60_000, view(), 1_000_700);
+  check(
+    "decideRecovery：第一次的判斷寫進日誌；重試時沿用——被刪的 OtherTest 照樣放回（不因為第一次撤回改了目錄就變成無法判斷），之後才被人改過的 Kept.java 不再撤回",
+    !first.reused &&
+      JSON.stringify(first.decision.only) === JSON.stringify(["java/com/x/GreeterTest.java", "java/com/x/Kept.java", "java/com/x/OtherTest.java"]) &&
+      retry.reused &&
+      JSON.stringify(retry.decision.only) === JSON.stringify(["java/com/x/GreeterTest.java", "java/com/x/OtherTest.java"]),
+    JSON.stringify({ first, retry }),
+  );
+  const movedDir = path.join(root, "retry-moved");
+  const moveCap: TreeCapture = {
+    root: "/t",
+    files: new Map<string, Buffer | null>([["resources/fixtures/order.json", Buffer.from('{"id":1}')]]),
+    fingerprints: new Map(),
+    dirs: new Set(["resources/fixtures"]),
+  };
+  const movedDecision = decideRecovery(
+    { path: movedDir, journal: {} as BatchJournal, trace: { written: [], session: { "resources/fixtures/order.json": "1:1" } }, lastSeen: 1_000_000 },
+    moveCap,
+    1_000_000,
+    60_000,
+    {
+      snapshot: () => ({ "resources/data/order.json": "1:1" }),
+      mtimeOf: (rel) => ({ "resources/data/order.json": 900_000, resources: 1_100_000, "resources/data": 900_000 })[rel],
+      read: (rel) => (rel === "resources/data/order.json" ? Buffer.from('{"id":1}') : undefined),
+    },
+    1_100_500,
+  ).decision;
+  fs.mkdirSync(movedDir, { recursive: true });
+  check(
+    "decideRecovery：死後的移動——新位置的檔不在要撤回的清單、舊位置的不算無法判斷，記在 moves",
+    !movedDecision.only.includes("resources/data/order.json") &&
+      movedDecision.undecided.length === 0 &&
+      JSON.stringify(movedDecision.moves) === '[{"from":"resources/fixtures/order.json","to":"resources/data/order.json"}]',
+    JSON.stringify(movedDecision),
+  );
+  const decidedAnew = decideRecovery({ ...deadRetry, path: path.join(root, "retry-fresh") }, retryCap, deadRetry.lastSeen, 60_000, view(), 1_000_700);
+  check(
+    "decideRecovery：（對照）不沿用而重新判斷的話，OtherTest 會因為目錄在死後改過而放不回去",
+    !decidedAnew.reused && decidedAnew.decision.undecided.includes("java/com/x/OtherTest.java"),
+    JSON.stringify(decidedAnew),
+  );
+  const lostTrace = decideRecovery(
+    { ...deadRetry, path: path.join(root, "retry-lost"), trace: { written: [] }, traceLost: true },
+    retryCap,
+    deadRetry.lastSeen,
+    60_000,
+    { snapshot: () => ({ "java/com/x/New.java": "1:1", "java/com/x/Kept.java": "1:1" }), mtimeOf: (rel) => ({ "java/com/x": 999_000, "java/com/x/New.java": 998_000, "java/com/x/Kept.java": 998_000 })[rel], read: () => undefined },
+    1_000_700,
+  );
+  check(
+    "decideRecovery：trace 不見了 → 那批開始時的檔與現在的檔全都算（死前改的），交給撤回逐一比對內容",
+    JSON.stringify(lostTrace.decision.only) === JSON.stringify(["java/com/x/Kept.java", "java/com/x/New.java", "java/com/x/OtherTest.java"]),
+    JSON.stringify(lostTrace),
+  );
+
+  // Waiting out a batch that may still be going: until it stops, or the time is up.
+  let clockNow = 0;
+  const fakeSleep = async (ms: number) => {
+    clockNow += ms;
+  };
+  let polls = 0;
+  const stopsAfter3 = await waitWhileBusy(() => (++polls <= 3 ? ["j"] : []), 60_000, 1_000, fakeSleep, () => clockNow);
+  check("waitWhileBusy：它停了就不再等，回傳空的", stopsAfter3.length === 0 && polls === 4 && clockNow === 3_000, `polls=${polls} t=${clockNow}`);
+  clockNow = 0;
+  const never = await waitWhileBusy(() => ["j"], 10_000, 3_000, fakeSleep, () => clockNow);
+  check("waitWhileBusy：時間到了還在跑 → 回傳還在跑的（呼叫端停下）", JSON.stringify(never) === '["j"]' && clockNow >= 10_000 && clockNow < 13_000, `t=${clockNow}`);
+
+  // Paths the caller accounts for its own way are neither undone nor listed as someone else's.
+  const leaveRoot = path.join(root, "leave");
+  fs.mkdirSync(path.join(leaveRoot, "a"), { recursive: true });
+  fs.writeFileSync(path.join(leaveRoot, "a", "old.json"), "1");
+  fs.writeFileSync(path.join(leaveRoot, "a", "keep.json"), "2");
+  const leaveCap = captureTree(leaveRoot);
+  fs.mkdirSync(path.join(leaveRoot, "b"), { recursive: true });
+  fs.renameSync(path.join(leaveRoot, "a", "old.json"), path.join(leaveRoot, "b", "old.json"));
+  fs.writeFileSync(path.join(leaveRoot, "a", "keep.json"), "changed by someone");
+  const leaveRb = rollbackTree(leaveCap, path.join(root, "leave-rejected"), "", new Set<string>(), new Set(["a/old.json", "b/old.json"]));
+  check(
+    "rollbackTree：leave 裡的路徑（之後的移動、無法判斷誰刪的）不撤回、也不列成別人的變更；其他沒在 only 裡的照樣列為別人的",
+    fs.existsSync(path.join(leaveRoot, "b", "old.json")) &&
+      !fs.existsSync(path.join(leaveRoot, "a", "old.json")) &&
+      JSON.stringify(leaveRb.foreign) === '["a/keep.json"]',
+    JSON.stringify(leaveRb),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+console.log("\n[30] 被強制終止的 run 留下的子程序（libs/shell.ts）");
+{
+  const stat = (name: string, state: string, pgrp: number, start: number) =>
+    `4242 (${name}) ${state} 1 ${pgrp} ${pgrp} 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 ${start} 7368704 1531`;
+  check("parseStat：狀態、程序群組、啟動時間", JSON.stringify(parseStat(stat("java", "S", 4242, 563817))) === '{"state":"S","pgrp":4242,"start":"563817"}');
+  check(
+    "parseStat：名稱裡有空白與括號也從最後一個「)」算起",
+    JSON.stringify(parseStat(stat("a b) (c", "R", 7, 99))) === '{"state":"R","pgrp":7,"start":"99"}',
+    JSON.stringify(parseStat(stat("a b) (c", "R", 7, 99))),
+  );
+  check("parseStat：不是 stat 的內容 → undefined", parseStat("garbage") === undefined && parseStat("1 (x) S 1") === undefined);
+  const me = processStart(process.pid);
+  if (process.platform === "linux") {
+    check("processStart（Linux，/proc）：自己的啟動時間讀得到、兩次一樣", !!me && me === processStart(process.pid), String(me));
+  }
+  if (process.platform !== "win32") {
+    const viaPs = processStart(process.pid, "darwin");
+    check("processStart（其他 POSIX，ps -o lstart=）：讀得到、兩次一樣", !!viaPs && viaPs === processStart(process.pid, "darwin"), String(viaPs));
+    // ps prints the start in the local zone: two runs under different TZ would never match each other's.
+    const savedTz = process.env.TZ;
+    process.env.TZ = "TST-8"; // a POSIX zone, eight hours east: no tz database needed
+    const underTaipei = processStart(process.pid, "darwin");
+    const local = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" }).stdout.trim();
+    if (savedTz === undefined) delete process.env.TZ;
+    else process.env.TZ = savedTz;
+    check(
+      "processStart（ps）：不論使用者的時區與語系，都用同一種格式與 UTC（兩次執行在不同 TZ 下也認得彼此的子程序）",
+      !!viaPs && underTaipei === viaPs && (local === "" || local !== viaPs),
+      `${underTaipei} / ${viaPs} / local ${local}`,
+    );
+  }
+  check("processStart：Windows 沒有便宜的辦法 → undefined（只點名、不結束）", processStart(process.pid, "win32") === undefined);
+  const done = spawnSync(process.execPath, ["-e", "0"]);
+  check("processStart：已經結束的程序 → undefined", processStart(done.pid ?? 0) === undefined && processStart(0x3ffffffe) === undefined);
+
+  const rec = { pid: 4242, start: "563817", cmd: "mvn test" };
+  const win = { from: 1_000_000, to: 2_000_000 };
+  const act = (o: Parameters<typeof orphanAction>[1]) => JSON.stringify(orphanAction(rec, o, win));
+  check("orphanAction：同一個程序（啟動時間相同）→ 結束它的程序群組", act({ start: "563817", groupAlive: true }) === '{"kind":"stop-group"}');
+  check("orphanAction：pid 被別的程序重用（啟動時間不同）→ 不是它的", act({ start: "999", groupAlive: true }) === '{"kind":"not-ours"}');
+  check(
+    "orphanAction：沒記到啟動時間 → 無從確認，不碰還在的程序",
+    JSON.stringify(orphanAction({ ...rec, start: "" }, { start: "563817", groupAlive: true }, win)) === '{"kind":"not-ours"}',
+  );
+  check("orphanAction：都不在了 → gone", act({ groupAlive: false }) === '{"kind":"gone"}');
+  check(
+    "orphanAction：launcher 已經不在、群組還有程序 → 只結束那次執行還活著時啟動的（fork 出去的 JVM）；之後才啟動的可能是別人重用了這個群組 id，只列出",
+    act({ groupAlive: true, members: [{ pid: 11, startMs: 1_500_000 }, { pid: 12, startMs: 2_500_000 }, { pid: 13 }] }) ===
+      '{"kind":"stop-members","pids":[11],"left":[12,13]}',
+    act({ groupAlive: true, members: [{ pid: 11, startMs: 1_500_000 }, { pid: 12, startMs: 2_500_000 }, { pid: 13 }] }),
+  );
+  check(
+    "orphanAction：比那個子程序還早啟動的成員不是它 fork 的",
+    act({ groupAlive: true, members: [{ pid: 14, startMs: 900_000 }] }) === '{"kind":"stop-members","pids":[],"left":[14]}',
+  );
+  check("orphanAction：launcher 不在、又看不到成員何時啟動（沒有 /proc）→ 只回報，不結束", act({ groupAlive: true }) === '{"kind":"report"}');
+  if (process.platform === "linux") {
+    const mine = processStart(process.pid);
+    const started = mine ? startMsOf(mine) : undefined;
+    const expected = Date.now() - process.uptime() * 1000;
+    check("startMsOf：/proc 的啟動時間換算成時刻（誤差在幾秒內）", started !== undefined && Math.abs(started - expected) < 3_000, `${started} vs ${expected}`);
+  }
+  check("groupMembers：不是 Linux → 看不到（undefined）", groupMembers(process.pid, "darwin") === undefined);
+
+  if (process.platform !== "win32") {
+    // A real process group, and a zombie in it: `sleep 0.1` ends while its parent (which exec'd into
+    // `sleep 30`) never waits for it.
+    const leader = spawn("sh", ["-c", "sleep 0.1 & echo $!; exec sleep 30"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    const zombie = Number(await new Promise<string>((r) => leader.stdout!.once("data", (d) => r(String(d)))));
+    await new Promise((r) => setTimeout(r, 400));
+    check("groupAlive：群組裡還有在跑的程序 → true", groupAlive(leader.pid!), String(leader.pid));
+    if (process.platform === "linux") {
+      const members = groupMembers(leader.pid!) ?? [];
+      check(
+        "groupMembers：列出群組裡還在跑的程序與啟動時間，已經結束的（zombie）不列",
+        members.some((m) => m.pid === leader.pid && m.startMs !== undefined && Math.abs(m.startMs - Date.now()) < 10_000) &&
+          !members.some((m) => m.pid === zombie),
+        JSON.stringify(members),
+      );
+    }
+    if (process.platform === "linux") {
+      let isZombie = false;
+      try {
+        isZombie = / Z /.test(fs.readFileSync(`/proc/${zombie}/stat`, "utf8"));
+      } catch {
+        /* reaped already */
+      }
+      if (isZombie) check("processStart：已經結束、還沒被回收的程序（zombie）→ undefined", processStart(zombie) === undefined);
+    }
+    process.kill(-leader.pid!, "SIGKILL");
+    await new Promise((r) => leader.once("exit", r));
+    await new Promise((r) => setTimeout(r, 200));
+    check("groupAlive：群組的程序都結束了 → false（還沒被回收的也不算）", !groupAlive(leader.pid!), String(leader.pid));
+  }
+
+  // The children journal: a tracked child is on disk while it runs, and off it once it has ended.
+  const jdir = fs.mkdtempSync(path.join(os.tmpdir(), "testgen-children-"));
+  const file = path.join(jdir, "children.json");
+  journalChildren(file, { repoRoot: "/repo", host: "box", boot: 1, pid: process.pid, start: me ?? "" }, 50);
+  const t0 = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(file, t0, t0);
+  const beatWait = Date.now() + 2_000;
+  while (fs.statSync(file).mtimeMs < t0.getTime() + 1_000 && Date.now() < beatWait) await new Promise((r) => setTimeout(r, 20));
+  check("journalChildren：心跳在執行期間更新紀錄的時間（下一次執行拿它當最後還活著的時刻）", fs.statSync(file).mtimeMs > t0.getTime() + 1_000);
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { detached: DETACH_CHILDREN, stdio: "ignore" });
+  trackForShutdown(child);
+  const listed = JSON.parse(fs.readFileSync(file, "utf8"));
+  check(
+    "journalChildren：執行中的子程序連同啟動時間寫進紀錄",
+    listed.repoRoot === "/repo" && listed.children.length === 1 && listed.children[0].pid === child.pid &&
+      (process.platform === "win32" || listed.children[0].start === processStart(child.pid!)),
+    JSON.stringify(listed),
+  );
+  const build = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { detached: DETACH_CHILDREN, stdio: "ignore" });
+  trackForShutdown(build, "build");
+  const kinds = JSON.parse(fs.readFileSync(file, "utf8")).children.map((c: { pid: number; kind?: string }) => [c.pid === build.pid, c.kind]);
+  check(
+    "journalChildren：建置記成 kind=build（只寫 target/）；其他的（agent session）記成 other",
+    JSON.stringify(kinds) === JSON.stringify([[false, "other"], [true, "build"]]),
+    JSON.stringify(kinds),
+  );
+  await Promise.all([child, build].map((c) => (c.exitCode !== null ? Promise.resolve() : new Promise((r) => c.once("exit", r)))));
+  check("journalChildren：子程序結束就從紀錄移除", JSON.parse(fs.readFileSync(file, "utf8")).children.length === 0);
+  journalChildren(undefined);
+  fs.utimesSync(file, t0, t0);
+  await new Promise((r) => setTimeout(r, 200));
+  check("journalChildren(undefined)：不再記錄，心跳也停", fs.statSync(file).mtimeMs < t0.getTime() + 1_000);
+  fs.rmSync(jdir, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

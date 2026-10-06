@@ -12,10 +12,23 @@ import * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
-import { ApiTurn, buildFixture, envKnobsInSource, EXISTING_TEST, gitAvailable, jdkAvailable, repoLockPath, RUN_DIR, Scenario, targetDirOf, TESTGEN_ROOT } from "./itest-lib";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  ApiTurn,
+  buildFixture,
+  CALC_TEST as CALC_TEST_TEXT,
+  envKnobsInSource,
+  EXISTING_TEST,
+  gitAvailable,
+  jdkAvailable,
+  repoLockPath,
+  RUN_DIR,
+  Scenario,
+  targetDirOf,
+  TESTGEN_ROOT,
+} from "./itest-lib";
 import { FIXED_TEST as FIXED_TEST_TEXT, SCENARIOS } from "./itest-scenarios";
-import { planSpawn } from "../libs/shell";
+import { planSpawn, processStart } from "../libs/shell";
 
 let passCount = 0;
 let failCount = 0;
@@ -41,6 +54,9 @@ function check(name: string, cond: boolean, detail = "") {
 // tool auto-loads its own .env: an operator's UT_STRICT_COV=1 must not decide whether a
 // coverage assertion here passes. The completeness check below keeps this list honest.
 
+// Journal owners a scenario started (rerun.liveOwner): none outlives its scenario.
+const liveOwners: number[] = [];
+
 const BASE_ENV: Record<string, string> = {
   UT_AGENT_TIMEOUT_MS: "60000",
   UT_ALLOW_DIRTY_BASELINE: "0",
@@ -53,6 +69,8 @@ const BASE_ENV: Record<string, string> = {
   UT_API_MAX_TURNS: "8",
   UT_AGENT_RETRY_WINDOW_MS: "180000",
   UT_BUILD_TIMEOUT_MS: "60000",
+  // A journal unexpectedly still beating fails fast here, not after six minutes.
+  UT_OTHER_RUN_WAIT_MS: "20000",
   UT_MAX_BUILD_OUTPUT_CHARS: "67108864",
   UT_CA_CERTS: "",
   UT_HTTPS_PROXY: "",
@@ -80,6 +98,7 @@ const BASE_ENV: Record<string, string> = {
   UT_REVIEWER_MUST_READ: "1",
   UT_REVIEW_MAX_RETRIES: "2",
   UT_RUNNER: "opencode",
+  UT_RESUME: "1",
   UT_RUNS_DIR: "",
   UT_SCORE_THRESHOLDS: "",
   UT_SKILL_DIR: "",
@@ -100,12 +119,16 @@ const BASE_ENV: Record<string, string> = {
 // 127.0.0.1 in it, the fixture proxy never saw a connection and the scenario failed there.
 const PROXY_ENV = /^(?:https?_proxy|no_proxy|all_proxy)$/i;
 
+// A Gradle user home that does not exist: an init script in the developer's own (~/.gradle/init.d)
+// can configure test retries (gates/build.ts gradleRetriesTests), and no scenario may depend on it.
+const NO_GRADLE_HOME = path.join(os.tmpdir(), "testgen-itest-no-gradle-home");
+
 function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (!k.startsWith("UT_") && !PROXY_ENV.test(k)) env[k] = v;
   }
-  return { ...env, ...BASE_ENV, ...extra };
+  return { ...env, GRADLE_USER_HOME: NO_GRADLE_HOME, ...BASE_ENV, ...extra };
 }
 
 // ─── Child process plumbing ──────────────────────────────────────────────────
@@ -163,6 +186,15 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
           /* no run holds the lock: the checks will say so */
         }
       }
+      // A hard kill, on every platform: Windows' process.kill is TerminateProcess, which is exactly that.
+      if (turn.kill) {
+        try {
+          process.kill(JSON.parse(fs.readFileSync(repoLockPath(root), "utf8")).pid, "SIGKILL");
+        } catch {
+          /* no run holds the lock: the checks will say so */
+        }
+      }
+      for (const rel of turn.sideDelete ?? []) fs.rmSync(path.join(root, rel), { force: true });
       for (const [rel, content] of Object.entries(turn.sideWrite ?? {})) {
         fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
         fs.writeFileSync(path.join(root, rel), content);
@@ -202,13 +234,23 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
           function: { name: t.name, arguments: JSON.stringify(t.args) },
         }));
       }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          choices: [{ message, ...(turn.finishReason ? { finish_reason: turn.finishReason } : {}) }],
-          usage: { completion_tokens: 11 },
-        }),
-      );
+      const respond = () => {
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message, ...(turn.finishReason ? { finish_reason: turn.finishReason } : {}) }],
+            usage: { completion_tokens: 11 },
+          }),
+        );
+      };
+      // An interrupt turn's answer waits: sent at once, it raced the signal — the run read it and went
+      // on to its next step (a build, the next batch) before its handler ran. The run ends meanwhile.
+      if (turn.interrupt && process.platform !== "win32") {
+        setTimeout(respond, 15_000).unref();
+        return;
+      }
+      respond();
     });
   });
   return new Promise((resolve) => {
@@ -216,7 +258,11 @@ function startFakeApi(turns: ApiTurn[], root: string): Promise<{ url: string; cl
       const port = (server.address() as { port: number }).port;
       resolve({
         url: `http://127.0.0.1:${port}/v1`,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () =>
+          new Promise<void>((r) => {
+            server.close(() => r());
+            server.closeAllConnections?.();
+          }),
       });
     });
   });
@@ -279,6 +325,10 @@ interface Ctx {
   mvnCalls: number;
   /** Origins the fixture proxy was asked to reach; undefined when no proxy ran. */
   proxySeen?: string[];
+  /** With rerun: the first run, whose end the checks' run is the rerun of. */
+  first?: { result: Record<string, unknown>; runDir: string; code: number; stdout: string };
+  /** With rerun2: the rerun, after which the checks' run is the third. */
+  second?: { result: Record<string, unknown>; runDir: string; code: number; stdout: string };
   read(rel: string): string;
   exists(rel: string): boolean;
   runRead(rel: string): string;
@@ -294,11 +344,9 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
   let result: Record<string, unknown> = {};
   let proxySeen: string[] | undefined;
 
+  let first: Ctx["first"];
+  let second: Ctx["second"];
   if (sc.entry === "loop") {
-    const api = await startFakeApi(sc.api ?? [], root);
-    const proxy = sc.proxy ? await startProxy() : undefined;
-    proxySeen = proxy?.seen;
-    const apiHost = new URL(api.url).host;
     const runsBase = path.join(root, sc.runsInRepo ? "testgen-runs" : path.join(".itest", "runs"));
     // Held by a live process — this one — exactly as a second testgen on the same repo would see.
     const lock = sc.lockHeld ? repoLockPath(root) : undefined;
@@ -311,30 +359,118 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
       fs.symlinkSync(process.execPath, path.join(bin, "node"));
       noJdkEnv = { JAVA_HOME: "", PATH: bin };
     }
-    out = await runTsx(
-      path.join(TESTGEN_ROOT, "loop.ts"),
-      [targetDirOf(sc)],
-      root,
-      childEnv({
-        ...sc.env,
-        UT_RUNNER: "api",
-        UT_API_BASE_URL: api.url,
-        UT_RUNS_DIR: runsBase,
-        ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
-        // Scenarios opt into the bypass by naming the endpoint's own host:port.
-        ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
-        ...noJdkEnv,
-      }),
-    );
-    await api.close();
-    await proxy?.close();
+    const runLoop = async (turns: ApiTurn[], env: Record<string, string> = {}, target?: string) => {
+      const api = await startFakeApi(turns, root);
+      const proxy = sc.proxy ? await startProxy() : undefined;
+      proxySeen = proxy?.seen;
+      const apiHost = new URL(api.url).host;
+      const done = await runTsx(
+        path.join(TESTGEN_ROOT, "loop.ts"),
+        [target ?? targetDirOf(sc)],
+        root,
+        childEnv({
+          ...sc.env,
+          ...env,
+          UT_RUNNER: "api",
+          UT_API_BASE_URL: api.url,
+          UT_RUNS_DIR: runsBase,
+          ...(proxy ? { UT_HTTP_PROXY: proxy.url } : {}),
+          // Scenarios opt into the bypass by naming the endpoint's own host:port.
+          ...(sc.noProxy ? { UT_NO_PROXY: apiHost } : {}),
+          ...noJdkEnv,
+        }),
+      );
+      await api.close();
+      await proxy?.close();
+      // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; the newest is the run that just ended.
+      const repoRuns = path.join(runsBase, path.basename(root));
+      const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
+      const dir = ids.length ? path.join(repoRuns, ids[ids.length - 1]) : path.join(root, RUN_DIR);
+      const summary = path.join(dir, "summary.json");
+      const res: Record<string, unknown> = fs.existsSync(summary) ? JSON.parse(fs.readFileSync(summary, "utf8")) : {};
+      return { out: done, runDir: dir, result: res };
+    };
+    let run = await runLoop(sc.api ?? []);
+    if (sc.rerun) {
+      first = { result: run.result, runDir: run.runDir, code: run.out.code, stdout: run.out.stdout };
+      // What the api log holds from here on is the second run's.
+      fs.rmSync(path.join(root, ".itest", "api-requests.jsonl"), { force: true });
+      if (sc.rerun.backdateMs) {
+        const t = (Date.now() - sc.rerun.backdateMs) / 1000;
+        const age = (d: string) => {
+          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            const p = path.join(d, e.name);
+            if (e.isDirectory()) age(p);
+            else if (e.isFile()) fs.utimesSync(p, t, t);
+          }
+        };
+        age(root);
+      }
+      const firstRel = path.relative(root, run.runDir);
+      if (sc.rerun.pipeDirAt && process.platform !== "win32") {
+        const p = path.join(root, sc.rerun.pipeDirAt);
+        fs.rmSync(p, { recursive: true, force: true });
+        fs.mkdirSync(p, { recursive: true });
+        spawnSync("mkfifo", [path.join(p, "pipe")]);
+      }
+      // A rewrite is what the file held all along: its time stays (a journal's time is its heartbeat).
+      for (const rw of [sc.rerun.rewrite ?? []].flat()) {
+        const p = path.join(root, rw.file.replace("{{firstRun}}", firstRel));
+        try {
+          const st = fs.statSync(p);
+          fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(rw.from, rw.to));
+          fs.utimesSync(p, st.atimeMs / 1000, st.mtimeMs / 1000);
+        } catch {
+          /* not there: the checks say what is missing */
+        }
+      }
+      for (const [from, to] of sc.rerun.renames ?? []) {
+        fs.mkdirSync(path.dirname(path.join(root, to)), { recursive: true });
+        fs.renameSync(path.join(root, from), path.join(root, to));
+      }
+      if (sc.rerun.liveOwner) {
+        const owner = spawn(process.execPath, ["-e", `setTimeout(() => {}, ${sc.rerun.liveOwner.ms})`], { stdio: "ignore", detached: true });
+        owner.unref();
+        liveOwners.push(owner.pid!);
+        const start = processStart(owner.pid!) ?? "";
+        const jdir = path.join(root, sc.rerun.liveOwner.journal.replace("{{firstRun}}", firstRel));
+        for (const f of ["owner.json", "journal.json"]) {
+          const p = path.join(jdir, f);
+          try {
+            fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(/"pid":\d+,"start":"[^"]*"/, `"pid":${owner.pid},"start":"${start}"`));
+          } catch {
+            /* not there: the checks say what is missing */
+          }
+        }
+      }
+      for (const [key, content] of Object.entries(sc.rerun.between ?? {})) {
+        const rel = key.replace("{{firstRun}}", firstRel);
+        const p = path.join(root, rel);
+        if (content === null) fs.rmSync(p, { force: true });
+        else {
+          fs.mkdirSync(path.dirname(p), { recursive: true });
+          fs.writeFileSync(p, content);
+        }
+      }
+      run = await runLoop(sc.rerun.api ?? [], sc.rerun.env, sc.rerun.target);
+      if (sc.rerun2) {
+        second = { result: run.result, runDir: run.runDir, code: run.out.code, stdout: run.out.stdout };
+        fs.rmSync(path.join(root, ".itest", "api-requests.jsonl"), { force: true });
+        for (const [rel, content] of Object.entries(sc.rerun2.between ?? {})) {
+          const p = path.join(root, rel);
+          if (content === null) fs.rmSync(p, { force: true });
+          else {
+            fs.mkdirSync(path.dirname(p), { recursive: true });
+            fs.writeFileSync(p, content);
+          }
+        }
+        run = await runLoop(sc.rerun2.api ?? [], sc.rerun2.env, sc.rerun2.target);
+      }
+    }
     if (lock) fs.rmSync(lock, { force: true });
-    // RUNS_DIR = <UT_RUNS_DIR>/<repo basename>/<runId>; exactly one run per scenario.
-    const repoRuns = path.join(runsBase, path.basename(root));
-    const ids = fs.existsSync(repoRuns) ? fs.readdirSync(repoRuns).sort() : [];
-    if (ids.length) runDir = path.join(repoRuns, ids[ids.length - 1]);
-    const summary = path.join(runDir, "summary.json");
-    if (fs.existsSync(summary)) result = JSON.parse(fs.readFileSync(summary, "utf8"));
+    out = run.out;
+    runDir = run.runDir;
+    result = run.result;
   } else {
     out = await runTsx(
       path.join(TESTGEN_ROOT, "scripts", "itest-case.ts"),
@@ -372,6 +508,8 @@ async function runScenario(sc: Scenario): Promise<Ctx> {
     argv,
     mvnCalls: argv.length,
     proxySeen,
+    first,
+    second,
     read: rd(root),
     exists: ex(root),
     runRead: rd(runDir),
@@ -386,6 +524,11 @@ const funnelOf = (c: Ctx): Funnel => (c.result.funnel as Funnel) ?? [];
 const gates = (c: Ctx) => funnelOf(c).map((f) => `${f.gate}/${f.outcome}`);
 /** Every maven invocation the loop made, flattened for substring assertions. */
 const everyCall = (c: Ctx, arg: string) => c.argv.length > 0 && c.argv.every((a) => a.includes(arg));
+// A Gradle build that runs the target's test task whatever its last execution left: its results are
+// deleted before it (an unqualified cleanTest runs in every project it reaches), and the build cache
+// is off (a FROM-CACHE result would come back). Plain output, for the parsers.
+const gradleForced = (a: string[]) =>
+  !a.includes("cleanTest") && a.includes("test") && a.includes("-Dorg.gradle.caching=false") && a.includes("--console=plain");
 const noCall = (c: Ctx, prefix: string) =>
   c.argv.every((a) => !a.some((x) => x.startsWith(prefix)));
 
@@ -469,6 +612,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("prompt 落地", c.runExists("iter-1/prompt.md"));
   },
 
+  "tests-all-skipped-in-suite": (c) => {
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("第 1 輪記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說 CalcTest 的 2 個測試全部被略過", fb.includes("com.x.CalcTest：你新寫的測試類別，2 個測試全部被略過"), fb.slice(0, 800));
+  },
+  "tests-not-run-cjk-display-name": (c) => {
+    check("第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
+    check("第 1 輪記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名沒被執行的 CalcTest（別的類別的中文名字不算它的）", fb.includes("com.x.CalcTest") && fb.includes("你新寫的測試類別，這次建置沒有執行它"), fb.slice(0, 800));
+  },
   "tests-not-run-framework": (c) => {
     check("第 2 輪（改寫成 JUnit 4 後）才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
     check("第 1 輪記在 build gate", gates(c)[0] === "build/fail", gates(c).join(","));
@@ -1032,7 +1187,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
       JSON.stringify(c.result.toleratedFailures ?? []).includes("com.x.LegacyTest#old_behaviour()"),
       JSON.stringify(c.result.toleratedFailures),
     );
-    check("跑的是 gradlew", c.argv.length === 2 && c.argv.every((a) => a.includes("test") && a.includes("--console=plain")), JSON.stringify(c.argv));
+    check("跑的是 gradlew，而且強制執行 test task", c.argv.length === 2 && c.argv.every(gradleForced), JSON.stringify(c.argv));
   },
 
   "loop-gradle-baseline-repair": (c) => {
@@ -1239,6 +1394,18 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("writer 自己的測試失敗不重跑", c.mvnCalls === 2 && !c.runExists("iter-1/build-rerun.log"), `mvnCalls=${c.mvnCalls}`);
   },
 
+  "build-test-failure-ignored-timestamped-log": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2 && gates(c)[0] === "build/fail", JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說明 Maven 以 exit 0 結束是因為 testFailureIgnore", fb.includes("testFailureIgnore"), fb.slice(0, 400));
+  },
+
+  "writer-own-flaky-final-verify": (c) => {
+    check("第 1 輪最終驗收判 FAIL、第 2 輪才通過", gates(c)[0] === "build/final-verify-fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說它在完整模組重跑時不穩定，附上第一次失敗的訊息", fb.includes("完整模組") && fb.includes("不穩定") && fb.includes("expected: <3> but was: <4>"), fb.slice(0, 900));
+  },
+
   "build-test-failure-ignored-reports-only": (c) => {
     check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations]));
     check("回饋附上報告裡的錯誤", c.runRead("iter-1/feedback.md").includes("this.calc"), c.runRead("iter-1/feedback.md").slice(0, 600));
@@ -1262,9 +1429,62 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("回饋是編譯錯誤，不是「沒有執行任何測試」", fb.includes("cannot find symbol") && !fb.includes("0 個測試"), fb.slice(0, 600));
   },
 
+  // Evidence against a pass kept past the run that found it; what a test reaches, walked again.
+  "loop-resume-evidence-dirty-stop": (c) => evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("dirty-baseline"), "預檢紅燈中止（dirty-baseline）"),
+  "loop-resume-evidence-repair-failed": (c) => evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("repair-failed"), "修復失敗中止（repair-failed:*）"),
+  "loop-resume-evidence-repair-interrupted": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted"), "修復途中被中斷");
+  },
+  "loop-resume-evidence-dirty-allowed": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted"), "放行紅燈、重做 Calc 時被中斷");
+  },
+  "loop-resume-flaky-non-target": (c) =>
+    evidenceKept(
+      c,
+      (s) => s?.code === 0 && (s?.stdout ?? "").includes("com.x.CalcTest 是不穩定的測試"),
+      "只做 Greeter、建置判定 CalcTest 不穩定、Greeter 通過",
+      true,
+    ),
+  // The report names the nested class: the record is its outer class's, and void all the same.
+  "loop-resume-flaky-nested-non-target": (c) =>
+    evidenceKept(
+      c,
+      (s) => s?.code === 0 && (s?.stdout ?? "").includes("com.x.CalcTest$Add 是不穩定的測試"),
+      "只做 Greeter、建置判定 CalcTest$Add 不穩定、Greeter 通過",
+      true,
+    ),
+  "loop-resume-ondemand-lib-shadow": (c) => redone(c, "它的測試現在會用到 src/test/java/com/x/Assertions.java"),
+  "loop-resume-spring-external-base": (c) => redone(c, "src/test/resources/application.yml 在上次通過之後改過"),
+  "loop-resume-external-base-no-spring": (c) => resumedCalc(c, "src/test/java/com/x/CalcTest.java", CALC_TEST_TEXT.replace("import org.junit.jupiter.api.Test;", "import org.junit.jupiter.api.Test;\nimport com.corp.test.AbstractTest;").replace("class CalcTest {", "class CalcTest extends AbstractTest {")),
+  "loop-resume-xml-import": (c) => redone(c, "src/test/resources/stubs-context.xml 在上次通過之後改過"),
+  "loop-resume-fixture-dir": (c) => redone(c, "src/test/resources/cases/c1.json 在上次通過之後改過"),
+  "loop-resume-shadow-declared-elsewhere": (c) => redone(c, ""),
+  "loop-resume-flaky-pending": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    const ZETA = "src/main/java/com/x/Zeta.java";
+    check("第一次：三批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("第二次：第 1 批判定 ZetaTest 不穩定，之後被 Ctrl-C", (c.second?.stdout ?? "").includes("com.x.ZetaTest 是不穩定的測試") && String(c.second?.result.stopReason).startsWith("interrupted"), `${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").slice(-1500)}`);
+    const l2 = ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>;
+    check("第二次的 passed.json 記下 Zeta 的作廢紀錄", l2.some((e) => e.cls === ZETA && !!e.invalid), JSON.stringify(l2.map((e) => [e.cls, e.invalid ?? null])));
+    check("第三次：不接續 Zeta", !resumedOf(c).includes(ZETA), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(resumedOf(c))}`);
+  },
+  "loop-resume-repair-round-flaky": (c) => {
+    check("重跑：修復以 flaky-baseline 結束、log 點名 CalcTest 不穩定", c.stdout.includes("判定為不穩定的測試（flaky）：com.x.CalcTest"), c.stdout.split("\n").filter((l) => l.includes("flaky") || l.includes("修復")).join("\n").slice(-900));
+    check("重跑：不接續 Calc", resumedOf(c).length === 0, `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(resumedOf(c))}`);
+  },
+  "loop-resume-evidence-review-toggle": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    evidenceKept(c, (s) => String(s?.result.stopReason).startsWith("interrupted") && (s?.stdout ?? "").includes("的預檢建置中不穩定"), "預檢記下 CalcTest 不穩定（不因 review 開關而跳過）、重做時被中斷");
+  },
+  "loop-resume-nested-display-flaky": (c) => redoneBy(c, "CalcTest 加法", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-new-global-extension": (c) => redone(c, ""),
+  "loop-resume-new-spring-component": (c) => redone(c, ""),
+
   "gradle-test-failure-ignored": (c) => {
     check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.crashed]));
-    check("跑的是 gradle 的 test 任務", c.argv[0]?.includes("test") && c.argv[0]?.includes("--console=plain"), JSON.stringify(c.argv[0]));
+    check("跑的是 gradle 的 test 任務，而且強制執行", gradleForced(c.argv[0] ?? []), JSON.stringify(c.argv[0]));
     const fb = c.runRead("iter-1/feedback.md");
     check("回饋說明是 ignoreFailures、附上失敗原因", fb.includes("ignoreFailures") && fb.includes("nothing was thrown"), fb.slice(0, 700));
   },
@@ -1294,10 +1514,93 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("回報目標模組執行了 0 個測試", fb.includes("0 個測試"), fb.slice(0, 400));
   },
 
-  "gradle-retry-passed-green": (c) => {
-    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+  "gradle-same-name-params-failing": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「[2] -1」", fb.includes("[2] -1") && fb.includes("ignoreFailures"), fb.slice(0, 600));
+    check("不記成不穩定的測試", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
   },
 
+  "gradle-same-display-name-failing": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    check("不記成不穩定的測試", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
+  },
+
+  "gradle-same-name-quiet-log": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2 && gates(c)[0] === "build/fail", JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「[2] -1」", fb.includes("[2] -1"), fb.slice(0, 600));
+  },
+
+  "gradle-log-says-failed": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說明是 ignoreFailures", fb.includes("ignoreFailures"), fb.slice(0, 600));
+  },
+
+  "gradle-retry-failed-again": (c) => {
+    check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations, c.result.flakyTests]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名失敗的「除法」", fb.includes("除法"), fb.slice(0, 600));
+  },
+
+  "gradle-retry-passed-fails-task": (c) => {
+    check("第 1 輪判 build/fail、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check(
+      "回饋說「除法」重試才通過、附第一次失敗的訊息",
+      fb.includes("重試才通過") && fb.includes("com.x.CalcTest › 除法") && fb.includes("第一次失敗：org.opentest4j.AssertionFailedError: expected: <true> but was: <false>"),
+      fb.slice(0, 900),
+    );
+    check("不把它列成失敗的測試（沒有失敗的測試類別、沒有引用原始的 <failure>）", !fb.includes("----- com.x.CalcTest（") && !fb.includes("----- TEST-com.x.CalcTest.xml -----"), fb.slice(0, 900));
+  },
+
+  "writer-own-flaky-test": (c) => {
+    check("第 1 輪判 build/flaky、第 2 輪才通過", gates(c)[0] === "build/flaky" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋點名不穩定的測試與它第一次失敗的訊息", fb.includes("com.x.CalcTest") && fb.includes("div_byZero_throwsIllegalArgument") && fb.includes("depends on test order"), fb.slice(0, 800));
+    check("writer 自己的測試不記成「需要人檢視的不穩定測試」", c.result.flakyTests === undefined, JSON.stringify(c.result.flakyTests));
+  },
+
+  "phrased-all-display-names-not-run": (c) => {
+    check("第 1 輪判 build/fail（CalcTest 沒被執行）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說 CalcTest 這次沒有被執行", fb.includes("com.x.CalcTest") && fb.includes("沒有執行"), fb.slice(0, 600));
+  },
+
+  "display-name-spoofs-class": (c) => {
+    check("第 1 輪判 build/fail（CalcTest 沒被執行）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason, c.result.iterations]));
+    const fb = c.runRead("iter-1/feedback.md");
+    check("回饋說 CalcTest 這次沒有被執行", fb.includes("com.x.CalcTest") && fb.includes("沒有執行"), fb.slice(0, 600));
+  },
+
+  "gradle-retry-passed-green": (c) => {
+    check("第 1 輪就通過", c.result.success === true && c.result.iterations === 1, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.finalFeedback]));
+    check(
+      "重試才過的 ExistingTest 記成不穩定的測試（summary 的 flakyTests）",
+      JSON.stringify(c.result.flakyTests) === '["com.x.ExistingTest"]' && c.stdout.includes("失敗之後被重跑才通過"),
+      JSON.stringify(c.result.flakyTests),
+    );
+  },
+
+  "ran-check-section-not-cut-by-test-output": (c) => {
+    check("第 1 輪就通過（CalcTest 的 Running 行在目標模組的 surefire 區段裡）", c.result.success === true && c.result.iterations === 1, JSON.stringify([gates(c), c.result.stopReason, c.runRead("iter-1/feedback.md").slice(0, 300)]));
+  },
+  "ran-check-lossy-report-of-disabled-class": (c) => {
+    check("第 1 輪就通過（CalcTest 自己的 .txt：2 個都跑了）", c.result.success === true && c.result.iterations === 1, JSON.stringify([gates(c), c.result.stopReason, c.runRead("iter-1/feedback.md").slice(0, 300)]));
+  },
+  "ran-check-exact-report-of-disabled-class": (c) => {
+    check("第 1 輪就通過（CalcTest 自己的 .txt：2 個都跑了）", c.result.success === true && c.result.iterations === 1, JSON.stringify([gates(c), c.result.stopReason, c.runRead("iter-1/feedback.md").slice(0, 300)]));
+  },
+  "ran-check-lossy-report-credited": (c) => {
+    check("第 1 輪判 build/fail（CalcTest 沒被執行）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason]));
+    check("回饋點名 CalcTest", c.runRead("iter-1/feedback.md").includes("com.x.CalcTest"), c.runRead("iter-1/feedback.md").slice(0, 400));
+  },
+  "gradle-stale-results-not-evidence": (c) => {
+    check("第 1 輪判 build/fail（舊的結果不算 CalcTest 有跑）、第 2 輪才通過", gates(c)[0] === "build/fail" && c.result.success === true && c.result.iterations === 2, JSON.stringify([gates(c), c.result.stopReason]));
+    check("回饋說 CalcTest 這次沒有被執行", c.runRead("iter-1/feedback.md").includes("com.x.CalcTest") && c.runRead("iter-1/feedback.md").includes("沒有執行"), c.runRead("iter-1/feedback.md").slice(0, 400));
+    check("每一次建置都強制執行 test task", c.argv.length === 2 && c.argv.every(gradleForced), JSON.stringify(c.argv));
+  },
   "gradle-up-to-date-failing": (c) => {
     check("第 1 輪判紅、第 2 輪才通過", c.result.success === true && c.result.iterations === 2, JSON.stringify([c.result.stopReason, c.result.iterations, c.result.crashed]));
     check("回饋附上測試結果裡的失敗", c.runRead("iter-1/feedback.md").includes("nothing was thrown"), c.runRead("iter-1/feedback.md").slice(0, 600));
@@ -1550,6 +1853,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("每批各自的 prompt 只含自己的類別", p2.includes("Greeter.java") && !p2.includes("Calc.java"), p2.slice(0, 600));
     check("建置 3 次：預檢 + 第 1 批 + 第 2 批", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
     check("逐批進度落地在 batches.json", c.runRead("batches.json").includes("Greeter.java"));
+    check("兩批都結束了（一批撤回、一批通過）：沒有留下復原日誌", !c.runExists("batch-1-Calc/inflight") && !c.runExists("batch-2-Greeter/inflight"));
   },
 
   "loop-batches-all-pass": (c) => {
@@ -1559,6 +1863,7 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("兩批都通過、都沒有撤回", b.length === 2 && b.every((x) => x.success === true && !x.rolledBack), JSON.stringify(b));
     check("兩個測試檔都在", c.exists("src/test/java/com/x/CalcTest.java") && c.exists("src/test/java/com/x/GreeterTest.java"));
     check("沒有 rejected 目錄", !c.runExists("batch-1-Calc/rejected") && !c.runExists("batch-2-Greeter/rejected"));
+    check("通過的批次不留復原日誌", !c.runExists("batch-1-Calc/inflight") && !c.runExists("batch-2-Greeter/inflight"));
     const params = JSON.parse(c.runRead("params.json") || "{}");
     check("params.json 記錄 batchSize", params.batchSize === 1, String(params.batchSize));
   },
@@ -1676,6 +1981,12 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     );
     check("src/test 只留通過 gate 的測試", c.exists("src/test/java/com/x/CalcTest.java") && !c.exists("src/test/java/com/x/GreeterTest.java"));
     check("中斷那批的嘗試保留在 rejected/", c.runExists("batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java"));
+    check("中斷那批已經撤回：它的復原日誌刪掉", !c.runExists("batch-2-Greeter/inflight") && !c.runExists("batch-1-Calc/inflight"));
+    check(
+      "被中斷時收掉了建置：子程序紀錄是空的（下一次執行不必再找）",
+      JSON.parse(c.runRead("children.json") || '{"children":["missing"]}').children.length === 0,
+      c.runRead("children.json"),
+    );
     check("沒跑的 Zeta 列在 notRun", JSON.stringify(c.result.notRun ?? []).includes("Zeta.java"), JSON.stringify(c.result.notRun));
   },
 
@@ -1905,7 +2216,771 @@ const CHECKS: Record<string, (c: Ctx) => void> = {
     check("建置 3 次：預檢 + 修復驗證 + gate", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
     check("新測試確實產生", c.exists("src/test/java/com/x/CalcTest.java"));
   },
+
+  // ── Resuming an earlier run ────────────────────────────────────────────────
+  "loop-resume-all-passed": (c) => {
+    resumedCalc(c);
+    check("不再找 agent（重跑沒有任何 api 請求）", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+  },
+
+  "loop-resume-review-passed": (c) => {
+    resumedCalc(c);
+    check("不再找 writer 與 reviewer", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+    check("說明 review 分數以現在的門檻重新判定過", c.stdout.includes("review 分數以現在的門檻重新判定"), c.stdout.slice(-800));
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check("第一次的通過紀錄留下 reviewer 的分數", e?.verdict?.scores?.effectiveness === 8, JSON.stringify(e?.verdict));
+  },
+
+  "loop-resume-stale-report-strict": (c) => redone(c, "覆蓋率重新量測沒有通過：（"),
+  "loop-resume-stale-report-loose": (c) => {
+    resumedCalc(c);
+    check("沒有這次的報告就不說覆蓋率重新量過", c.stdout.includes("沒有這次建置的 JaCoCo 報告") && !c.stdout.includes("重新量過"), c.stdout.slice(-800));
+  },
+  "loop-resume-ran-unknown": (c) => redone(c, "這次的預檢建置認不出執行了哪些測試類別"),
+  "loop-resume-own-test-name": (c) => {
+    resumedCalc(c, "src/test/java/com/x/CalcBehaviourTest.java");
+    check("不再找 agent", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+  },
+  "loop-resume-test-edited": (c) => redone(c, "src/test/java/com/x/CalcTest.java 在上次通過之後改過"),
+  "loop-resume-touched-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-second-test-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-tests-all-skipped": (c) => redone(c, "com.x.CalcTest（全部被略過）"),
+  "loop-resume-own-test-failed": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中失敗過"),
+  "loop-resume-testng-suite-failed": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中失敗過"),
+  "loop-resume-package-differs-failed": (c) => redoneBy(c, "com.y.CalcTest", "預檢建置中失敗過"),
+  "loop-resume-concat-resource": (c) => {
+    check(
+      "第一次的通過紀錄記下 CalcTest 以字串相加點名的 fixture",
+      Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/resources/fixtures/order.json"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    redone(c, "src/test/resources/fixtures/order.json 在上次通過之後改過");
+  },
+  "loop-resume-concrete-base": (c) => {
+    resumedCalc(c, undefined, CALC_TEST_TEXT.replace("class CalcTest {", "class CalcTest extends CalcCases {"));
+    check("沒有找 agent", apiRequests(c).length === 0, `${apiRequests(c).length} 個請求`);
+  },
+  "loop-resume-no-test-class": (c) => redone(c, "上次通過時的檔案裡找不到會被執行的測試類別"),
+  "loop-resume-repair-changed-resource": (c) => {
+    check("重跑的預檢紅燈、修復迴圈改了測試資源後轉綠", c.stdout.includes("修復") && c.exists("src/test/resources/legacy.properties"), c.stdout.slice(0, 1500));
+    redone(c, "修復迴圈改過測試資源或 Spring 會自己載入的類別（resources/legacy.properties），任何測試都可能讀到它");
+  },
+  "loop-resume-repair-changed-config": (c) => {
+    check("重跑的預檢紅燈、修復迴圈加了 @TestConfiguration 後轉綠", c.stdout.includes("修復") && c.exists("src/test/java/com/x/TestConfig.java"), c.stdout.slice(0, 1500));
+    redone(c, "修復迴圈改過測試資源或 Spring 會自己載入的類別（com/x/TestConfig.java），任何測試都可能讀到它");
+  },
+  "loop-resume-repair-changed-helper": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑的預檢紅燈、修復迴圈加了 LegacyHelper 後轉綠", c.stdout.includes("修復") && c.exists("src/test/java/com/x/LegacyHelper.java"), c.stdout.slice(0, 1500));
+    check(
+      "重跑 exit 0：修復之後照樣接續 Calc（普通的 helper 不是任何測試都會讀到的東西）",
+      c.code === 0 && c.result.stopReason === "already-passed" && JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]',
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.slice(-900)}`,
+    );
+    check("重跑只有預檢與修復那兩次建置", c.mvnCalls === 4, `mvnCalls=${c.mvnCalls}`);
+  },
+  "loop-resume-testng-all-skipped": (c) => redone(c, "com.x.CalcTest（全部被略過）"),
+  "loop-resume-cjk-display-name-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-cjk-display-name-ran": (c) => {
+    resumedCalc(c, undefined, CALC_TEST_CJK_TEXT);
+    check("沒有找 agent", apiRequests(c).length === 0, `${apiRequests(c).length} 個請求`);
+  },
+  "loop-resume-cjk-display-name-flaky": (c) => redoneBy(c, "計算機測試", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-nested-display-name-flaky": (c) => redoneBy(c, "計算機測試 加法", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-surefire-flaky": (c) => redoneBy(c, "com.x.CalcTest", "預檢建置中不穩定：失敗之後重跑才通過"),
+  "loop-resume-cjk-fixture": (c) => {
+    check(
+      "第一次的通過紀錄記下 CalcTest 點名的 fixtures/訂單.json",
+      Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/resources/fixtures/訂單.json"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    redone(c, "src/test/resources/fixtures/訂單.json 在上次通過之後改過");
+  },
+  "loop-resume-prefixed-resource": (c) => {
+    check(
+      "第一次的通過紀錄記下以測試命名的 CalcTest.sql（測試裡沒有字串點名它）",
+      Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/resources/com/x/CalcTest.sql"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    redone(c, "src/test/resources/com/x/CalcTest.sql 在上次通過之後改過");
+  },
+  "loop-resume-other-package-helper": (c) => {
+    const files = Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {});
+    check(
+      "通過紀錄記下自己 package 的 Support，沒有記別的 package 的同名類別",
+      files.includes("src/test/java/com/x/Support.java") && !files.includes("src/test/java/com/y/Support.java"),
+      JSON.stringify(files),
+    );
+    resumedCalc(c, undefined, CALC_TEST_TEXT.replace("assertEquals(3, new Calc().add(1, 2));", "assertEquals(3, new Calc().add(Support.one(), 2));"));
+  },
+  "loop-resume-ledger-escape": (c) => redone(c, "紀錄裡的檔案路徑 ../outside/CalcTest.java 不在 repo 裡，這筆紀錄不能用"),
+  "loop-resume-shared-helper": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check(
+      "第一次在第 2 批通過時就說 Calc 的紀錄不再相符、為什麼",
+      (c.first?.stdout ?? "").includes("第 2 批改了 src/test/java/com/x/Support.java：Calc 的通過紀錄不再相符"),
+      (c.first?.stdout ?? "").split("\n").filter((l) => l.includes("接續")).join("\n").slice(-800),
+    );
+    check("重跑接續 Greeter", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Greeter.java"]', JSON.stringify(c.result.resumed));
+    check(
+      "重跑重新產生 Calc，說明是 Support.java 改過",
+      c.stdout.includes("src/test/java/com/x/Support.java 在上次通過之後改過") && c.code === 0 && c.result.success === true,
+      `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-900)}`,
+    );
+  },
+  "loop-resume-repair-green-log": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑的預檢紅燈、修復迴圈修好", c.stdout.includes("修復") && c.exists("src/test/java/com/x/LegacyHelper.java"), c.stdout.slice(0, 1500));
+    check(
+      "重跑 exit 0：修復那次建置的 log 說 CalcTest 跑了 → 接續 Calc",
+      c.code === 0 && c.result.stopReason === "already-passed" && JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]',
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.slice(-900)}`,
+    );
+  },
+  "loop-resume-flaky-single-run": (c) => {
+    check("第一次：Calc 通過、Greeter 沒過", c.first?.code === 2 && c.first?.result.stopReason === "some-batches-failed", `code=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑接續 Calc、Greeter 通過", c.code === 0 && JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', `code=${c.code} ${String(c.result.stopReason)} ${JSON.stringify(c.result.resumed)}`);
+    check("重跑不分批（一個 run 做剩下的類別）", !c.result.batches, JSON.stringify(Object.keys(c.result)));
+    const ledger = ledgerOf(c.runDir) as Array<LedgerEntry & { invalid?: string }>;
+    const calc = ledger.find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check(
+      "這次的 passed.json 裡帶過來的 Calc 紀錄標記作廢；Greeter 的照常",
+      /CalcTest/.test(calc?.invalid ?? "") && ledger.some((e) => e.cls === "src/main/java/com/x/Greeter.java" && !e.invalid),
+      JSON.stringify(ledger.map((e) => [e.cls, e.invalid ?? null])),
+    );
+  },
+  "loop-resume-flaky-later-batch": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    const calc = ledgerOf(c.first?.runDir ?? "").find((e) => e.cls === "src/main/java/com/x/Calc.java") as (LedgerEntry & { invalid?: string }) | undefined;
+    check(
+      "第一次的 passed.json 留著 Calc 的紀錄、標記作廢（不是刪掉——刪掉會讓更舊的紀錄又算數）",
+      !!calc && /CalcTest/.test(calc.invalid ?? "") && /不穩定/.test(calc.invalid ?? ""),
+      JSON.stringify(calc),
+    );
+    check("第一次說出 Calc 的紀錄作廢", (c.first?.stdout ?? "").includes("Calc 的通過紀錄作廢"), (c.first?.stdout ?? "").slice(-900));
+    check("重跑接續 Greeter", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Greeter.java"]', JSON.stringify(c.result.resumed));
+    check(
+      "重跑重新產生 Calc，說明它的測試不穩定",
+      /Calc\.java：它的測試 com\.x\.CalcTest 在 \S+ 的執行中不穩定/.test(c.stdout) && c.code === 0 && c.result.success === true,
+      `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-900)}`,
+    );
+  },
+  "loop-resume-referenced-helper-edited": (c) => {
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check("通過紀錄記下 CalcTest 用到的既有 Support.java", !!e && "src/test/java/com/x/Support.java" in e.files, JSON.stringify(e?.files));
+    redone(c, "src/test/java/com/x/Support.java 在上次通過之後改過");
+  },
+  "loop-resume-last-class-set-aside": (c) => {
+    check("第一次：Calc 過、Greeter 沒過", c.first?.result.stopReason === "some-batches-failed", String(c.first?.result.stopReason));
+    check("重跑接續 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    const b = (c.result.batches ?? []) as Array<Record<string, any>>;
+    check(
+      "重跑時 Greeter 仍是資料夾的一批：沒過就撤回，嘗試的版本在 rejected/",
+      b.length === 1 && b[0].success === false && JSON.stringify(b[0].rolledBack?.created ?? []).includes("GreeterTest.java"),
+      JSON.stringify(b.map((x) => [x.stopReason, x.rolledBack?.created])),
+    );
+    check("src/test 不留下沒通過的 GreeterTest.java", !c.exists("src/test/java/com/x/GreeterTest.java"));
+  },
+  "loop-resume-gradle": (c) => {
+    resumedCalc(c);
+    check("不再找 agent", apiRequests(c).length === 0, apiRequests(c).join("\n").slice(0, 400));
+    check("兩次執行的每一次建置都強制執行 test task", c.argv.length >= 3 && c.argv.every(gradleForced), JSON.stringify(c.argv));
+  },
+  "loop-resume-gradle-up-to-date": (c) => redone(c, "Gradle 的 test task 沒有實際執行"),
+  "loop-resume-source-edited": (c) => redone(c, "Calc.java 在上次通過之後改過"),
+  "loop-resume-new-test-file": (c) => redone(c, "多了上次通過時沒有的測試檔 src/test/java/com/x/CalcUnitTest.java"),
+  "loop-resume-helper-edited": (c) => {
+    const e = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java");
+    check(
+      "第一次的通過紀錄連同那批 writer 寫的 Support.java 一起記下",
+      !!e && "src/test/java/com/x/Support.java" in e.files && "src/test/java/com/x/CalcTest.java" in e.files,
+      JSON.stringify(e?.files),
+    );
+    redone(c, "src/test/java/com/x/Support.java 在上次通過之後改過");
+  },
+  "loop-resume-coverage-dropped": (c) => redone(c, "覆蓋率重新量測沒有通過：- Calc.java: line=40.0%"),
+  "loop-resume-tests-not-run": (c) => redone(c, "它的測試（com.x.CalcTest）沒有在這次的預檢建置中執行"),
+  "loop-resume-review-threshold-raised": (c) => redone(c, "上次的 review 判決以現在的門檻不通過（effectiveness（8 < 門檻 9））"),
+  "loop-resume-review-was-skipped": (c) => redone(c, "上次通過時 review gate 是關閉的"),
+  "loop-resume-rubric-changed": (c) => redone(c, "review 的 rubric 在上次通過之後改過"),
+  "loop-resume-dirty-baseline": (c) => redone(c, "但這次的預檢建置是紅的（UT_ALLOW_DIRTY_BASELINE=1 放行）"),
+  "loop-resume-skip-baseline": (c) => redone(c, "但這次沒有跑預檢建置（UT_SKIP_BASELINE=1）"),
+  "loop-resume-disabled": (c) => {
+    redone(c, "");
+    check("UT_RESUME=0 時不看先前的紀錄", !c.stdout.includes("[接續]"), c.stdout.slice(-800));
+    check("params.json 記錄 resume=false", JSON.parse(c.runRead("params.json") || "{}").resume === false);
+  },
+
+  "loop-resume-batches": (c) => {
+    check("第一次：Calc 通過、Greeter 沒過", c.first?.code === 2 && c.first?.result.stopReason === "some-batches-failed", `code=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑 exit 0", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+    check("重跑略過 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "重跑只剩一個類別，仍是資料夾目標的分批（沒過會撤回、執行中有復原日誌），不是單一類別的 run",
+      JSON.stringify(c.result.targetClasses) === '["src/main/java/com/x/Greeter.java"]' && b.length === 1 && b[0].success === true,
+      JSON.stringify([c.result.targetClasses, b.map((x) => x.targetClasses)]),
+    );
+    const prompt = c.runRead("batch-1-Greeter/iter-1/prompt.md");
+    check("writer 的 prompt 只有 Greeter", prompt.includes("Greeter.java") && !prompt.includes("com/x/Calc.java"), prompt.slice(0, 600));
+    const ledger = ledgerOf(c.runDir);
+    const calc = ledger.find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check(
+      "這次的 passed.json 帶著 Calc 的通過紀錄（指向第一次那批）與 Greeter 這次的",
+      !!calc && calc.dir.startsWith(c.first?.runDir ?? "?") && ledger.some((e) => e.cls === "src/main/java/com/x/Greeter.java"),
+      JSON.stringify(ledger.map((e) => [e.cls, e.dir])),
+    );
+    check("建置 5 次：第一次 3 次、重跑 2 次（預檢 + Greeter）", c.mvnCalls === 5, `mvnCalls=${c.mvnCalls}`);
+  },
+
+  // ── Round 5 ───────────────────────────────────────────────────────────────
+  "loop-resume-flaky-redo-interrupted": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    check("第一次：Calc 通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check(
+      "第二次：預檢說 CalcTest 不穩定、要重做 Calc，然後被 Ctrl-C",
+      (c.second?.stdout ?? "").includes("的預檢建置中不穩定") && c.second?.result.stopReason === "interrupted:SIGINT",
+      `${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n")}`,
+    );
+    const calc = (ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check("第二次的 passed.json 一開始就把 Calc 的紀錄記成作廢（說明原因）", /不穩定/.test(calc?.invalid ?? ""), JSON.stringify(calc));
+    check(
+      "第三次：不接續 Calc（第二次才看到它的測試不穩定，之後沒有新的通過）",
+      !resumedOf(c).includes("src/main/java/com/x/Calc.java") && c.stdout.includes("不穩定"),
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
+    );
+  },
+  "loop-resume-flaky-redo-failed": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    const b = (c.second?.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "第二次：預檢說 CalcTest 不穩定、接續 Greeter、重做 Calc 那批沒過而撤回",
+      (c.second?.stdout ?? "").includes("的預檢建置中不穩定") && b.length === 1 && b[0].success === false && !!b[0].rolledBack,
+      `${String(c.second?.result.stopReason)} ${JSON.stringify(b.map((x) => [x.targetClasses, x.success, x.stopReason]))}`,
+    );
+    check(
+      "第三次：不接續 Calc",
+      !resumedOf(c).includes("src/main/java/com/x/Calc.java"),
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
+    );
+  },
+  "loop-resume-flaky-before-pass": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}\n${(c.first?.stdout ?? "").slice(-1500)}`);
+    check("第一次：第 1 批判定 GreeterTest 不穩定", (c.first?.stdout ?? "").includes("com.x.GreeterTest 是不穩定的測試"), (c.first?.stdout ?? "").slice(-2500));
+    const g = (ledgerOf(c.first?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Greeter.java");
+    check("第一次：Greeter 的紀錄記成作廢（它帶著這次執行中不穩定、沒改過的 GreeterTest 通過）", /GreeterTest/.test(g?.invalid ?? ""), JSON.stringify(g?.invalid));
+    check(
+      "重跑：不接續 Greeter",
+      !resumedOf(c).includes("src/main/java/com/x/Greeter.java"),
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`,
+    );
+  },
+  "loop-resume-surefire-flaky-later-batch": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}\n${(c.first?.stdout ?? "").slice(-1500)}`);
+    const calc = (ledgerOf(c.first?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check("第一次：第 2 批的綠建置裡 CalcTest 是 <flakyFailure> → Calc 的紀錄記成作廢", /CalcTest/.test(calc?.invalid ?? ""), JSON.stringify(calc?.invalid));
+    check("第一次：說出 surefire 重跑才通過", (c.first?.stdout ?? "").includes("失敗之後被重跑才通過"), (c.first?.stdout ?? "").slice(-1500));
+    check("重跑：不接續 Calc", !resumedOf(c).includes("src/main/java/com/x/Calc.java"), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-phrased-flaky-later-batch": (c) => {
+    check("第一次：兩批都通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}\n${(c.first?.stdout ?? "").slice(-1500)}`);
+    const calc = (ledgerOf(c.first?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check("第一次：以 @DisplayName 點名的重跑才過 → Calc 的紀錄記成作廢", /計算機測試/.test(calc?.invalid ?? ""), JSON.stringify(calc?.invalid));
+    check("重跑：不接續 Calc", !resumedOf(c).includes("src/main/java/com/x/Calc.java"), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-spring-config-between-runs": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check(
+      "第一次的紀錄記下 Spring 會自己載入的 TestConfig.java",
+      Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/java/com/x/TestConfig.java"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    check("重跑：不接續 Calc，說 TestConfig.java 改過", resumedOf(c).length === 0 && c.stdout.includes("src/test/java/com/x/TestConfig.java 在上次通過之後改過"), `resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-application-yml-between-runs": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑：不接續 Calc，說 application.yml 改過", resumedOf(c).length === 0 && c.stdout.includes("src/test/resources/application.yml 在上次通過之後改過"), `resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-application-yml-not-spring": (c) => {
+    check(
+      "第一次的紀錄沒有 application.yml（不起 Spring 的測試讀不到它）",
+      !Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {}).includes("src/test/resources/application.yml"),
+      JSON.stringify(Object.keys(ledgerOf(c.first?.runDir ?? "")[0]?.files ?? {})),
+    );
+    check("重跑：照樣接續 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-two-top-level-types": (c) => {
+    check("重跑：不接續 Calc，說 TestData.java 改過", resumedOf(c).length === 0 && c.stdout.includes("src/test/java/com/x/TestData.java 在上次通過之後改過"), `resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-import-folder-mismatch": (c) => {
+    check("重跑：不接續 Calc，說它 import 的 Support 改過", resumedOf(c).length === 0 && c.stdout.includes("src/test/java/com/x/Support.java 在上次通過之後改過"), `resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-red-baseline-flake-then-repair": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑的預檢紅燈、修復迴圈修好", c.stdout.includes("修復") && c.exists("src/test/java/com/x/LegacyHelper.java"), c.stdout.slice(0, 1500));
+    check(
+      "重跑：不接續 Calc（這次的預檢裡 CalcTest 失敗後 surefire 重跑才過）",
+      resumedOf(c).length === 0 && c.stdout.includes("的預檢建置中不穩定"),
+      `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
+    );
+  },
+  "loop-resume-sniffed-ms950-helper": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}\n${(c.first?.stdout ?? "").slice(-1200)}`);
+    check("原始碼編碼是 sniffed（名稱不明）", (c.first?.stdout ?? "").includes("名稱不明"), (c.first?.stdout ?? "").split("\n").filter((l) => l.includes("編碼")).join("\n"));
+    check("重跑：不接續 Calc，說 CalcTest 呼叫的 Messages 改過", resumedOf(c).length === 0 && c.stdout.includes("src/test/java/com/x/Messages.java 在上次通過之後改過"), `resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-testng-flake-later-batch": (c) => {
+    const calc = (ledgerOf(c.first?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check("第一次：Calc 的紀錄因為 CalcTest 在後面的建置失敗、重跑才過而作廢", /CalcTest/.test(calc?.invalid ?? ""), `${JSON.stringify(calc?.invalid)}\n${(c.first?.stdout ?? "").slice(-1500)}`);
+    check("重跑：不接續 Calc", !resumedOf(c).includes("src/main/java/com/x/Calc.java"), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-log-only-all-skipped": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑：不接續 Calc（它的測試這次全部被略過）", resumedOf(c).length === 0 && c.stdout.includes("com.x.CalcTest（全部被略過）"), `resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`);
+  },
+  "loop-resume-flaky-then-interrupted": (c) => {
+    if (process.platform === "win32") return; // the interrupt is delivered by pid
+    const s = c.first?.stdout ?? "";
+    check("第一次：第 2 批判定 CalcTest 不穩定，之後被 Ctrl-C", s.includes("com.x.CalcTest 是不穩定的測試") && c.first?.result.stopReason === "interrupted:SIGINT", `${String(c.first?.result.stopReason)}\n${s.slice(-1500)}`);
+    const calc = (ledgerOf(c.first?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+    check("第一次：判定 flaky 的當下就把 Calc 的紀錄記成作廢", /CalcTest/.test(calc?.invalid ?? ""), JSON.stringify(calc?.invalid));
+    check("重跑：不接續 Calc", !resumedOf(c).includes("src/main/java/com/x/Calc.java"), `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-new-file-shadows": (c) => {
+    const files = ledgerOf(c.first?.runDir ?? "").find((x) => x.cls === "src/main/java/com/x/Calc.java")?.files ?? {};
+    check("第一次的紀錄記下 on-demand import 取到的 com/y/Support.java", typeof files["src/test/java/com/y/Support.java"] === "string", JSON.stringify(files));
+    check(
+      "重跑：不接續 Calc，說它的測試現在會用到之後才出現的 com/x/Support.java（重新走一次引用）",
+      resumedOf(c).length === 0 && c.stdout.includes("它的測試現在會用到 src/test/java/com/x/Support.java"),
+      `resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n")}`,
+    );
+  },
+  "loop-resume-repair-deleted-config": (c) => {
+    check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+    check("重跑的預檢紅燈、修復迴圈刪掉 TestConfig 後轉綠", c.stdout.includes("修復") && !c.exists("src/test/java/com/x/TestConfig.java"), c.stdout.slice(0, 1500));
+    check("重跑：不接續 Calc（修復迴圈刪掉了可能是 Spring 會自己載入的類別）", resumedOf(c).length === 0, `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}`);
+  },
+  "loop-resume-rerun-interrupted": (c) => {
+    if (process.platform === "win32") return; // the fake build signals the loop by its pid
+    check("重跑在 Greeter 被 Ctrl-C 中斷", c.result.stopReason === "interrupted:SIGINT", String(c.result.stopReason));
+    check("被中斷的 summary 照樣列出接續的 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    check("Calc 的通過紀錄已帶進這次的 passed.json", ledgerOf(c.runDir).some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+  },
+
+  // ── A run killed outright ──────────────────────────────────────────────────
+  "loop-killed-mid-writer": (c) => {
+    killedRecovered(c, { restored: true });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check("它改過的 ExistingTest.java 也算在撤回裡", (rb.restored ?? []).includes("java/com/x/ExistingTest.java"), JSON.stringify(rb));
+  },
+  "loop-killed-orphan-build": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("第一次被終止時，建置本身還在跑（孤兒）", pid > 0, c.read(".itest/orphan.pid"));
+      check("重跑一開始就結束它", pid > 0 && !pidAlive(pid), `pid ${pid} 還在`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+      const stoppedAt = c.stdout.indexOf("還在跑的子程序");
+      const rolledBackAt = c.stdout.indexOf("被強制終止，沒來得及撤回");
+      check(
+        "先結束還在跑的子程序、才撤回那批（還在寫檔的建置或 agent 會跟撤回搶）",
+        stoppedAt >= 0 && rolledBackAt > stoppedAt,
+        `stop@${stoppedAt} rollback@${rolledBackAt}`,
+      );
+      check("處理過的子程序紀錄移除（之後那些 pid 可能是任何人的）", !fs.existsSync(firstRunFile(c, "children.json")));
+      killedRecovered(c, { restored: true });
+      check("這次執行結束時，自己的子程序紀錄是空的", JSON.parse(c.runRead("children.json") || "{}").children?.length === 0, c.runRead("children.json"));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-fork": (c) => {
+    if (process.platform === "win32") return;
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("建置自己結束了，它 fork 出去的程序還在它的程序群組裡", pid > 0, c.read(".itest/orphan.pid"));
+      check("重跑結束了那個程序群組", pid > 0 && !pidAlive(pid), `pid ${pid} 還在`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-pid-reused": (c) => orphanLeftAlone(c, { recordKept: false }),
+  "loop-killed-orphan-other-checkout": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-other-host": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-rebooted": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-orphan-clock-stepped": (c) => {
+    if (process.platform !== "linux") return; // a boot id is Linux's; elsewhere the estimate is all there is
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("時鐘校正不影響：留下的建置照樣被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      check("log 說明結束了上一次留下的子程序", c.stdout.includes("上一次執行被強制終止時留下 1 個還在跑的子程序"), c.stdout.slice(0, 2000));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-corrupt-record": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    check("損毀的子程序紀錄不讓重跑當掉：照常撤回那批、接續到通過", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stderr.slice(-600)}`);
+    orphanLeftAlone(c, { recordKept: false });
+  },
+  "loop-killed-orphan-build-keeps-fix": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("留下的建置被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+      check(
+        "開發者在那之後修的 ExistingTest.java 留著，列為別人的變更",
+        c.read("src/test/java/com/x/ExistingTest.java").includes("fixed by the developer") && (rb.foreign ?? []).includes("java/com/x/ExistingTest.java"),
+        JSON.stringify(rb),
+      );
+      check("writer 新增的 GreeterTest.java 照樣撤回", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-orphan-other-container": (c) => {
+    if (process.platform !== "linux") return; // a pid namespace is Linux's
+    check("子程序紀錄帶著寫它的 pid namespace", /"pidns":"pid:\[1\]"/.test(firstRunRead(c, "children.json")), firstRunRead(c, "children.json") || "(紀錄不見了)");
+    orphanLeftAlone(c, { recordKept: true });
+  },
+  // Its record is that run's own, still in use: not ours to remove either.
+  "loop-killed-orphan-owner-alive": (c) => orphanLeftAlone(c, { recordKept: true }),
+  "loop-killed-other-host": (c) => {
+    killedLeftAlone(c);
+    check("別台機器的日誌原樣留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("也不替它寫 summary", firstSummary(c) === undefined, JSON.stringify(firstSummary(c)));
+    check("log 說明有別台機器的日誌、不處理", c.stdout.includes("是別台機器或別的容器留下的"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-other-host-same-checkout": (c) => killedRecovered(c, { restored: true }),
+  "loop-killed-busy-owner-exits": (c) => {
+    if (process.platform === "win32") return; // no start times to tell the owner by
+    check("先說明這個 checkout 上可能還有 testgen 在跑、等它", c.stdout.includes("可能還在執行的 testgen") && c.stdout.includes("它已經停止"), c.stdout.slice(0, 2000));
+    killedRecovered(c, { restored: true });
+  },
+  "loop-killed-busy-gives-up": (c) => {
+    if (process.platform === "win32") return; // no start times to tell the owner by
+    check("等不到它停止 → 以 checkout-busy 停下", c.code !== 0 && c.result.stopReason === "checkout-busy", `code=${c.code} ${JSON.stringify(c.result)}`);
+    check("說明原因與怎麼辦", (c.stdout + c.stderr).includes("可能還有另一個 testgen 在執行"), (c.stdout + c.stderr).slice(-1500));
+    check("它的日誌留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("沒有撤回、也沒有替它寫 summary（它可能還在跑）", firstSummary(c) === undefined && c.read("src/test/java/com/x/ExistingTest.java").includes(KILLED_LINE));
+    check("沒有開始產生測試（沒找 writer）", apiRequests(c).length === 0);
+  },
+  "loop-killed-trace-lost": (c) => {
+    check("說明 trace 讀不了、改用那批開始之後的所有變更", c.stdout.includes("trace.json 讀不了"), c.stdout.slice(0, 2500));
+    killedRecovered(c, { restored: true });
+  },
+  "loop-killed-moved-after-death": (c) => {
+    killedRecovered(c, { restored: true });
+    check("開發者的移動留著：data/order.json 在、fixtures/order.json 沒被放回", c.exists("src/test/resources/data/order.json") && !c.exists("src/test/resources/fixtures/order.json"));
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "移動的兩邊都不算那批的，也不列成別人的變更",
+      ![...(rb.created ?? []), ...(rb.undeleted ?? []), ...(rb.foreign ?? [])].some((f: string) => /order\.json$/.test(f)),
+      JSON.stringify(rb),
+    );
+    check("log 說明是之後的移動", c.stdout.includes("被移動過") && c.stdout.includes("data/order.json"), c.stdout.slice(0, 2500));
+    check(
+      "移走的原檔不當成「無法判斷誰刪的」（不點名、不存進 deleted/）",
+      !c.stdout.includes("無法判斷是被終止的 writer") && !fs.existsSync(firstRunFile(c, "batch-2-Greeter/deleted")),
+      c.stdout.slice(0, 2500),
+    );
+  },
+  "loop-killed-recloned": (c) => {
+    killedLeftAlone(c);
+    check("不屬於這個 checkout 的日誌丟掉，並說明", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")) && c.stdout.includes("重新 clone"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-corrupt-journal": (c) => {
+    killedLeftAlone(c);
+    check("損毀的日誌丟掉，並說明", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")) && c.stdout.includes("內容損毀"), c.stdout.slice(0, 2000));
+  },
+  "loop-killed-deleted-after-death": (c) => {
+    check("第一次執行被強制終止", !c.first?.result.stopReason);
+    check("死後才被刪掉的 ExistingTest.java 沒有被放回", !c.exists("src/test/java/com/x/ExistingTest.java"));
+    check(
+      "它原本的內容保留在那批的 deleted/",
+      firstRunRead(c, "batch-2-Greeter/deleted/src/test/java/com/x/ExistingTest.java") === EXISTING_TEST,
+      firstRunRead(c, "batch-2-Greeter/deleted/src/test/java/com/x/ExistingTest.java"),
+    );
+    check("log 說明無法判斷是誰刪的", c.stdout.includes("無法判斷是被終止的 writer") && c.stdout.includes("ExistingTest.java"), c.stdout.slice(0, 2500));
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check("writer 新增的 GreeterTest.java 照樣移出", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+    check("重跑照常完成", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-600)}`);
+  },
+  "loop-killed-restore-fails": (c) => {
+    if (process.platform === "win32") return; // mkfifo
+    check("撤回時有檔案放不回去 → 這次停下（不在寫到一半的測試上產生新的）", c.code !== 0 && c.result.stopReason === "killed-batch-not-restored", `code=${c.code} ${JSON.stringify(c.result)}`);
+    check("日誌留著，給下一次執行再試", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("說明原因與怎麼辦", c.stdout.includes("沒辦法完整撤回") || c.stderr.includes("沒辦法完整撤回"), (c.stdout + c.stderr).slice(-1500));
+    check("沒有開始產生測試（沒找 writer）", apiRequests(c).length === 0);
+  },
+  "loop-killed-writer-deleted": (c) => {
+    killedRecovered(c, { restored: false });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "被終止的 writer 刪掉的 ExistingTest.java 放回原本的內容",
+      (rb.undeleted ?? []).includes("java/com/x/ExistingTest.java") && c.read("src/test/java/com/x/ExistingTest.java") === EXISTING_TEST,
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-orphan-writes-on": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    const pid = Number(c.read(".itest/orphan.pid"));
+    try {
+      check("留下的程序被結束", pid > 0 && !pidAlive(pid), `pid ${pid}`);
+      const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+      check(
+        "它在心跳停了之後才寫的 GreeterTest.java 仍算那批的：撤回、嘗試的版本留在 rejected/",
+        (rb.created ?? []).includes("java/com/x/GreeterTest.java") &&
+          firstRunRead(c, "batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java").includes("written by the orphan"),
+        JSON.stringify(rb),
+      );
+      check("最後的 GreeterTest.java 是這次的 writer 寫的", !c.read("src/test/java/com/x/GreeterTest.java").includes("written by the orphan"));
+    } finally {
+      stopPid(pid);
+    }
+  },
+  "loop-killed-mid-build": (c) => {
+    if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+    killedRecovered(c, { restored: true });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "建置時測試寫進 src/test 的檔不是 writer 的：留著，列為別人的變更",
+      c.exists("src/test/resources/written-by-a-test.txt") && (rb.foreign ?? []).includes("resources/written-by-a-test.txt"),
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-edit-after-death": (c) => {
+    killedRecovered(c, { restored: false });
+    const rb = firstSummary(c)?.inProgress?.rolledBack ?? {};
+    check(
+      "rollback.md 說它是那次執行被終止之後才改的",
+      firstRunRead(c, "batch-2-Greeter/rollback.md").includes("在那次執行被終止之後才改過"),
+    );
+    check(
+      "死後才改的 ExistingTest.java 不是 writer 的：留著，列為別人的變更",
+      c.read("src/test/java/com/x/ExistingTest.java").includes("fixed by hand after the crash") &&
+        (rb.foreign ?? []).includes("java/com/x/ExistingTest.java") &&
+        !(rb.restored ?? []).includes("java/com/x/ExistingTest.java"),
+      JSON.stringify(rb),
+    );
+  },
+  "loop-killed-batch-recorded": (c) => {
+    killedLeftAlone(c);
+    const sum = firstSummary(c);
+    check("仍然補寫 summary：killed，但沒有 inProgress（那批已經有紀錄）", sum?.stopReason === "killed" && !sum?.inProgress, JSON.stringify(sum));
+    check("日誌用完就移除", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  },
+  "loop-killed-other-checkout": (c) => {
+    killedLeftAlone(c);
+    check("另一個 checkout 的日誌原樣留著", fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight/journal.json")));
+    check("也不替它寫 summary", firstSummary(c) === undefined, JSON.stringify(firstSummary(c)));
+  },
+  "loop-killed-run-ended": (c) => {
+    killedLeftAlone(c);
+    check("那次執行自己的 summary 不動", firstSummary(c)?.stopReason === "interrupted:SIGHUP", JSON.stringify(firstSummary(c)));
+    check("剩下的日誌丟掉", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  },
+
+  "loop-resume-after-interrupt": (c) => {
+    if (process.platform === "win32") return; // the fake build signals the loop by its pid
+    check("第一次在第 2 批被 Ctrl-C 中斷", c.first?.result.stopReason === "interrupted:SIGINT", String(c.first?.result.stopReason));
+    check("第一次的 passed.json 已經有第 1 批的 Calc", ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+    check("重跑 exit 0", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+    check("重跑略過 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+    const b = (c.result.batches ?? []) as Array<Record<string, unknown>>;
+    check(
+      "重跑分兩批：Greeter、Zeta",
+      JSON.stringify(b.map((x) => (x.targetClasses as string[]).map((t) => t.replace(/\\/g, "/")))) ===
+        '[["src/main/java/com/x/Greeter.java"],["src/main/java/com/x/Zeta.java"]]',
+      JSON.stringify(b.map((x) => x.targetClasses)),
+    );
+    check("SUMMARY 列出接續的類別", c.stdout.includes("[接續] Calc（先前的執行已通過"), c.stdout.slice(-800));
+    check("三個測試檔都在", ["CalcTest", "GreeterTest", "ZetaTest"].every((t) => c.exists(`src/test/java/com/x/${t}.java`)));
+  },
 };
+
+// ─── Killed-run helpers ──────────────────────────────────────────────────────
+
+// Running: there, and not a zombie — a killed orphan waits to be reaped by a pid 1 that may be slow to.
+const pidAlive = (pid: number) => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return !/^[ZX]$/.test(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]);
+  } catch {
+    /* no such process — or no /proc: ask the kernel */
+  }
+  try {
+    process.kill(pid, 0);
+    return process.platform !== "linux";
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+/** The rerun had no business stopping the process the killed run's record names: it is still running. */
+function orphanLeftAlone(c: Ctx, o: { recordKept: boolean }): void {
+  if (process.platform === "win32") return; // the fake build kills its parent by pid, and on Windows that is cmd.exe
+  const pid = Number(c.read(".itest/orphan.pid"));
+  try {
+    check("那個程序沒有被結束：還活著", pid > 0 && pidAlive(pid), `pid ${pid}`);
+    check("沒有說結束了什麼", !c.stdout.includes("還在跑的子程序"), c.stdout.slice(0, 2000));
+    check(
+      o.recordKept ? "不是這次能處理的紀錄（別的 checkout、機器、容器、開機，或主人還活著）：原樣留著" : "看過的紀錄移除（之後那些 pid 可能是任何人的）",
+      fs.existsSync(firstRunFile(c, "children.json")) === o.recordKept,
+    );
+  } finally {
+    stopPid(pid);
+  }
+}
+
+/** A scenario's orphan does not outlive its checks, whatever they found. */
+const stopPid = (pid: number) => {
+  try {
+    if (pid > 0) process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+};
+
+const KILLED_LINE = "the killed writer was here";
+const firstRunFile = (c: Ctx, rel: string) => path.join(c.first?.runDir ?? "/nonexistent", rel);
+const firstRunRead = (c: Ctx, rel: string) => {
+  try {
+    return fs.readFileSync(firstRunFile(c, rel), "utf8");
+  } catch {
+    return "";
+  }
+};
+const firstSummary = (c: Ctx): Record<string, any> | undefined => {
+  try {
+    return JSON.parse(fs.readFileSync(firstRunFile(c, "summary.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/** The rerun set the killed batch aside from its journal, then went on as usual. */
+function killedRecovered(c: Ctx, o: { restored: boolean }): void {
+  check("第一次執行被強制終止：它自己沒有留下 summary", !c.first?.result.stopReason, JSON.stringify(c.first?.result));
+  const sum = firstSummary(c);
+  check(
+    "重跑替它補寫 summary：stopReason=killed、由這次執行收尾、被終止的是第 2 批",
+    sum?.stopReason === "killed" && sum?.recoveredBy === c.runDir && sum?.inProgress?.batch === 2,
+    JSON.stringify(sum),
+  );
+  const rb = sum?.inProgress?.rolledBack ?? {};
+  check("writer 新增的 GreeterTest.java 移出 src/test", (rb.created ?? []).includes("java/com/x/GreeterTest.java"), JSON.stringify(rb));
+  check(
+    "嘗試的版本保留在那批的 rejected/",
+    fs.existsSync(firstRunFile(c, "batch-2-Greeter/rejected/src/test/java/com/x/GreeterTest.java")),
+  );
+  if (o.restored) {
+    check("writer 改過的 ExistingTest.java 還原成原本的內容", c.read("src/test/java/com/x/ExistingTest.java") === EXISTING_TEST, c.read("src/test/java/com/x/ExistingTest.java"));
+  }
+  check(
+    "rollback.md 寫在那批的 artifacts，說明是被強制終止後由下一次執行撤回的",
+    firstRunRead(c, "batch-2-Greeter/rollback.md").includes("被強制終止"),
+  );
+  check("復原日誌用完就移除", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/inflight")));
+  check("log 說明撤回了哪一次的哪一批", c.stdout.includes("第 2 批（Greeter）被強制終止"), c.stdout.slice(0, 1500));
+  check("重跑照常接續 Calc、完成 Greeter", c.code === 0 && c.result.success === true && JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', `code=${c.code} ${String(c.result.stopReason)} ${JSON.stringify(c.result.resumed)}\n${c.stdout.slice(-600)}`);
+}
+
+/** The journal was not this rerun's to act on: nothing of the killed batch was undone. */
+function killedLeftAlone(c: Ctx): void {
+  check("被終止那批改過的 ExistingTest.java 沒有被撤回", c.read("src/test/java/com/x/ExistingTest.java").includes(KILLED_LINE));
+  check("沒有撤回：那批沒有 rollback.md", !fs.existsSync(firstRunFile(c, "batch-2-Greeter/rollback.md")));
+  check("沒有說撤回了什麼", !c.stdout.includes("被強制終止"), c.stdout.slice(0, 1500));
+  check("重跑照常完成", c.code === 0 && c.result.success === true, `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-600)}`);
+}
+
+// ─── Resume helpers ──────────────────────────────────────────────────────────
+
+type LedgerEntry = { cls: string; dir: string; files: Record<string, string | null>; verdict: { scores: Record<string, number> } | null };
+const ledgerOf = (runDir: string): LedgerEntry[] => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(runDir, "passed.json"), "utf8")).entries ?? [];
+  } catch {
+    return [];
+  }
+};
+const resumedOf = (c: Ctx) => ((c.result.resumed ?? []) as Array<{ cls: string }>).map((r) => r.cls.replace(/\\/g, "/"));
+const apiRequests = (c: Ctx) => c.read(".itest/api-requests.jsonl").split("\n").filter(Boolean);
+
+/** CalcTest with a Chinese class-level @DisplayName, as the resume scenarios write it. */
+const CALC_TEST_CJK_TEXT = CALC_TEST_TEXT.replace(
+  "import org.junit.jupiter.api.Test;",
+  "import org.junit.jupiter.api.DisplayName;\nimport org.junit.jupiter.api.Test;",
+).replace("class CalcTest {", '@DisplayName("計算機測試")\nclass CalcTest {');
+
+/** The rerun found Calc's pass still holding: nothing left to write. */
+function resumedCalc(c: Ctx, testFile = "src/test/java/com/x/CalcTest.java", content?: string): void {
+  check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+  check("第一次留下 passed.json，記著 Calc", ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === "src/main/java/com/x/Calc.java"));
+  check("重跑 exit 0，stopReason = already-passed", c.code === 0 && c.result.success === true && c.result.stopReason === "already-passed", `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`);
+  check("summary 列出接續的 Calc", JSON.stringify(resumedOf(c)) === '["src/main/java/com/x/Calc.java"]', JSON.stringify(c.result.resumed));
+  check("重跑只建置一次：預檢", c.mvnCalls === 3, `mvnCalls=${c.mvnCalls}`);
+  check("說明略過了什麼、依據是什麼", c.stdout.includes("[接續] 1 個類別在先前的執行已通過所有 gate"), c.stdout.slice(-800));
+  const carried = ledgerOf(c.runDir).find((e) => e.cls === "src/main/java/com/x/Calc.java");
+  check(
+    "這次的 passed.json 帶著 Calc 的通過紀錄，指向第一次的 artifacts，只有紀錄自己的欄位",
+    !!carried && carried.dir === c.first?.runDir && !("run" in carried),
+    JSON.stringify(carried),
+  );
+  check(
+    `${path.basename(testFile)} 還是第一次通過時的內容`,
+    c.read(testFile) === (content ?? CALC_TEST_TEXT.replace("class CalcTest", `class ${path.basename(testFile, ".java")}`)),
+  );
+}
+
+/** redone, for evidence a build found against it: "它的測試 <test> 在 <run> 的<what>". */
+function redoneBy(c: Ctx, test: string, what: string): void {
+  redone(c, "");
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  check(
+    `說明為什麼要重新產生：它的測試 ${test} 在 … 的${what}`,
+    new RegExp(`它的測試 ${esc(test)} 在 \\S+ 的${esc(what)}`).test(c.stdout),
+    c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-1200),
+  );
+}
+
+/** The rerun found Calc's pass no longer holding, said why, and wrote Calc again. */
+function redone(c: Ctx, why: string): void {
+  check("第一次執行通過", c.first?.code === 0 && c.first?.result.success === true, `first=${c.first?.code} ${String(c.first?.result.stopReason)}`);
+  check("重跑沒有略過 Calc", resumedOf(c).length === 0, JSON.stringify(c.result.resumed));
+  if (why) {
+    check(`說明為什麼要重新產生：${why}`, c.stdout.includes(why), c.stdout.split("\n").filter((l) => l.includes("接續") || l.startsWith("  - ")).join("\n").slice(-1200));
+  }
+  check(
+    "重跑照常產生並通過",
+    c.code === 0 && c.result.success === true && c.result.stopReason === "gates-passed",
+    `code=${c.code} ${String(c.result.stopReason)}\n${c.stdout.slice(-800)}`,
+  );
+  check("writer 被叫來重寫", apiRequests(c).length > 0);
+}
+
+/** Run 1 passed Calc, run 2 found evidence against it and stopped, run 3's baseline is green. */
+function evidenceKept(c: Ctx, secondOk: (s: Ctx["second"]) => boolean, what: string, firstPartial = false): void {
+  const CALC = "src/main/java/com/x/Calc.java";
+  check(
+    "第一次：Calc 通過",
+    ledgerOf(c.first?.runDir ?? "").some((e) => e.cls === CALC && !(e as { invalid?: string }).invalid) && (firstPartial || c.first?.code === 0),
+    `first=${c.first?.code} ${String(c.first?.result.stopReason)}`,
+  );
+  check(
+    `第二次：${what}`,
+    secondOk(c.second),
+    `second=${c.second?.code} ${String(c.second?.result.stopReason)}\n${(c.second?.stdout ?? "").slice(-1500)}`,
+  );
+  const l2 = ledgerOf(c.second?.runDir ?? "") as Array<LedgerEntry & { invalid?: string }>;
+  check("第二次的 passed.json 記下 Calc 的作廢紀錄", l2.some((e) => e.cls === CALC && !!e.invalid), `passed.json=${JSON.stringify(l2.map((e) => [e.cls, e.invalid ?? null]))}`);
+  check(
+    "第三次：不接續 Calc",
+    !resumedOf(c).includes(CALC),
+    `code=${c.code} ${String(c.result.stopReason)} resumed=${JSON.stringify(c.result.resumed)}\n${c.stdout.split("\n").filter((l) => l.includes("接續")).join("\n")}`,
+  );
+}
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -1920,8 +2995,11 @@ async function main() {
     `未釘住：${missing.join(", ")}`,
   );
 
+  // One scenario by name, or a group by a prefix ending in "*" (loop-resume-*).
   const only = process.argv[2];
-  const list = only ? SCENARIOS.filter((s) => s.name === only) : SCENARIOS;
+  const list = only
+    ? SCENARIOS.filter((s) => (only.endsWith("*") ? s.name.startsWith(only.slice(0, -1)) : s.name === only))
+    : SCENARIOS;
   if (!list.length) {
     console.error(`找不到情境：${only}`);
     process.exit(1);
@@ -1944,6 +3022,13 @@ async function main() {
       console.log("  [SKIP] Windows：「只有 node 的 PATH」這個情境只在 POSIX 上搭得出來");
       continue;
     }
+    // A report named "?????" is what a POSIX locale writes for a name it cannot hold; Windows allows no
+    // "?" in a file name at all (and keeps the name's characters there).
+    const reportNames = sc.mvn.flatMap((s) => [...(s.surefire ?? []).map((r) => r.cls), ...(s.surefireXml ?? []).map((r) => r.suite), ...Object.keys(s.writeFiles ?? {})]);
+    if (process.platform === "win32" && reportNames.some((n) => /[?*<>|"]/.test(n))) {
+      console.log("  [SKIP] Windows：這個情境的報告檔名有 ?（POSIX locale 寫不出的字），Windows 的檔名不允許");
+      continue;
+    }
     const ctx = await runScenario(sc);
     if (ctx.result.crashed) {
       check(`${sc.name} 執行未崩潰`, false, String(ctx.result.crashed).slice(0, 800));
@@ -1960,6 +3045,7 @@ async function main() {
     } catch (e) {
       check(`${sc.name} 斷言未拋錯`, false, `${String(e)}\nstderr: ${ctx.stderr.slice(-500)}`);
     }
+    for (const pid of liveOwners.splice(0)) stopPid(pid);
     // A failed scenario keeps its fixture: the artifacts, the build log and the argv log are
     // the whole diagnosis, and they are gone by the time anyone reads the output otherwise.
     if (failCount > before) console.log(`  → 保留 fixture 供診斷：${ctx.root}`);

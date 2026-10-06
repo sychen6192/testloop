@@ -30,6 +30,7 @@ import {
   TEST_SCOPE,
   RUNNER_KIND,
   RUNS_DIR,
+  MAX_FAILURE_CASES,
 } from "./config";
 import { log, banner, tail } from "./libs/log";
 import { AgentRunner, BuildTool, ModuleInfo, ReviewVerdict } from "./libs/types";
@@ -57,6 +58,7 @@ import {
 } from "./prompts";
 import { TestConventions } from "./libs/conventions";
 import { collectTestMetrics, findShrunk, MetricsSnapshot, testMetrics } from "./libs/testmetrics";
+import { decodeJavaSource } from "./libs/javasrc";
 import {
   runBuild,
   runBaseline,
@@ -66,7 +68,10 @@ import {
   BuildRun,
   ExpectedTest,
   expectedTestOf,
+  FlakyCase,
+  flakyTestCases,
   NOT_RUN_HEADER,
+  outerClassName,
   ranTestClasses,
   testOnlyFailures,
 } from "./gates/build";
@@ -111,6 +116,9 @@ export interface OrchestratorConfig {
   ranAtBaseline?: string[];
   // What the writer changed, for a batch that does not pass: see WriterTrace.
   trace?: WriterTrace;
+  // Told the moment tests are found to fail and then pass when run again: a pass that hangs on them is
+  // written down as void there and then, not when the batch ends (which an interrupt never reaches).
+  onFlaky?: (classes: string[]) => void;
 }
 
 /**
@@ -123,6 +131,8 @@ export interface OrchestratorConfig {
 export interface WriterTrace {
   written: Set<string>;
   inSession?: { root: string; before: TreeSnapshot };
+  /** Called when either of the above changes: the batch keeps them on disk for a run killed outright. */
+  onChange?: () => void;
 }
 
 /** The writer's changes so far, those of a session still open (or cut short) included. */
@@ -154,13 +164,18 @@ function testsThatMustRun(
   preexisting: MetricsSnapshot,
   ranBefore: string[] | undefined,
   wholeModule: boolean,
+  // The module's source encoding: a @DisplayName is compared with what surefire reports, as javac read it.
+  charset: string | undefined,
+  // The encoding `preexisting` was counted in: a file's count now is taken the same way, or a file
+  // read better now than then "grew".
+  countedIn: string | undefined,
 ): ExpectedTest[] {
   const before = new Set(ranBefore ?? []);
   const out = new Map<string, ExpectedTest>();
   const writtenFiles = new Set<string>();
   const read = (file: string) => {
     try {
-      return fs.readFileSync(file, "latin1");
+      return fs.readFileSync(file);
     } catch {
       return undefined; // deleted
     }
@@ -169,20 +184,20 @@ function testsThatMustRun(
     if (!rel.endsWith(".java") || rel.startsWith("resources/")) continue;
     const file = path.join(testRoot, rel);
     writtenFiles.add(path.resolve(file));
-    const src = read(file);
+    const bytes = read(file);
     const had = preexisting[rel];
-    const t = src === undefined ? undefined : expectedTestOf(src, file, had ? "changed" : "created");
+    const t = bytes === undefined ? undefined : expectedTestOf(decodeJavaSource(bytes, charset), file, had ? "changed" : "created");
     if (!t) continue;
     if (!had) out.set(t.fqcn, t);
     else if (before.has(t.fqcn)) out.set(t.fqcn, t);
-    else if (testMetrics(src!).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
+    else if (testMetrics(decodeJavaSource(bytes!, countedIn)).tests > had.tests) out.set(t.fqcn, { ...t, origin: "grown" });
   }
   if (wholeModule) {
     for (const fqcn of before) {
       const file = path.join(testRoot, ...fqcn.split(".")) + ".java";
       if (out.has(fqcn) || writtenFiles.has(path.resolve(file))) continue; // the writer's: judged above
-      const src = read(file);
-      const t = src === undefined ? undefined : expectedTestOf(src, file, "untouched");
+      const bytes = read(file);
+      const t = bytes === undefined ? undefined : expectedTestOf(decodeJavaSource(bytes, charset), file, "untouched");
       if (t) out.set(fqcn, t);
     }
   }
@@ -402,6 +417,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const everWritten = new Set<string>();
   // Untouched test classes that failed a build and passed its rebuild (see recheckUntouched).
   const flakyTests = new Set<string>();
+  const noteFlaky = (classes: string[]) => {
+    classes.forEach((c) => flakyTests.add(c));
+    cfg.onFlaky?.(classes);
+  };
   const flakyField = () => (flakyTests.size ? { flakyTests: [...flakyTests].sort() } : {});
   // The untouched classes the last build failed in twice, when that is what its report was about.
   let lastCollateral: string[] | undefined;
@@ -409,8 +428,11 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
   // What every pre-existing test file had before round 1. The writer may reshape the files it
-  // creates, but may not take anything away from these — see libs/testmetrics.ts.
-  const originalMetrics = collectTestMetrics(testRoot);
+  // creates, but may not take anything away from these — see libs/testmetrics.ts. Counted in the
+  // encoding known now, and every count after it in the same one: a later build that tells the
+  // encoding better changes what is read, not what was taken away.
+  const countedIn = cfg.sourceEncoding?.name;
+  const originalMetrics = collectTestMetrics(testRoot, countedIn);
 
   // Scoped iterations: surefire runs only the target classes' tests, and the module-wide run
   // is deferred to a single verification before success rather than skipped. Maven only —
@@ -489,6 +511,47 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       return untouched ? failing : undefined;
     };
     const names = (failures: Array<{ cls: string }>) => [...new Set(failures.map((f) => f.cls))];
+    // Whether a class a report names is one the writer wrote or changed: by its path, by the class its
+    // file declares, by the @DisplayName a phrased report goes by ("<that> <nested's>" for a @Nested one).
+    const writersClass = (name: string): boolean => {
+      const java = [...everWritten].map((f) => f.replace(/\\/g, "/")).filter((f) => f.endsWith(".java"));
+      if (java.includes(`${outerClassName(name).replace(/\./g, "/")}.java`)) return true;
+      const n = name.normalize("NFC");
+      return java.some((f) => {
+        const abs = path.join(testRoot, f);
+        try {
+          const t = expectedTestOf(decodeJavaSource(fs.readFileSync(abs), sourceEncoding?.name), abs, "created");
+          const shown = t?.displayName?.normalize("NFC");
+          return !!t && (outerClassName(name) === t.fqcn || (!!shown && (n === shown || n.startsWith(`${shown} `))));
+        } catch {
+          return false;
+        }
+      });
+    };
+    // Tests surefire ran again after they failed (rerunFailingTestsCount), or Gradle's test-retry did,
+    // or TestNG's retry analyzer, in any build that finished — a green one hides them, a red one names
+    // only what failed at the last: they are no more reliable than the ones a rebuild turned green. Those
+    // the writer wrote are its to fix — returned, the build gate fails on them; the others are noted.
+    const rerunFlakes = (b: BuildRun): FlakyCase[] => {
+      if (b.aborted) return [];
+      const all = flakyTestCases(cfg.buildTool, cfg.mod, b.startedAt, b.gate.raw ?? "");
+      const own = all.filter((c) => writersClass(c.cls));
+      const found = [...new Set(all.filter((c) => !own.includes(c)).map((c) => outerClassName(c.cls)))].filter((c) => !flakyTests.has(c)).sort();
+      if (found.length) {
+        log(`[WARN] 失敗之後被重跑才通過（surefire 的 rerunFailingTestsCount、Gradle 的 test-retry 或 TestNG 的 retry analyzer）：${found.join("、")} 是不穩定的測試，需要人檢視`);
+        noteFlaky(found);
+        save("flaky.txt", [...flakyTests].sort().join("\n"));
+      }
+      return own;
+    };
+    const ownFlakyReport = (own: FlakyCase[]) =>
+      [
+        "你寫的測試在這次建置中失敗、重跑之後才通過（surefire 的 rerunFailingTestsCount、Gradle 的 test-retry 或 TestNG 的 retry analyzer）——" +
+          "它不穩定，建置綠了也不算通過：",
+        ...own.slice(0, MAX_FAILURE_CASES).map((c) => `  ✗ ${c.cls}${c.test ? ` › ${c.test}` : ""}${c.message ? `\n    第一次失敗：${clampText(c.message, 500)}` : ""}`),
+        ...(own.length > MAX_FAILURE_CASES ? [`  （另有 ${own.length - MAX_FAILURE_CASES} 個未列出，見 build.log）`] : []),
+        "常見原因：測試之間共用可變的狀態（static 欄位、單例、檔案、資料庫）、依賴執行順序、時間或亂數、沒有等到非同步的結果。請讓它每一次都得到相同的結果，不要靠重試。",
+      ].join("\n");
     const recheckUntouched = async (
       first: BuildRun,
       opts: BuildOptions,
@@ -507,8 +570,8 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         const cleared = names(suspects).filter((c) => !failingAgain.has(c));
         const flaky = cleared.length ? cleared : names(suspects);
         log(`[WARN] 重跑後通過：${flaky.join("、")} 是不穩定的測試（flaky），需要人檢視`);
-        flaky.forEach((c) => flakyTests.add(c));
-        save("flaky.txt", flaky.join("\n"));
+        noteFlaky(flaky);
+        save("flaky.txt", [...flakyTests].sort().join("\n"));
         return again;
       }
       const still = untouchedFailures(again);
@@ -540,7 +603,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     log(`Step 1/4：${feedback ? "依上輪失敗報告修正" : "首次產生"}測試`);
     // Taken before the view opens and after it closes: what the round changed, net of the view.
     const before = snapshotTree(writableTree);
-    if (cfg.trace) cfg.trace.inSession = { root: writableTree, before };
+    if (cfg.trace) {
+      cfg.trace.inSession = { root: writableTree, before };
+      cfg.trace.onChange?.();
+    }
     const protectedBefore = snapshotProtected();
     const encView = openEncodingView(sourceEncoding, testRoot, { agentFiles: agentSources(testRoot, everWritten) });
     const targetSources = targetSourceViews(sourceEncoding, cfg.targetClasses);
@@ -580,6 +646,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     if (cfg.trace) {
       rawChanged.forEach((f) => cfg.trace!.written.add(f));
       cfg.trace.inSession = undefined;
+      cfg.trace.onChange?.();
     }
     if (writer.outputTokens !== undefined) {
       totalOutputTokens = (totalOutputTokens ?? 0) + writer.outputTokens;
@@ -657,7 +724,7 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     // Shrink guard: to the build gate, "fixed the failing test" and "deleted the failing test"
     // are the same green. The round fails before any build, with the numbers, so the writer
     // puts back what it removed instead of the loop validating a hollowed-out suite.
-    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot, countedIn));
     if (shrunk.length) {
       const report = renderShrinkFeedback(shrunk);
       save("test-shrink.txt", report);
@@ -687,13 +754,15 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const buildOpts: BuildOptions = {
       onlyTests,
       tolerate: cfg.tolerate,
-      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped),
+      mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, !scoped, sourceEncoding?.name, countedIn),
       ranBefore: cfg.ranAtBaseline,
+      charset: sourceEncoding?.name,
     };
     lastCollateral = undefined;
     const firstBuild = await runBuild(cfg.buildTool, cfg.mod, buildOpts);
     save("build.log", firstBuild.gate.raw ?? firstBuild.gate.report);
     const built = await recheckUntouched(firstBuild, buildOpts, "build-rerun.log");
+    const ownFlaky = rerunFlakes(built);
     const build = built.gate;
     // The coverage gate only trusts a report written after the build that counts started.
     const buildStartedAt = built.startedAt;
@@ -716,6 +785,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       const stop = failRound(build.report, "連續兩輪得到完全相同的失敗報告，判定迴圈卡住，提前結束。");
       if (stop) return stop;
       log("→ 帶著失敗報告進入下一輪");
+      continue;
+    }
+    if (ownFlaky.length) {
+      log(`[FAIL] 編譯與測試 gate：writer 寫的測試不穩定（${[...new Set(ownFlaky.map((c) => c.cls))].join("、")}）`);
+      record({ gate: "build", outcome: "flaky", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+      const stop = failRound(ownFlakyReport(ownFlaky), "連續兩輪 writer 的測試都以同樣的方式不穩定，判定迴圈卡住，提前結束。");
+      if (stop) return stop;
+      log("→ 帶著不穩定測試的報告進入下一輪");
       continue;
     }
 
@@ -824,12 +901,14 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
         log("最終驗收：以完整模組範圍重跑，確認新測試沒有打壞既有測試");
         const verifyOpts: BuildOptions = {
           tolerate: cfg.tolerate,
-          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true),
+          mustRun: testsThatMustRun(testRoot, everWritten, originalMetrics, cfg.ranAtBaseline, true, sourceEncoding?.name, countedIn),
           ranBefore: cfg.ranAtBaseline,
+          charset: sourceEncoding?.name,
         };
         const firstVerify = await runBuild(cfg.buildTool, cfg.mod, verifyOpts);
         save("final-verify.log", firstVerify.gate.raw ?? firstVerify.gate.report);
         const verified = await recheckUntouched(firstVerify, verifyOpts, "final-verify-rerun.log");
+        const ownVerifyFlaky = rerunFlakes(verified);
         const full = verified.gate;
         if (full.passed) ranTests = ranTestClasses(cfg.buildTool, cfg.mod, verified.startedAt, full.raw ?? "");
         if (verified.elsewhere) {
@@ -850,6 +929,17 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
               ? "目標類別的測試本身全部通過，但以完整模組範圍重跑時，有該執行的測試沒有被執行，請修正。\n"
               : "目標類別的測試本身全部通過，但以完整模組範圍重跑時有其他測試失敗——新測試打壞了既有測試，請修正。\n") +
               full.report,
+            "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
+          );
+          if (stop) return stop;
+          log("→ 帶著最終驗收失敗進入下一輪");
+          continue;
+        }
+        if (ownVerifyFlaky.length) {
+          log("[FAIL] 最終驗收：writer 寫的測試在完整模組重跑時不穩定");
+          record({ gate: "build", outcome: "final-verify-fail", changedFiles: changed.length, writerOutputTokens: writer.outputTokens });
+          const stop = failRound(
+            `目標類別的測試本身全部通過，但以完整模組範圍重跑時不穩定——多半是和其他測試共用了狀態。\n${ownFlakyReport(ownVerifyFlaky)}`,
             "連續兩輪最終驗收失敗於相同原因，判定迴圈卡住，提前結束。",
           );
           if (stop) return stop;
@@ -922,6 +1012,11 @@ export interface RepairConfig {
   baseline: BaselineResult;
   testStack?: TestStack;
   sourceEncoding?: SourceEncoding;
+  // Each build the repair runs, the moment it is done (`startedAt`: when it started — its reports are
+  // the ones written since), and each round's changes to the test tree, as the writer's are named:
+  // what they say against the passes on record goes down before the repair can end or be stopped.
+  onBuild?: (b: BaselineResult, startedAt: number) => void;
+  onChanged?: (changed: string[]) => void;
 }
 
 export interface RepairResult {
@@ -938,6 +1033,9 @@ export interface RepairResult {
   changedFiles: string[];
   // On success: the test classes the green build ran — what every later round must keep running.
   ranTests?: string[];
+  // On success: the green build's log — which classes it ran and which passed only on a rerun, where
+  // its reports do not say. "raw" as a build's log is everywhere: summaries leave it out (stripRaw).
+  raw?: string;
 }
 
 // A writer-changed path (relative to src/test/java, or resources/…) as a repo-relative path.
@@ -950,7 +1048,7 @@ function repoRelTest(mod: ModuleInfo, changed: string): string {
 // (an inner class lives in its outer class's file).
 function brokenItemFile(mod: ModuleInfo, item: string): string {
   if (item.endsWith(".java")) return (path.isAbsolute(item) ? path.relative(REPO_ROOT, item) : item).replace(/\\/g, "/");
-  return repoRelTest(mod, `${item.replace(/\$.*$/, "").replace(/\./g, "/")}.java`);
+  return repoRelTest(mod, `${outerClassName(item).replace(/\./g, "/")}.java`);
 }
 
 // Could this round's edits have broken `file` without touching it? Yes when it names a class
@@ -981,11 +1079,12 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
   const writableTree = path.join(cfg.mod.moduleRoot, "src", "test");
   const scopeSkip = writerScopeSkip(REPO_ROOT, cfg.mod.moduleRoot, [RUNS_DIR]);
   const snapshotProtected = () => snapshotTree(REPO_ROOT, { skipDir: scopeSkip });
-  const originalMetrics = collectTestMetrics(testRoot);
+  const countedIn = cfg.sourceEncoding?.name;
+  const originalMetrics = collectTestMetrics(testRoot, countedIn);
   const touched = new Set<string>();
   let current = cfg.baseline;
   // What ran before the repair — the failing classes included — has to be running when it is green.
-  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map((c) => c.replace(/\$.*$/, ""))])];
+  const ranBefore = [...new Set([...(cfg.baseline.ranTests ?? []), ...cfg.baseline.failingTestClasses.map(outerClassName)])];
   let testStack = cfg.testStack;
   let sourceEncoding = cfg.sourceEncoding;
   const testRootForEncoding = path.join(cfg.mod.moduleRoot, "src", "test", "java");
@@ -1089,6 +1188,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
     const changed = writerChanges(rawChanged);
     const outOfScope = outOfScopeChanges(protectedBefore, snapshotProtected());
     changed.forEach((f) => touched.add(f));
+    if (changed.length) cfg.onChanged?.(changed);
     save("changed-files.txt", changed.length ? changed.join("\n") : "（本輪未變更任何測試檔）");
     log(`writer 變更了 ${changed.length} 個測試檔`);
     if (outOfScope.length) {
@@ -1123,14 +1223,17 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       // while another test failed flakily looked like a flaky red, and turned green here.
       if (writer.status === "ok" && current.compileErrorFiles.length === 0 && current.failingTestClasses.length > 0 && !current.notRun) {
         log("writer 沒有改任何檔案——重跑一次建置，確認紅燈是否穩定重現（flaky 測試會在這裡消失）");
+        const recheckStartedAt = Date.now();
         const recheck = await runBaseline(
           cfg.buildTool,
           cfg.mod,
           "repair",
-          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+          testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name, countedIn),
           ranBefore,
+          sourceEncoding?.name,
         );
         save("recheck-build.log", recheck.raw);
+        if (!recheck.aborted) cfg.onBuild?.(recheck, recheckStartedAt);
         if (recheck.clean) {
           log(`[WARN] 預檢的紅燈重跑後消失，判定為不穩定的測試（flaky）：${current.failingTestClasses.join("、")}——這些測試需要人檢視`);
           return {
@@ -1141,6 +1244,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
             report: `預檢時失敗、重跑後通過的測試（flaky）：${current.failingTestClasses.join("、")}`,
             changedFiles: [...touched].sort(),
             ranTests: recheck.ranTests,
+            raw: recheck.raw,
           };
         }
         // The rebuild is the module as it now stands, and may say something the writer never saw.
@@ -1154,7 +1258,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       return giveUp("writer-no-op", noOpReason(writer.status, testRootRel(cfg.mod), true), round);
     }
 
-    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot));
+    const shrunk = findShrunk(originalMetrics, collectTestMetrics(testRoot, countedIn));
     if (shrunk.length) {
       const shrinkReport = renderShrinkFeedback(shrunk);
       save("test-shrink.txt", shrinkReport);
@@ -1177,10 +1281,12 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
       cfg.buildTool,
       cfg.mod,
       "repair",
-      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true),
+      testsThatMustRun(testRoot, touched, originalMetrics, ranBefore, true, sourceEncoding?.name, countedIn),
       ranBefore,
+      sourceEncoding?.name,
     );
     save("build.log", current.raw);
+    if (!current.aborted) cfg.onBuild?.(current, rebuildStartedAt);
     testStack = refineTestStack(testStack, cfg.mod, current.raw, rebuildStartedAt);
     sourceEncoding = refineEncoding(sourceEncoding, measureSourceEncoding(cfg.mod, REPO_ROOT, current.raw));
     save("build-summary.md", current.summary);
@@ -1196,6 +1302,7 @@ export async function repairBaseline(cfg: RepairConfig): Promise<RepairResult> {
         report: current.summary,
         changedFiles: [...touched].sort(),
         ranTests: current.ranTests,
+        raw: current.raw,
       };
     }
     report = describe(current);

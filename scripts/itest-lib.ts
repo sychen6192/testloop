@@ -82,6 +82,17 @@ export interface MvnStep {
   failOut?: string;
   /** Sends SIGINT to the process that ran the build (the loop), then waits to be killed: Ctrl-C. */
   interrupt?: boolean;
+  /** SIGKILLs the process that ran the build (the loop) — no handler runs (POSIX): the OOM killer. */
+  killLoop?: boolean;
+  /** With killLoop: the build goes on for this long after the loop is gone — an orphan, its pid in
+   *  .itest/orphan.pid — then ends by itself. */
+  linger?: number;
+  /** With linger: what lingers is a process the build started in its own process group (surefire's
+   *  forked JVM); the build itself ends at once. */
+  lingerFork?: boolean;
+  /** With linger: while it lingers, the orphan keeps writing this file (repo-relative) — an agent
+   *  session still writing src/test after its run was killed. */
+  lingerWrite?: { file: string; content: string };
   /** Repo-relative file the build replaces with a directory holding a named pipe (POSIX): a path
    *  a rollback cannot put a file back at, whatever its privileges. */
   pipeDirAt?: string;
@@ -154,6 +165,50 @@ export interface Scenario {
   jdk?: boolean;
   /** Runs with no JDK to be found: JAVA_HOME empty, PATH holding only node (POSIX). */
   noJdk?: boolean;
+  /**
+   * entry=loop: run loop.ts a second time on the same fixture once the first run has ended — the
+   * same target, run again. The mvn plan carries on where the first run left it; the checks see the
+   * second run, and the first as `first`.
+   */
+  rerun?: {
+    api?: ApiTurn[];
+    /** On top of the scenario's env. */
+    env?: Record<string, string>;
+    /** This run's target, repo-relative (default: the scenario's). */
+    target?: string;
+    /** Files written (a string) or deleted (null) between the two runs, repo-relative; `{{firstRun}}` in a
+     *  path is the first run's artifacts directory. */
+    between?: Record<string, string | null>;
+    /** Every file of the fixture — the first run's artifacts included — made this much older first: the
+     *  first run ended that long ago, and whatever `between` writes happened after it. */
+    backdateMs?: number;
+    /** Replacements in files between the runs (`{{firstRun}}` as in `between`), in order. */
+    rewrite?: { file: string; from: RegExp; to: string } | Array<{ file: string; from: RegExp; to: string }>;
+    /**
+     * Between the runs, a process that lives this long is started and made the owner of this journal
+     * (`{{firstRun}}/batch-N-X/inflight`): its pid and start time in owner.json and journal.json — a
+     * run on this checkout that is still going, then stops.
+     */
+    liveOwner?: { journal: string; ms: number };
+    /** Moved between the runs, repo-relative (a file or a directory), keeping their times: `mv`, `git mv`. */
+    renames?: Array<[string, string]>;
+    /** Between the runs, this file (repo-relative) becomes a directory holding a named pipe (POSIX): a
+     *  path nothing can put a file back at. */
+    pipeDirAt?: string;
+  };
+  /**
+   * entry=loop, with rerun: a third run once the rerun has ended. The mvn plan carries on; the checks
+   * see the third run, the first as `first` and the rerun as `second`.
+   */
+  rerun2?: {
+    api?: ApiTurn[];
+    /** On top of the scenario's env. */
+    env?: Record<string, string>;
+    /** This run's target, repo-relative (default: the scenario's). */
+    target?: string;
+    /** Files written (a string) or deleted (null) between the second run and the third, repo-relative. */
+    between?: Record<string, string | null>;
+  };
   mvn: MvnStep[];
 }
 
@@ -173,6 +228,11 @@ export interface ApiTurn {
   sideWrite?: Record<string, string>;
   /** Ctrl-C while the agent session is running: SIGINT to the run holding the repo's lock. */
   interrupt?: boolean;
+  /** The run holding the repo's lock is SIGKILLed while this turn is served: no handler runs, nothing is undone. */
+  kill?: boolean;
+  /** Files the endpoint deletes (relative to the fixture root) while serving this turn — a writer runtime
+   *  that can delete (opencode's), which the api runner's own tools cannot. */
+  sideDelete?: string[];
   /** The round's artifacts directory (the newest iter-N under .itest/runs) becomes a file while
    *  this turn is served: whatever the run writes there next fails — a crash mid-round. */
   breakRunDir?: boolean;
@@ -354,6 +414,28 @@ if (step.interrupt && process.platform !== "win32") {
   process.kill(process.ppid, "SIGINT");
   setTimeout(() => process.exit(0), 60000);
   return;
+}
+if (step.killLoop && process.platform !== "win32") {
+  if (step.linger && step.lingerFork) {
+    const fork = require("child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, " + step.linger + ")"], { stdio: "ignore" });
+    fork.unref();
+    fs.writeFileSync(path.join(itest, "orphan.pid"), String(fork.pid));
+  } else if (step.linger) {
+    fs.writeFileSync(path.join(itest, "orphan.pid"), String(process.pid));
+  }
+  process.kill(process.ppid, "SIGKILL");
+  // Nothing is written to stdout from here: the pipe's reader is gone.
+  if (step.linger && !step.lingerFork) {
+    if (step.lingerWrite) {
+      const target = path.join(root, step.lingerWrite.file);
+      setInterval(() => {
+        try { fs.writeFileSync(target, step.lingerWrite.content); } catch (e) { /* its directory may be gone */ }
+      }, 50);
+    }
+    setTimeout(() => process.exit(0), step.linger);
+    return;
+  }
+  process.exit(0);
 }
 
 const sfDir = (mod) => path.join(root, mod || ".", "target", "surefire-reports");

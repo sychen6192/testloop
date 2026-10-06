@@ -51,7 +51,7 @@ export function shLive(
       shell: process.platform === "win32",
       detached: DETACH_CHILDREN,
     });
-    trackForShutdown(child);
+    trackForShutdown(child, "build");
 
     let timedOut = false;
     const timer = timeoutMs
@@ -424,6 +424,10 @@ export function onShutdown(fn: (reason: string) => void): void {
 export function killAll(): void {
   for (const c of liveChildren) killTree(c, "SIGKILL", { wait: true });
   liveChildren.clear();
+  if (childRecords.size) {
+    childRecords.clear();
+    persistChildren();
+  }
 }
 
 function shutdown(reason: string, code: number): never {
@@ -465,11 +469,249 @@ export function installShutdownHandlers(): void {
   });
 }
 
-/** Registers `child` so an interrupted run still takes its process tree down with it. */
-export function trackForShutdown(child: ChildProcess): void {
+/**
+ * Registers `child` so an interrupted run still takes its process tree down with it. `kind`: "build"
+ * for a build (it writes target/, not src/test); anything else — an agent session — may write the
+ * test tree.
+ */
+export function trackForShutdown(child: ChildProcess, kind: ChildRecord["kind"] = "other"): void {
   liveChildren.add(child);
-  child.once("exit", () => liveChildren.delete(child));
+  recordChild(child, kind);
+  child.once("exit", () => {
+    liveChildren.delete(child);
+    if (childRecords.delete(child)) persistChildren();
+  });
   installShutdownHandlers();
+}
+
+// ─── Children a killed run leaves running ────────────────────────────────────
+//
+// A run killed outright (SIGKILL: the OOM killer, kill -9) runs none of the handlers above. The
+// build it had started goes on for the rest of its minutes, writing target/ under the next run's
+// baseline — two builds in one target/ — and an agent session goes on writing src/test under the
+// next run's writer. So while a child runs it is also on disk, in the run's artifacts: its pid, and
+// what tells that process from a later one given the same pid — its start time. The next run on the
+// repo takes down what is left of it (loop.ts stopOrphans).
+
+/** A tracked child: on POSIX the leader of its own process group (DETACH_CHILDREN). */
+export interface ChildRecord {
+  pid: number;
+  /** processStart() of it when it was spawned; "" when that could not be read. */
+  start: string;
+  /** What it was, for the log. */
+  cmd: string;
+  /**
+   * "build": writes the build's outputs, not the test tree — stopping one left running says nothing
+   * about when src/test was last written. Absent in records of earlier versions: taken as "other".
+   */
+  kind?: "build" | "other";
+}
+
+export interface ChildrenJournal {
+  /** Canonical repo root, host, boot and pid namespace (libs/lock.ts, libs/batch.ts thisHost): whose, and where they run. */
+  repoRoot: string;
+  host: string;
+  boot: number;
+  bootId?: string;
+  pidns?: string;
+  /** The run itself: its pid and processStart(). */
+  pid: number;
+  start: string;
+  children: ChildRecord[];
+}
+
+const childRecords = new Map<ChildProcess, ChildRecord>();
+let childrenJournal: { file: string; owner: Omit<ChildrenJournal, "children">; beat: ReturnType<typeof setInterval> } | undefined;
+
+/**
+ * From here on, the children being tracked are kept in `file` as well (undefined: no longer). Its
+ * time is kept current while the run lives: what the next run takes as the moment it was last alive,
+ * once this one is killed. `beatMs`: for the selftest.
+ */
+export function journalChildren(file: string | undefined, owner?: Omit<ChildrenJournal, "children">, beatMs = 30_000): void {
+  if (childrenJournal) clearInterval(childrenJournal.beat);
+  childrenJournal = undefined;
+  if (file && owner) {
+    const beat = setInterval(() => {
+      const now = new Date();
+      try {
+        fs.utimesSync(file, now, now);
+      } catch {
+        /* not written yet, or gone */
+      }
+    }, beatMs);
+    beat.unref();
+    childrenJournal = { file, owner, beat };
+  }
+  persistChildren();
+}
+
+function persistChildren(): void {
+  if (!childrenJournal) return;
+  try {
+    const doc: ChildrenJournal = { ...childrenJournal.owner, children: [...childRecords.values()] };
+    fs.writeFileSync(`${childrenJournal.file}.tmp`, JSON.stringify(doc));
+    fs.renameSync(`${childrenJournal.file}.tmp`, childrenJournal.file);
+  } catch {
+    /* the run goes on; killed outright, it leaves these children unrecorded, as it used to */
+  }
+}
+
+function recordChild(child: ChildProcess, kind: ChildRecord["kind"]): void {
+  if (child.pid === undefined) return;
+  childRecords.set(child, { pid: child.pid, start: processStart(child.pid) ?? "", cmd: child.spawnargs.join(" ").slice(0, 300), kind });
+  persistChildren();
+}
+
+/**
+ * Pure: the fields of a /proc/<pid>/stat line that matter here — state (3), process group (5) and
+ * start time (22). The name, field 2, is in parentheses and may itself hold spaces and parentheses:
+ * the fields are counted from the last ")". undefined when the line is not one.
+ */
+export function parseStat(stat: string): { state: string; pgrp: number; start: string } | undefined {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return undefined;
+  const f = stat.slice(close + 2).split(" ");
+  if (!/^\d+$/.test(f[19] ?? "") || !/^-?\d+$/.test(f[2] ?? "")) return undefined;
+  return { state: f[0], pgrp: Number(f[2]), start: f[19] };
+}
+
+// A process that has ended but not been waited for yet: dead. Its parent is gone too when it is an
+// orphan's, and the process it was handed to (pid 1 of a container) may not reap it for a while.
+const ended = (state: string) => state === "Z" || state === "X";
+
+/**
+ * What tells a process from a later one given the same pid: its start time as the OS reports it —
+ * /proc on Linux (in clock ticks since boot, exact), `ps -o lstart=` elsewhere on POSIX (to the
+ * second). undefined: no such process, or no way to tell (Windows).
+ */
+export function processStart(pid: number, platform: string = process.platform): string | undefined {
+  if (platform === "win32") return undefined;
+  if (platform === "linux") {
+    try {
+      const st = parseStat(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+      return st && !ended(st.state) ? st.start : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    // One format and one zone whatever the user's are: two runs started under different LC_TIME or TZ
+    // would otherwise never recognise each other's children.
+    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+    });
+    const out = r.status === 0 ? r.stdout.trim() : "";
+    return out || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let clockTicks: number | undefined;
+/** Linux: when a process started, in ms since the epoch, from its /proc start time (clock ticks since boot). */
+export function startMsOf(ticks: string): number | undefined {
+  let btime: number | undefined;
+  try {
+    btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]);
+  } catch {
+    return undefined;
+  }
+  if (!btime) return undefined;
+  if (clockTicks === undefined) {
+    const r = spawnSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 5_000 });
+    clockTicks = Number(r.stdout?.trim()) || 100;
+  }
+  return btime * 1000 + (Number(ticks) * 1000) / clockTicks;
+}
+
+/** Linux: the processes of group `pgid` still running, with when each started. undefined elsewhere. */
+export function groupMembers(pgid: number, platform: string = process.platform): Array<{ pid: number; startMs?: number }> | undefined {
+  if (platform !== "linux") return undefined;
+  let pids: string[];
+  try {
+    pids = fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+  } catch {
+    return undefined;
+  }
+  const out: Array<{ pid: number; startMs?: number }> = [];
+  for (const p of pids) {
+    try {
+      const st = parseStat(fs.readFileSync(`/proc/${p}/stat`, "utf8"));
+      if (st && st.pgrp === pgid && !ended(st.state)) out.push({ pid: Number(p), startMs: startMsOf(st.start) });
+    } catch {
+      /* gone meanwhile */
+    }
+  }
+  return out;
+}
+
+export type OrphanAction =
+  | { kind: "stop-group" }
+  | { kind: "stop-members"; pids: number[]; left: number[] }
+  | { kind: "report" }
+  | { kind: "gone" }
+  | { kind: "not-ours" };
+
+/**
+ * Pure: what to do with a child a killed run left recorded. Its leader still running as the same
+ * process (same start time): take its group down. A process with that pid that started at another
+ * time is someone else's (the pid was reused), and a record without a start time cannot be told from
+ * one. No process with that pid, but a group with that id still running (a build's forked JVM
+ * outliving the launcher): its id may have been handed out again — the pid reused by a process that
+ * led a group of its own and left it behind, as a script that backgrounds a server does — so only the
+ * members that started while the killed run was alive (`window`, from its child's start to the run's
+ * last sign of life) are taken down; the rest are named (`left`). Without start times to tell by
+ * (no /proc: `members` undefined), nothing of such a group is taken down: it is reported.
+ */
+export function orphanAction(
+  rec: ChildRecord,
+  now: { start?: string; groupAlive: boolean; members?: Array<{ pid: number; startMs?: number }> },
+  window: { from?: number; to: number },
+): OrphanAction {
+  if (now.start !== undefined) return rec.start && now.start === rec.start ? { kind: "stop-group" } : { kind: "not-ours" };
+  if (!now.groupAlive) return { kind: "gone" };
+  if (!now.members) return { kind: "report" };
+  const within = (m: { startMs?: number }) =>
+    m.startMs !== undefined && (window.from === undefined || m.startMs >= window.from - 2_000) && m.startMs <= window.to;
+  return {
+    kind: "stop-members",
+    pids: now.members.filter(within).map((m) => m.pid),
+    left: now.members.filter((m) => !within(m)).map((m) => m.pid),
+  };
+}
+
+/**
+ * Whether any process of the group led by `pgid` is still running (POSIX). On Linux, one that has
+ * ended and waits to be reaped does not count; elsewhere the kernel is asked, and it counts those too.
+ */
+export function groupAlive(pgid: number, platform: string = process.platform): boolean {
+  if (platform === "linux") {
+    let pids: string[] = [];
+    try {
+      pids = fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+    } catch {
+      /* no /proc: ask the kernel below */
+    }
+    if (pids.length) {
+      return pids.some((p) => {
+        try {
+          const st = parseStat(fs.readFileSync(`/proc/${p}/stat`, "utf8"));
+          return !!st && st.pgrp === pgid && !ended(st.state);
+        } catch {
+          return false; // gone meanwhile
+        }
+      });
+    }
+  }
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /** Turns a spawn errno into its actual cause, rather than guessing one cause for all of them. */

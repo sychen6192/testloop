@@ -136,7 +136,8 @@ Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapS
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`，包含 prompt、writer 總結、build log、
 覆蓋率、審查判決與失敗報告。同層的 `params.json` 記錄工具版本戳記，`project-facts.json` 記錄
 量到的測試相依與原始碼編碼（見下方 Troubleshooting）。資料夾目標分批時，每批在自己的
-`batch-NN-<類別>/` 底下。
+`batch-NN-<類別>/` 底下。通過所有 gate 的類別記在同層的 `passed.json`，重跑同一個目標時據此接續
+（見「中斷後重跑：接續先前的執行」）。
 
 ## 參數
 
@@ -149,6 +150,7 @@ Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapS
 | `UT_MODEL` | - | writer 的後備模型，僅在 `UT_WRITER_MODEL` 未設時生效 |
 | `UT_MAX_ITER` | 5 | 最大迭代輪數（分批時為每批） |
 | `UT_BATCH_SIZE` | 1 | 目標是資料夾時，每批幾個類別。每批是一個完整的 writer → gate 迴圈：新的 session、自己的迭代輪數；沒通過的批次撤回它對 `src/test` 的變更（保留在該批的 `rejected/`），不影響其他批次。見「一次處理整個資料夾」 |
+| `UT_RESUME` | 1 | 0 = 每個目標類別都重新產生。預設會略過先前的執行已通過所有 gate、而且類別與測試檔都沒變的類別——前提是這次的預檢建置照樣跑過它們的測試、覆蓋率重新量過也達標、review 分數以現在的門檻重新判定也通過。見「中斷後重跑：接續先前的執行」 |
 | `UT_MIN_LINE_COV` / `UT_MIN_BRANCH_COV` | 80 / 70 | 覆蓋率門檻，單位 % |
 | `UT_STRICT_COV` | - | 1 = 無 JaCoCo 報告直接 FAIL |
 | `UT_ALLOW_ZERO_TESTS` | - | 1 = 允許「編譯成功但 0 測試」通過 build gate。預設 fail-closed 擋下 |
@@ -168,6 +170,7 @@ Validation 限制（`@Pattern`、`@Size`……，要用 Validator 測）與 MapS
 | `UT_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `UT_AGENT_TIMEOUT_MS` | 900000 | 單輪 agent 逾時，單位毫秒 |
 | `UT_BUILD_TIMEOUT_MS` | 1800000 | build/test gate 逾時；逾時會終止整棵程序樹 |
+| `UT_OTHER_RUN_WAIT_MS` | 360000 | 這個 checkout 有一份復原日誌還有動靜（另一個 testgen 可能還在跑：剛被重啟的容器、繞過 repo 鎖的執行）時，開始前等它停止的時間；等不到就以 `checkout-busy` 停下。預設比心跳被信任的 5 分鐘長，被強制終止的執行等得到；0 = 不等 |
 | `UT_MAX_BUILD_OUTPUT_CHARS` | 67108864 | 建置輸出在記憶體中保留的字元上限；超過時丟棄前段、只留尾端與 `[ERROR]` / `Tests run:` 行（避免測試大量輸出 log 時撐爆字串上限而中斷） |
 | `UT_STANDARDS_PATH` | 工具內建 | writer 契約（standards）路徑覆蓋 |
 | `UT_SKILL_DIR` | 自動搜尋 | rubric 來源覆蓋。未設時依序找目標 repo、工具內建 |
@@ -245,6 +248,30 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
 - **中途按 Ctrl-C（或 crash）**：正在跑的那一批比照失敗批次撤回——它的測試還沒通過任何 gate。writer 的
   session 還沒結束就被打斷（或 session 途中的請求失敗，例如 token 過期）時，它已經寫的檔一樣算它的、一樣撤回。
   `summary.json` 的 `inProgress` 是被中斷的那一批，`notRun` 是還沒輪到的類別。
+- **程序被強制終止**（OOM killer、`kill -9`、斷電、CI job 被取消、Windows 關掉主控台視窗而收尾超過約 10 秒）：
+  沒有機會撤回正在跑的那一批。所以每一批執行期間都在自己的 artifacts 留著一份復原日誌
+  （`batch-NN-<類別>/inflight/`：批次開始時的 `src/test`、建置輸出的清單、writer 改過哪些檔，外加每 30 秒一次的心跳）。
+  下一次對同一個 checkout 執行時，一開始就依日誌把那批撤回——和 Ctrl-C 時一樣，嘗試的版本保留在
+  `rejected/`——並替那次執行補寫 `summary.json`（`stopReason: "killed"`）。最後一次心跳之後才改過的檔不是 writer
+  的（多半是你在那之後的手動修改），原樣留著並列在 `rollback.md`。那批開始時存在、現在不見了的檔，只在它所在的
+  目錄之後沒被動過時才放回；動過（切換分支、拉進別人的刪除）就無法判斷是誰刪的，不放回，原本的內容存在那批的
+  `deleted/`，log 會列出來。之後被移動的檔（`mv`、`git mv`、IDE 的搬移：新位置的內容和原檔一模一樣）兩邊都不動。
+  有檔案放不回去時（多半是 IDE 或防毒軟體鎖住）這次執行停下（`killed-batch-not-restored`），日誌留著，關掉鎖住
+  檔案的程式後重跑即可——重跑照第一次的判斷撤回。這個 checkout 的日誌還有動靜時（另一個 testgen 可能還在跑：
+  剛被重啟的容器、另一個容器掛同一個 checkout），先等它停止（`UT_OTHER_RUN_WAIT_MS`，預設 6 分鐘），等不到就以
+  `checkout-busy` 停下。共用 `runs` 目錄的別台機器（或同一台機器上的另一個容器）留下、描述它自己的 checkout 的
+  日誌不碰；同一個路徑已經重新 clone 過、或測試目錄被刪掉重建過，舊日誌就丟掉。批次正常結束時（通過、撤回、
+  scope-violation）日誌就刪掉。沒有這一步時，寫到一半的測試會被下一次執行當成既有測試：防掏空 guard 不准刪它、
+  writer 被要求改它、預檢因它而紅。
+  它啟動的建置或 agent session 也不會跟著死：Maven 會繼續跑完（連同 surefire fork 出去的 JVM），和下一次執行的
+  預檢一起寫同一個 `target/`，agent 繼續寫 `src/test`。所以執行中的子程序也記在 artifacts 的 `children.json`
+  （pid 與啟動時間），下一次執行一開始、在撤回之前就把還在跑的結束掉（連同它的程序群組），log 會列出來；agent
+  session 在被結束之前寫進 `src/test` 的檔也算那一批的（建置不算：它只寫 `target/`，你在那之後的修正照樣留著）。
+  只結束確定是同一個程序的：同一台機器（同一個 pid namespace）、
+  同一次開機、啟動時間吻合——pid 已經被別的程序重用就不碰。建置本身已經結束、只剩它 fork 出去的程序時，只結束
+  那次執行還活著時啟動的（Linux），其餘列出來請你確認。Windows 上 node 結束時會帶走它直接啟動的程序，但它們再
+  啟動的（mvn 底下的 java.exe、opencode）不會，也無從確認，所以只列出那次執行當時在跑的指令，請你在工作管理員
+  確認後結束。
 - **環境問題會提前停止。** agent 無法執行（spawn-error）、writer 改了測試範圍外的檔案（scope-violation，
   變更原樣保留給你檢視）、連續兩批以同一個 `writer-no-op` / `reviewer-unparseable` 結束、連續兩批的
   建置以同樣的原因失敗（去掉各批的類別名稱與數字後一字不差、且沒提到自己的類別，例如相依解析不到——問題在
@@ -256,12 +283,76 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   `notRun` 是沒執行的類別，`attention` 是 run 留在原地、要你先處理的東西（沒還原的範圍外變更、放不回去的
   檔案、太大沒有備份的檔、不是 writer 做而沒有撤回的變更、失敗一次重跑就過的不穩定測試）；被中斷或 crash 時的 summary 也有。`stopReason`：`gates-passed`、`some-batches-failed`、`stopped:<原因>`（提前停止且還有類別沒跑；
   原因是 `runner-spawn-error`、`scope-violation`、`out-of-scope-failure`、`writer-no-op`、`reviewer-unparseable`、
-  `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`。
-  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`。
+  `repeated-build-failure`、`repeated-env-failure`、`rollback-failed`）、`interrupted:<signal>`、`crash`，
+  以及重跑時目標類別都已通過而什麼都不用做的 `already-passed`（exit 0，見下一節）。
+  全部通過才 exit 0，否則 exit 2。每一批跑完就更新一次 `batches.json`，通過的批次另記進 `passed.json`——
+  重跑同一個目標時，已通過的類別不再產生（見下一節）。
 - **建置次數隨批數增加。** 每批至少一次建置；`UT_TEST_SCOPE=generated` 時每批通過前還會做一次完整模組
   驗收。建置很慢的模組建議搭配 `UT_TEST_SCOPE=generated`，或把 `UT_BATCH_SIZE` 調大一些來分攤。
 - 只有一個類別（或 `UT_BATCH_SIZE` 不小於類別數）時就是單一一批，行為與 artifacts 版面都和以前一樣：
   沒通過時測試檔留在原處，由你決定怎麼處理。
+
+### 中斷後重跑：接續先前的執行
+
+同一個目標再跑一次（被中斷、有幾批沒過、或只是想補完），先前已通過所有 gate 的類別**不會再產生一次**。
+每一批（或單一類別的 run）通過時，loop 把它通過時的樣子記在該次 artifacts 的 `passed.json`：類別原始碼、
+它的測試檔、那批 writer 寫的其他檔（共用的 helper、`src/test/resources` 裡的檔），以及這些測試引用到的
+測試目錄裡的檔（繼承的基底類別、呼叫的 helper——名字照 javac 的方式解析，以檔案**宣告**的 package 與 top-level 型別為準
+（package 與目錄不符、一個檔裡的第二個類別、中文類別名、註解裡以 `\u000a` 藏起來的程式碼都認得）：import 的、同 package
+的、on-demand import 的、寫了完整類名的；哪裡都看不到的名字不是測試目錄裡的類別——、字串裡點名的資源
+（`src/test/java` 裡的非 .java 檔也算；點名的是目錄或 pattern——`src/test/resources/cases`、`classpath*:cases/**/*.json`
+——就記下底下每一個檔；從模組根算起的路徑——`testdata/orders.json`、`src/test/data/`——記下那裡的檔）與完整類名
+（`@MethodSource("com.x.Fixtures#cases")`）、記下的資源裡點名的類別與資源（context XML 的 `<bean class>` 與
+`<import resource>`、`spring.config.import`、`data-locations`；UTF-16 的檔照 BOM 讀，4 MB 以上讀不完的讓紀錄不接續）、
+以測試命名的檔（`CalcTest.sql`、`@Nested` 的 `CalcTest$Add.sql`、`CalcTest-context.xml`、approval／snapshot 檔）；
+Gradle 的 `src/testFixtures` 與 pom `<testResources>` 的目錄也在測試的 classpath 上；symlink 的 fixture 目錄照樣走進去；
+Windows／macOS 上資源名稱不分大小寫；原始碼以模組的編碼讀，編碼名稱不明時先試 Big5、GBK、Shift_JIS、EUC-KR（讀得出
+假名的 Shift_JIS 優先）；類別與資源各記最近的 400 個，超過的紀錄不接續），再加上沒有測試點名、卻是每個測試都帶著跑的：
+JUnit／Mockito／logging 自己讀的設定（`junit-platform.properties`、`META-INF/services` 與它點名的類別、
+`mockito-extensions`、`logback-test.xml`），起 Spring context 的測試另記 Spring 自己載入的（`application*.yml`／
+`.properties` 與 `config/` 下的、`schema*.sql`／`data*.sql`、`META-INF/spring*`、`spring.properties`、
+`messages*.properties`、`logback-spring.xml`、Flyway／Liquibase 的 `db/migration`、`db/changelog`，以及測試目錄裡
+component scan 找得到的類別：top-level 的 `@Configuration`／`@Component`／`@Entity`……、一般 helper 裡巢狀的也算，
+模組自己帶 `@Component` 的自訂註解也認得）。測試相依有 spring-test 時，測試類別繼承或掛著模組外（不是 JUnit、Mockito、
+AssertJ 這類測試函式庫）的型別——另一個模組的 `@SpringBootTest` 基底類別、jar 裡的 meta-annotation——也當成會起
+Spring context。以上全部的 sha256，reviewer 的分數與依據的 rubric。重跑時，預檢之後逐一檢查每個目標類別（看它最新的
+一筆紀錄）：
+
+- **紀錄仍描述現在的樹**：類別與上面那些檔一個 byte 都沒變、沒有多出當時沒有的測試檔（reviewer 沒看過它），而且從它的
+  測試重新走一次引用，走到的檔和當時一樣——之後才加的檔不在任何指紋裡：同 package 的類別蓋過 on-demand import 或
+  `java.lang` 的（javac 改綁它）、新的 `junit-platform.properties` 或 `META-INF/services` 的 extension、測試目錄裡新的
+  `@Component` 或 `data.sql`，都只有重新走一次才看得到。有人把測試用的 helper 掏空，建置照樣綠、覆蓋率照樣在，
+  只有這一項看得到。
+- **建置**：這次的預檢建置是綠的（或修復後轉綠），而且它的**每一個**測試類別（它自己的測試檔與那批 writer 寫的；
+  只是被引用的基底類別與 helper 只比對內容）都確實執行了、不是全部被略過（TestNG 與 JUnit 4 `Suite` 的報告裡它的
+  每個 case 都 skipped 也算；報告寫到別處時看 log 的略過數；`@DisplayName` 命名的報告與 `Running` 行以寫的名字對回
+  類別，一個名字只算給唯一能叫這個名字的類別，巢狀類別的「外層 內層」也認得）。Gradle 目標專案的 test task 這次沒有
+  實際執行時重新產生（Gradle 的建置前一律刪掉目標專案的 `build/test-results/test`、關掉 build cache，test task 每次都
+  真的執行）。預檢紅燈而以 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1` 時，沒有東西可以證明它們現在仍然
+  通過，全部重新產生。
+- **覆蓋率**：從這次預檢建置的 JaCoCo 報告以現在的門檻重新量——別的測試或它呼叫的類別改了，覆蓋率會變，
+  即使這兩個檔都沒動。
+- **review**：不重跑 reviewer（那正是略過要省下的），但只在它看過的東西都沒變、rubric 也沒換時沿用，
+  而且分數以現在的門檻重新判定；上次是 `UT_SKIP_REVIEW=1` 通過的，這次開了 review 就重新產生。
+
+全部符合才略過，log 以 `[接續]` 開頭列出略過了哪些、依據哪一次；先前通過過但這次要重做的也列出原因。略過的類別
+記進這次的 `passed.json`，也列在 `summary.json` 的 `resumed`；它們的測試之後每一批的建置都必須照樣執行。
+剩下要做的即使只有一個類別，資料夾目標也照樣分批（沒過就撤回）。目標類別全都略過時只跑預檢，以
+`stopReason: "already-passed"` exit 0。reviewer 的模型與工具版本不在比對之內：換了模型、或升級工具後想重新審，
+設 `UT_RESUME=0` 全部重新產生；刪掉 `runs/<repo>/` 也一樣（紀錄就在裡面）。
+
+**不利於紀錄的證據，看到的當下就寫下來。** 一個類別的測試在建置中失敗過、或失敗之後重跑才通過（surefire 的
+`rerunFailingTestsCount`；有設定 test-retry 的 Gradle 建置裡同名的先敗後過；TestNG 的 retry analyzer 把失敗的那次記成
+skipped、再記一次通過），它的某個檔編譯失敗，或修復迴圈改過測試資源或 Spring 會自己載入的類別（刪掉的也算）——
+在預檢、在修復迴圈的每一次建置、在之後每一批的建置——當下就把**所有執行記過的類別**裡被點到的那些的最新紀錄記成
+作廢、寫進這次的 `passed.json`，不論這次是不是目標、`UT_RESUME` 開不開：這次停在紅燈的預檢、修復途中被 Ctrl-C、
+重做沒過，下一次也不會拿更舊的紀錄接續；這次執行裡之後才通過、帶著同一個不穩定測試的類別也一樣作廢。同一次執行
+裡，後面的批次改了前面通過紀錄裡的檔（擴充共用的 helper、把測試加進 suite），前面那筆就不再相符——它的審查沒看過
+新的版本：log 在那一批通過時就說，下一次重跑重新產生那個類別。`passed.json` 讀不了、是別的版本寫的、格式不對時，
+裡面點名的類別當成沒有可用的紀錄（不會回頭用更舊的）；它是個目錄、FIFO 或沒有權限讀時，還沒找到紀錄的類別都一樣
+（修好或刪掉那個檔之前）；寫入以整份寫完、fsync 之後才換上。比對的是內容：git 的 autocrlf 改了換行也算改過；
+`runs/<repo 名>` 以 repo 目錄名區分，同名的另一個 checkout 共用紀錄（只會少接續，不會誤接續）；路徑大小寫
+不敏感的檔案系統上，目標要用和上次同樣的大小寫。
 
 ## Troubleshooting
 
@@ -286,8 +377,12 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   類別層級的 `@Disabled` / `@Ignore`。回饋會列出這次實際執行了哪些類別、各是什麼框架，writer 照著改寫。
   writer 加了測試的既有類別在清單上時，那個類別本來就沒被執行——加在那裡的測試等於沒寫。writer 沒改過的既有
   類別也在清單上時，是這輪的變更讓它們不再被執行（例如測試資源裡的設定；分批時也包括前面批次寫好的測試）。
-  以類別層級 `@DisplayName` 命名的報告會對回類別；報告關掉、或完全對不到任何類別時 loop 看不出來，只印 WARN、
-  不判。
+  以類別層級 `@DisplayName` 命名的報告與 `Running` 行（surefire 的 phrased reporter）以寫的名字對回類別——檔名在
+  POSIX locale 下每個中文字都成了 `?`，兩個類別同名時也只留最後寫的那一份，所以類別自己以 FQCN 命名的報告優先；
+  一個名字只算給唯一能叫這個名字的類別：兩個類別的 `@DisplayName` 一樣、或某個類別的 `@DisplayName` 就是另一個
+  類別的 FQCN（`@DisplayName("com.x.HiddenSpec")`），這個名字誰都不算（報告檔一律以類別命名時，檔名照樣算數）；
+  reportNameSuffix 下的「計算機測試(unit)」也認得。回饋說「與 com.x.OrderTest 相同」時，給它一個獨一無二的名字就好。
+  報告關掉、或完全對不到任何類別時 loop 看不出來，只印 WARN、不判。
 - **`unmappable character (0x..) for encoding MS950`，或 log 出現「原始碼編碼：MS950」。** javac 以
   MS950 讀原始碼：pom 這樣設定，或 pom 沒設 `project.build.sourceEncoding`、在繁中 Windows 上用 JDK 17
   以前的版本建置（平台編碼就是 MS950）。在這種模組裡，writer 以 UTF-8 寫的中文依工具鏈不是讓模組編不過，
@@ -334,7 +429,12 @@ writer → 編譯測試 → 覆蓋率 → review 迴圈**：新的 writer / revi
   `gates-passed` 收場（以真的專案重現過）。log 與 `baseline.md` 會寫明是哪一種。之後照一般的紅燈處理：修復
   迴圈、`UT_ALLOW_DIRTY_BASELINE=1`，或先修好那些測試（Gradle 也一樣）。`-fn` 下只算編譯與測試的失敗，別的
   plugin（copy-resources、checkstyle）失敗不算；失敗一次、重跑後通過的測試（`rerunFailingTestsCount`，log 裡的
-  `Flakes`；Gradle 的 test-retry plugin）也不算失敗。
+  `Flakes`；Gradle 設定了 test-retry plugin 時——它的綠建置 log 照樣印 `1 failed` 與 `There were failing tests`，這時
+  以測試結果為準、同名的測試失敗之後又通過才算重試通過；沒設定時同名的一敗一過是兩個測試，照樣是紅的）也不算失敗，
+  但記成不穩定的測試（summary 的 `flakyTests`）——writer 自己寫的測試例外：它失敗之後重跑才通過，那一輪判 FAIL，
+  回饋附上第一次失敗的訊息，要它讓測試每次都得到相同的結果。Maven 的 log 每行前面有時間或 thread 名稱
+  （`.mvn/maven.config` 的 `-Dorg.slf4j.simpleLogger.showDateTime=true`、`showThreadName`）時，照 Maven 自己第一行的
+  樣子拿掉再判讀。
 - **中止，說「目標模組一個測試都沒有執行」（stopReason `tests-skipped`）。** pom、settings.xml 或
   `.mvn/maven.config` 設了 `skipTests` 或 `maven.test.skip`，surefire 只印一行 `Tests are skipped.`——每一輪都
   一樣，writer 寫的測試永遠驗證不了，所以預檢就停下，不開 writer session（模組還沒有任何測試原始碼時例外：

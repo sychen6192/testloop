@@ -51,6 +51,11 @@ export interface TestStack {
   /** hamcrest-core alone: CoreMatchers and MatcherAssert, but no org.hamcrest.Matchers. */
   hamcrestCoreOnly?: boolean;
   powermock?: string;
+  /**
+   * Spring's test support (spring-test, or the starter that brings it): a test can start a context
+   * from a base class or an annotation the test tree never shows (libs/resume.ts referencedTestFiles).
+   */
+  springTest?: string;
   /** "8", "11", "17"… — the level test sources compile at. */
   javaRelease?: string;
   /** The compiler's own log line wins over the pom: it reflects testRelease, profiles, maven.config. */
@@ -179,6 +184,7 @@ const JAR_PATTERNS: Array<[keyof TestStack, RegExp]> = [
   ["mockito", /(?:^|[\\/])mockito-(?:core|all)-(\d[\w.-]*?)\.jar$/],
   ["assertj", /(?:^|[\\/])assertj-core-(\d[\w.-]*?)\.jar$/],
   ["powermock", /(?:^|[\\/])powermock-(?:core|api-mockito2?|module-junit4)-(\d[\w.-]*?)\.jar$/],
+  ["springTest", /(?:^|[\\/])spring-test-(\d[\w.-]*?)\.jar$/],
 ];
 // Hamcrest 2 is one jar ("hamcrest-2.2.jar"); 1.x split it, and hamcrest-core — what JUnit 4 pulls
 // in — has no org.hamcrest.Matchers.
@@ -497,6 +503,8 @@ export function stackFromPom(facts: PomFacts): TestStack | undefined {
   }
   const powermock = dep(/^powermock-/);
   if (powermock) stack.powermock = version(powermock);
+  const springTest = dep(/^(?:spring-test|spring-boot-starter-test)$/);
+  if (springTest) stack.springTest = version(springTest);
   const bootTest = dep("spring-boot-starter-test");
   const boot = facts.springBootVersion;
   const row = bootTest && boot ? bootLine(boot) : undefined;

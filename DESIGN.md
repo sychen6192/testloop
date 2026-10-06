@@ -18,6 +18,9 @@ loop.ts -- 參數驗證 / 模組偵測 / rubric 載入 / startup guard / runs/ �
         │    └ 紅燈 → repairBaseline：同一 writer + 同樣 guard + 同一指令，修到綠才往下；修不好才停
         │  測試相依量測（measureTestStack：surefire classpath，退回 pom）與原始碼編碼量測
         │    （measureSourceEncoding：pom，退回 build log 的平台編碼）→ 寫進 prompt
+        │  被強制終止的 run 留下還在跑的子程序 → 先結束（libs/shell.ts children.json）
+        │  被強制終止的 run 留下的批次復原日誌 → 先替它撤回（libs/batch.ts，在預檢之前）
+        │  接續（libs/resume.ts）：先前已通過、類別與測試都沒變、預檢中照樣通過的類別不再產生
         │  資料夾目標 → 依 UT_BATCH_SIZE 分批，每批一個完整的 orchestrate；
         │    沒通過的批次撤回它對 src/test 的變更（保留在 batch-NN/rejected/）
         │
@@ -59,7 +62,10 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    註解再刪字串，字串裡的 `"**/*.java"` 會一路吃到下一個註解，把中間的測試全數吃掉，writer 加一段 Javadoc 就會被判
    「刪減」。沒關上的註解或 text block 也只清掉開頭那個符號——清到檔尾同樣讓後面的測試全部「消失」，而編不過的
    是那個開頭，交給建置報錯。`enabled = false` 也只在 `@Test(…)` 裡算——否則測試裡的 `boolean enabled = false;`
-   會讓一個測 feature flag 的回合被判掏空。（writer 能
+   會讓一個測 feature flag 的回合被判掏空。原始碼以模組的編碼讀（`decodeJavaSource`），整次執行用開始時的那一個：
+   以 UTF-8 讀 MS950，「成功」的第二個 byte 是 `\`，字串吃掉後面的程式碼，那個檔的測試數成 0——刪掉它的測試量尺
+   看不到，而以正確編碼讀的「該跑的測試」檢查把它當成「加了測試」。建置途中量得更準的編碼不拿來數：拿新讀法數的
+   去比舊讀法數的，一樣會把沒動過的檔判成刪減或加了測試。（writer 能
    刪測試 = 能把失敗「刪到會過」= 同一個洞的另一面。有了這兩道 assert，「修復既有紅燈」才敢
    交給 writer 做——先前否決的理由是修好與掏空在 build gate 眼裡一模一樣，現在分得出來。）
    第三道是**有跑才算**：綠燈只證明跑到的測試通過，沒證明該跑的有跑。以真的 Maven 實測：surefire 2.22.2、
@@ -74,8 +80,35 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
    類別改成 abstract 由上面的數量量尺擋下。writer 新寫的類別測試全部 skipped 也不算。修復迴圈裡 writer 沒改
    任何檔案時的 flaky 確認重跑同樣要檢查：紅燈的建置不檢查誰沒跑，一輪裡把失敗的測試改成不執行、同時另一個
    測試 flaky 紅燈，重跑轉綠就會被當成 flaky 放行。
-   判不出來時不判：類別層級 `@DisplayName` 命名的報告（檔名裡的非 ASCII 變成 `?`）會對回類別，但報告關了、
-   寫到別處、或完全對不到任何測試類別時只印 WARN——這道檢查判錯的代價是每一輪都 FAIL、run 永遠不會成功，
+   判不出來時不判：類別層級 `@DisplayName` 命名的報告（surefire 的 phrased reporter）會對回類別。一份報告以它
+   **裡面**寫的名字認——XML 的 testsuite 名、.txt 的 `Test set:`，UTF-8、完整——檔名只在讀不到內容時才用：檔名是
+   JVM 的檔名編碼寫的，POSIX locale 下每個寫不出來的字變成一個 `?`（五個字的名字都是 `?????`），而且一個名字只有
+   一個檔，兩個類別同名時留下的是最後寫的那一份（實測 surefire 3.2.5：一個 `@Disabled` 類別最後寫了
+   `TEST-服務測試.xml`，另一個同名、2 個測試都過的類別就被判成「全部被略過」）。所以一個類別先看它自己以 FQCN
+   命名的報告，只有沒有時才看 `@DisplayName` 命名的；而一個名字——報告的、`Running` 行的（phrased 的 `Running`
+   行是一整行的 `@DisplayName`）、suite 報告裡的——只算給**唯一**能叫這個名字的類別：它的 FQCN 是這個名字的、
+   `@DisplayName` 是這個名字的，以及（名字不是類別名時）`@DisplayName` 讀不到的，全是候選（名字比對照 JUnit 的
+   讀法：原始碼以模組的編碼讀、跳脫照 javac、以 Java 的 trim 去掉 U+0020 以下的字——全形空白留著；寫在
+   `@ExtendWith({…})` 之前的也讀得到）。`@DisplayName("com.x.HiddenSpec")` 的類別跑了，它的報告與 `Running` 行叫
+   `com.x.HiddenSpec`，而 HiddenSpec 本身不在 includes 裡：先前那個名字就替它作了證（實測 surefire 3.2.5）。報告檔
+   一律以類別命名（沒有任何一個檔以別的名字命名：`usePhrasedFileName` 沒開）時，檔名就是類別的，照樣算數。同名的
+   類別判「沒有執行」、而有 phrased 的檔或 `Running` 行叫那個名字時，回饋點名另一個類別，要 writer 給它一個獨一無二
+   的名字——這是 writer 自己改得了的。只剩檔名時，要字數一樣、模組裡沒有別的類別的名字也對得上、也沒有名字讀不到的
+   類別（常數）才算。報告全都以 `@DisplayName` 命名、模組裡每個類別都有 `@DisplayName` 時照樣對得回類別（先前
+   當成「看不到」不判，writer 沒被執行的類別照樣通過），`reported`——預檢記下的「介入前有執行」——列的也是類別
+   而不是名字。reportNameSuffix 下 phrased 的名字是「<名字>(<suffix>)」，也認得。模組的 `@DisplayName` 讀一次，
+   之後只在檔案變了才重讀，沒有「DisplayName」字樣的檔不解析。
+   suite 報告（TestNG 的 `TEST-TestSuite.xml`、JUnit 4 的 `Suite`）是它的成員唯一的報告：它在裡面的每個 case 都
+   skipped 也算全部被略過。報告寫到別處、只剩 log 時，全部被略過看 log 裡它那行的 `Skipped:`。log 的 `Running`
+   行只算目標模組的 surefire 區段——`-am` 帶進來的上游模組裡同名的類別不是它。區段從 Maven 印的 plugin 標頭
+   （`[INFO] --- surefire:3.2.5:test (default-test) @ web ---`）到下一個標頭：只認整行、Maven 自己印的，一個測試
+   印出的「[INFO] Building monthly report」或句中的 `--- x @ y ---` 都不會切斷它（先前會，報告寫到別處時後面的類別
+   每一輪都判成沒有執行）。Maven logger 在每行前面加時間（`showDateTime`：`12:00:00,123`、`2026-09-30 12:00:00`、
+   `2026-09-30T12:00:00.123Z`）或 thread 名稱（`showThreadName`：`[main]`，surefire 的那幾行是
+   `[ThreadedStreamConsumer]`）時，一個 build 的 log 在任何判讀之前先拿掉它（`normalizeMavenLog`：照 Maven 自己第一行
+   的樣子，數字當任何數字、括號裡的名字當任何名字，只拿掉後面接著 level 標籤的）——先前以 `[INFO]`、`[ERROR]` 開頭
+   判讀的全部落空：testFailureIgnore 下失敗的測試判 PASS、`Tests are skipped.` 沒認出、區段找不到而把上游同名的類別
+   算成目標模組的（Maven 3.9.11 實測）。報告關了、寫到別處、或完全對不到任何測試類別時只印 WARN——這道檢查判錯的代價是每一輪都 FAIL、run 永遠不會成功，
    比放過一個沒執行的測試更糟。回饋說出這次執行了哪些類別、各是什麼框架（限縮執行時退回 writer 介入前執行的
    那些）、類名是否符合 surefire 的 includes（`*Tests` 要 2.20 以後——Maven 3.8 沒指定版本時用的 2.12.4 不跑），
    writer 才知道該改寫成什麼。限縮執行時 `-Dtest` 帶的是 `Name,Name$*`：surefire 3.0.0-M5 以前的 `-Dtest=Name`
@@ -97,10 +130,26 @@ orchestrator.ts  ←-- 唯一 loop controller（確定性）
      .txt 摘要同樣寫 `Failures: 1`，分不出來，所以不採用。找元素之前先把 CDATA 等長換成空白：測試輸出與堆疊都在
      CDATA 裡，一個 flaky 第一次失敗留下的訊息裡的 `<error code="503">`、測試印出的 `</testcase>` 都是文字。綠建置
      只讀每份報告開頭的計數，計數不是 0 才完整解析。
-   Gradle 同理，另外還要看測試結果本身：test 任務 up-to-date 時什麼都不印（開發者先跑過一次 `gradle test`，或這輪的
-   修改沒有改到 bytecode），而測試結果目錄只存著最後一次執行的結果。Gradle 以 exit 0 帶過的失敗也從這裡點名，
-   所以預檢照樣修得了、`UT_ALLOW_DIRTY_BASELINE` 照樣容忍得了。test-retry plugin（預設不合併重試）把每次重試寫成
-   獨立的 test case：同名的測試有一次通過就不算失敗，否則重試後通過的綠建置會被判紅。
+   Gradle 同理，另外還要看測試結果本身：log 可能什麼都不說（quiet），而測試結果目錄只存著最後一次執行的結果。
+   Gradle 的建置前一律刪掉目標專案的 `build/test-results/test`、以 `-Dorg.gradle.caching=false` 執行 `test`：test 任務
+   沒有實際執行（`UP-TO-DATE`——什麼都沒改；`FROM-CACHE`——build cache 有這組輸入的輸出，每次撤回回到的正是上一批
+   建置過的那棵樹）時留下的結果不是這次執行的，一個只有真的跑才會失敗的測試就這樣過了。刪掉輸出解決前者、解決不了
+   後者（Gradle 8.14.3 實測），關掉 cache 用屬性而不用 `--no-build-cache`：Gradle 4 以前不認得那個選項、整個建置
+   失敗；`--rerun` 要 7.6。不用 `cleanTest`：沒指定專案的 `cleanTest` 在它碰到的每一個專案都執行（根專案底下有
+   子專案、`-p` 的專案底下還有巢狀的），每一輪都重跑所有子專案的測試——多花的時間之外，子專案一個不穩定或依賴
+   狀態的測試讓每一輪都紅（實測）。Gradle 以 exit 0 帶過的失敗也從這裡點名，所以預檢照樣修得了、
+   `UT_ALLOW_DIRTY_BASELINE` 照樣容忍得了。
+   重試只在建置設定了它時才算（`gradleRetriesTests`：build script、version catalog、precompiled script plugin 與 Gradle
+   user home 的 init script 提到 test-retry plugin 或 retry 區塊，註解、build 目錄與測試用的 fixture 腳本不算）。這時
+   test-retry（預設不合併重試）把每次重試寫成獨立的 test case、排在它重試的那次之後，綠建置的 log 照樣印
+   `N tests completed, M failed` 與 `There were failing tests`：以測試結果為準，同名的測試失敗之後又通過才算重試通過，
+   一個通過只抵它之前的一個失敗（Gradle 8.14.3 + test-retry 1.6.2 實測：參數化方法重試時整個方法重跑）。沒設定時同名
+   的 test case 是不同的測試——兩個參數化方法同樣的參數都叫「[2] -1」、重複的 `@DisplayName`、同名的 DynamicTest——
+   一個通過不抵另一個的失敗，log 說有失敗也照樣算（上一版不分，一個通過就吃掉另一個真的失敗，writer 失敗的測試判
+   PASS）。已知的限制：retry 設定寫在 CI 才開的條件裡時一律當作會重試；plugin 從 repo 外套用（公司的 convention
+   plugin）時看不到，每個失敗都算——多判紅一輪，不會多放行。給 writer 的回饋照 surefire 報告的樣子逐個測試列出
+   （名稱、訊息、第一個 frame），重試通過的不列；沒有測試失敗到最後、卻有測試重試才通過（`failOnPassedAfterRetry`
+   讓建置因此失敗）時，回饋說明是哪些測試不穩定與它們第一次失敗的訊息，不把它們當成失敗的測試。
    不強制加 `-Dmaven.test.failure.ignore=false`：那會讓 reactor 停在失敗的上游模組，`UT_ALLOW_DIRTY_BASELINE`
    容忍的上游紅燈就再也建置不到目標模組；讓 Maven 照專案的設定跑完、由報告判定，兩種專案都對。零測試的判斷同理：
    `-q`（`.mvn/maven.config` 或 `MAVEN_ARGS`）的綠建置一行 `Tests run` 都不印，只看 log 會讓每一輪都判成
@@ -369,6 +418,274 @@ production code 上）、連續兩批以同一個 `writer-no-op` 或 `reviewer-u
 **不變的部分。** 只有一批時（單一類別，或 `UT_BATCH_SIZE` 不小於類別數）走原本的路徑，artifacts
 版面、summary 形狀、失敗時測試檔留在原處，都與以前相同。分批不改 build gate 的承諾：每批仍是完整
 模組建置（或 `UT_TEST_SCOPE=generated` 時每批通過前的完整驗收）。代價是建置次數隨批數增加，README 說明。
+
+## 已採納：接續先前的執行（2026-09-28）
+
+**問題。** 資料夾目標一批一個類別，每批是幾個 writer / reviewer session 加幾次建置——一批幾分鐘到半小時。
+跑到第二十個類別時被打斷（終端機斷線、筆電睡著、建置吃光記憶體），或跑完有三批沒過，同一個目標再跑一次就
+從第一個類別重來：已經通過的幾個小時重做一遍，writer 還被要求「改進」剛通過所有 gate 的測試。
+
+**作法。** 每一批（或單一類別的 run）通過時，把它通過時的樣子記在該次 artifacts 的 `passed.json`
+（`libs/resume.ts`）：類別原始碼、它的測試檔（`findExistingTests` 的命名慣例）、那批 writer 寫的其他檔
+（不是別的類別的測試——共用 helper、`src/test/resources`），以及這些檔在測試目錄裡引用到的檔——它繼承的
+基底類別、呼叫的 fixture builder 與斷言 helper（連同它們再引用的），字串常值裡點名的資源，以測試命名的資源
+（`CalcTest.sql`——`@Sql` 沒寫路徑時 Spring 載入的、`CalcTest-context.xml`、approval／snapshot 檔；
+`src/test/java` 裡的非 .java 檔也算資源）（`referencedTestFiles`）——各自的 sha256；只因為被引用才記下的另列在
+`refs`。名字照 javac 的方式解析，以檔案**宣告**的為準：一批通過時把測試目錄讀一次（`indexTestTree`：每個檔的
+package 與 top-level 型別），放在和 package 不符的目錄、一個檔裡的第二個型別都找得到，非 ASCII 的類別名也是名字
+（Java 的識別字是任何文字的字母），Unicode 跳脫先照 javac 解開（註解裡的 `\u000a` 是換行，後面的是程式碼）。
+single-type import 的、同 package 的、on-demand import 的、寫了完整類名的；哪裡都看不到的名字（JDK 的 `Math`、main 的
+類別）不是測試目錄裡的類別。之後才加的同 package 類別會讓 javac 改綁它——蓋過 on-demand import 的（連 JUnit 的
+`org.junit.jupiter.api.*`）、`java.lang` 的、宣告在別的檔裡的——測試的行為變了而紀錄裡的檔一個 byte 都沒變：這由重跑時
+重新走一次引用抓到（見下），不再記下「當時不存在的同名檔」（那只抓得到同名的檔、只對樹裡的型別）。讀不了
+的檔宣告什麼不知道，以檔名算。先前以檔案的路徑找：import 的類別放在和 package 不符的目錄就整個名字略過（那個
+helper 改了看不到），都對不到時算每一個同名的；再之前每一個同名的都算：每個 package 都有一個 `Fixtures` 的樹裡，
+一個測試記下所有 package 的 `Fixtures` 與它們的 builder，60 個 package 就碰到上限、永遠不接續。字串常值與記下的
+資源（256 KB 以內、會點名類別的那幾種：XML、properties、YAML、JSON、`META-INF/services`、`spring.factories`／
+`.imports`——approval 檔、SQL、CSV 是資料）裡的完整類名也算引用：JUnit 的 `@MethodSource("com.x.Fixtures#cases")`、
+`Class.forName("com.x.Outer$Inner")`、context XML 的 `<bean class="com.x.StubRepo">`、`META-INF/services` 的一行。
+記下的資源裡點名的資源也算（`<import resource="classpath:stubs-context.xml"/>`、`spring.config.import`、
+`spring.sql.init.data-locations`）；UTF-16 的照 BOM 讀；上限提高到 4 MB，讀不完的讓紀錄 partial（先前 256 KB 以上
+的直接跳過、也不算 partial，裡面點名的東西改了看不到）。常值點名的是目錄或 pattern（`src/test/resources/cases`、
+`classpath*:cases/**/*.json`）時算底下每個檔（`resourcesUnder`，以 classpath 的根與模組根兩種寫法都認）；從模組根
+算起、而檔不在索引裡的路徑（`testdata/orders.json`、`src/test/data/`——測試以模組根為工作目錄）算那裡的檔，只收
+帶 `/` 或副檔名的（「.」「error」是字，不是路徑），目錄超過上限就 partial。測試的 classpath 不只 `src/test`：
+Gradle 的 `src/testFixtures/java`、`resources`，pom `<testResources>` 列的目錄也索引進來。Windows、macOS 的檔案系統
+不分大小寫，資源名稱也不分（`Fixture.JSON` 讀的就是 `fixture.json`）。
+以測試命名的資源以 `.`、`-`、`_`、`$` 接在測試名後（Spring 替 `@Nested` 類別找的是 `CalcTest$Add.sql`）；symlink
+的 fixture 目錄照樣走進去（每個目錄只走一次）。原始碼先以模組的編碼解碼再 lex（`decodeJavaSource`）：以 byte 讀
+MS950，「功、許、蓋」的第二個 byte 是 `\`，`"處理成功"` 的結尾引號被當成跳脫，同一行後面的 helper 與資源全部消失；
+編碼名稱不明（設在 repo 外的 parent pom）時依序試 Big5、GBK、Shift_JIS、EUC-KR，第一個整份都解得開的就用——
+不是這個檔的那一個，在它解得開的地方多半也和真的那個一樣把 lead byte 與下一個 byte 當成一個字，lexer 要的就是這個；
+都不行才逐 byte。例外是 Shift_JIS 的半形片假名：一個 byte 一個字，Big5 與 GBK 卻把它當 lead byte、把下一個 byte（可能
+就是 `\`）當第二個——所以 Shift_JIS 解得開、而且讀出連續的全形假名時優先（Big5 的 byte 從 0xA1 起，永遠拼不出
+0x82／0x83 開頭的假名）。只有半形片假名、沒有任何全形假名的 Shift_JIS 檔照舊以 Big5 讀（已知限制：拿半形片假名當
+判斷依據，Big5 的「處理成功」就會被讀成 Shift_JIS）。非 ASCII 的資源名也要是真的字才對得上（兩邊都正規化成 NFC）。
+
+每個測試都帶著跑、卻沒有測試點名的也記下（不佔上限）：JUnit、Mockito、TestNG 與測試 logging 自己讀的設定——
+resources 根目錄的 `junit-platform.properties`、`META-INF/services/**`、`mockito-extensions/**`、`logback-test.xml`、
+`log4j2-test.*`、`testng.xml`——連同它們點名的類別（自動註冊的 extension）。走訪到的任何一個檔起 Spring context
+（`@SpringBootTest`、`@ContextConfiguration`、`@Sql`、`@WebServiceServerTest`、`SpringExtension`……，基底類別上的也算）
+時，再加上 Spring 自己載入的：`application*`／`bootstrap*` 的 yml 與 properties（連同 `config/` 下的）、
+`schema*.sql`／`data*.sql`、`META-INF/spring*`、`spring.properties`、`messages*.properties`（MessageSource）、
+`logback-spring.xml`／`log4j2-spring.xml`、Flyway 與 Liquibase 在測試資料庫上跑的 `db/migration/**`、`db/changelog/**`，
+以及測試目錄裡 component scan 找得到的類別（`springLoaded`：`@Component` 與它的 stereotype、`@Configuration`、
+`@TestConfiguration`、JSR-330 的 `@Named`／`@ManagedBean`、JPA 的 `@Entity`……；模組自己宣告、帶著這些的註解——
+`@UseCase` 是個 `@Component`——也算，main 與 test 的都讀）。兩次執行之間有人改了 `application.yml` 或一個被 component
+scan 找到的 stub，每個起 context 的測試跑的東西都變了，而這些檔沒有一個測試點名。測試類別的檔裡只算 top-level 的：
+巢狀在測試類別裡的設定類別由 Spring Boot 的 TestTypeExcludeFilter 留給那個測試（它就在那個測試檔裡）；一般 helper
+裡巢狀的 `@Configuration` 照樣被 scan 到，算。不起 Spring 的測試不記 Spring 的：它讀不到 `application.yml`，改了照樣
+接續。起不起 context 不一定看得到：公司的 `@SpringBootTest` 基底類別放在另一個模組或 jar、meta-annotation 來自 jar，
+測試目錄裡沒有一個檔寫著 Spring。所以模組的測試相依有 spring-test（`TestStack.springTest`：surefire 的 classpath，
+退回 pom；Gradle 看設定）時，測試類別繼承、實作或掛著模組外的型別——不是 JUnit、Mockito、AssertJ、Hamcrest、
+Lombok、TestNG 這類測試函式庫的——就當成會起 context（多記的只是讓 `application.yml` 改了的時候多重做）。
+reviewer 的分數與 blockers、它依據的 rubric 的 sha256。
+reviewer 讀測試時也讀這些，而測試的行為就掛在它們上面：一個被掏空的斷言 helper 讓建置照樣綠、覆蓋率照樣在
+（覆蓋率量的是執行，不是斷言）。引用的走訪由近而遠，類別與資源各有上限（各 400 個）：資源各算各的，一個點名
+上千個 golden file 的 helper 才不會用掉它呼叫的 helper 需要的額度。字串常值從 lexer 處理過的原始碼取（
+`stringLiterals`，`libs/javasrc.ts` 的 `codeOnly` 保留引號、清空內容，逐字對齊）：同一行的 `"fixtures/" + "order.json"`
+是兩個常值，char 常值與註解裡的引號不算。帶路徑的常值只點名那個路徑的資源（`golden/case1/expected.json` 不是每一個
+`expected.json`），只有檔名、或路徑對不上時才算同名的每一個。任一個上限到了，紀錄標記 `partial`，而 partial 的紀錄
+不接續：超出的部分改了看不到，而被掏空的 helper 建置與覆蓋率都照樣過。下一次執行在預檢（與修復）之後、分批之前，
+對每個目標類別取**最新的一筆**紀錄逐項確認，全部成立才略過：
+
+- **紀錄描述的就是現在**：類別與紀錄裡的每個檔一個 byte 都沒變（當時不存在的仍不存在），也沒有多出當時沒有
+  的測試檔。比內容不比 mtime——git checkout、複製 repo 都會改 mtime，內容才是 gate 看過的東西。只看最新的
+  一筆：較舊的紀錄對得上，只說明它列的那些檔回到了當時的樣子——較新的那次通過所依賴、之後又被改過的 helper
+  可能根本不在舊紀錄裡。
+- **走到的還是那些檔**：從紀錄裡它的測試與那批寫的檔重新走一次引用（`reachMismatch`，所有候選共用一份測試目錄
+  的索引），走到的必須就是紀錄的 `refs`。之後才出現的檔不在任何指紋裡：一個同 package 的 `Assertions` 讓
+  `import org.junit.jupiter.api.*` 的斷言改綁它、一個 `junit-platform.properties` 打開 extension 的自動註冊再加一個
+  吞掉失敗的 `TestExecutionExceptionHandler`、一個新的 `@Component` stub 或 `data.sql`——建置照樣綠、覆蓋率照樣在，
+  內容比對一個都看不到。紀錄說不存在、現在也沒人走得到的路徑不算。走訪的規則改了（工具升級），舊紀錄走出來不一樣
+  就重做一次，不必另外升版號。
+- **建置**：這次的預檢建置（或讓它轉綠的修復）是綠的，而且它的**每一個**會被執行的測試類別——它自己的測試檔
+  與那批 writer 寫的（不只是符合命名慣例的那些，writer 自己命名的、順手改過的別的測試也算），不含只是被引用的
+  `refs`——都在這次建置中執行過、而且不是全部被略過：與 build gate 的 ran-check 同一段程式（`checkTestsRan`）。
+  只要其中一個有跑就算的話，那批順手改過的既有測試有跑，就替一個沒被執行的新測試作了證；反過來，一個被引用、
+  自己也有 `@Test` 卻不在 surefire includes 裡的基底類別，要求它單獨執行就永遠接續不了。所有候選類別的測試一起
+  以一次 `checkTestsRan` 判斷（它讀這次建置的報告，報告以 `@DisplayName` 命名時還要讀模組每個測試的原始碼）。
+  報告寫到別處、只有 log 時，全部略過看 log 每個類別那行的 `Skipped:`。它的測試這次失敗過、不穩定，修復迴圈
+  改過資源——這些證據在看到的當下就把紀錄記成作廢（見「發現了就寫下」），這裡讀到的最新一筆就是作廢的那筆。
+  紀錄裡找不到會被執行的測試類別時無從證明，重新產生。
+  Gradle 的 test task 這次沒有實際執行（`SKIPPED`，或 log 看不出來；建置本身已經排除了 `UP-TO-DATE` 與
+  `FROM-CACHE`，見 build gate）時，`build/test-results/test` 不是這棵樹的證據，什麼都不略過；看的是目標專案自己的
+  test task（buildSrc 以外最淺的那個）——`gradle test` 在子專案裡也會執行，子專案的有跑不代表目標的有跑。
+  修復讓預檢轉綠時，`Running` 行與 `Flakes:` 看的是修復那次綠燈建置的 log。預檢紅燈而被 `UT_ALLOW_DIRTY_BASELINE` 放行、或 `UT_SKIP_BASELINE=1`
+  時，沒有東西證明它們現在仍然通過，什麼都不略過；報告對不到任何類別時也一樣。
+- **覆蓋率**：用 coverage gate 自己的 `checkCoverage` 對這次預檢的 JaCoCo 報告重新量，門檻是現在的。
+  別的測試被刪、它呼叫的類別改了，覆蓋率會變，即使紀錄裡的檔都沒動——所以不能沿用當時的數字。沒有這次建置
+  產生的報告時與 gate 的判斷一致（寬鬆模式不檢查、`UT_STRICT_COV=1` 不通過），log 不宣稱「重新量過」。
+- **review**：不重跑 reviewer——那是略過要省下的東西。判決只在它的輸入都沒變時沿用：它讀的類別與測試檔（上一項
+  已比對）、它依據的 rubric；分數交給 `gates/review.ts` 的 `parseVerdict` 以現在的門檻重新判定（pipeline
+  判定，LLM 不算分——與 review gate 同一段程式）。當時 review gate 是關閉的，這次開著就重新產生。
+
+略過的類別不給 writer，紀錄帶進這次的 `passed.json`（下一次就在最新的一次找得到），列在 summary 的
+`resumed`。它們的測試在 `ranAtBaseline` 裡：之後每一批的建置都必須照樣執行它們（ran-check），後面的 writer
+打壞它們就是那一批的紅燈。全部略過時只跑預檢，`stopReason: "already-passed"`、exit 0。資料夾目標在略過之後
+即使只剩一個類別，也照樣以批次執行（沒過就撤回、執行中有復原日誌）：是不是分批由目標決定，不是由剩下幾個
+決定——否則最常見的重跑（有幾批沒過，再跑一次）會把最後那一批沒過的測試留在 `src/test`。
+
+**同一次執行裡的變化。** 後面的批次改了前面通過紀錄裡的檔——擴充共用的 helper、把自己的測試加進 JUnit 4
+suite——前面那筆就不再相符，下一次重跑重新產生那個類別。這是刻意的：更新前面那筆的雜湊等於讓它的判決涵蓋一個
+它的 reviewer 沒讀過的 helper 版本，而後面那批的 reviewer 審的是自己的測試，不保證讀了那份 diff。代價是共用
+helper 每一批都改的模組，重跑要重做前面的類別；重做時測試已經在、helper 也有了需要的方法，writer 多半不再動它，
+所以通常一兩次就收斂。log 在那一批通過時就說哪一筆不再相符、為什麼（`noteStale`，只看那批寫過的檔；不分批的
+run 也一樣）。紀錄標記作廢（`invalid`）而不是刪掉：只看最新一筆的規則下，刪掉會讓更舊的一筆重新算數。
+
+**發現了就寫下。** 不利於一筆紀錄的證據，看到的當下就寫成作廢的紀錄進這次的 `passed.json`（`voidMatching`；
+`voidEntry`：`invalid` 寫原因，`source` 換成讀不了的值，不認得 `invalid` 的舊版本也會重做）：
+- 一次建置裡它的測試失敗過、失敗之後重跑才通過（surefire 的 `<flakyFailure>` / `<flakyError>`，沒有 XML 時看 log 的
+  `Flakes:`；有設定 test-retry 的 Gradle 建置裡同名的先敗後過；TestNG 的 retry analyzer 把失敗的那次記成 skipped、
+  再記一次同名的通過——實測 TestNG 7.5 + surefire 2.22.2／3.2.5，只在 TestNG 可能在跑時才這樣認：測試 classpath 上有
+  它、報告沒有 classpath，或 Gradle 設定提到它），或它的哪個檔編譯失敗：預檢建置一結束（在修復迴圈、在因紅燈而停下
+  之前）、修復迴圈的每一次建置（`RepairConfig.onBuild`，重跑確認那次也算）、之後每一批的建置（`onFlaky`）。失敗的
+  類別取自 suite 名與失敗案例自己的 `classname`——TestNG 只寫一個 `TEST-TestSuite.xml`、JUnit 4 的 `Suite` 以 suite
+  類別命名；比對的一邊用測試檔的路徑、它宣告的 package，也用 phrased 報告的名字：`@DisplayName`，沒有的話是簡名，
+  `@Nested` 類別是「外層 內層」（實測 surefire 3.2.5）；名字不是字串常值（常數）時，任何不是類別名的名字都可能是它。
+  報告給的名字連同它原樣與切到外層類別的兩種都比（`$` 後面接數字的「NT$1000折扣」不切）。
+- 修復迴圈改過測試資源，或 Spring 會自己載入的類別（`springLoaded`；刪掉的 `.java` 原本是什麼已經不知道，一律算）：
+  profile、classpath 掃描、字串路徑，任何測試都可能讀到它，而 reviewer 沒看過——那個模組的每一筆紀錄都作廢
+  （`RepairConfig.onChanged`，每一輪 writer 改完就寫）。修復改的是普通的 helper 時不必——用到它的測試在紀錄的 `refs`
+  裡，照常比對。
+對象是**所有執行記過的類別**的最新一筆（這次的 `passed.json` 在前，其他執行的讀一次），不只這次的目標與這次通過的，
+也不論 `UT_RESUME` 開不開。上一版只在接續時、而且只對目標寫：停在紅燈預檢的 `die`、修復途中的 Ctrl-C、`UT_RESUME=0`、
+預檢紅燈被放行、review 開關讓它以別的理由重做，證據都只在記憶體裡，下一次執行就又拿那筆較舊的紀錄接續——而那次的
+預檢剛好沒有 flake；只重做 Greeter 的那次看到 CalcTest 不穩定，Calc 的紀錄卻不在它的目標裡。接續時讀的就包括這次
+的 `passed.json`，作廢的那筆是最新的一筆。這次執行裡之後才通過、帶著同一個不穩定測試的類別，紀錄一寫下就是作廢的
+——它帶著一個這次執行已經看過失敗的測試通過。writer 自己寫的測試不穩定不在此列：那是它這一輪要修的（build gate 判
+FAIL），不是需要人檢視的測試。紀錄寫不進去時照實說（磁碟上留著的是上一次寫成功的版本），要人以 `UT_RESUME=0` 重跑
+或刪掉那份 `passed.json`。
+
+讀紀錄由新到舊，每個目標類別取到最新的一筆就不再往舊的找（`readLedgers` 的 `wanted`）：每次執行的 `passed.json`
+都帶著它接續的紀錄，所以通常讀一兩份就夠——先前每次啟動讀遍所有執行的紀錄，300 個類別、100 次執行是 240 MB、
+1.3 秒。一份點名了某個類別、卻讀不了（截斷、不是 JSON、別的版本寫的、那筆的格式不對）的 `passed.json`，就是那個
+類別最新的一筆，當成作廢的：略過它等於讓更舊的紀錄重新算數。整份讀不了的（是個目錄、FIFO——不等它的寫入端、以
+O_NONBLOCK 打開再 fstat——或沒有權限）不知道點名了誰，還沒找到紀錄的類別都當作廢，直到它修好或被刪掉。紀錄裡的路徑必須在 repo 裡（共用的 runs 目錄裡一份
+被改過的紀錄可以指向任何地方）；雜湊只讀一般檔案——先不等待地打開再問它是什麼（打開 FIFO 會一直等寫入端，先
+stat 再開，中間可能換成了別的東西）——分段讀、大小不限；`passed.json` 整份寫完（單一個 write 可能只寫了一部分：
+磁碟滿）、fsync 才換上。執行的先後以 run id（啟動時刻的 ISO 時間）排序：時鐘在兩次執行之間被調回去時，之後的
+執行排在之前的前面，讀到的「最新」可能是較舊的一筆。它照樣要逐 byte 比對、這次的預檢與覆蓋率照樣重新驗證；會
+接續錯，要時鐘倒退再加上真正較新的那筆不一樣（作廢、多記了檔）。以 run id 排序是刻意的：不需要另外的狀態，
+runs 目錄被複製、搬走也不變（檔案時間會變）。
+
+**為什麼預設開啟。** 重跑多半就是為了補完被打斷的那次；略過的每一個類別都經過這次的建置與覆蓋率重新驗證，
+沿用的只有 reviewer 的判決，而它的輸入逐 byte 比對過。最壞的情況是該略過的沒略過——那就是以前的行為。
+要全部重新產生設 `UT_RESUME=0`。
+
+**沒有做的。** reviewer 的模型、prompt 範本與工具版本不在比對之內——沿用的判決只比對 reviewer 讀的東西與
+rubric。換了模型、或升級工具後想重新審一遍，設 `UT_RESUME=0`。Spring 會自己找到的類別認得模組自己宣告的
+stereotype（main 與 test 裡帶著 `@Component` 的 `@interface`），jar 裡的自訂 stereotype 看不到。引用的走訪看測試目錄、
+Gradle 的 `src/testFixtures`、pom 的 `<testResources>` 與測試點名的模組根路徑：`String.format` 組出來的路徑、
+`src/main` 裡的常數、上游模組的 test-jar 都看不到。比對的是內容：git 的 autocrlf 改了換行也算改過；`runs/<repo 名>`
+以目錄名區分，同名的另一個 checkout 共用紀錄（只會少接續）；路徑大小寫不敏感的檔案系統上，目標要用和上次同樣的
+大小寫。被 SIGKILL 的 run 留下的半成品在接續之前就由它的復原日誌撤回（下一節），不在任何通過紀錄裡。
+
+## 已採納：替被強制終止的 run 收尾（2026-09-28）
+
+**問題。** 失敗或被中斷（Ctrl-C、SIGTERM、SIGHUP、crash）的批次由執行它的程序撤回——前提是程序活著做完這件事。
+被強制終止的就沒有：OOM killer 的 SIGKILL、`kill -9`、斷電、被取消的 CI job，以及 Windows 關掉主控台視窗
+（Node 收到 SIGHUP 後約 10 秒就被結束，而收尾要先等 `taskkill` 收掉程序樹）。那一批 writer 寫到一半的測試
+留在 `src/test`，下一次執行把它當既有測試：防掏空 guard 不准減少它的 `@Test`、它被當成「既有測試檔」交給
+writer 修改、預檢可能因它而紅，修復迴圈再花幾輪修一個根本沒通過任何 gate 的檔案。
+
+**作法。** 每一批開始時寫一份復原日誌到它的 artifacts（`batch-NN/inflight/`，`libs/batch.ts`）：批次開始時的
+`src/test`（`captureTree` 已經讀進記憶體的內容，接成單一個 `start.bin`——一個檔一份的話，數千個小檔、每批一次，
+遇上每次寫入都要掃描的防毒軟體就是秒級的成本；太大沒留的只記指紋，與記憶體裡的 capture 同一套限制）、
+建置輸出的清單、以及 writer 目前改過哪些檔與開著的 session 開始時的樹快照（orchestrator 在 session 開始與結束時
+通知，`WriterTrace.onChange`）。程序活著時每 30 秒更新日誌的時間戳（心跳）。批次以任何程序活著的方式結束，日誌
+就刪掉。日誌寫不完整（磁碟滿）時整份刪掉、警告、照常執行——半份日誌對下一次執行沒有用。日誌的每個檔都先
+fsync 再改名就位（目錄也 sync）：斷電之後 ext4、XFS 可能留下一個改名了、內容卻從沒寫進磁碟的空檔——日誌存在的
+理由正是斷電。trace 還是讀不了時（損毀）不丟日誌：不知道 writer 改了什麼，就把那批開始之後、那次執行死前的所有
+變更都當成那批的撤回（一樣先存進 `rejected/`）。下一次對同一個 repo 執行，在拿到 repo 鎖、還原編碼視圖之後、
+預檢之前，找出被終止的 run 留下的日誌，用同一個 `setAside` 撤回——撤回的範圍是日誌記下的 writer 變更，加上開著的
+session 開始之後的差異——並替那次執行補寫 `summary.json`（`killed`）。
+
+**誰的變更。** 撤回只動 writer 改的：最後一次心跳（加一個心跳間隔的寬限）之後才改過的檔，是那次執行死後別人
+改的（多半是開發者的手動修正），原樣留著、列在 `rollback.md`。寬限內的誤判也不會遺失東西：撤回前一律先複製到
+`rejected/`。它留下的 agent session 在這次執行一開始才被結束時（見下面），那次執行「最後還活著」的時刻就是結束
+它們的那一刻：孤兒 writer 在心跳停了之後寫的檔照樣是那批的。留下的是建置時不算——建置只寫 `target/`，結束它
+不代表 writer 活到那時；算的話，開發者在當機之後對那批 writer 碰過的檔做的修正，都會被當成 writer 的而撤回。
+不見了的檔沒有時間可看，看它所在的目錄：目錄在那次執行死後沒被改過，才算 writer 刪的、放回；改過（分支切換、
+拉進別人的刪除或改名）或整個目錄不見了，就無法判斷是誰刪的——不放回，原本的內容存到那批的 `deleted/`，
+log 點名。放回一個別人刻意刪掉的檔，會讓預檢編譯一個不該存在的檔、修復迴圈去「修」它。那批開始時就沒有的檔
+（writer 新增、之後又不見了）沒有東西可放回，也不點名。死後的**移動**另外認：`mv`、`git mv`、IDE 的搬移保留
+檔案的時間，新位置的檔看起來和 writer 自己寫的一樣舊，而舊位置的目錄已經變了——撤回新的、不放回舊的，兩邊
+就都沒了。所以一個那批開始時沒有的檔，內容和一個「無法判斷誰刪的」原檔一個 byte 都不差，就是之後的移動：兩邊
+都不動、不列成別人的變更，log 點名（`movesAfterDeath`）。空檔不算證據：writer 新建的任何空檔都對得上。writer 自己
+在死前的改名不受影響：那時舊位置的目錄還沒在死後改過，舊檔照樣放回、新檔照樣撤回。
+撤回要動哪些檔（`decideRecovery`）在動手之前就寫進日誌（`decision.json`）：撤回停在半路——檔案被鎖住、這次
+執行自己也被終止——下一次重試照同一份判斷做。第一次嘗試自己搬走、放回的檔也在死後改了目錄與時間，重新判斷
+的話，那個沒放回去的檔會落在「死後改過的目錄」裡，變成無法判斷而再也不放回。重試時只排除在第一次判斷之後被人
+改過的檔。
+非 UTF-8 模組被終止時若編碼視圖開著（writer 或 reviewer 的 session 途中），下一次執行從視圖的日誌放回原本的
+bytes 時也放回原本的修改時間（到毫秒以下）；帶著復原當下的時間，這些檔在比對時就成了「死後才改的」，那批
+writer 寫過的中文測試就留在 `src/test`。
+
+**哪些日誌能動。** 日誌記下 repo 的正規化路徑（與 repo 鎖同一個 `canonicalRoot`）、那個路徑當時是哪一個目錄
+（repo 根與測試目錄的 inode 與建立時間，`dirIdentity`——不含裝置號碼：overlayfs、btrfs subvolume、NFS 在掛載時才
+分配它，重開機——日誌存在的理由之一——之後同一個目錄就換了號碼）、run 的 pid 與啟動時間、主機名、開機時間與 pid
+namespace（Linux）。開機以 Linux 的 `boot_id`（`/proc/sys/kernel/random/boot_id`）認，沒有時才用估算的開機時間
+（現在的時鐘減掉 uptime）：NTP 校正或睡眠後修正時鐘，估算值就跟著跳，兩次執行就認不出同一次開機——留下的建置
+與 agent 因此不會被結束。別的 repo 路徑（共用 runs 目錄的另一個 checkout）的不碰。只處理這個 checkout 的：共用 runs
+目錄的別台機器寫的日誌，描述的通常是那台機器上同一個路徑、它自己的 checkout——拿它撤回這台的樹，會把這台的檔
+換成那台的、把這台的測試移進別人的 `rejected/`——所以不碰，也不刪（那是它自己下一次執行要用的）；除非證明是
+同一個目錄（inode 與建立時間都相同：每次都換主機名稱的容器掛同一個 volume），那時它的 pid 在這裡沒有意義，只看
+心跳。同一台機器上共用主機名與開機時間的另一個容器（host network）也只看心跳；它的 checkout 不是這一個時留給它。
+同一台機器、同一個 pid namespace 上，路徑一樣但已經是另一個目錄（刪掉重新 clone 過）、或測試目錄被刪除或重建過，
+日誌描述的東西已經不在，丟掉。日誌指向的東西都要在範圍內：測試目錄是這個 checkout 裡某個模組的 `src/test`、它
+點名的每個檔都在測試目錄裡（沒有 `..`）、它的 artifacts 以找到它的位置為準、建置輸出只認那個模組放測試的地方
+（`target/test-classes`、Gradle 的 `build/classes/*/test` 與 `build/resources/test`，`journalOutputDirs`）——撤回會
+清空一個批次開始時不存在的輸出目錄，日誌若能點名 `src/main`，它就會被清空。runs 目錄可以共用，別人寫進去的東西
+不能讓撤回寫到 `src/test` 以外。
+持有 repo 鎖時，同一台機器上這個 repo 不會有別的執行，但 pid 只在同一次開機、同一個 pid namespace 才有意義：
+重開機過就一定已死；pid 還在而且啟動時間吻合才是同一個程序（啟動時間與子程序紀錄同一套：Linux 讀 `/proc`，
+其他 POSIX 用 `ps`）——記了啟動時間、現在卻讀不到，就是已經結束（zombie 照樣回應 `kill 0`）；沒記（Windows）時
+退回 pid 還在而且心跳新鮮；另一個 pid namespace 或別台機器寫的只能等心跳停超過 5 分鐘。那次執行有 `summary.json`
+（它自己收了尾）時，日誌是剩下的，丟掉；日誌寫到一半（沒有 `journal.json`，只有寫在最前面的 owner）而寫它的執行
+已死，也丟掉；解析得了但欄位不對、或指向範圍外的（手動改壞、別的工具寫的）丟掉並警告——每次啟動都當掉不是選項。
+
+**這個 checkout 上可能還在跑的。** 一份這個 checkout 的日誌，它的執行可能還活著（剛被重啟的容器——新的 pid
+namespace，心跳還在 5 分鐘內；繞過 repo 鎖的執行；另一個容器掛同一個 checkout）：在它上面開始，會把它寫到一半
+的測試當成既有測試，或和它的 writer 搶同一個 `src/test`。repo 鎖在系統暫存目錄，每個容器各有一份，擋不住。所以
+先等它停止（`UT_OTHER_RUN_WAIT_MS`，預設 6 分鐘——比心跳被信任的 5 分鐘長，被強制終止的執行一定等得到它沉默），
+停了就照常替它收尾；等不到就以 `checkout-busy` 停下、日誌留著。
+
+**撤回不完整時停下。** 撤回時有檔案放不回去（多半是 IDE 或防毒軟體鎖住）、或撤回途中出錯，這次執行以
+`killed-batch-not-restored` 停下，日誌留著給下一次再試：`start.bin` 是那些檔原本內容的唯一副本，而在還留著半成品
+的樹上產生新測試，半成品會被當成既有測試保護起來。
+
+**順序。** 通過的批次先刪日誌、再記進 `passed.json`：兩者之間被終止時兩者都沒有，下一次執行重做那個類別。
+反過來的話，下一次執行會撤回一批通過了所有 gate 的測試。失敗的批次先撤回、再刪日誌：兩者之間被終止時，
+下一次執行照日誌再撤一次，已經還原的檔內容相同、不會再動。那批已經記在 `batches.json` 裡時，日誌只是剩下的，
+不撤回，只補寫 summary。
+
+**沒有做的。** 單一類別的 run 沒通過時本來就不撤回（測試留給人決定），被強制終止也一樣，不寫日誌——資料夾目標
+在接續之後只剩一個類別時仍是一批，照寫。修復迴圈被中斷時也不撤回（與 Ctrl-C 相同）。檔案系統不記建立時間時，
+目錄只能以 inode 認：checkout 刪掉、在同一個路徑重新 clone、又剛好拿到同一個 inode，而且重跑就在那次執行最後一次
+心跳後一分鐘內——那時新 clone 的檔還在寬限之內，可能被當成那批的變更撤回（撤回前一樣先存進 `rejected/`）。
+ext4、XFS、APFS、NTFS 都記建立時間。
+
+**它留下還在跑的子程序。** 子程序在 POSIX 上各自是程序群組的 leader（才能整群結束），所以 run 被 SIGKILL 時
+它們不會跟著死：Maven 連同 surefire fork 的 JVM 會把剩下的幾分鐘跑完，與下一次執行的預檢寫同一個 `target/`；
+opencode 的 session 會繼續寫 `src/test`，跟撤回搶。所以追蹤中的子程序也寫在 run 的 artifacts
+（`children.json`，`libs/shell.ts`）：pid、啟動時間（Linux 讀 `/proc/<pid>/stat`，其他 POSIX 用 `ps -o lstart=`），
+以及 run 本身的 pid 與啟動時間、repo、主機、開機時間、pid namespace；run 活著時每 30 秒更新它的時間（心跳）。
+`ps` 以 `LC_ALL=C TZ=UTC` 執行：它印的是當地時間與語系的格式，兩次執行在不同的 `TZ` 或 `LC_TIME` 下就永遠認不出
+彼此的紀錄。下一次執行在一切之前（編碼視圖、批次撤回都在後面）處理它：只看同一個 repo、同一台主機、同一次開機、
+同一個 pid namespace 的紀錄；紀錄的主人還是同一個程序（只有繞過 repo 鎖時才可能）就不碰；每個子程序只在它還是
+同一個程序（啟動時間吻合）時結束它的整個群組；pid 被別的程序重用（啟動時間不同）就不碰。每筆紀錄記下它是不是
+建置（`kind`）：只有結束 agent session 才把那次執行的「最後還活著」延後。launcher 已經不在而
+群組還有成員（建置結束了、它 fork 出去的 JVM 還在）時，群組 id 可能已經被發給別人——pid 被一個自己開了群組、
+又先離開的程序拿去（把伺服器丟到背景的啟動 script、double-fork 的 daemon），它留下的成員就在同一個 id 底下——
+所以只結束那次執行活著時啟動的成員（Linux：`/proc` 的啟動時間，從紀錄的子程序啟動，到那次執行最後一次心跳加
+一個間隔），其餘點名；看不到每個成員啟動時間的平台一個都不結束，只點名。已經結束、等著被回收的程序（zombie，
+容器的 pid 1 常常不回收）不算還在跑。處理過的紀錄就刪掉：之後那些 pid 可能是任何人的。結束了 agent session 的
+那次執行，它的「最後還活著」延到結束的那一刻（上面「誰的變更」）。
+Windows：node 結束時 libuv 的 job object 會帶走它直接啟動的程序（`shell: true` 的 cmd.exe、opencode.cmd 的
+cmd.exe），而真正做事的 java.exe、opencode 是它們再啟動的，不在 job 裡、也沒有被記錄——紀錄裡的 pid 是已經死掉
+的那一個。所以 Windows 上只列出那次執行當時在跑的指令，請人在工作管理員找它們，不自動結束。qwen runner 的 CLI
+由 `@qwen-code/sdk` 在它自己裡面啟動，不經過 `trackForShutdown`，不在紀錄裡。
 
 ## 已否決方案（防止重新提案）
 
